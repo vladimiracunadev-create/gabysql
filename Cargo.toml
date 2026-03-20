@@ -1,0 +1,16 @@
+﻿[package]
+name = "gabysql"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Embedded personal database engine in Rust"
+
+[lib]
+name = "gabysql"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+

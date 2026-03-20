@@ -1,0 +1,50 @@
+﻿# SECURITY
+
+## Estado actual de seguridad
+`gabysql` es hoy un motor embebido con server HTTP opcional. Su postura de seguridad es suficiente para laboratorio, desarrollo local y un producto base controlado, pero no debe presentarse todavía como plataforma multiusuario endurecida de nivel enterprise.
+
+## Versiones soportadas
+- `0.1.x`: soportada
+- versiones previas al rewrite en Rust: no soportadas
+
+## Qué protecciones existen hoy
+- `phpgabyadmin` usa cookie firmada cuando `GABYADMIN_TOKEN` está definido.
+- `phpgabyadmin` bloquea hosts remotos salvo `GABYADMIN_ALLOW_REMOTE=1`.
+- `gabysql-server` puede exigir token HTTP con `-token`.
+- El nombre de DB en modo `-dir` se normaliza y bloquea rutas arbitrarias.
+- El motor hace rollback en errores de ejecución SQL dentro de la transacción activa.
+
+## Qué no existe todavía
+- No hay TLS nativo en `gabysql-server`.
+- No hay cifrado en reposo del `.db`.
+- No hay control fino de usuarios/roles.
+- No hay aislamiento multi-tenant.
+- No hay auditoría avanzada ni security logs estructurados.
+
+## Recomendaciones de hardening
+### Para server HTTP
+- publica `gabysql-server` detrás de un reverse proxy con TLS
+- usa `-token` siempre que no sea un laboratorio efímero
+- expón el puerto solo en red de confianza o localhost
+
+### Para `phpgabyadmin`
+- usa `GABYADMIN_TOKEN`
+- no habilites `GABYADMIN_ALLOW_REMOTE=1` salvo necesidad real
+- si lo expones por red, hazlo detrás de un proxy con autenticación adicional
+
+### Para almacenamiento
+- restringe permisos del archivo `.db`
+- realiza backups offline
+- evita compartir directorios de datos sin controles del sistema operativo
+
+## Divulgación responsable
+Si encuentras una vulnerabilidad:
+1. no publiques secretos, tokens ni pasos de explotación destructivos
+2. repórtala de forma privada al mantenedor por GitHub o canal directo antes de divulgación pública
+3. incluye versión, entorno y pasos de reproducción mínimos
+
+## Riesgos conocidos
+- el modelo de concurrencia sigue siendo básico
+- el API no implementa rate limiting
+- el admin web depende de la exposición segura del entorno donde se publica
+- el formato en disco aún no tiene sistema formal de migraciones entre versiones mayores

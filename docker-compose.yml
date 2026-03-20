@@ -1,0 +1,26 @@
+﻿services:
+  gabysql-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gabysql-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - gabysql-data:/data
+
+  phpgabyadmin:
+    image: php:8.2-apache
+    container_name: phpgabyadmin
+    depends_on:
+      - gabysql-server
+    environment:
+      GABYADMIN_ALLOW_REMOTE: "1"
+      GABYADMIN_SERVER: "http://gabysql-server:8080"
+    ports:
+      - "8000:80"
+    volumes:
+      - ./web:/var/www/html:ro
+
+volumes:
+  gabysql-data:

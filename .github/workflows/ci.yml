@@ -1,0 +1,61 @@
+﻿name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --all-targets
+      - name: cargo build release
+        run: cargo build --release --bin gabysql --bin gabysql-server
+      - name: Upload release binaries (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gabysql-${{ runner.os }}-release
+          path: |
+            target/release/gabysql
+            target/release/gabysql-server
+      - name: Upload release binaries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gabysql-${{ runner.os }}-release
+          path: |
+            target/release/gabysql.exe
+            target/release/gabysql-server.exe
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker build
+        run: docker build -t gabysql .
+
+  php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+      - name: Lint landing
+        run: php -l web/index.php
+      - name: Lint admin
+        run: php -l web/phpgabyadmin/index.php

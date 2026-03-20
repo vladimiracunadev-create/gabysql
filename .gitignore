@@ -1,0 +1,6 @@
+﻿*.db
+*.wal
+*.exe
+.DS_Store
+target/
+.docker/
