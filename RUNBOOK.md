@@ -1,9 +1,13 @@
-﻿# RUNBOOK
+﻿# 🧰 RUNBOOK
 
-## Objetivo
-Este runbook describe la operación base de `gabysql` en modo local y server HTTP.
+> **Guía de operación diaria, smoke checks, backup y recovery de `gabysql`.**
 
-## 1. Arranque estándar
+> **Audiencia**: Operadores, maintainers, soporte técnico.
+
+---
+
+## 🚀 Arranque estándar
+
 ### Single DB
 ```powershell
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080
@@ -20,7 +24,10 @@ cargo run --release --bin gabysql-server -- -dir ./dbs -addr :8080
 docker compose up -d --build
 ```
 
-## 2. Smoke checks mínimos
+---
+
+## ✅ Smoke checks mínimos
+
 ### Health
 ```powershell
 Invoke-WebRequest -UseBasicParsing http://localhost:8080/health
@@ -41,35 +48,52 @@ Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' 
 Invoke-WebRequest -UseBasicParsing "http://localhost:8080/rows?db=demo.db&table=users&limit=25&offset=0"
 ```
 
-## 3. Backup recomendado
-### Recomendación principal
-Haz backup offline:
-1. Detén el proceso que escribe.
-2. Verifica que no quede `.wal` pendiente.
-3. Copia el `.db`.
+---
+
+## 💾 Backup recomendado
+
+### Estrategia principal
+1. Detén el proceso que escribe
+2. Verifica que no quede `.wal` pendiente
+3. Copia el `.db`
 
 ### Qué evitar
-- No hagas backup de un `.db` activo suponiendo consistencia total.
-- No copies solo el `.db` si hubo una caída y todavía existe `.wal` sin replay.
+- no hacer backup de un `.db` activo suponiendo consistencia total
+- no copiar solo el `.db` si hubo una caída y todavía existe `.wal` sin replay
 
-## 4. Recovery tras caída
+---
+
+## ♻️ Recovery tras caída
+
 Si quedó un archivo `.wal` junto al `.db`:
-1. Abre la base con `gabysql info <db>` o arranca el server apuntando a esa DB.
-2. `Pager::open` reintentará replay si el WAL tiene marcador `COMMIT`.
-3. Tras el replay correcto, el `.wal` se elimina.
+1. Abre la base con `gabysql info <db>` o arranca el server apuntando a esa DB
+2. `Pager::open` reintentará replay si el WAL tiene marcador `COMMIT`
+3. Tras el replay correcto, el `.wal` se elimina
 
-## 5. Operación de `phpgabyadmin`
-- Mantén el admin expuesto solo en red local o detrás de un reverse proxy controlado.
-- Usa `GABYADMIN_TOKEN` si no es un laboratorio desechable.
-- No habilites `GABYADMIN_ALLOW_REMOTE=1` salvo que realmente necesites apuntar a otro host.
+> [!IMPORTANT]
+> El recovery actual depende de la existencia de `COMMIT` en el WAL. Si el archivo quedó truncado o sin commit marker, el WAL se descarta.
 
-## 6. Operación con token HTTP
+---
+
+## 🌐 Operación de `phpgabyadmin`
+
+- Mantén el admin expuesto solo en red local o detrás de un reverse proxy controlado
+- Usa `GABYADMIN_TOKEN` si no es un laboratorio desechable
+- No habilites `GABYADMIN_ALLOW_REMOTE=1` salvo que realmente necesites apuntar a otro host
+
+---
+
+## 🔐 Operación con token HTTP
+
 Si el server usa `-token secret`, verifica con:
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Headers @{ 'X-Gabysql-Token' = 'secret' } http://localhost:8080/health
 ```
 
-## 7. Comandos útiles
+---
+
+## 🧪 Comandos útiles
+
 ### Validación nativa
 ```powershell
 cargo fmt --check
@@ -88,13 +112,23 @@ docker compose up -d --build
 docker compose down
 ```
 
-## 8. Incidentes comunes
-- `bad magic (not gabysql db)`: el archivo no es una DB válida de `gabysql`.
-- `duplicate primary key`: se intentó insertar una PK ya existente.
-- `WHERE soporta solo '=' o BETWEEN`: la consulta usa un filtro no soportado todavía.
-- `401 unauthorized`: falta token o es incorrecto.
-- `db inválida`: el nombre de DB trae ruta o caracteres no permitidos en modo `-dir`.
+---
 
-## 9. Observabilidad actual
-Hoy el server escribe errores a stderr y expone solo `/health` como endpoint de salud.
-No hay todavía métricas Prometheus, tracing distribuido ni dashboard integrado.
+## 🚨 Incidentes comunes
+
+| Incidente | Significado |
+|---|---|
+| `bad magic (not gabysql db)` | el archivo no es una DB válida |
+| `duplicate primary key` | intento de insertar PK repetida |
+| `WHERE soporta solo '=' o BETWEEN` | consulta fuera del subconjunto SQL actual |
+| `401 unauthorized` | token faltante o incorrecto |
+| `db inválida` | nombre de DB no aceptado en modo `-dir` |
+
+---
+
+## 📈 Observabilidad actual
+
+Hoy el server:
+- escribe errores a stderr
+- expone `/health` como endpoint de salud
+- no tiene todavía métricas Prometheus, tracing distribuido ni dashboard integrado

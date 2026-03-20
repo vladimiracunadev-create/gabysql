@@ -1,46 +1,85 @@
-﻿# gabysql
+﻿# 🗄️ gabysql
 
-`gabysql` es una base de datos embebida escrita en Rust, con archivo único `.db`, WAL simple y una superficie SQL pequeña pero estable para uso local, laboratorios, demos y un producto base que pueda crecer con orden.
+> **Motor embebido en Rust con archivo único `.db`, WAL simple, API HTTP y admin web liviano.**
 
-No intenta competir todavía con PostgreSQL, MySQL o SQLite en amplitud funcional. El foco actual es otro: storage claro, formato en disco entendible, portabilidad real en Windows/Linux/macOS y una ruta de endurecimiento honesta.
+[![CI](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/ci.yml/badge.svg)](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+![Status](https://img.shields.io/badge/status-base%20estable-2e8b57)
+![Target](https://img.shields.io/badge/target-Windows%20%7C%20Linux%20%7C%20macOS-1f6feb)
+![Storage](https://img.shields.io/badge/storage-single--file%20db%20%2B%20wal-8a5a2b)
 
-## Estado del producto
-- Base funcional y estable para `CREATE`, `INSERT` y `SELECT`.
-- Server HTTP/JSON listo para uso local o laboratorio.
-- Admin web `phpgabyadmin` operando sobre la API HTTP.
-- Validación nativa en Windows, Linux y macOS vía CI.
-- Validación reproducible vía Docker y `docker compose`.
+`gabysql` es una base de datos embebida escrita en Rust, pensada como un producto base serio: storage claro, formato en disco entendible, portabilidad real y una ruta de evolución honesta. No pretende todavía reemplazar a PostgreSQL, MySQL o SQLite en amplitud funcional; hoy prioriza estabilidad, durabilidad y claridad arquitectónica.
 
-## Qué hace hoy
+---
+
+## 🚦 Estado actual del producto
+
+> **Estado**: 🟢 Base estable  
+> **Superficie SQL**: `CREATE`, `INSERT`, `SELECT`, `WHERE PK`, `LIMIT/OFFSET`  
+> **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`  
+> **Portabilidad**: Windows, Linux y macOS por CI  
+> **Runtime opcional**: Docker + `docker compose`
+
+## 🎯 Qué resuelve hoy este repositorio
+
+- **Base local embebida** con archivo único `.db`.
+- **Motor SQL mínimo pero útil** para crear tablas, insertar y consultar datos.
+- **API HTTP/JSON** para operar una o múltiples bases.
+- **Admin web** `phpgabyadmin` para exploración y operación básica.
+- **Ruta documental completa** para instalar, operar, extender y endurecer el producto.
+
+---
+
+## 🧭 Rutas recomendadas según perfil
+
+| Perfil | Documento de entrada | Qué mirar primero |
+|---|---|---|
+| Principiante | [docs/BEGINNERS_GUIDE.md](docs/BEGINNERS_GUIDE.md) | recorrido de 10 minutos |
+| Usuario / operador | [USER_MANUAL.md](USER_MANUAL.md) | CLI, server y admin web |
+| Operación | [RUNBOOK.md](RUNBOOK.md) | health checks, backup, recovery |
+| Técnico / maintainer | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | capas del motor y flujo interno |
+| API / integración | [docs/API.md](docs/API.md) | endpoints, auth y payloads |
+| Seguridad | [SECURITY.md](SECURITY.md) | postura actual y hardening |
+
+---
+
+## ✨ Capacidades actuales
+
+### Storage y catálogo
 - Archivo `.db` con páginas de `4096` bytes.
-- WAL after-image con recovery por marcador `COMMIT`.
+- WAL after-image con replay por marcador `COMMIT`.
+- Catálogo persistente de tablas.
 - Índice persistente de hojas enlazadas por PK `INT`.
-- Catálogo de tablas persistente.
-- SQL soportado:
-  - `CREATE TABLE`
-  - `INSERT`
-  - `SELECT * FROM tabla`
-  - `SELECT columnas FROM tabla LIMIT/OFFSET`
-  - `SELECT ... WHERE <pk> = valor`
-  - `SELECT ... WHERE <pk> BETWEEN a AND b`
-- Tipos soportados:
-  - `INT`
-  - `TEXT`
-  - `BOOL`
-  - `FLOAT`
-  - `DATE`
-  - `DATETIME`
-  - `JSON`
-  - `NULL` en columnas no PK
 
-## Compatibilidad
-- Nativo: Windows, Linux y macOS mediante binarios Rust.
-- Contenedores: Docker para validar y desplegar `gabysql-server` y `phpgabyadmin`.
-- CI: GitHub Actions valida `cargo fmt`, `cargo clippy`, `cargo test` y build `release` en `ubuntu-latest`, `windows-latest` y `macos-latest`.
-- Artefactos: la CI genera binarios `release` por sistema operativo validado.
+### SQL soportado
+- `CREATE TABLE`
+- `INSERT`
+- `SELECT * FROM tabla`
+- `SELECT columnas FROM tabla LIMIT/OFFSET`
+- `SELECT ... WHERE <pk> = valor`
+- `SELECT ... WHERE <pk> BETWEEN a AND b`
 
-## Inicio rápido
-### Opción 1: Docker
+### Tipos soportados
+- `INT`
+- `TEXT`
+- `BOOL`
+- `FLOAT`
+- `DATE`
+- `DATETIME`
+- `JSON`
+- `NULL` en columnas no PK
+
+### Runtime y acceso
+- CLI `gabysql`
+- API `gabysql-server`
+- Admin web `phpgabyadmin`
+- Docker y `docker compose`
+
+---
+
+## ⚡ Inicio rápido
+
+### Opción A — Docker
 ```powershell
 docker build -t gabysql .
 docker run --rm -p 8080:8080 -v ${PWD}\data:/data gabysql
@@ -51,11 +90,11 @@ Stack completo:
 docker compose up -d --build
 ```
 
-Luego:
+Entradas principales:
 - API: `http://localhost:8080`
 - Admin web: `http://localhost:8000/phpgabyadmin/`
 
-### Opción 2: nativo
+### Opción B — Nativo
 ```powershell
 cargo build --release --bin gabysql --bin gabysql-server
 cargo run --release --bin gabysql -- init demo.db
@@ -64,28 +103,36 @@ cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name,ac
 cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users;"
 ```
 
-Server HTTP:
+Levantar API:
 ```powershell
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080
 ```
 
-Admin web:
+Levantar admin web:
 ```powershell
 php -S localhost:8000 -t web
 ```
 
-## Documentación
-- [INSTALL.md](./INSTALL.md): instalación y build en Windows, Linux, macOS y Docker.
-- [USER_MANUAL.md](./USER_MANUAL.md): uso de CLI, server HTTP y `phpgabyadmin`.
-- [RUNBOOK.md](./RUNBOOK.md): operación diaria, backup, recovery y smoke checks.
-- [TROUBLESHOOTING.md](./TROUBLESHOOTING.md): fallos frecuentes y cómo resolverlos.
-- [CONTRIBUTING.md](./CONTRIBUTING.md): flujo de trabajo y reglas para cambios.
-- [SECURITY.md](./SECURITY.md): postura de seguridad y hardening recomendado.
-- [CHANGELOG.md](./CHANGELOG.md): cambios ya realizados.
-- [ROADMAP.md](./ROADMAP.md): próximos focos del producto.
-- [docs/INDEX.md](./docs/INDEX.md): mapa completo de documentación técnica.
+---
 
-## Arquitectura del repo
+## 📚 Mapa documental
+
+| Documento | Rol |
+|---|---|
+| [INSTALL.md](INSTALL.md) | instalación y build por sistema operativo |
+| [USER_MANUAL.md](USER_MANUAL.md) | uso diario del producto |
+| [RUNBOOK.md](RUNBOOK.md) | operación, backup y recovery |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | resolución de fallos frecuentes |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | reglas de colaboración |
+| [SECURITY.md](SECURITY.md) | postura de seguridad y hardening |
+| [CHANGELOG.md](CHANGELOG.md) | cambios relevantes aplicados |
+| [ROADMAP.md](ROADMAP.md) | dirección técnica y fases futuras |
+| [docs/INDEX.md](docs/INDEX.md) | índice técnico completo |
+
+---
+
+## 🏗️ Arquitectura del repositorio
+
 - `src/storage.rs`: header, pager, WAL y recovery.
 - `src/bptree.rs`: índice persistente de hojas enlazadas.
 - `src/catalog.rs`: metadatos de tablas y catálogo.
@@ -96,7 +143,10 @@ php -S localhost:8000 -t web
 - `tests/integration_test.rs`: validaciones principales de storage y SQL.
 - `web/phpgabyadmin/index.php`: admin web sobre la API.
 
-## Validación actual
+---
+
+## ✅ Validación actual
+
 El repositorio ya fue validado con:
 - `cargo fmt --check`
 - `cargo check --tests`
@@ -106,7 +156,10 @@ El repositorio ya fue validado con:
 - `GET /health` sobre `gabysql-server`
 - respuesta HTML de `phpgabyadmin`
 
-## Limitaciones actuales
+---
+
+## ⚠️ Limitaciones deliberadas
+
 - No hay `UPDATE` ni `DELETE` todavía.
 - No hay `JOIN`, `ORDER BY`, `GROUP BY` ni planner cost-based.
 - La PK actual debe ser `INT`.
@@ -114,7 +167,8 @@ El repositorio ya fue validado con:
 - No hay MVCC ni locking fuerte entre procesos.
 - La estructura persistente actual no es todavía un B+Tree multinivel completo.
 
-## Dirección técnica
+## 🧠 Dirección técnica
+
 La dirección correcta hoy es tratar a `gabysql` como un motor embebido tipo SQLite en fase temprana:
 - storage local
 - formato en disco explícito

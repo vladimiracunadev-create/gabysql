@@ -1,7 +1,12 @@
-﻿# API
+﻿# 🌐 API
 
-## Resumen
-`gabysql-server` expone una API HTTP/JSON simple para:
+> **Referencia HTTP/JSON de `gabysql-server`: endpoints, autenticación, payloads y respuestas.**
+
+---
+
+## 🧭 Resumen
+
+`gabysql-server` expone una API simple para:
 - listar bases
 - crear bases en modo multi DB
 - listar tablas
@@ -9,32 +14,42 @@
 - leer filas
 - ejecutar SQL
 
-## Autenticación
+---
+
+## 🔐 Autenticación
+
 Si el server se arranca con `-token <valor>`, cada request debe incluir uno de estos headers:
 - `X-Gabysql-Token: <valor>`
 - `Authorization: Bearer <valor>`
 
 Sin token válido, el server responde `401`.
 
-## Modos de operación
-### Single DB
-```powershell
-gabysql-server -db demo.db -addr :8080
-```
+---
 
-En este modo, el server trabaja sobre una sola DB y no necesitas enviar `db` en cada request.
+## 🗂️ Modos de operación
 
-### Multi DB
-```powershell
-gabysql-server -dir ./dbs -addr :8080
-```
+| Modo | Comando | Implicación |
+|---|---|---|
+| Single DB | `gabysql-server -db demo.db -addr :8080` | no necesitas enviar `db` en cada request |
+| Multi DB | `gabysql-server -dir ./dbs -addr :8080` | debes enviar `db` en los endpoints que operan sobre una base |
 
-En este modo sí debes enviar `db` en los endpoints que operan sobre una base específica.
+---
 
-## Endpoints
+## 🚏 Endpoints
 
-### `GET /health`
-Verifica que el server esté arriba.
+| Método | Ruta | Qué hace |
+|---|---|---|
+| `GET` | `/health` | health check del server |
+| `GET` | `/dbs` | lista bases disponibles |
+| `POST` | `/dbs` | crea una DB en modo `-dir` |
+| `GET` | `/tables` | lista tablas de una DB |
+| `GET` | `/schema` | devuelve schema de una tabla |
+| `GET` | `/rows` | devuelve filas con paginación |
+| `POST` | `/exec` | ejecuta una o más sentencias SQL |
+
+---
+
+## `GET /health`
 
 Ejemplo de respuesta:
 ```json
@@ -47,10 +62,11 @@ Ejemplo de respuesta:
 }
 ```
 
-### `GET /dbs`
-Lista bases disponibles.
+---
 
-#### Respuesta en modo single DB
+## `GET /dbs`
+
+### Respuesta en modo single DB
 ```json
 {
   "ok": true,
@@ -60,7 +76,7 @@ Lista bases disponibles.
 }
 ```
 
-#### Respuesta en modo multi DB
+### Respuesta en modo multi DB
 ```json
 {
   "ok": true,
@@ -69,7 +85,10 @@ Lista bases disponibles.
 }
 ```
 
-### `POST /dbs`
+---
+
+## `POST /dbs`
+
 Crea una base en modo `-dir`.
 
 Request:
@@ -84,8 +103,9 @@ Posibles respuestas:
 - `409` ya existe
 - `400` nombre inválido
 
-### `GET /tables?db=demo.db`
-Lista tablas registradas.
+---
+
+## `GET /tables?db=demo.db`
 
 Ejemplo:
 ```json
@@ -105,11 +125,15 @@ Ejemplo:
 }
 ```
 
-### `GET /schema?db=demo.db&table=users`
+---
+
+## `GET /schema?db=demo.db&table=users`
+
 Retorna el schema de una tabla.
 
-### `GET /rows?db=demo.db&table=users&limit=25&offset=0`
-Devuelve filas proyectadas por orden natural del índice principal.
+---
+
+## `GET /rows?db=demo.db&table=users&limit=25&offset=0`
 
 Reglas:
 - `limit` por defecto: `25`
@@ -130,7 +154,10 @@ Ejemplo:
 }
 ```
 
-### `POST /exec`
+---
+
+## `POST /exec`
+
 Ejecuta una o más sentencias SQL dentro de una transacción.
 
 Request:
@@ -153,15 +180,23 @@ Ejemplo de respuesta:
 }
 ```
 
-## Errores frecuentes
-- `400`: SQL inválido, tabla inexistente, request incompleto.
-- `401`: token faltante o incorrecto.
-- `404`: endpoint o tabla inexistente.
-- `405`: operación no permitida en ese modo.
-- `409`: DB ya existe.
-- `500`: error interno inesperado.
+---
 
-## Notas operacionales
-- El server protege escrituras con un mutex de proceso.
-- No existe todavía rate limiting.
-- No hay TLS nativo; usa reverse proxy si expones el servicio.
+## 🚨 Errores frecuentes
+
+| Código | Motivo típico |
+|---|---|
+| `400` | SQL inválido, tabla inexistente, request incompleto |
+| `401` | token faltante o incorrecto |
+| `404` | endpoint o tabla inexistente |
+| `405` | operación no permitida en ese modo |
+| `409` | DB ya existe |
+| `500` | error interno inesperado |
+
+---
+
+## 🧠 Notas operacionales
+
+- El server protege escrituras con un mutex de proceso
+- No existe todavía rate limiting
+- No hay TLS nativo; usa reverse proxy si expones el servicio

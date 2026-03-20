@@ -1,6 +1,11 @@
-﻿# ARCHITECTURE
+﻿# 🏗️ ARCHITECTURE
 
-## Visión general
+> **Vista de alto nivel del motor, su flujo interno y las responsabilidades por módulo.**
+
+---
+
+## 🧭 Visión general
+
 `gabysql` está dividido en capas simples y explícitas:
 - CLI para trabajo local
 - engine SQL para parsear y ejecutar
@@ -10,24 +15,48 @@
 - server HTTP para exponer la base
 - `phpgabyadmin` como cliente web del API
 
-## Flujo interno
-### Por CLI
-1. `gabysql exec` abre el `Pager`.
-2. inicia transacción.
-3. `parse()` divide y valida sentencias.
-4. `Engine` ejecuta cada `Statement`.
-5. si todo sale bien, `commit()` escribe WAL y aplica páginas.
-6. si algo falla, hace rollback.
+## 🔄 Flujo principal
 
-### Por HTTP
-1. `gabysql-server` acepta la request.
-2. valida token si existe.
-3. abre la DB correspondiente.
-4. protege escritura con mutex cuando corresponde.
-5. ejecuta SQL o consulta catálogo/filas.
-6. serializa JSON y responde.
+```mermaid
+graph LR
+    CLI["gabysql / gabysql-server"] --> PARSER["Parser SQL"]
+    PARSER --> ENGINE["Engine"]
+    ENGINE --> CATALOG["Catalog"]
+    ENGINE --> TREE["Indice persistente"]
+    CATALOG --> PAGER["Pager"]
+    TREE --> PAGER
+    PAGER --> WAL["WAL"]
+    PAGER --> DB["Archivo .db"]
+    WEB["phpgabyadmin"] --> API["HTTP JSON"]
+    API --> ENGINE
+```
 
-## Componentes
+---
+
+## 🖥️ Flujo por CLI
+
+1. `gabysql exec` abre el `Pager`
+2. inicia transacción
+3. `parse()` divide y valida sentencias
+4. `Engine` ejecuta cada `Statement`
+5. si todo sale bien, `commit()` escribe WAL y aplica páginas
+6. si algo falla, hace rollback
+
+---
+
+## 🌐 Flujo por HTTP
+
+1. `gabysql-server` acepta la request
+2. valida token si existe
+3. abre la DB correspondiente
+4. protege escritura con mutex cuando corresponde
+5. ejecuta SQL o consulta catálogo/filas
+6. serializa JSON y responde
+
+---
+
+## 🧩 Componentes
+
 ### `src/storage.rs`
 Responsable de:
 - crear y abrir archivos `.db`
@@ -71,23 +100,32 @@ Responsable de:
 - listar DBs, tablas y filas
 - importar CSV vía múltiples `INSERT`
 
-## Decisiones actuales
-- Rust para el core del motor.
-- archivo único `.db` + `.wal` temporal.
-- SQL pequeño pero verificable.
-- server HTTP sin dependencias externas grandes.
-- admin web desacoplado del motor.
+---
 
-## Trade-offs conscientes
+## 🧠 Decisiones actuales
+
+- Rust para el core del motor
+- archivo único `.db` + `.wal` temporal
+- SQL pequeño pero verificable
+- server HTTP sin dependencias externas grandes
+- admin web desacoplado del motor
+
+---
+
+## ⚖️ Trade-offs conscientes
+
 - simplicidad por sobre throughput máximo
 - claridad del storage por sobre feature breadth
-- rango y full scan aceptables para tablas pequeñas/medianas
+- rango y full scan aceptables para tablas pequeñas o medianas
 - seguridad básica suficiente para entorno controlado, no endurecimiento enterprise total
 
-## Camino de evolución
-Las siguientes mejoras naturales son:
+---
+
+## 📈 Camino de evolución
+
+Las mejoras naturales siguientes son:
 - `UPDATE` y `DELETE`
 - índices secundarios
 - planner básico
 - mejor locking
-- versionado/migración del formato en disco
+- versionado y migración del formato en disco

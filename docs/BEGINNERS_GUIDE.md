@@ -1,6 +1,11 @@
-﻿# BEGINNERS GUIDE
+﻿# 🧭 BEGINNERS GUIDE
 
-## Objetivo
+> **Recorrido corto para levantar `gabysql` y entender su flujo base sin perderte en el detalle.**
+
+---
+
+## 🎯 Objetivo
+
 En 10 minutos deberías poder:
 - crear una base
 - crear una tabla
@@ -9,7 +14,10 @@ En 10 minutos deberías poder:
 - levantar el server HTTP
 - abrir `phpgabyadmin`
 
-## Opción rápida con Docker
+---
+
+## 🐳 Opción rápida con Docker
+
 ```powershell
 docker compose up -d --build
 ```
@@ -18,7 +26,10 @@ Luego abre:
 - `http://localhost:8080/health`
 - `http://localhost:8000/phpgabyadmin/`
 
-## Opción rápida nativa
+---
+
+## 💻 Opción rápida nativa
+
 ### 1. Compilar
 ```powershell
 cargo build --release --bin gabysql --bin gabysql-server
@@ -58,13 +69,19 @@ php -S localhost:8000 -t web
 
 Abre `http://localhost:8000/phpgabyadmin/`.
 
-## Qué revisar si algo falla
-- build nativo en Windows: revisa [../TROUBLESHOOTING.md](../TROUBLESHOOTING.md)
-- endpoints HTTP: revisa [API.md](./API.md)
-- instalación: revisa [../INSTALL.md](../INSTALL.md)
+---
 
-## Siguiente paso recomendado
+## 🧩 Qué revisar si algo falla
+
+- build nativo en Windows: [TROUBLESHOOTING](../TROUBLESHOOTING.md)
+- endpoints HTTP: [API](API.md)
+- instalación: [INSTALL](../INSTALL.md)
+
+---
+
+## 📍 Siguiente paso recomendado
+
 Después del primer recorrido, sigue con:
-- [ARCHITECTURE.md](./ARCHITECTURE.md)
-- [TECHNICAL_SPECS.md](./TECHNICAL_SPECS.md)
-- [../RUNBOOK.md](../RUNBOOK.md)
+- [ARCHITECTURE](ARCHITECTURE.md)
+- [TECHNICAL_SPECS](TECHNICAL_SPECS.md)
+- [RUNBOOK](../RUNBOOK.md)

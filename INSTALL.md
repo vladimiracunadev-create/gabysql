@@ -1,22 +1,37 @@
-﻿# INSTALL
+﻿# 💻 INSTALL
 
-## Objetivo
-Esta guía deja `gabysql` funcionando de forma nativa o con Docker en Windows, Linux y macOS.
+> **Guía de instalación y arranque de `gabysql` en Windows, Linux, macOS y Docker.**
 
-## Rutas recomendadas
-- Si quieres validar rápido el producto completo: usa Docker.
-- Si quieres desarrollar o depurar el motor: usa build nativo con Rust.
-- Si quieres usar `phpgabyadmin`: necesitas además PHP para servir `web/` o Docker Compose.
+> **Uso recomendado**: 📍 Empieza aquí si quieres levantar el producto por primera vez.
 
-## Requisitos mínimos
-- Rust estable con `cargo`.
-- Git para clonar/versionar.
-- PHP 8.2 o compatible para `phpgabyadmin`.
-- Docker Desktop o Docker Engine + Compose v2 si usarás contenedores.
+---
 
-Consulta también [docs/REQUIREMENTS.md](./docs/REQUIREMENTS.md).
+## 🧭 Elige tu ruta
 
-## Windows
+| Ruta | Ideal para | Resultado |
+|---|---|---|
+| Nativo con Rust | desarrollo, depuración, cambios al motor | binarios locales + tests |
+| Docker | validación reproducible, demo rápida, server + admin | stack listo con API y web |
+| PHP local | uso de `phpgabyadmin` fuera de Docker | interfaz web sobre API |
+
+---
+
+## 📋 Requisitos mínimos
+
+- Rust estable con `cargo`
+- Git
+- PHP 8.2 o compatible para `phpgabyadmin`
+- Docker Desktop o Docker Engine + Compose v2 si usarás contenedores
+
+> [!TIP]
+> Si tu objetivo es validar rápido el producto completo, Docker es la ruta más corta.
+
+Consulta también [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).
+
+---
+
+## 🪟 Windows
+
 ### Build nativo
 1. Instala `rustup` y el toolchain estable.
 2. Si quieres correr `cargo test` nativo en Windows, instala además:
@@ -29,9 +44,12 @@ cargo build --release --bin gabysql --bin gabysql-server
 ```
 
 ### Nota importante
-Si no tienes `link.exe` o bibliotecas como `kernel32.lib`, el camino más rápido es usar Docker para validar el proyecto completo mientras instalas el toolchain nativo de Windows.
+Si te faltan `link.exe` o bibliotecas como `kernel32.lib`, usa Docker mientras terminas de instalar el toolchain nativo.
 
-## Linux
+---
+
+## 🐧 Linux
+
 ```bash
 cargo build --release --bin gabysql --bin gabysql-server
 ```
@@ -41,7 +59,10 @@ Recomendado además:
 - `pkg-config`
 - PHP 8.2 si usarás el admin web fuera de Docker
 
-## macOS
+---
+
+## 🍎 macOS
+
 ```bash
 cargo build --release --bin gabysql --bin gabysql-server
 ```
@@ -50,7 +71,10 @@ Recomendado:
 - Xcode Command Line Tools
 - PHP o Docker para el admin web
 
-## Build nativo rápido
+---
+
+## ⚡ Build nativo rápido
+
 ```powershell
 cargo build --release --bin gabysql --bin gabysql-server
 cargo run --release --bin gabysql -- init demo.db
@@ -59,7 +83,10 @@ cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name) V
 cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users;"
 ```
 
-## Levantar el server HTTP
+---
+
+## 🌐 Levantar el server HTTP
+
 ### Single DB
 ```powershell
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080
@@ -71,7 +98,10 @@ mkdir dbs
 cargo run --release --bin gabysql-server -- -dir ./dbs -addr :8080
 ```
 
-## Levantar `phpgabyadmin`
+---
+
+## 🧪 Levantar `phpgabyadmin`
+
 Con el server ya corriendo:
 ```powershell
 php -S localhost:8000 -t web
@@ -81,11 +111,14 @@ Abrir:
 - `http://localhost:8000/phpgabyadmin/`
 
 Variables útiles:
-- `GABYADMIN_TOKEN`: exige login para entrar al admin.
-- `GABYADMIN_SERVER`: server por defecto al abrir el admin.
-- `GABYADMIN_ALLOW_REMOTE=1`: permite apuntar a un server remoto.
+- `GABYADMIN_TOKEN`: exige login para entrar al admin
+- `GABYADMIN_SERVER`: server por defecto al abrir el admin
+- `GABYADMIN_ALLOW_REMOTE=1`: permite apuntar a un server remoto
 
-## Docker
+---
+
+## 🐳 Docker
+
 ### Imagen única
 ```powershell
 docker build -t gabysql .
@@ -97,23 +130,31 @@ docker run --rm -p 8080:8080 -v ${PWD}\data:/data gabysql
 docker compose up -d --build
 ```
 
-Servicios:
+Entradas principales:
 - API: `http://localhost:8080`
 - Admin web: `http://localhost:8000/phpgabyadmin/`
 
-## Validación post-instalación
+---
+
+## ✅ Validación post-instalación
+
 ```powershell
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-Si estás en Windows y el toolchain nativo todavía no está listo, valida así:
+Si estás en Windows y el toolchain nativo todavía no está listo:
 ```powershell
 docker build -t gabysql .
 ```
 
-## Dónde se guardan los datos
-- Nativo: donde tú indiques el archivo `.db`.
-- Docker `gabysql`: en `/data` dentro del contenedor; monta un volumen o carpeta host.
-- Docker Compose: volumen `gabysql-data`.
+---
+
+## 🗂️ Dónde se guardan los datos
+
+| Modo | Ubicación |
+|---|---|
+| Nativo | donde tú indiques el archivo `.db` |
+| Docker `gabysql` | `/data` dentro del contenedor |
+| Docker Compose | volumen `gabysql-data` |

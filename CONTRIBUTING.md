@@ -1,22 +1,30 @@
-﻿# CONTRIBUTING
+﻿# 🤝 CONTRIBUTING
 
-## Objetivo
-Las contribuciones a `gabysql` deben priorizar estabilidad, legibilidad del formato en disco y coherencia entre código, pruebas y documentación.
+> **Cómo contribuir sin romper estabilidad, storage ni coherencia documental.**
 
-## Principios del repositorio
-- No prometer en docs lo que el motor todavía no soporta.
-- Si cambias storage, parser o semántica SQL, agrega o ajusta pruebas.
-- Si cambias comportamiento visible, actualiza también la documentación.
-- Prefiere cambios pequeños, verificables y reversibles.
+---
 
-## Flujo recomendado
-1. Entender el comportamiento actual.
-2. Implementar el cambio en el módulo correspondiente.
-3. Ejecutar validaciones locales.
-4. Actualizar documentación afectada.
-5. Revisar límites, compatibilidad y riesgos.
+## 🧭 Principios del repositorio
 
-## Validaciones obligatorias
+- No prometer en docs lo que el motor todavía no soporta
+- Si cambias storage, parser o semántica SQL, agrega o ajusta pruebas
+- Si cambias comportamiento visible, actualiza también la documentación
+- Prefiere cambios pequeños, verificables y reversibles
+
+---
+
+## 🔄 Flujo recomendado
+
+1. Entender el comportamiento actual
+2. Implementar el cambio en el módulo correspondiente
+3. Ejecutar validaciones locales
+4. Actualizar documentación afectada
+5. Revisar límites, compatibilidad y riesgos
+
+---
+
+## ✅ Validaciones obligatorias
+
 ```powershell
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -30,16 +38,24 @@ Si tu entorno Windows todavía no tiene toolchain nativo completo, valida al men
 docker build -t gabysql .
 ```
 
-## Dónde tocar cada cosa
-- `src/storage.rs`: pager, header, WAL y recovery.
-- `src/bptree.rs`: índice persistente por PK.
-- `src/catalog.rs`: catálogo de tablas.
-- `src/sql.rs`: SQL parser, engine y serialización de filas.
-- `src/server.rs`: API HTTP/JSON.
-- `web/phpgabyadmin/index.php`: admin web.
-- `tests/integration_test.rs`: pruebas de integración del core.
+---
 
-## Contrato documental
+## 🗺️ Dónde tocar cada cosa
+
+| Área | Archivo principal |
+|---|---|
+| Pager, header, WAL y recovery | `src/storage.rs` |
+| Índice persistente por PK | `src/bptree.rs` |
+| Catálogo de tablas | `src/catalog.rs` |
+| SQL parser, engine y row codec | `src/sql.rs` |
+| API HTTP/JSON | `src/server.rs` |
+| Admin web | `web/phpgabyadmin/index.php` |
+| Pruebas del core | `tests/integration_test.rs` |
+
+---
+
+## 📚 Contrato documental
+
 Si un cambio afecta comportamiento real, revisa al menos:
 - `README.md`
 - `CHANGELOG.md`
@@ -48,7 +64,10 @@ Si un cambio afecta comportamiento real, revisa al menos:
 - `RUNBOOK.md`
 - la documentación técnica correspondiente en `docs/`
 
-## Qué cambios requieren prueba nueva
+---
+
+## 🧪 Qué cambios requieren prueba nueva
+
 - cambios en formato en disco
 - cambios en WAL o recovery
 - cambios en parser o gramática SQL
@@ -56,7 +75,10 @@ Si un cambio afecta comportamiento real, revisa al menos:
 - cambios en endpoints HTTP
 - cambios en semántica de errores
 
-## Qué evitar
+---
+
+## 🚫 Qué evitar
+
 - introducir features “anunciadas” sin pruebas
 - ampliar SQL sin revisar impacto en docs
 - asumir concurrencia que todavía no existe
