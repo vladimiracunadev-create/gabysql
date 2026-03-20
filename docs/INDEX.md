@@ -24,6 +24,7 @@
 - [API](API.md)
 - [REQUIREMENTS](REQUIREMENTS.md)
 - [CONTRIBUTING](../CONTRIBUTING.md)
+- [Análisis de proyecciones](tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md)
 
 ---
 
@@ -48,6 +49,7 @@
 | Technical Specs | Técnico | formato en disco, WAL, tipos y límites | [Abrir](TECHNICAL_SPECS.md) |
 | API | Integración / backend | endpoints HTTP, auth y payloads | [Abrir](API.md) |
 | Requirements | Todos | requisitos mínimos y compatibilidad por OS | [Abrir](REQUIREMENTS.md) |
+| Análisis de proyecciones | Producto / arquitectura | cómo aterrizar los PDFs estratégicos en `gabysql` | [Abrir](tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md) |
 
 ---
 
