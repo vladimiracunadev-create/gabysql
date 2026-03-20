@@ -24,6 +24,8 @@
 - [API](API.md)
 - [REQUIREMENTS](REQUIREMENTS.md)
 - [CONTRIBUTING](../CONTRIBUTING.md)
+- [Plan maestro](PLAN_MAESTRO_GABYSQL.md)
+- [Especificación `gabybench`](GABYBENCH_SPEC.md)
 - [Análisis de proyecciones](tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md)
 
 ---
@@ -49,6 +51,8 @@
 | Technical Specs | Técnico | formato en disco, WAL, tipos y límites | [Abrir](TECHNICAL_SPECS.md) |
 | API | Integración / backend | endpoints HTTP, auth y payloads | [Abrir](API.md) |
 | Requirements | Todos | requisitos mínimos y compatibilidad por OS | [Abrir](REQUIREMENTS.md) |
+| Plan maestro | Producto / arquitectura | hoja de ruta paso a paso con control de riesgo | [Abrir](PLAN_MAESTRO_GABYSQL.md) |
+| Gabybench Spec | Producto / performance | DB canónica de prueba y comparación | [Abrir](GABYBENCH_SPEC.md) |
 | Análisis de proyecciones | Producto / arquitectura | cómo aterrizar los PDFs estratégicos en `gabysql` | [Abrir](tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md) |
 
 ---

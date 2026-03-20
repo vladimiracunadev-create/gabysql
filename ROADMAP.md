@@ -2,7 +2,7 @@
 
 > **Dirección técnica de `gabysql`: qué está estable hoy y qué falta para acercarlo a una v1 más seria.**
 
-> **Base estratégica adicional**: ver [docs/tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md](docs/tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md) para la lectura ejecutiva de las proyecciones RDBMS y su priorización aplicada a `gabysql`.
+> **Base estratégica adicional**: ver [docs/tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md](docs/tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md) para la lectura ejecutiva de las proyecciones RDBMS, [docs/PLAN_MAESTRO_GABYSQL.md](docs/PLAN_MAESTRO_GABYSQL.md) para la hoja de ruta paso a paso, y [docs/GABYBENCH_SPEC.md](docs/GABYBENCH_SPEC.md) para la base canónica de benchmark y comparación con otros motores.
 
 ---
 
@@ -46,9 +46,10 @@
 - planner básico con stats
 - `EXPLAIN`
 - mejor layout interno del índice
-- benchmarks reproducibles
+- benchmarks reproducibles con `gabybench`
 - profiling y tuning de scans/rangos
 - observabilidad del server más madura
+- comparación objetiva con SQLite, PostgreSQL, MySQL/MariaDB y DuckDB
 
 ### Fase 4 — Operación de producto
 - release process más formal
