@@ -136,7 +136,7 @@ impl<'a> Engine<'a> {
 
         let mut seen = HashSet::new();
         let mut values = HashMap::new();
-        for (column_name, value) in stmt.columns.into_iter().zip(stmt.values.into_iter()) {
+        for (column_name, value) in stmt.columns.into_iter().zip(stmt.values) {
             let normalized = normalize_ident(&column_name);
             if !seen.insert(normalized.clone()) {
                 return Err(DbError::new("columna duplicada en INSERT"));
