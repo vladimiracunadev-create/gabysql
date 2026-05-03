@@ -59,38 +59,44 @@ graph LR
 
 ### `src/storage.rs`
 Responsable de:
-- crear y abrir archivos `.db`
-- mantener header
-- gestionar páginas
-- escribir WAL y hacer recovery
+- crear (sin sobrescribir) y abrir archivos `.db`; expone `create_force` para reset explícito
+- mantener el header del formato `VERSION=3`
+- gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
+- finalizar el checksum antes de cada flush y verificarlo al leer
+- escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`
 
 ### `src/bptree.rs`
+**B+Tree real con dos tipos de página:**
+- `LEAF`: entradas `(key, value)` ordenadas, encadenadas por `next` para scans secuenciales eficientes.
+- `INTERNAL`: `(first_child, [(key, child) ...])`. Lookup desciende por la rama correcta hasta llegar a una hoja.
+
 Responsable de:
 - almacenar pares `key -> value`
-- insertar filas por PK
-- leer por PK
-- recorrer rangos y scans
+- inserción/upsert/delete por PK con splits en cascada
+- mantener `root_page` estable cuando el root necesita splittear (técnica copy-up: el contenido del root se copia a una página nueva y el slot de root se reescribe como nuevo `INTERNAL`)
+- recorrer rangos y full scans descendiendo al leftmost-leaf y siguiendo el chain `next`
 
 ### `src/catalog.rs`
 Responsable de:
-- registrar tablas
-- leer schema
-- validar `CREATE TABLE`
-- resolver páginas raíz de cada tabla
+- registrar tablas usando hashing **FNV-1a-64** (estable entre versiones de Rust)
+- leer schema y resolver páginas raíz de cada tabla
+- validar `CREATE TABLE` (PK obligatoria, escalar `INT`)
+- exponer `insert_row`, `upsert_row`, `delete_row`, `get_row`, `scan_rows`, `range_rows`
 
 ### `src/sql.rs`
 Responsable de:
 - tokenizar SQL
-- parsear sentencias soportadas
-- validar tipos y filtros
+- parsear `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- validar tipos y filtros (todos los WHERE actuales son sobre la PK)
 - serializar y deserializar filas
-- ejecutar `CREATE`, `INSERT`, `SELECT`
+- ejecutar las sentencias contra el `Engine`: `UPDATE` re-codifica la fila completa y rechaza mutar la PK; `DELETE` retorna error si la PK no existe
 
 ### `src/server.rs`
 Responsable de:
 - exponer endpoints HTTP/JSON
 - resolver single DB o multi DB
 - aplicar autenticación por token
+- limitar conexiones simultáneas (default 64, configurable con `-max-connections`); las que exceden el techo reciben `503`
 - serializar resultados
 
 ### `web/phpgabyadmin/index.php`
@@ -124,8 +130,11 @@ Responsable de:
 ## 📈 Camino de evolución
 
 Las mejoras naturales siguientes son:
-- `UPDATE` y `DELETE`
+- ~~`UPDATE` y `DELETE`~~ ✅ entregado (por PK)
+- ~~checksums por página~~ ✅ entregado (CRC32-IEEE en trailer)
+- ~~B+Tree multinivel real~~ ✅ entregado (LEAF + INTERNAL con root estable)
+- comando `integrity_check` que recorra el B+Tree y revalide CRCs
 - índices secundarios
 - planner básico
-- mejor locking
-- versionado y migración del formato en disco
+- mejor locking entre procesos
+- política formal de migración entre versiones del formato en disco

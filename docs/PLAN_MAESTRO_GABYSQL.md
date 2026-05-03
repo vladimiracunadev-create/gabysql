@@ -95,15 +95,19 @@ Congelar una base confiable antes de tocar componentes críticos.
 
 ## Fase 1 — Integridad del storage y recovery
 
+> **Estado**: parcialmente entregada (2026-05-03). Ver [CHANGELOG](../CHANGELOG.md) para los hitos. Falta `integrity_check` operacional y crash tests dirigidos.
+
 ### Objetivo
 Endurecer el corazón del motor sin ampliar demasiado la superficie SQL.
 
 ### Alcance
-- versionado formal del formato en disco
-- checksums por página o frame WAL
-- crash tests
-- `integrity_check`
-- mejor política de compatibilidad de archivos
+- ~~versionado formal del formato en disco~~ ✅ entregado (`VERSION = 3`, rechazo explícito)
+- ~~checksums por página o frame WAL~~ ✅ entregado (CRC32-IEEE en trailer de cada página + verificación en replay)
+- ~~B+Tree multinivel real~~ ✅ entregado (LEAF + INTERNAL, root estable)
+- ~~hashing del catálogo estable~~ ✅ entregado (FNV-1a-64)
+- crash tests (kill -9 entre WAL y file flush) — pendiente
+- `integrity_check` (recorrido completo, validación de CRCs y de invariantes del B+Tree) — pendiente
+- mejor política de compatibilidad de archivos — pendiente (hoy: rechazo explícito sin migración)
 
 ### Trabajo paso a paso
 1. Especificar v1 formal del file format
@@ -137,16 +141,18 @@ Corromper compatibilidad de archivos o recovery.
 
 ## Fase 2 — Correctitud funcional básica
 
+> **Estado**: arrancada (2026-05-03). `UPDATE` y `DELETE` por PK ya están en main; faltan constraints declarativas.
+
 ### Objetivo
 Completar las operaciones esenciales del motor y dejar reglas de datos más serias.
 
 ### Alcance
-- `UPDATE` por PK
-- `DELETE` por PK
-- `NOT NULL`
-- `DEFAULT`
-- `UNIQUE`
-- casts y semántica de `NULL` más claras
+- ~~`UPDATE` por PK~~ ✅ entregado
+- ~~`DELETE` por PK~~ ✅ entregado
+- `NOT NULL` — pendiente
+- `DEFAULT` — pendiente
+- `UNIQUE` — pendiente
+- casts y semántica de `NULL` más claras — pendiente
 
 ### Trabajo paso a paso
 1. implementar constraints en catálogo

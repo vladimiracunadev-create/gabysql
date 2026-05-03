@@ -9,8 +9,12 @@
 | Campo | Valor |
 |---|---|
 | Magic | `GABYSQL1` |
-| Versión de formato | `1` |
-| Tamaño de página por defecto | `4096` bytes |
+| Versión de formato | `3` |
+| Tamaño de página | `4096` bytes (fijo en esta versión) |
+| Trailer de checksum por página | `4` bytes (CRC32-IEEE) |
+| Hashing del catálogo | FNV-1a-64 (estable entre versiones de Rust) |
+
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay. Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
 
 ---
 
@@ -19,18 +23,20 @@
 | Offset | Significado |
 |---|---|
 | `0..7` | magic |
-| `8..11` | versión `u32` little-endian |
-| `12..13` | page size `u16` little-endian |
+| `8..11` | versión `u32` little-endian (debe ser `3`) |
+| `12..13` | page size `u16` little-endian (debe ser `4096`) |
 | `16..19` | page count `u32` little-endian |
 | `20..23` | `catalog_root_page` `u32` little-endian |
+| `last 4` | CRC32-IEEE del resto de la página |
 
 ---
 
 ## 💾 Modelo de persistencia
 
-- El archivo `.db` guarda header, catálogo y páginas del índice principal
-- Cada tabla mantiene una página raíz apuntando a una cadena de hojas persistentes
-- El catálogo guarda `TableMeta` serializado para cada tabla
+- El archivo `.db` guarda header, catálogo y páginas del índice principal.
+- Cada tabla mantiene una página raíz que es el root de su B+Tree.
+- El catálogo guarda `TableMeta` serializado para cada tabla, indexado por `FNV-1a-64(nombre normalizado)`.
+- Cada página persistida en disco lleva su CRC32 en los últimos 4 bytes; los encoders del B+Tree y del header reservan ese espacio.
 
 ---
 
@@ -40,31 +46,39 @@ Formato actual:
 - record page: `[type=1][pageNo u32][len u32][bytes]`
 - commit marker: `[type=2]`
 
+> El payload `bytes` de cada record es la página completa de `len = page_size`, **incluido su trailer CRC**. Por tanto, el CRC de la página dentro del WAL hace de checksum del record: durante `replay_to` la verificación falla si el WAL fue truncado o flipped antes de aplicarse al `.db`.
+
 ### Regla de durabilidad
-1. se escriben after-images al WAL
-2. se escribe `COMMIT`
-3. se sincroniza el WAL
-4. se aplican páginas al `.db`
-5. se sincroniza el `.db`
-6. se elimina el `.wal`
+1. el Pager finaliza el CRC trailer de cada página dirty
+2. se escriben after-images al WAL
+3. se escribe `COMMIT`
+4. se sincroniza el WAL
+5. se aplican páginas al `.db`
+6. se sincroniza el `.db`
+7. se elimina el `.wal`
 
 ### Recovery
-- si existe `.wal` con `COMMIT`, se reaplican páginas al `.db`
+- si existe `.wal` con `COMMIT`, cada record se valida por CRC y se aplica al `.db`
+- si algún record falla el CRC, el replay aborta con error explícito (no se reescribe la DB con datos corruptos)
 - si no existe `COMMIT`, el WAL se descarta
 
 ---
 
 ## 🌿 Índice persistente actual
 
-No es todavía un B+Tree multinivel completo.
+**B+Tree real** con dos tipos de página:
 
-Hoy el motor usa una estructura de hojas enlazadas:
-- clave: `i64`
-- valor: bytes serializados de fila
-- split al llenarse una hoja
-- scan por cadena enlazada
-- búsqueda puntual por PK
-- rango por `BETWEEN`
+| Tipo | Layout |
+|---|---|
+| `LEAF` (1) | `[type:u8][next:u32][count:u16] + count × ([key:i64][vlen:u16][bytes])` |
+| `INTERNAL` (2) | `[type:u8][reserved:u32][count:u16][first_child:u32] + count × ([key:i64][child:u32])` |
+
+- Lookup desciende por `INTERNAL` → eventualmente cae en `LEAF` (O(log N)).
+- Splits en cascada: si una hoja se llena, se divide y promueve la primera key de la mitad derecha al padre. Si el padre se llena, se promueve la mediana, etc.
+- **Root estable**: cuando el root necesita splittear, su contenido se copia a una página nueva y el slot original se reescribe como `INTERNAL` con dos hijos. El número de página del root nunca cambia, por lo que el catálogo no necesita actualizarse.
+- Full scan: descender al leftmost-leaf y seguir el chain `next`.
+- Range scan (`BETWEEN`): descender al leaf que contiene `from`, recorrer hasta `to`.
+- `delete` por PK: localizar la hoja, remover la entrada y reescribir la hoja. (Esta versión no rebalancea: las páginas pueden quedar parcialmente vacías; un futuro `vacuum` se hará cargo.)
 
 ---
 
@@ -74,9 +88,9 @@ Cada `TableMeta` contiene:
 - nombre de tabla
 - nombre de PK
 - columnas y tipos
-- página raíz de la tabla
+- página raíz de la tabla (root de su B+Tree)
 
-El catálogo usa hash del nombre de tabla para direccionamiento y detecta colisiones al leer.
+El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowercase). Una colisión de hash devuelve error explícito al abrir.
 
 ---
 
@@ -94,9 +108,11 @@ El catálogo usa hash del nombre de tabla para direccionamiento y detecta colisi
 
 ## 🧱 Reglas de fila
 
-- la PK debe ser `INT`
+- la PK debe ser una sola columna `INT` escalar (no se admiten PKs compuestas ni de otros tipos en esta versión)
 - la PK no puede ser `NULL`
-- una PK duplicada devuelve error
+- una PK duplicada devuelve error en `INSERT`
+- `UPDATE` no permite mutar la PK
+- `UPDATE` y `DELETE` sobre una PK inexistente retornan error explícito
 - columnas no presentes en `INSERT` quedan en `NULL` cuando aplica
 
 ---
@@ -107,19 +123,19 @@ El catálogo usa hash del nombre de tabla para direccionamiento y detecta colisi
 - `CREATE TABLE`
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ...`
-- `WHERE <pk> = ...`
-- `WHERE <pk> BETWEEN ... AND ...`
-- `LIMIT`
-- `OFFSET`
+- `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)
+- `WHERE <pk> BETWEEN ... AND ...` (solo en `SELECT`)
+- `LIMIT` / `OFFSET`
+- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N`
+- `DELETE FROM <tabla> WHERE <pk> = N`
 
 ### No soportado todavía
-- `UPDATE`
-- `DELETE`
 - `JOIN`
 - `ORDER BY`
 - `GROUP BY`
 - `LIKE`
 - `WHERE` sobre columnas no PK
+- `UPDATE` / `DELETE` por rango
 
 ---
 
@@ -128,6 +144,7 @@ El catálogo usa hash del nombre de tabla para direccionamiento y detecta colisi
 - mutex de proceso para escrituras
 - modo single DB o multi DB
 - token opcional por header
+- techo de conexiones simultáneas (default `64`, configurable con `-max-connections`); las conexiones extra reciben `503 Service Unavailable`
 - `limit` máximo de `1000` en `/rows`
 
 ---

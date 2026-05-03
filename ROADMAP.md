@@ -9,12 +9,14 @@
 ## 🚦 Estado actual
 
 - Core reescrito en Rust
-- Pager con header, páginas fijas y formato en disco versión `1`
-- WAL after-image con replay por `COMMIT`
-- Índice persistente de hojas enlazadas por PK `INT`
-- Catálogo de tablas persistente
-- SQL mínimo estable: `CREATE`, `INSERT`, `SELECT`, `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`
-- Server HTTP/JSON para single DB y multi DB
+- Pager con header, páginas fijas y formato en disco **versión `3`**
+- Cada página persistida lleva trailer CRC32-IEEE (4 bytes); corrupción se detecta al leer y al replay del WAL
+- WAL after-image con replay por `COMMIT` y verificación CRC del payload de cada página
+- **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits
+- Catálogo de tablas persistente con hashing FNV-1a-64 (estable entre versiones de Rust)
+- SQL estable: `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE` (todos por PK), `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`
+- Server HTTP/JSON para single DB y multi DB con tope de conexiones simultáneas (default 64, configurable con `-max-connections`)
+- `Pager::create` rehúsa sobrescribir un archivo existente; `gabysql init --force` para reset intencional
 - Admin web `phpgabyadmin` sobre la API HTTP
 - CI en Windows, Linux y macOS
 - Docker para validación y despliegue reproducible
@@ -25,13 +27,15 @@
 ## 🎯 Prioridades antes de llamarlo v1 serio
 
 ### Fase 1 — Robustez funcional
-- `UPDATE` y `DELETE` por PK
+- ~~`UPDATE` y `DELETE` por PK~~ ✅ entregado
+- ~~checksums por página + WAL~~ ✅ entregado (CRC32-IEEE)
 - `NOT NULL`, `DEFAULT` y constraints básicas
 - mejor validación de tipos en parser y engine
+- crash tests dirigidos (kill -9 entre WAL y file flush)
+- comando `integrity_check` que recorra y valide CRCs y la estructura del B+Tree
 - mejoras de full scan para tablas medianas
 - cobertura adicional en parser, storage y server
-- checksums + crash tests + `integrity_check`
-- política más clara de compatibilidad del formato en disco
+- política más clara de compatibilidad del formato en disco (changelog explícito por bump de VERSION)
 
 ### Fase 2 — Storage y consulta
 - índices secundarios

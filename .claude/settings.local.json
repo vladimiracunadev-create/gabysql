@@ -11,7 +11,8 @@
       "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/app\" -v gabysql-target:/app/target -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm sh -c \"rustup component add rustfmt 2>&1 >/dev/null; cargo fmt --check 2>&1 | head -40 && echo === && cargo test --quiet 2>&1 | tail -25\")",
       "Bash(git commit -m 'feat\\(storage\\): CRC32-IEEE checksums on pages and WAL records *)",
       "Bash(git commit -m 'feat\\(server\\): cap concurrent connections \\(default 64\\) *)",
-      "Bash(git commit -m 'feat\\(sql\\): UPDATE and DELETE by primary key *)"
+      "Bash(git commit -m 'feat\\(sql\\): UPDATE and DELETE by primary key *)",
+      "Bash(git commit -m 'docs: sweep all documentation for the 8 critical-finding fixes *)"
     ]
   }
 }

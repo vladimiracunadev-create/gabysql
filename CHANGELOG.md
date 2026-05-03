@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-05-03 — Tercera intervención: cierre de hallazgos críticos del MVP
+
+> **On-disk format jump: VERSION 1 → 3.** Toda DB creada antes de esta entrega es rechazada explícitamente al abrir. Recrearla con la versión actual (`gabysql init <file.db>`).
+
+### 🧱 Cambios estructurales del motor
+- **B+Tree real**: el índice por PK pasó de una lista enlazada de hojas a un B+Tree con nodos internos. Lookup descendente en O(log N), `root_page` permanece estable cruzando splits gracias a copy-up del root.
+- **Hash del catálogo determinista**: las claves del catálogo de tablas se calculaban con `DefaultHasher` (no estable entre versiones de Rust). Reemplazado por FNV-1a-64 inline en código.
+- **Checksums CRC32-IEEE**: cada página persiste un trailer de 4 bytes con su CRC. El Pager lo finaliza antes de flushear y verifica al leer y al replay del WAL. La corrupción ahora produce error explícito en vez de silencio.
+- **`Pager::create` no destructivo**: rehúsa sobrescribir un archivo existente. Se introdujo `create_force` para el camino explícito de reset (`gabysql init --force <file.db>`).
+- **`page_size` honesto**: el header valida que `page_size == PAGE_SIZE_DEFAULT`; el campo se mantiene en disco para una futura revisión del formato.
+
+### ✨ Funcionalidad SQL
+- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N;` (no permite cambiar la PK).
+- `DELETE FROM <tabla> WHERE <pk> = N;` (error si la PK no existe).
+- Mensajes de error de PK más explícitos sobre la limitación INT-only de esta versión.
+
+### 🛡️ Endurecimiento del modo server
+- `gabysql-server` aplica un techo de conexiones concurrentes (default 64, configurable con `-max-connections N`). Conexiones extra reciben 503 y se cierran sin generar threads.
+
+### 🧪 Validación
+- 9/9 tests de integración (incluye nuevos: split de B+Tree con 600 filas, detección de corrupción por checksum, rechazo de overwrite, UPDATE/DELETE roundtrip).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`: OK.
+
+### ⚠️ Migración requerida
+- Bases de datos creadas con versiones anteriores a esta entrega no son legibles. El error es explícito (`unsupported gabysql file format: version=...`). Re-crear con el binario actual.
+
+---
+
 ## 2026-03-19 — Segunda intervención: migración completa a Rust y estabilización base
 
 ### 🧱 Estado actual del sistema
@@ -53,8 +81,8 @@
 - `GET http://localhost:8080/health`: OK
 - `GET http://localhost:8000`: OK
 
-### ⚠️ Límites actuales conocidos
-- El índice persistente sigue siendo una estructura de hojas enlazadas por PK `INT`; no es todavía un B+Tree multinivel completo
+### ⚠️ Límites actuales conocidos (al cierre de la 2ª intervención)
+- El índice persistente sigue siendo una estructura de hojas enlazadas por PK `INT`; no es todavía un B+Tree multinivel completo *(superado en la 3ª intervención: ver entrada superior)*
 - No hay optimizer cost-based ni estadísticas de consulta
 - No hay concurrencia avanzada, MVCC ni transacciones complejas
 - Sigue siendo un producto base estable para evolucionar, no un reemplazo directo de motores maduros como PostgreSQL o MySQL

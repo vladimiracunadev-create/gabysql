@@ -68,10 +68,11 @@ Invoke-WebRequest -UseBasicParsing "http://localhost:8080/rows?db=demo.db&table=
 Si quedó un archivo `.wal` junto al `.db`:
 1. Abre la base con `gabysql info <db>` o arranca el server apuntando a esa DB
 2. `Pager::open` reintentará replay si el WAL tiene marcador `COMMIT`
-3. Tras el replay correcto, el `.wal` se elimina
+3. Cada página dentro del WAL se valida por CRC32 antes de aplicarse al `.db`
+4. Tras el replay correcto, el `.wal` se elimina
 
 > [!IMPORTANT]
-> El recovery actual depende de la existencia de `COMMIT` en el WAL. Si el archivo quedó truncado o sin commit marker, el WAL se descarta.
+> El recovery actual depende de la existencia de `COMMIT` en el WAL. Si el archivo quedó truncado o sin commit marker, el WAL se descarta. Si una página del WAL falla la verificación CRC, el replay aborta con error explícito en vez de corromper el `.db`.
 
 ---
 
@@ -119,8 +120,16 @@ docker compose down
 | Incidente | Significado |
 |---|---|
 | `bad magic (not gabysql db)` | el archivo no es una DB válida |
+| `unsupported gabysql file format: version=N` | la DB fue creada con una versión anterior del formato; recrearla |
+| `page N corrupt: checksum mismatch` | corrupción detectada al leer; restaurar desde backup |
+| `WAL record for page N fails checksum` | WAL corrupto antes del replay; restaurar `.db` desde backup y descartar `.wal` |
+| `refusing to overwrite existing database` | `gabysql init` detectó un archivo previo; usar `init --force` si la intención es reset |
 | `duplicate primary key` | intento de insertar PK repetida |
+| `fila no existe: PK=N` | `UPDATE` o `DELETE` sobre una PK que no existe |
+| `no se permite cambiar la PRIMARY KEY en UPDATE` | un `UPDATE ... SET pk = ...` fue rechazado |
 | `WHERE soporta solo '=' o BETWEEN` | consulta fuera del subconjunto SQL actual |
+| `WHERE solo soporta PK` | un `UPDATE`/`DELETE`/`SELECT` filtró por columna no PK |
+| `server busy: N active connections (max M)` | el servidor alcanzó `-max-connections`; el cliente debe reintentar |
 | `401 unauthorized` | token faltante o incorrecto |
 | `db inválida` | nombre de DB no aceptado en modo `-dir` |
 
@@ -130,5 +139,6 @@ docker compose down
 
 Hoy el server:
 - escribe errores a stderr
+- al arrancar imprime `single`, `dir` y el `max_connections` efectivo
 - expone `/health` como endpoint de salud
 - no tiene todavía métricas Prometheus, tracing distribuido ni dashboard integrado

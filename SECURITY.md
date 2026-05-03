@@ -22,8 +22,11 @@
 - `phpgabyadmin` usa cookie firmada cuando `GABYADMIN_TOKEN` está definido
 - `phpgabyadmin` bloquea hosts remotos salvo `GABYADMIN_ALLOW_REMOTE=1`
 - `gabysql-server` puede exigir token HTTP con `-token`
+- `gabysql-server` cap de conexiones simultáneas (default `64`, configurable con `-max-connections`); las extra reciben `503` y se cierran sin spawning de threads (mitigación básica de exhausting de recursos)
 - el nombre de DB en modo `-dir` se normaliza y bloquea rutas arbitrarias
 - el motor hace rollback ante errores de ejecución SQL dentro de la transacción activa
+- `Pager::create` rehúsa sobrescribir un archivo existente (mitiga pérdida de datos por uso accidental de `init`)
+- cada página persistida valida CRC32-IEEE al leerse y al replay del WAL (mitiga corrupción silenciosa, no es protección contra adversarios con acceso al disco)
 
 ---
 
@@ -67,7 +70,8 @@ Si encuentras una vulnerabilidad:
 
 ## 🧠 Riesgos conocidos
 
-- el modelo de concurrencia sigue siendo básico
-- el API no implementa rate limiting
+- el modelo de concurrencia sigue siendo básico (mutex de proceso para escrituras)
+- el API no implementa rate limiting por cliente; el techo de `-max-connections` es una salvaguarda mínima, no un sustituto de rate limiting o WAF
 - el admin web depende de la exposición segura del entorno donde se publica
-- el formato en disco aún no tiene sistema formal de migraciones entre versiones mayores
+- el formato en disco aún no tiene sistema formal de migraciones entre versiones mayores; un bump de VERSION bloquea la apertura con error explícito (no migra automáticamente)
+- los CRC32 detectan corrupción accidental, no manipulación adversarial intencional (un atacante con acceso de escritura al `.db` puede recomputar el CRC)

@@ -158,13 +158,13 @@ Ejemplo:
 
 ## `POST /exec`
 
-Ejecuta una o más sentencias SQL dentro de una transacción.
+Ejecuta una o más sentencias SQL dentro de una transacción. Acepta `CREATE`, `INSERT`, `SELECT`, `UPDATE` y `DELETE` (los dos últimos solo con filtro `WHERE <pk> = N`).
 
 Request:
 ```json
 {
   "db": "demo.db",
-  "sql": "CREATE TABLE users (id INT PRIMARY KEY, name TEXT); INSERT INTO users (id,name) VALUES (1,'Ana'); SELECT * FROM users;"
+  "sql": "CREATE TABLE users (id INT PRIMARY KEY, name TEXT); INSERT INTO users (id,name) VALUES (1,'Ana'); UPDATE users SET name = 'Ana M' WHERE id = 1; SELECT * FROM users;"
 }
 ```
 
@@ -192,11 +192,13 @@ Ejemplo de respuesta:
 | `405` | operación no permitida en ese modo |
 | `409` | DB ya existe |
 | `500` | error interno inesperado |
+| `503` | techo de conexiones simultáneas alcanzado (default `64`) |
 
 ---
 
 ## 🧠 Notas operacionales
 
-- El server protege escrituras con un mutex de proceso
-- No existe todavía rate limiting
-- No hay TLS nativo; usa reverse proxy si expones el servicio
+- El server protege escrituras con un mutex de proceso.
+- El server limita conexiones concurrentes (default `64`, ajustable con `gabysql-server -max-connections N`). Conexiones por encima del techo reciben `503`.
+- No existe todavía rate limiting por IP/cliente.
+- No hay TLS nativo; usa reverse proxy si expones el servicio.

@@ -48,7 +48,7 @@
       <h1>gabysql</h1>
       <p class="lead">
         <b>gabysql</b> es una base de datos <b>embebida</b> escrita en <b>Rust</b>, orientada a archivo único,
-        WAL simple, árbol de hojas enlazadas persistente y un subconjunto de SQL lo bastante pequeño como para ser entendible,
+        WAL con CRC32 por página, B+Tree real sobre la PK y un subconjunto de SQL lo bastante pequeño como para ser entendible,
         pero lo bastante sólido para operar como producto base.
       </p>
       <div class="badges">
@@ -82,7 +82,10 @@ VALUES (1,'Ana',TRUE,9.5);
 SELECT * FROM users;
 SELECT id,name FROM users LIMIT 10 OFFSET 20;
 SELECT * FROM users WHERE id = 1;
-SELECT * FROM users WHERE id BETWEEN 1 AND 10;</code></pre>
+SELECT * FROM users WHERE id BETWEEN 1 AND 10;
+
+UPDATE users SET name = 'Ana M' WHERE id = 1;
+DELETE FROM users WHERE id = 1;</code></pre>
           </div>
           <div>
             <h3>Tipos</h3>

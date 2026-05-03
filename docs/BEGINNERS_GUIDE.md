@@ -56,12 +56,20 @@ cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name,ac
 cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users;"
 ```
 
-### 6. Levantar API
+### 6. Modificar y borrar
+```powershell
+cargo run --release --bin gabysql -- exec demo.db "UPDATE users SET name = 'Ana M' WHERE id = 1;"
+cargo run --release --bin gabysql -- exec demo.db "DELETE FROM users WHERE id = 2;"
+```
+
+> `UPDATE` y `DELETE` siempre se filtran por la PK. Esta versión rechaza filtros por otras columnas y no permite cambiar la PK con `UPDATE`.
+
+### 7. Levantar API
 ```powershell
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080
 ```
 
-### 7. Abrir admin web
+### 8. Abrir admin web
 En otra terminal:
 ```powershell
 php -S localhost:8000 -t web

@@ -15,8 +15,9 @@
 ## 🚦 Estado actual del producto
 
 > **Estado**: 🟢 Base estable  
-> **Superficie SQL**: `CREATE`, `INSERT`, `SELECT`, `WHERE PK`, `LIMIT/OFFSET`  
-> **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`  
+> **Superficie SQL**: `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE` (todos por PK), `WHERE PK`, `LIMIT/OFFSET`  
+> **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página  
+> **Formato en disco**: `VERSION = 3` (B+Tree real con nodos internos, hash de catálogo FNV-1a-64 estable)  
 > **Portabilidad**: Windows, Linux y macOS por CI  
 > **Runtime opcional**: Docker + `docker compose`
 
@@ -46,10 +47,11 @@
 ## ✨ Capacidades actuales
 
 ### Storage y catálogo
-- Archivo `.db` con páginas de `4096` bytes.
-- WAL after-image con replay por marcador `COMMIT`.
-- Catálogo persistente de tablas.
-- Índice persistente de hojas enlazadas por PK `INT`.
+- Archivo `.db` con páginas de `4096` bytes; los últimos 4 bytes de cada página son CRC32-IEEE.
+- WAL after-image con replay por marcador `COMMIT`; cada página dentro del WAL se valida por CRC antes de aplicarse.
+- Catálogo persistente de tablas con hashing FNV-1a-64 (estable entre versiones de Rust).
+- Índice por PK como **B+Tree real** con nodos internos: lookup descendente en O(log N).
+- `Pager::create` rehúsa sobrescribir un archivo existente (use `gabysql init --force` para reset intencional).
 
 ### SQL soportado
 - `CREATE TABLE`
@@ -58,6 +60,8 @@
 - `SELECT columnas FROM tabla LIMIT/OFFSET`
 - `SELECT ... WHERE <pk> = valor`
 - `SELECT ... WHERE <pk> BETWEEN a AND b`
+- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (no permite mutar la PK)
+- `DELETE FROM <tabla> WHERE <pk> = N`
 
 ### Tipos soportados
 - `INT`
@@ -133,8 +137,8 @@ php -S localhost:8000 -t web
 
 ## 🏗️ Arquitectura del repositorio
 
-- `src/storage.rs`: header, pager, WAL y recovery.
-- `src/bptree.rs`: índice persistente de hojas enlazadas.
+- `src/storage.rs`: header, pager, WAL, checksums CRC32 y recovery.
+- `src/bptree.rs`: B+Tree real (hojas + nodos internos) con root estable.
 - `src/catalog.rs`: metadatos de tablas y catálogo.
 - `src/sql.rs`: tokenizer, parser, row codec y engine.
 - `src/server.rs`: server HTTP/JSON.
@@ -160,12 +164,12 @@ El repositorio ya fue validado con:
 
 ## ⚠️ Limitaciones deliberadas
 
-- No hay `UPDATE` ni `DELETE` todavía.
+- `UPDATE` y `DELETE` solo soportan filtro por PK (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
 - No hay `JOIN`, `ORDER BY`, `GROUP BY` ni planner cost-based.
-- La PK actual debe ser `INT`.
+- La PK debe ser una sola columna `INT`.
 - No hay índices secundarios.
 - No hay MVCC ni locking fuerte entre procesos.
-- La estructura persistente actual no es todavía un B+Tree multinivel completo.
+- El servidor cap por defecto a 64 conexiones simultáneas (`-max-connections N` para ajustar).
 
 ## 🧠 Dirección técnica
 

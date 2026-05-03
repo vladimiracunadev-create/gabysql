@@ -22,11 +22,13 @@ El binario principal sirve para inicializar bases, inspeccionar metadatos, ejecu
 
 ### Comandos
 ```text
-gabysql init <file.db>
+gabysql init [--force] <file.db>
 gabysql info <file.db>
 gabysql exec <file.db> "<SQL...>"
 gabysql repl <file.db>
 ```
+
+> `init` rehúsa sobrescribir un archivo existente. Pasa `--force` para reemplazarlo intencionalmente.
 
 ### Ejemplos
 ```powershell
@@ -59,6 +61,8 @@ INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);
 SELECT * FROM users;
 SELECT id,name FROM users WHERE id = 1;
 SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;
+UPDATE users SET name = 'Ana M', active = FALSE WHERE id = 1;
+DELETE FROM users WHERE id = 1;
 ```
 
 ### Tipos soportados
@@ -72,10 +76,12 @@ SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;
 - `NULL` para columnas no PK
 
 ### Reglas importantes
-- La PK debe existir y ser `INT`
-- `PRIMARY KEY` no puede ser `NULL`
-- PK duplicada se rechaza
-- `WHERE` hoy solo soporta `=` y `BETWEEN` sobre la PK
+- La PK debe ser **una sola columna `INT`**. Esta versión no soporta PKs compuestas ni de otros tipos.
+- `PRIMARY KEY` no puede ser `NULL`.
+- PK duplicada se rechaza al `INSERT`.
+- `WHERE` solo soporta `=` (en SELECT/UPDATE/DELETE) y `BETWEEN` (solo en SELECT) sobre la columna PK.
+- `UPDATE` no permite cambiar la PK; intentarlo devuelve error explícito.
+- `UPDATE` y `DELETE` sobre una PK inexistente retornan error (no son no-ops silenciosos).
 
 ---
 
@@ -111,6 +117,12 @@ cargo run --release --bin gabysql-server -- -db demo.db -token secret
 El cliente debe enviar uno de estos headers:
 - `X-Gabysql-Token: secret`
 - `Authorization: Bearer secret`
+
+### Tope de conexiones simultáneas
+El servidor por defecto limita a `64` conexiones activas. Las conexiones por encima del techo reciben `503` y se cierran sin generar threads. Para ajustarlo:
+```powershell
+cargo run --release --bin gabysql-server -- -dir ./dbs -max-connections 32
+```
 
 > [!TIP]
 > Para detalles de endpoints, payloads y errores, ve a [docs/API.md](docs/API.md).

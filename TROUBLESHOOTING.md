@@ -37,13 +37,37 @@ cargo run --release --bin gabysql -- init demo.db
 
 ---
 
-## 🔢 `unsupported version`
+## 🔢 `unsupported gabysql file format: version=N (expected 3)`
 
 ### Causa
-Intentas abrir un archivo con una versión de formato no soportada por este build.
+Intentas abrir un archivo con una versión de formato anterior. Las versiones `1` y `2` quedaron explícitamente fuera de la versión actual (`1` usaba `DefaultHasher` no estable; `2` no tenía CRC por página).
 
 ### Solución
-Usa la misma versión del motor que creó el archivo o migra el formato cuando exista soporte oficial de upgrade.
+- Re-crear la base con el binario actual: `gabysql init <file.db>`.
+- Si tenías datos en la DB vieja, exportarlos antes con la versión que la creó (no hay aún herramienta automatizada de migración).
+
+---
+
+## 🛡️ `page N corrupt: checksum mismatch` o `WAL record for page N fails checksum`
+
+### Causa
+La verificación CRC32 detectó que la página leída del `.db` o del `.wal` no coincide con su checksum almacenado. Causa típica: corte de energía durante una escritura, fallo de disco, o edición manual del archivo.
+
+### Solución
+- Restaurar `.db` desde el backup más reciente.
+- Borrar el `.wal` solo si el error sale del WAL replay: el `.db` previo aún es válido.
+- Si la corrupción es persistente, validar el medio de almacenamiento (smartctl, chkdsk).
+
+---
+
+## 🚫 `refusing to overwrite existing database`
+
+### Causa
+`gabysql init <file.db>` se ejecutó sobre un archivo que ya existe. Es deliberado: la versión actual no destruye archivos sin pedirlo.
+
+### Solución
+- Si querías iniciar la DB existente, usa `gabysql info <file.db>` o `gabysql exec <file.db> ...` directamente.
+- Si querías reset intencional: `gabysql init --force <file.db>`.
 
 ---
 
@@ -55,7 +79,29 @@ Insertaste una fila con una PK `INT` ya usada.
 ### Solución
 - usa otra PK
 - consulta primero
-- no asumas comportamiento tipo upsert: hoy no existe
+- si quieres modificar el row, usa `UPDATE <tabla> SET ... WHERE <pk> = N`
+
+---
+
+## ✏️ `fila no existe: PK=N`
+
+### Causa
+Un `UPDATE` o `DELETE` apuntó a una PK que no existe en la tabla.
+
+### Solución
+- consulta primero con `SELECT ... WHERE pk = N`
+- los `UPDATE`/`DELETE` son explícitos: no son no-ops silenciosos como en otros motores
+
+---
+
+## 🚦 `server busy: N active connections (max M)` (HTTP 503)
+
+### Causa
+El servidor alcanzó el techo de conexiones simultáneas (default `64`).
+
+### Solución
+- el cliente debe reintentar tras un backoff corto
+- subir el techo si tu carga lo justifica: `gabysql-server -max-connections 128`
 
 ---
 
@@ -65,7 +111,18 @@ Insertaste una fila con una PK `INT` ya usada.
 La consulta usa operadores no implementados (`LIKE`, `>`, `<`, etc.).
 
 ### Solución
-Restringe `WHERE` a la PK con `=` o `BETWEEN`.
+Restringe `WHERE` a la PK con `=` o `BETWEEN`. Recordá que `UPDATE` y `DELETE` solo aceptan `=`, no `BETWEEN`.
+
+---
+
+## 🛑 `WHERE solo soporta PK (...)`
+
+### Causa
+Filtraste por una columna no PK. Esta versión solo indexa por PK.
+
+### Solución
+- usa la PK para localizar el row
+- si necesitas filtros por otras columnas, materializa los datos por full scan en cliente o espera a la fase de índices secundarios del ROADMAP
 
 ---
 
