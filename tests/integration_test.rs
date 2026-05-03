@@ -148,6 +148,57 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn update_and_delete_by_pk_roundtrip() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("upd-del");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT, score FLOAT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO u (id,name,score) VALUES (1,'Ana',9.0); \
+         INSERT INTO u (id,name,score) VALUES (2,'Beto',7.0); \
+         INSERT INTO u (id,name,score) VALUES (3,'Caro',8.5);",
+    )?;
+
+    // UPDATE single column.
+    run_sql(&db, "UPDATE u SET name = 'Ana M' WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT name FROM u WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("Ana M".to_string()));
+
+    // UPDATE multiple columns.
+    run_sql(&db, "UPDATE u SET name = 'B2', score = 10.0 WHERE id = 2;")?;
+    let res = run_sql(&db, "SELECT name, score FROM u WHERE id = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("B2".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Float(10.0));
+
+    // DELETE by PK.
+    run_sql(&db, "DELETE FROM u WHERE id = 3;")?;
+    let res = run_sql(&db, "SELECT id FROM u;")?;
+    assert_eq!(res[0].rows.len(), 2);
+
+    // UPDATE on missing row should error.
+    let err = run_sql(&db, "UPDATE u SET name = 'X' WHERE id = 999;").unwrap_err();
+    assert!(err.to_string().contains("fila no existe"));
+
+    // Cannot change PK.
+    let err = run_sql(&db, "UPDATE u SET id = 99 WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("PRIMARY KEY"));
+
+    // DELETE non-PK column should error.
+    let err = run_sql(&db, "DELETE FROM u WHERE name = 1;").unwrap_err();
+    assert!(err.to_string().contains("WHERE solo soporta PK"));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn create_refuses_to_overwrite_existing_db() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("no-overwrite");
     let wal = wal_path(&db);

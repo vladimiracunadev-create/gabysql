@@ -9,6 +9,23 @@ pub enum Statement {
     CreateTable(CreateTableStmt),
     Insert(InsertStmt),
     Select(SelectStmt),
+    Update(UpdateStmt),
+    Delete(DeleteStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    pub table: String,
+    pub assignments: Vec<(String, Value)>,
+    pub where_column: String,
+    pub where_pk: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    pub table: String,
+    pub where_column: String,
+    pub where_pk: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +94,8 @@ impl<'a> Engine<'a> {
             Statement::CreateTable(stmt) => self.exec_create(stmt),
             Statement::Insert(stmt) => self.exec_insert(stmt),
             Statement::Select(stmt) => self.exec_select(stmt),
+            Statement::Update(stmt) => self.exec_update(stmt),
+            Statement::Delete(stmt) => self.exec_delete(stmt),
         }
     }
 
@@ -198,6 +217,69 @@ impl<'a> Engine<'a> {
             columns: output_columns,
             rows,
             message: None,
+        })
+    }
+
+    fn exec_update(&mut self, stmt: UpdateStmt) -> DbResult<ResultSet> {
+        let mut catalog = Catalog::open(self.pager);
+        let meta = catalog
+            .get_table(&stmt.table)?
+            .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?;
+        ensure_pk_filter(&meta, &stmt.where_column)?;
+
+        let mut overrides: HashMap<String, Value> = HashMap::new();
+        for (column_name, value) in stmt.assignments {
+            let normalized = normalize_ident(&column_name);
+            if normalized == normalize_ident(&meta.primary_key) {
+                return Err(DbError::new(
+                    "no se permite cambiar la PRIMARY KEY en UPDATE (esta versión)",
+                ));
+            }
+            if meta.column(&normalized).is_none() {
+                return Err(DbError::new(format!("columna no existe: {}", column_name)));
+            }
+            if overrides.insert(normalized, value).is_some() {
+                return Err(DbError::new("columna duplicada en SET"));
+            }
+        }
+
+        let existing = catalog
+            .get_row(meta.root_page, stmt.where_pk)?
+            .ok_or_else(|| DbError::new(format!("fila no existe: PK={}", stmt.where_pk)))?;
+        let mut current = decode_row(&meta, &existing)?;
+        for (key, value) in overrides {
+            current.insert(key, value);
+        }
+        let (pk, row_bytes) = encode_row(&meta, &current)?;
+        if pk != stmt.where_pk {
+            return Err(DbError::new("PK derivada del row no coincide con WHERE"));
+        }
+        catalog.upsert_row(meta.root_page, pk, row_bytes)?;
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("OK".to_string()),
+        })
+    }
+
+    fn exec_delete(&mut self, stmt: DeleteStmt) -> DbResult<ResultSet> {
+        let mut catalog = Catalog::open(self.pager);
+        let meta = catalog
+            .get_table(&stmt.table)?
+            .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?;
+        ensure_pk_filter(&meta, &stmt.where_column)?;
+        let removed = catalog.delete_row(meta.root_page, stmt.where_pk)?;
+        if !removed {
+            return Err(DbError::new(format!(
+                "fila no existe: PK={}",
+                stmt.where_pk
+            )));
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("OK".to_string()),
         })
     }
 }
@@ -580,9 +662,54 @@ impl Parser {
         if self.match_keyword("SELECT") {
             return self.parse_select();
         }
+        if self.match_keyword("UPDATE") {
+            return self.parse_update();
+        }
+        if self.match_keyword("DELETE") {
+            return self.parse_delete();
+        }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE)",
         ))
+    }
+
+    fn parse_update(&mut self) -> DbResult<Statement> {
+        let table = self.expect_ident()?;
+        self.expect_keyword("SET")?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.expect_ident()?;
+            self.expect_symbol("=")?;
+            let value = self.expect_value()?;
+            assignments.push((column, value));
+            if !self.match_symbol(",") {
+                break;
+            }
+        }
+        self.expect_keyword("WHERE")?;
+        let where_column = self.expect_ident()?;
+        self.expect_symbol("=")?;
+        let where_pk = self.expect_integer()?;
+        Ok(Statement::Update(UpdateStmt {
+            table,
+            assignments,
+            where_column,
+            where_pk,
+        }))
+    }
+
+    fn parse_delete(&mut self) -> DbResult<Statement> {
+        self.expect_keyword("FROM")?;
+        let table = self.expect_ident()?;
+        self.expect_keyword("WHERE")?;
+        let where_column = self.expect_ident()?;
+        self.expect_symbol("=")?;
+        let where_pk = self.expect_integer()?;
+        Ok(Statement::Delete(DeleteStmt {
+            table,
+            where_column,
+            where_pk,
+        }))
     }
 
     fn parse_create(&mut self) -> DbResult<Statement> {

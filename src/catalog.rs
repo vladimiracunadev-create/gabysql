@@ -212,6 +212,17 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
+    pub fn upsert_row(&mut self, root_page: u32, key: i64, value: Vec<u8>) -> DbResult<()> {
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root_page, key, value)?;
+        Ok(())
+    }
+
+    pub fn delete_row(&mut self, root_page: u32, key: i64) -> DbResult<bool> {
+        let mut tree = Tree::new(self.pager);
+        tree.delete(root_page, key)
+    }
+
     fn ensure_root(&mut self) -> DbResult<u32> {
         let header = self.pager.header();
         if header.catalog_root_page != 0 {
