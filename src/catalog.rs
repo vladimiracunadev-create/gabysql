@@ -231,7 +231,9 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
         return Err(DbError::new("nombre de tabla vacío"));
     }
     if meta.primary_key.trim().is_empty() {
-        return Err(DbError::new("PRIMARY KEY requerida (solo INT)"));
+        return Err(DbError::new(
+            "PRIMARY KEY requerida (esta versión solo soporta una PK escalar de tipo INT)",
+        ));
     }
     if meta.columns.is_empty() {
         return Err(DbError::new("se requieren columnas"));
@@ -249,7 +251,10 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
         }
         if column.name.eq_ignore_ascii_case(&meta.primary_key) {
             if column.column_type != ColumnType::Int {
-                return Err(DbError::new("PRIMARY KEY debe ser INT"));
+                return Err(DbError::new(format!(
+                    "PRIMARY KEY '{}' debe ser INT (esta versión sólo admite PK INT escalar; ver USER_MANUAL)",
+                    column.name
+                )));
             }
             pk_ok = true;
         }
