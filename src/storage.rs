@@ -6,7 +6,11 @@ use std::path::{Path, PathBuf};
 
 pub const PAGE_SIZE_DEFAULT: usize = 4096;
 pub const MAGIC: &[u8; 8] = b"GABYSQL1";
-pub const VERSION: u32 = 1;
+// File-format version. Bumped to 2 when the catalog hashing scheme moved from
+// std::collections::hash_map::DefaultHasher (unstable across Rust releases) to
+// FNV-1a-64. Older DB files are rejected explicitly at open time with a clear
+// message so users understand why and don't silently lose tables.
+pub const VERSION: u32 = 2;
 
 const WAL_REC_PAGE: u8 = 1;
 const WAL_REC_COMMIT: u8 = 2;
@@ -57,7 +61,11 @@ impl Header {
         }
         let version = u32::from_le_bytes(src[8..12].try_into().unwrap());
         if version != VERSION {
-            return Err(DbError::new("unsupported version"));
+            return Err(DbError::new(format!(
+                "unsupported gabysql file format: version={} (expected {}). \
+                 Re-create the database with the current binary.",
+                version, VERSION
+            )));
         }
         let page_size = u16::from_le_bytes(src[12..14].try_into().unwrap());
         if page_size == 0 {

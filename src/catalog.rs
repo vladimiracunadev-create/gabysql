@@ -2,7 +2,6 @@ use crate::bptree::{init_leaf_page, Tree};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnType {
@@ -261,10 +260,20 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
     Ok(())
 }
 
+/// Stable on-disk hash for catalog keys. FNV-1a 64-bit. We must not depend on
+/// `std::collections::hash_map::DefaultHasher` here: the standard library
+/// explicitly does not guarantee its output is stable across Rust versions,
+/// and the result of this function is persisted inside DB files.
 fn hash_name(name: &str) -> i64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.trim().to_ascii_lowercase().hash(&mut hasher);
-    hasher.finish() as i64
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let normalized = name.trim().to_ascii_lowercase();
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in normalized.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash as i64
 }
 
 fn push_string(out: &mut Vec<u8>, value: &str) -> DbResult<()> {
