@@ -1,6 +1,6 @@
 use gabysql::bptree::init_leaf_page;
 use gabysql::sql::{parse, Engine, Value};
-use gabysql::storage::{Header, Pager, PAGE_SIZE_DEFAULT};
+use gabysql::storage::{finalize_page_checksum, Header, Pager, PAGE_SIZE_DEFAULT};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -122,9 +122,11 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
     header.catalog_root_page = 1;
     let mut header_page = vec![0; PAGE_SIZE_DEFAULT];
     header.encode_into(&mut header_page)?;
+    finalize_page_checksum(&mut header_page);
 
     let mut leaf_page = vec![0; PAGE_SIZE_DEFAULT];
     init_leaf_page(&mut leaf_page);
+    finalize_page_checksum(&mut leaf_page);
 
     let mut wal_bytes = Vec::new();
     push_wal_page(&mut wal_bytes, 0, &header_page);
@@ -140,6 +142,42 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
     assert_eq!(page[0], 1);
     reopened.close()?;
     assert!(!wal.exists());
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn page_checksum_detects_corruption() -> Result<(), Box<dyn Error>> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let db = temp_db_path("checksum");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
+
+    // Flip a byte inside the leaf page (page 2 here in practice).
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(PAGE_SIZE_DEFAULT as u64 * 2 + 50))?;
+    let mut byte = [0u8; 1];
+    use std::io::Read;
+    f.read_exact(&mut byte)?;
+    f.seek(SeekFrom::Start(PAGE_SIZE_DEFAULT as u64 * 2 + 50))?;
+    f.write_all(&[byte[0] ^ 0xFF])?;
+    drop(f);
+
+    let err = run_sql(&db, "SELECT id FROM u WHERE id = 1;").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("corrupt"),
+        "expected checksum error, got: {}",
+        msg
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())
@@ -180,7 +218,10 @@ fn btree_splits_leaves_and_promotes_internal_root() -> Result<(), Box<dyn Error>
 
     // Page count must have grown beyond a few leaves (proves splits + internal).
     let pager = Pager::open(&db)?;
-    assert!(pager.header().page_count > 6, "expected splits to grow the file");
+    assert!(
+        pager.header().page_count > 6,
+        "expected splits to grow the file"
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())

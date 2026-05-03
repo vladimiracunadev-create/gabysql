@@ -7,7 +7,9 @@
       "Bash(git commit -m 'feat\\(bptree\\): real B+Tree with internal nodes *)",
       "Bash(git commit -m 'fix\\(catalog\\): replace DefaultHasher with FNV-1a-64 *)",
       "Bash(git -C /c/dev/gabysql merge --ff-only claude/mystifying-ritchie-3fec2f)",
-      "Bash(git -C /c/dev/gabysql push origin main)"
+      "Bash(git -C /c/dev/gabysql push origin main)",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/app\" -v gabysql-target:/app/target -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm sh -c \"rustup component add rustfmt 2>&1 >/dev/null; cargo fmt --check 2>&1 | head -40 && echo === && cargo test --quiet 2>&1 | tail -25\")",
+      "Bash(git commit -m 'feat\\(storage\\): CRC32-IEEE checksums on pages and WAL records *)"
     ]
   }
 }

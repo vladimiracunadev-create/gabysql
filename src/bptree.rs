@@ -1,4 +1,4 @@
-use crate::storage::Pager;
+use crate::storage::{Pager, PAGE_CHECKSUM_BYTES};
 use crate::{DbError, DbResult};
 
 const PAGE_TYPE_LEAF: u8 = 1;
@@ -205,7 +205,10 @@ impl<'a> Tree<'a> {
                 let Some((split_key, right_no)) = promoted else {
                     return Ok(None);
                 };
-                let pos = match internal.entries.binary_search_by_key(&split_key, |(k, _)| *k) {
+                let pos = match internal
+                    .entries
+                    .binary_search_by_key(&split_key, |(k, _)| *k)
+                {
                     Ok(_) => {
                         return Err(DbError::new(
                             "split key colisiona con entrada interna existente",
@@ -326,15 +329,19 @@ fn pick_child(internal: &InternalNode, key: i64) -> u32 {
     chosen
 }
 
+fn usable_page_size(page_size: usize) -> usize {
+    page_size - PAGE_CHECKSUM_BYTES
+}
+
 fn leaf_fits(page_size: usize, kvs: &[KeyValue]) -> bool {
     let payload_size = kvs
         .iter()
         .fold(LEAF_HEADER_SIZE, |size, kv| size + 8 + 2 + kv.value.len());
-    payload_size <= page_size
+    payload_size <= usable_page_size(page_size)
 }
 
 fn internal_fits(page_size: usize, entries: &[(i64, u32)]) -> bool {
-    INTERNAL_HEADER_SIZE + entries.len() * INTERNAL_ENTRY_SIZE <= page_size
+    INTERNAL_HEADER_SIZE + entries.len() * INTERNAL_ENTRY_SIZE <= usable_page_size(page_size)
 }
 
 fn decode_leaf(page: &[u8]) -> DbResult<LeafNode> {
@@ -419,7 +426,7 @@ fn encode_internal(page_size: usize, internal: &InternalNode) -> DbResult<Vec<u8
     if !internal_fits(page_size, &internal.entries) {
         return Err(DbError::new("internal too large"));
     }
-    let max_entries = (page_size - INTERNAL_HEADER_SIZE) / INTERNAL_ENTRY_SIZE;
+    let max_entries = (usable_page_size(page_size) - INTERNAL_HEADER_SIZE) / INTERNAL_ENTRY_SIZE;
     if max_entries < INTERNAL_MAX_ENTRIES_FLOOR {
         return Err(DbError::new("page size too small for internal node"));
     }

@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 
 pub const PAGE_SIZE_DEFAULT: usize = 4096;
 pub const MAGIC: &[u8; 8] = b"GABYSQL1";
-// File-format version. Bumped to 2 when the catalog hashing scheme moved from
-// std::collections::hash_map::DefaultHasher (unstable across Rust releases) to
-// FNV-1a-64. Older DB files are rejected explicitly at open time with a clear
-// message so users understand why and don't silently lose tables.
-pub const VERSION: u32 = 2;
+// File-format version. Bumped to:
+//   2 -> moved catalog hashing from DefaultHasher to FNV-1a-64.
+//   3 -> reserved last 4 bytes of every page for a CRC32-IEEE checksum
+//        and added a per-record CRC to the WAL.
+pub const VERSION: u32 = 3;
+
+/// Trailer used inside every page on disk for the CRC32 checksum.
+pub const PAGE_CHECKSUM_BYTES: usize = 4;
 
 const WAL_REC_PAGE: u8 = 1;
 const WAL_REC_COMMIT: u8 = 2;
@@ -113,6 +116,7 @@ impl Pager {
         let header = Header::new();
         let mut page0 = vec![0; PAGE_SIZE_DEFAULT];
         header.encode_into(&mut page0)?;
+        finalize_page_checksum(&mut page0);
         file.write_all(&page0)?;
         file.sync_all()?;
 
@@ -132,6 +136,8 @@ impl Pager {
         let mut page0 = vec![0; PAGE_SIZE_DEFAULT];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut page0)?;
+        verify_page_checksum(&page0)
+            .map_err(|err| DbError::new(format!("header page corrupt: {}", err)))?;
         let mut header = Header::decode(&page0)?;
 
         let wal_path = wal_path_for(&path);
@@ -147,6 +153,9 @@ impl Pager {
             let mut refreshed = vec![0; PAGE_SIZE_DEFAULT];
             file.seek(SeekFrom::Start(0))?;
             file.read_exact(&mut refreshed)?;
+            verify_page_checksum(&refreshed).map_err(|err| {
+                DbError::new(format!("header page corrupt after WAL replay: {}", err))
+            })?;
             header = Header::decode(&refreshed)?;
         }
 
@@ -190,12 +199,17 @@ impl Pager {
             return Err(DbError::new("no active tx"));
         }
 
-        let dirty_pages: Vec<(u32, Vec<u8>)> = self
+        // Materialize dirty pages and finalize their checksum trailer once,
+        // before they hit either WAL or main file.
+        let mut dirty_pages: Vec<(u32, Vec<u8>)> = self
             .cache
             .iter()
             .filter(|(_, page)| page.dirty)
             .map(|(no, page)| (*no, page.data.clone()))
             .collect();
+        for (_, data) in dirty_pages.iter_mut() {
+            finalize_page_checksum(data);
+        }
 
         let wal = self
             .wal
@@ -235,6 +249,7 @@ impl Pager {
         let mut page0 = vec![0; PAGE_SIZE_DEFAULT];
         self.file.seek(SeekFrom::Start(0))?;
         self.file.read_exact(&mut page0)?;
+        verify_page_checksum(&page0)?;
         self.header = Header::decode(&page0)?;
         self.in_tx = false;
         Ok(())
@@ -307,6 +322,7 @@ impl Pager {
             let mut data = vec![0; self.page_size()];
             self.file.seek(SeekFrom::Start(0))?;
             self.file.read_exact(&mut data)?;
+            verify_page_checksum(&data)?;
             data
         };
         self.header.encode_into(&mut header_page)?;
@@ -330,6 +346,8 @@ impl Pager {
         let mut data = vec![0; self.page_size()];
         self.file.seek(SeekFrom::Start(self.page_offset(no)))?;
         self.file.read_exact(&mut data)?;
+        verify_page_checksum(&data)
+            .map_err(|err| DbError::new(format!("page {} corrupt: {}", no, err)))?;
         self.cache.insert(no, CachedPage { data, dirty: false });
         Ok(())
     }
@@ -449,6 +467,15 @@ impl Wal {
                     }
                     let mut data = vec![0; len];
                     self.file.read_exact(&mut data)?;
+                    // Page payload inside the WAL already carries its CRC
+                    // trailer. Verify before applying so a torn write is
+                    // refused instead of silently corrupting the DB file.
+                    verify_page_checksum(&data).map_err(|err| {
+                        DbError::new(format!(
+                            "WAL record for page {} fails checksum: {}",
+                            page_no, err
+                        ))
+                    })?;
                     db.seek(SeekFrom::Start(page_no as u64 * page_size as u64))?;
                     db.write_all(&data)?;
                 }
@@ -463,4 +490,62 @@ fn wal_path_for(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".wal");
     PathBuf::from(value)
+}
+
+/// Write the CRC32-IEEE of `page[..len-4]` into the trailing 4 bytes.
+pub fn finalize_page_checksum(page: &mut [u8]) {
+    let n = page.len();
+    assert!(
+        n >= PAGE_CHECKSUM_BYTES,
+        "page smaller than checksum trailer"
+    );
+    let crc = crc32_ieee(&page[..n - PAGE_CHECKSUM_BYTES]);
+    page[n - PAGE_CHECKSUM_BYTES..].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Recompute the CRC32-IEEE over the page payload and compare against the
+/// trailing 4 bytes. Returns an error if they don't match.
+pub fn verify_page_checksum(page: &[u8]) -> DbResult<()> {
+    if page.len() < PAGE_CHECKSUM_BYTES {
+        return Err(DbError::new("page smaller than checksum trailer"));
+    }
+    let n = page.len();
+    let stored = u32::from_le_bytes(page[n - PAGE_CHECKSUM_BYTES..].try_into().unwrap());
+    let calculated = crc32_ieee(&page[..n - PAGE_CHECKSUM_BYTES]);
+    if stored != calculated {
+        return Err(DbError::new(format!(
+            "checksum mismatch (stored=0x{:08x}, computed=0x{:08x})",
+            stored, calculated
+        )));
+    }
+    Ok(())
+}
+
+fn crc32_table() -> &'static [u32; 256] {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0u32; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0xEDB88320
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
+        }
+        table
+    })
+}
+
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let table = crc32_table();
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for byte in data {
+        let idx = ((crc ^ *byte as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ table[idx];
+    }
+    !crc
 }
