@@ -71,8 +71,14 @@ impl Header {
             )));
         }
         let page_size = u16::from_le_bytes(src[12..14].try_into().unwrap());
-        if page_size == 0 {
-            return Err(DbError::new("invalid page size"));
+        // Format v3 only supports the default page size. The field is kept on
+        // disk so a future format revision can lift the constraint without
+        // another binary header change.
+        if page_size as usize != PAGE_SIZE_DEFAULT {
+            return Err(DbError::new(format!(
+                "unsupported page_size={}; this build requires {}",
+                page_size, PAGE_SIZE_DEFAULT
+            )));
         }
         Ok(Self {
             version,
