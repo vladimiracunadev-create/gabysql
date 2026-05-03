@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker volume *)",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/app\" -v gabysql-target:/app/target -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm sh -c \"cargo test --quiet 2>&1\")",
+      "Bash(git add *)",
+      "Bash(git commit -m 'feat\\(bptree\\): real B+Tree with internal nodes *)"
+    ]
+  }
+}

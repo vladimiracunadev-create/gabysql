@@ -145,6 +145,47 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn btree_splits_leaves_and_promotes_internal_root() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("btree-splits");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE big (id INT PRIMARY KEY, name TEXT);")?;
+
+    // Insert enough rows that the root must transition from leaf to internal.
+    // Each row ~ 8 + (1+8) + (1+2+10) = ~30 bytes; with leaf overhead this
+    // forces multiple leaves and at least one root split.
+    for i in 0..600i64 {
+        let sql = format!("INSERT INTO big (id,name) VALUES ({},'row{:05}');", i, i);
+        run_sql(&db, &sql)?;
+    }
+
+    // Point lookup at far edge proves descent through internal node.
+    let res = run_sql(&db, "SELECT id,name FROM big WHERE id = 599;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(599));
+
+    // Range across multiple leaves.
+    let res = run_sql(&db, "SELECT id FROM big WHERE id BETWEEN 100 AND 199;")?;
+    assert_eq!(res[0].rows.len(), 100);
+    assert_eq!(res[0].rows[0][0], Value::Integer(100));
+    assert_eq!(res[0].rows[99][0], Value::Integer(199));
+
+    // Full scan still finds all 600.
+    let res = run_sql(&db, "SELECT id FROM big;")?;
+    assert_eq!(res[0].rows.len(), 600);
+
+    // Page count must have grown beyond a few leaves (proves splits + internal).
+    let pager = Pager::open(&db)?;
+    assert!(pager.header().page_count > 6, "expected splits to grow the file");
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
