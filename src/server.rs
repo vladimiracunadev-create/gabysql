@@ -7,15 +7,30 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub single_db: Option<PathBuf>,
     pub dir: Option<PathBuf>,
     pub token: Option<String>,
+    pub max_connections: usize,
+}
+
+impl ServerConfig {
+    pub fn new(single_db: Option<PathBuf>, dir: Option<PathBuf>, token: Option<String>) -> Self {
+        Self {
+            single_db,
+            dir,
+            token,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
 }
 
 pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
@@ -29,17 +44,37 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
     let bind_addr = normalize_bind_addr(addr);
     let listener = TcpListener::bind(&bind_addr)?;
     let write_lock = Arc::new(Mutex::new(()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_connections = if config.max_connections == 0 {
+        DEFAULT_MAX_CONNECTIONS
+    } else {
+        config.max_connections
+    };
 
     eprintln!(
-        "gabysql-server escuchando en {} (single={:?} dir={:?})",
-        bind_addr, config.single_db, config.dir
+        "gabysql-server escuchando en {} (single={:?} dir={:?} max_connections={})",
+        bind_addr, config.single_db, config.dir, max_connections
     );
 
     for stream in listener.incoming() {
-        let config = config.clone();
-        let write_lock = Arc::clone(&write_lock);
         match stream {
             Ok(mut stream) => {
+                let current = active.load(Ordering::Acquire);
+                if current >= max_connections {
+                    let body = format!(
+                        "{{\"ok\":false,\"error\":{}}}",
+                        json_string(&format!(
+                            "server busy: {} active connections (max {})",
+                            current, max_connections
+                        ))
+                    );
+                    let _ = write_response(&mut stream, Response::json(503, body));
+                    continue;
+                }
+                active.fetch_add(1, Ordering::AcqRel);
+                let config = config.clone();
+                let write_lock = Arc::clone(&write_lock);
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
                     let response = match read_request(&mut stream)
                         .and_then(|request| handle_request(request, &config, &write_lock))
@@ -54,6 +89,7 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
                         ),
                     };
                     let _ = write_response(&mut stream, response);
+                    active.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             Err(err) => eprintln!("accept error: {}", err),
