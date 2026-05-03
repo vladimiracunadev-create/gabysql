@@ -21,11 +21,19 @@ fn run() -> DbResult<()> {
 
     match args[1].as_str() {
         "init" => {
-            if args.len() != 3 {
-                usage();
-                std::process::exit(2);
-            }
-            let mut pager = Pager::create(&args[2])?;
+            let (force, file) = match args.len() {
+                3 => (false, &args[2]),
+                4 if args[2] == "--force" => (true, &args[3]),
+                _ => {
+                    usage();
+                    std::process::exit(2);
+                }
+            };
+            let mut pager = if force {
+                Pager::create_force(file)?
+            } else {
+                Pager::create(file)?
+            };
             pager.close()?;
             println!("OK");
         }
@@ -143,6 +151,6 @@ fn value_to_string(value: &Value) -> String {
 
 fn usage() {
     println!(
-        "Uso:\n  gabysql init <file.db>\n  gabysql info <file.db>\n  gabysql exec <file.db> \"<SQL...>\"\n  gabysql repl <file.db>\n\nSQL soportado:\n  CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);\n  INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);\n  SELECT * FROM users;\n  SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;"
+        "Uso:\n  gabysql init [--force] <file.db>\n  gabysql info <file.db>\n  gabysql exec <file.db> \"<SQL...>\"\n  gabysql repl <file.db>\n\n  init refuses to overwrite an existing file; pass --force to replace it.\n\nSQL soportado:\n  CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);\n  INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);\n  SELECT * FROM users;\n  SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;"
     );
 }

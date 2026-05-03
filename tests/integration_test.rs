@@ -148,6 +148,40 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn create_refuses_to_overwrite_existing_db() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("no-overwrite");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE keep (id INT PRIMARY KEY);")?;
+
+    let err = match Pager::create(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::create to refuse overwrite"),
+    };
+    assert!(
+        err.to_string().contains("refusing to overwrite"),
+        "got: {}",
+        err
+    );
+
+    // create_force succeeds and the new DB is empty (no 'keep' table).
+    let mut forced = Pager::create_force(&db)?;
+    forced.close()?;
+    let err = run_sql(&db, "INSERT INTO keep (id) VALUES (1);").unwrap_err();
+    assert!(
+        err.to_string().contains("tabla no existe"),
+        "force-created DB still has old data: {}",
+        err
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn page_checksum_detects_corruption() -> Result<(), Box<dyn Error>> {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};

@@ -99,12 +99,32 @@ pub struct Pager {
 }
 
 impl Pager {
+    /// Create a brand-new database file. Refuses to overwrite an existing
+    /// file — callers must explicitly remove the old DB first or use
+    /// [`Pager::create_force`] when overwrite is the intent.
     pub fn create(path: impl AsRef<Path>) -> DbResult<Self> {
+        Self::create_internal(path, false)
+    }
+
+    /// Create a database file, removing any existing one at the path. Only
+    /// use this when the caller is intentionally discarding the old file.
+    pub fn create_force(path: impl AsRef<Path>) -> DbResult<Self> {
+        Self::create_internal(path, true)
+    }
+
+    fn create_internal(path: impl AsRef<Path>, force: bool) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
+        }
+        if !force && path.exists() {
+            return Err(DbError::new(format!(
+                "refusing to overwrite existing database: {}. \
+                 Delete it first or use create_force().",
+                path.display()
+            )));
         }
         let mut file = OpenOptions::new()
             .create(true)
