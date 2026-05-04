@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Mantener pinned-a-SHA todas las acciones de los workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-group:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # Cargo: hoy el grafo es vacío, pero esto deja Dependabot listo para el día
+  # que se introduzcan crates. Update individual (no group) para que cada PR
+  # de bump sea revisable por separado.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "rust"
+
+  # Docker: la imagen base es rust:1.94-bookworm; ese tag se mueve y
+  # Dependabot puede sugerir bumps mayores cuando salen.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "docker"

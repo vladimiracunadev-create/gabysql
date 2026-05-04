@@ -10,10 +10,13 @@
 
 ## 🧾 Versiones soportadas
 
-| Línea | Estado |
-|---|---|
-| `0.1.x` | soportada |
-| implementación previa al rewrite en Rust | no soportada |
+| Línea | Estado | Formato en disco |
+|---|---|---|
+| `0.1.x` (último binario en `main`) | soportada | `VERSION = 3` |
+| `0.1.x` previo al cierre de hallazgos críticos del MVP | sin soporte de seguridad | `VERSION = 1` o `2` |
+| implementación previa al rewrite en Rust | no soportada | n/a |
+
+> Cualquier reporte de vulnerabilidad debe estar reproducido contra el `HEAD` de `main` o el último release publicado. No se publicarán parches retroactivos para versiones anteriores del formato en disco.
 
 ---
 
@@ -62,9 +65,31 @@
 ## 📣 Divulgación responsable
 
 Si encuentras una vulnerabilidad:
-1. no publiques secretos, tokens ni pasos de explotación destructivos
-2. repórtala de forma privada al mantenedor por GitHub o canal directo antes de divulgación pública
-3. incluye versión, entorno y pasos de reproducción mínimos
+1. **No abrir un Issue público**. Usa "Report a vulnerability" en la pestaña *Security* del repositorio, o contacta al mantenedor por DM.
+2. No publiques secretos, tokens ni pasos de explotación destructivos en canales abiertos hasta que el reporte esté triado.
+3. Incluye:
+   - commit SHA exacto contra el que reproduces (idealmente `HEAD` de `main`).
+   - sistema operativo, toolchain de Rust, modo (CLI / server / Docker).
+   - pasos mínimos de reproducción, sin payloads destructivos contra terceros.
+   - impacto estimado (lectura de datos ajenos, escritura, DoS, ejecución, etc).
+
+### Compromiso de respuesta
+- Acuse de recibo: **3 días hábiles**.
+- Triage inicial: **7 días hábiles**.
+- Fix público + advisory: depende de severidad. Crítico → rama `main` + nota en [CHANGELOG.md](CHANGELOG.md) tan pronto como exista parche verificable.
+
+### Lo que cubre
+- Bypass de los CRC32 que valida el WAL/Pager.
+- Lectura/escritura cruzada entre DBs en modo `-dir` (path traversal).
+- Bypass del filtro `WHERE pk = N` para mutar filas no autorizadas.
+- Saltarse `-token` o el cap de conexiones.
+- Inyección SQL más allá del subconjunto soportado.
+- Ejecución arbitraria a través del parser, codec o `phpgabyadmin`.
+
+### Lo que NO se considera vulnerabilidad
+- Falta de TLS nativo en `gabysql-server` (documentado, usar reverse proxy).
+- Que un atacante con acceso de escritura al disco pueda recomputar CRCs (los CRCs son anti-corrupción, no anti-tampering).
+- Exposición pública de `phpgabyadmin` sin token (la doc lo desaconseja explícitamente).
 
 ---
 

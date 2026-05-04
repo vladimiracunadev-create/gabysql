@@ -1,0 +1,265 @@
+name: Security Scan
+
+# Modelo de amenaza: gabysql persiste DBs locales y expone un servidor HTTP
+# sin TLS nativo (-token opcional). Un commit malicioso fusionado a main
+# puede:
+#   - Exfiltrar archivos .db del operador o cambiar el formato a uno corrupto.
+#   - Inyectar código que omita la verificación CRC del WAL y acepte payloads
+#     manipulados durante el replay.
+#   - Saltarse el límite de conexiones del server o el filtro WHERE-PK.
+#   - Introducir dependencias Cargo con backdoor (hoy el grafo es vacío,
+#     pero esto blinda el repo para cuando se agreguen crates).
+#
+# Por eso tratamos el CI como frontera de confianza:
+#   - Acciones third-party pinned a SHA (no a tag movible).
+#   - persist-credentials: false en todos los checkout.
+#   - Permisos minimos (contents: read) por job.
+#   - cargo-audit + cargo-deny sobre el grafo de dependencias.
+#   - Detección de Trojan Source, ofuscación, secretos (FS + historial).
+#   - grype con fail-on critical sobre la imagen Docker publicable.
+#
+# Los workflows mismos se auditan en .github/workflows/workflow-security.yml.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 4 * * 1'  # lunes 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. cargo-audit: vulnerabilidades en deps Cargo (RustSec) ──────────────
+  cargo_audit:
+    name: cargo-audit (RustSec advisory DB)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ENFORCEMENT: ${{ github.event_name == 'pull_request' && 'soft' || 'hard' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-audit (pinned)
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Run cargo-audit
+        run: |
+          set +e
+          cargo audit --color never 2>&1 | tee /tmp/cargo-audit.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "## cargo-audit"
+            echo ""
+            echo '```'
+            cat /tmp/cargo-audit.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ] && [ "$ENFORCEMENT" = "hard" ]; then
+            echo "::error::Vulnerabilidades en deps Rust (modo hard - push/schedule)"
+            exit "$rc"
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::Vulnerabilidades en deps Rust (modo soft en PR)"
+          fi
+
+  # ── 2. cargo-deny: licencias + advisories + bans + sources ────────────────
+  cargo_deny:
+    name: cargo-deny (advisories + licenses + sources)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-deny (pinned)
+        run: cargo install cargo-deny --version 0.19.4 --locked
+      - name: Run cargo-deny
+        run: cargo deny --all-features check
+
+  # ── 3. detect-secrets: filesystem + historial reciente ────────────────────
+  secrets:
+    name: detect-secrets (tracked + history)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # necesario para escaneo de historial
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install detect-secrets (pinned)
+        run: pip install detect-secrets==1.5.0
+      - name: Validar baseline si existe
+        run: |
+          if [ -f .secrets.baseline ]; then
+            python -m json.tool .secrets.baseline > /dev/null
+            echo "Baseline JSON valido"
+          else
+            echo "Sin baseline - escaneo limpio"
+          fi
+      - name: Escaneo del filesystem actual
+        run: |
+          detect-secrets scan \
+            --exclude-files '\.git/|target/|\.tmp.*|Cargo\.lock|\.secrets\.baseline' \
+            --exclude-lines '^\s*//|^\s*#' \
+            > /tmp/scan_output.json
+          python - <<'PY'
+          import json, sys
+          data = json.load(open('/tmp/scan_output.json'))
+          results = data.get('results', {})
+          if results:
+              print('::error::Posibles secretos detectados en filesystem:')
+              for fpath, items in results.items():
+                  for it in items:
+                      print(f"  {fpath}:{it.get('line_number')}  type={it.get('type')}")
+              sys.exit(1)
+          print('OK: sin secretos expuestos en filesystem')
+          PY
+      - name: Escaneo de los ultimos 50 commits
+        run: |
+          set -e
+          status=0
+          for sha in $(git log --format="%H" -n 50); do
+            tmp=$(mktemp -d)
+            git --work-tree="$tmp" checkout "$sha" -- . 2>/dev/null || { rm -rf "$tmp"; continue; }
+            (
+              cd "$tmp"
+              detect-secrets scan \
+                --exclude-files '\.git/|target/|Cargo\.lock|\.secrets\.baseline|\.lock$' \
+                > /tmp/hist_scan.json 2>/dev/null || true
+            )
+            rm -rf "$tmp"
+            if python -c 'import json,sys; d=json.load(open("/tmp/hist_scan.json")); sys.exit(1 if d.get("results") else 0)'; then
+              :
+            else
+              echo "::error::Secreto detectado en commit $sha"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then exit 1; fi
+          echo "OK: historial reciente limpio"
+
+  # ── 4. Trojan Source + zero-width + ofuscación + URLs de exfil ────────────
+  supply_chain:
+    name: Supply chain (Trojan Source + obfuscation + exfil)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      # CVE-2021-42574: caracteres bidi Unicode pueden ocultar lógica maliciosa
+      # haciendo que el código se vea distinto al humano vs. al compilador.
+      - name: Detectar caracteres Unicode bidireccionales
+        run: |
+          if git ls-files -z | xargs -0 grep -PlU $'\x{202a}|\x{202b}|\x{202c}|\x{202d}|\x{202e}|\x{2066}|\x{2067}|\x{2068}|\x{2069}|\x{200f}|\x{061c}' 2>/dev/null; then
+            echo "::error::Caracteres bidireccionales detectados (Trojan Source - CVE-2021-42574)"
+            exit 1
+          fi
+          echo "OK: sin Trojan Source"
+      - name: Detectar zero-width / homoglyphs en código fuente
+        run: |
+          # Limitado a archivos de código (no docs).
+          if git ls-files -z '*.rs' '*.php' '*.py' '*.js' '*.ts' '*.yml' '*.yaml' \
+             | xargs -0 grep -PlU $'\x{200B}|\x{200C}|\x{200D}|\x{FEFF}' 2>/dev/null; then
+            echo "::error::Caracteres zero-width detectados en código fuente"
+            exit 1
+          fi
+          echo "OK: sin zero-width sospechosos"
+      - name: Detectar patrones peligrosos en Rust y PHP
+        run: |
+          # Rust: bloques unsafe + mem::transmute + std::process::Command con
+          # interpolación. PHP: eval, system, exec con concatenación.
+          # Excluye .github y tests cuyo propósito es documentar IOCs.
+          status=0
+          rust_files=$(git ls-files '*.rs' | grep -Ev '^(\.github/|tests/.*detect.*)' || true)
+          php_files=$(git ls-files '*.php' || true)
+
+          if [ -n "$rust_files" ]; then
+            # std::mem::transmute fuera de tests - flag para revisión.
+            hits=$(echo "$rust_files" | xargs grep -lE 'std::mem::transmute|mem::transmute' 2>/dev/null || true)
+            if [ -n "$hits" ]; then
+              echo "::warning::std::mem::transmute detectado (revisar):"
+              echo "$hits" | sed 's/^/  /'
+            fi
+            # std::process::Command con interpolación de format!/concat.
+            hits=$(echo "$rust_files" | xargs grep -lE 'Command::new\([^)]*(format!|\+\s*&)' 2>/dev/null || true)
+            if [ -n "$hits" ]; then
+              echo "::error::Command::new con interpolación dinámica:"
+              echo "$hits" | sed 's/^/  /'
+              status=1
+            fi
+          fi
+
+          if [ -n "$php_files" ]; then
+            hits=$(echo "$php_files" | xargs grep -lE '\beval\s*\(|\bsystem\s*\(.*\.|\bexec\s*\(.*\.' 2>/dev/null || true)
+            if [ -n "$hits" ]; then
+              echo "::error::eval/system/exec con interpolación en PHP:"
+              echo "$hits" | sed 's/^/  /'
+              status=1
+            fi
+          fi
+
+          if [ "$status" -ne 0 ]; then exit 1; fi
+          echo "OK: sin patrones de ofuscación"
+      - name: Detectar URLs de webhook/exfil hardcodeadas
+        run: |
+          # Solo archivos de código y config. Excluye workflows (que
+          # documentan los mismos patrones como IOCs) y vendored locks.
+          MATCHES=$(git ls-files -z '*.rs' '*.php' '*.py' '*.js' '*.ts' '*.json' '*.toml' '*.yaml' '*.yml' \
+            | grep -zEv '\.github/workflows/' \
+            | xargs -0 grep -lE '(discord\.com/api/webhooks|hooks\.slack\.com|webhook\.site|requestbin\.com|burpcollaborator\.net|ngrok\.io|pastebin\.com/raw)' 2>/dev/null || true)
+          if [ -n "$MATCHES" ]; then
+            echo "::error::URL de webhook/exfil sospechosa hardcodeada en:"
+            printf '%s\n' "$MATCHES"
+            exit 1
+          fi
+          echo "OK: sin URLs de exfil sospechosas"
+
+  # ── 5. Container scan: grype sobre imagen Docker ──────────────────────────
+  container_scan:
+    name: Container image scan (grype)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build -t "scan-target:ci" .
+      - name: Install grype (pinned)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin v0.110.0
+      - name: Scan with grype (table to log + summary, fail on critical)
+        run: |
+          set -o pipefail
+          /usr/local/bin/grype scan-target:ci -o table | tee /tmp/grype-report.txt
+          {
+            echo "## Grype Container Scan"
+            echo ""
+            echo '```'
+            cat /tmp/grype-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          /usr/local/bin/grype scan-target:ci --fail-on critical -o table

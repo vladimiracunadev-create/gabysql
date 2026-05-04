@@ -12,7 +12,8 @@
       "Bash(git commit -m 'feat\\(storage\\): CRC32-IEEE checksums on pages and WAL records *)",
       "Bash(git commit -m 'feat\\(server\\): cap concurrent connections \\(default 64\\) *)",
       "Bash(git commit -m 'feat\\(sql\\): UPDATE and DELETE by primary key *)",
-      "Bash(git commit -m 'docs: sweep all documentation for the 8 critical-finding fixes *)"
+      "Bash(git commit -m 'docs: sweep all documentation for the 8 critical-finding fixes *)",
+      "Bash(docker run *)"
     ]
   }
 }

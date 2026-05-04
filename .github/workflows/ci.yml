@@ -1,8 +1,25 @@
-﻿name: CI
+name: CI
+
+# Modelo de confianza:
+#   - Workflow-level permissions = contents:read (default deny).
+#   - Cada job eleva permisos solo si los necesita.
+#   - persist-credentials:false en checkout para que un step posterior
+#     no pueda re-usar el GITHUB_TOKEN del checkout para escribir.
+#   - Acciones third-party pinned a SHA (commit hash) — un tag movible
+#     puede ser repunteado a un commit malicioso sin que el repo se entere.
+#   - Auditoría adicional en .github/workflows/security.yml y
+#     .github/workflows/workflow-security.yml.
 
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
@@ -11,10 +28,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: cargo fmt
         run: cargo fmt --check
@@ -26,7 +48,7 @@ jobs:
         run: cargo build --release --bin gabysql --bin gabysql-server
       - name: Upload release binaries (Unix)
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: gabysql-${{ runner.os }}-release
           path: |
@@ -34,7 +56,7 @@ jobs:
             target/release/gabysql-server
       - name: Upload release binaries (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: gabysql-${{ runner.os }}-release
           path: |
@@ -43,16 +65,24 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
       - name: Docker build
         run: docker build -t gabysql .
 
   php:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@34a5396826718e0013f08e3e639d1c315d5f6b23  # v2.35.0
         with:
           php-version: '8.2'
       - name: Lint landing
