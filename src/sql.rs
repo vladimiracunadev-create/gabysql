@@ -11,6 +11,20 @@ pub enum Statement {
     Select(SelectStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    CreateIndex(CreateIndexStmt),
+    DropIndex(DropIndexStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStmt {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStmt {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +110,12 @@ impl<'a> Engine<'a> {
             Statement::Select(stmt) => self.exec_select(stmt),
             Statement::Update(stmt) => self.exec_update(stmt),
             Statement::Delete(stmt) => self.exec_delete(stmt),
+            Statement::CreateIndex(_) | Statement::DropIndex(_) => {
+                // Implemented in the next milestone (exec_create_index /
+                // exec_drop_index). Returning an explicit error keeps the
+                // parser tested independently of the executor.
+                Err(DbError::new("CREATE/DROP INDEX aún no ejecutable"))
+            }
         }
     }
 
@@ -669,8 +689,11 @@ impl Parser {
         if self.match_keyword("DELETE") {
             return self.parse_delete();
         }
+        if self.match_keyword("DROP") {
+            return self.parse_drop();
+        }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP)",
         ))
     }
 
@@ -713,7 +736,30 @@ impl Parser {
         }))
     }
 
+    fn parse_create_index(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        self.expect_keyword("ON")?;
+        let table = self.expect_ident()?;
+        self.expect_symbol("(")?;
+        let column = self.expect_ident()?;
+        self.expect_symbol(")")?;
+        Ok(Statement::CreateIndex(CreateIndexStmt {
+            name,
+            table,
+            column,
+        }))
+    }
+
+    fn parse_drop(&mut self) -> DbResult<Statement> {
+        self.expect_keyword("INDEX")?;
+        let name = self.expect_ident()?;
+        Ok(Statement::DropIndex(DropIndexStmt { name }))
+    }
+
     fn parse_create(&mut self) -> DbResult<Statement> {
+        if self.match_keyword("INDEX") {
+            return self.parse_create_index();
+        }
         self.expect_keyword("TABLE")?;
         let name = self.expect_ident()?;
         self.expect_symbol("(")?;
