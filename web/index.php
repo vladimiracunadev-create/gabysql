@@ -104,13 +104,30 @@ DELETE FROM users WHERE id = 1;</code></pre>
       </section>
 
       <section class="card">
-        <h2>Panel Web</h2>
-        <p>
-          <b>phpgabyadmin</b> se mantiene como frontend ligero. No ejecuta el motor directamente:
-          consume el API HTTP expuesto por <code>gabysql-server</code>.
+        <h2>Herramientas web incluidas</h2>
+        <p class="muted">El repo trae dos clientes web vanilla, sin npm. Ambos viven bajo <code>web/</code> y se sirven con el mismo <code>php -S</code> o desde Docker compose.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px">
+          <div style="border:1px solid #243244;border-radius:10px;padding:12px;background:#101824">
+            <h3 style="margin:0 0 6px 0">📐 gabymodeler</h3>
+            <p class="muted" style="margin:0 0 8px 0;font-size:13px">
+              Modela esquemas (entidades, columnas, índices, FK informativas) y exporta SQL DDL listo para gabysql:
+              <code>CREATE DATABASE</code> + <code>CREATE TABLE</code> + <code>CREATE INDEX</code>.
+            </p>
+            <p style="margin:0"><a class="btn" href="/modeler/">Abrir gabymodeler</a></p>
+          </div>
+          <div style="border:1px solid #243244;border-radius:10px;padding:12px;background:#101824">
+            <h3 style="margin:0 0 6px 0">🧭 phpgabyadmin</h3>
+            <p class="muted" style="margin:0 0 8px 0;font-size:13px">
+              Admin web. Browse paginado, Structure con índices CRUD inline, SQL con snippets de un click.
+              Consume la API HTTP de <code>gabysql-server</code>.
+            </p>
+            <p style="margin:0"><a class="btn" href="/phpgabyadmin/">Abrir phpgabyadmin</a></p>
+          </div>
+        </div>
+        <p class="muted" style="margin-top:10px;font-size:13px">
+          Flujo recomendado: <b>gabymodeler</b> diseña → exporta SQL → pegas en <b>phpgabyadmin → tab SQL</b> → ejecuta.
+          Por defecto se espera <code>gabysql-server</code> en <code>http://localhost:8080</code>.
         </p>
-        <p><a class="btn" href="/phpgabyadmin/">Abrir phpgabyadmin</a></p>
-        <p class="muted">Por defecto se espera un servidor local en <code>http://localhost:8080</code>.</p>
         <p class="warn">El admin está pensado para entorno controlado. Si se expone fuera de localhost, usa token.</p>
       </section>
     </div>

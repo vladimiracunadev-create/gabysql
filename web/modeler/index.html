@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gabymodeler · gabysql</title>
+<style>
+  /* ---------- base ---------- */
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    font-family:Georgia,"Times New Roman",serif;
+    color:#edf3ff;
+    background:radial-gradient(circle at top,#172131 0%,#0d1117 48%,#090c12 100%);
+    overflow:hidden;
+  }
+  a{color:#7cc4ff}
+  code,pre{font-family:ui-monospace,Menlo,Consolas,monospace}
+  button,select,input{font-family:inherit;font-size:14px;color:#edf3ff}
+  button{background:#1f2a3a;border:1px solid #2c3b50;border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:hover{background:#27344a}
+  button.primary{background:#2a4470;border-color:#3c5d96}
+  button.primary:hover{background:#345287}
+  button.danger{background:#5a2030;border-color:#7a2c44;color:#ffd6e0}
+  button.ghost{background:transparent;border:1px dashed #2c3b50}
+  input,select{background:#0e1622;border:1px solid #2c3b50;border-radius:6px;padding:4px 8px}
+  .muted{color:#90a4c0}
+  .row{display:flex;gap:8px;align-items:center}
+
+  /* ---------- layout ---------- */
+  header{
+    position:fixed;inset:0 0 auto 0;height:56px;
+    background:rgba(13,17,23,.92);
+    border-bottom:1px solid #243244;
+    display:flex;align-items:center;gap:10px;
+    padding:0 16px;z-index:5;
+    backdrop-filter:blur(10px);
+  }
+  header h1{margin:0;font-size:18px;letter-spacing:.5px}
+  header .spacer{flex:1}
+  main{position:fixed;inset:56px 0 0 0;display:grid;grid-template-columns:300px 1fr}
+  aside{
+    background:rgba(20,27,36,.85);
+    border-right:1px solid #243244;
+    overflow-y:auto;padding:14px;
+  }
+  aside h3{margin:6px 0 4px 0;font-size:13px;letter-spacing:.5px;text-transform:uppercase;color:#a8b9d4}
+  #canvas{position:relative;overflow:auto;background:
+    repeating-linear-gradient(0deg,transparent 0 49px,#1a2434 49px 50px),
+    repeating-linear-gradient(90deg,transparent 0 49px,#1a2434 49px 50px),
+    #0d1119;
+  }
+  svg.relations{position:absolute;inset:0;width:5000px;height:3000px;pointer-events:none;z-index:1}
+
+  /* ---------- entity card ---------- */
+  .entity{
+    position:absolute;min-width:240px;max-width:320px;
+    background:#141d2a;border:1px solid #2c3b50;border-radius:10px;
+    box-shadow:0 8px 28px rgba(0,0,0,.35);
+    z-index:2;
+  }
+  .entity.selected{border-color:#3c5d96;box-shadow:0 0 0 2px rgba(60,93,150,.5),0 8px 28px rgba(0,0,0,.35)}
+  .entity-head{
+    display:flex;gap:6px;align-items:center;
+    padding:8px 10px;background:#1c2738;border-bottom:1px solid #2c3b50;
+    border-radius:10px 10px 0 0;cursor:move;user-select:none;
+  }
+  .entity-head input{flex:1;background:transparent;border:1px solid transparent}
+  .entity-head input:focus{background:#0e1622;border-color:#2c3b50}
+  .entity-body{padding:6px 10px}
+  .entity-body table{width:100%;border-collapse:collapse;font-size:13px}
+  .entity-body th{font-weight:normal;color:#90a4c0;text-align:left;padding:4px 4px;border-bottom:1px solid #243244}
+  .entity-body td{padding:3px 2px;border-bottom:1px solid #1a2536}
+  .entity-body tr:last-child td{border-bottom:0}
+  .entity-body input[type="text"]{width:100%;padding:2px 6px;font-size:13px}
+  .entity-body select{padding:2px 4px;font-size:12px}
+  .entity-foot{padding:6px 10px;display:flex;gap:6px}
+  .entity-foot button{font-size:12px;padding:3px 8px}
+  .colflag{cursor:pointer;font-size:11px;padding:1px 5px;border-radius:4px;border:1px solid #2c3b50;color:#90a4c0;user-select:none}
+  .colflag.on{background:#3c5d96;border-color:#3c5d96;color:#fff}
+  .colflag.idx.on{background:#2d7a66;border-color:#2d7a66}
+
+  /* ---------- modal ---------- */
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)}
+  .modal-bg.show{display:flex}
+  .modal{
+    background:#141d2a;border:1px solid #2c3b50;border-radius:14px;
+    width:min(820px,92vw);max-height:80vh;display:flex;flex-direction:column;
+    box-shadow:0 24px 64px rgba(0,0,0,.55);
+  }
+  .modal-head{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid #243244}
+  .modal-head h2{margin:0;font-size:16px}
+  .modal-body{padding:12px 16px;overflow:auto}
+  .modal-body pre{
+    margin:0;background:#0e1622;border:1px solid #243244;border-radius:8px;
+    padding:12px;color:#cfe3ff;font-size:12.5px;white-space:pre-wrap;word-break:break-word;
+  }
+  .modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 16px;border-top:1px solid #243244}
+
+  .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid #2c3b50;color:#a8b9d4}
+  .ok{color:#7be0a3}
+  .err{color:#ff8b9b}
+</style>
+</head>
+<body>
+<header>
+  <h1>📐 gabymodeler</h1>
+  <span class="pill">esquema lógico → físico → SQL</span>
+  <span class="spacer"></span>
+  <button id="btn-new-entity" class="primary">＋ Nueva entidad</button>
+  <button id="btn-export">Exportar SQL</button>
+  <button id="btn-save">💾 Guardar</button>
+  <button id="btn-load">📂 Cargar</button>
+  <button id="btn-clear" class="danger">🗑️ Limpiar</button>
+  <a href="../" class="pill" style="text-decoration:none">← Landing</a>
+</header>
+
+<main>
+  <aside>
+    <h3>Modelo</h3>
+    <div class="row" style="margin-bottom:10px">
+      <label class="muted" style="font-size:13px">DB:</label>
+      <input id="db-name" type="text" value="modeler_demo" style="flex:1" />
+    </div>
+    <div class="row" style="margin-bottom:14px">
+      <label class="row muted" style="font-size:12px;cursor:pointer">
+        <input id="opt-ifnotexists" type="checkbox" checked /> CREATE DATABASE IF NOT EXISTS
+      </label>
+    </div>
+
+    <h3>Tipos de columna soportados</h3>
+    <div class="muted" style="font-size:12px;line-height:1.6">
+      <code>INT</code> · <code>TEXT</code> · <code>BOOL</code> · <code>FLOAT</code> ·
+      <code>DATE</code> · <code>DATETIME</code> · <code>JSON</code><br/>
+      <span style="font-size:11px">PK debe ser INT. JSON no es indexable.</span>
+    </div>
+
+    <h3 style="margin-top:14px">Acciones</h3>
+    <div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
+      <button id="btn-load-sample">📦 Cargar ejemplo</button>
+      <a href="../phpgabyadmin/" target="_blank" rel="noopener" class="pill" style="text-align:center;text-decoration:none;padding:6px 12px">↗ Probar en phpgabyadmin</a>
+    </div>
+
+    <h3 style="margin-top:14px">Entidades</h3>
+    <ul id="entity-list" style="list-style:none;padding-left:0;margin:0;font-size:13px"></ul>
+
+    <h3 style="margin-top:14px">Cómo se usa</h3>
+    <ol class="muted" style="font-size:12px;line-height:1.7;padding-left:18px">
+      <li>Click en <b>＋ Nueva entidad</b>.</li>
+      <li>Define columnas; marca PK donde corresponda.</li>
+      <li>Marca el flag <b>idx</b> en columnas que quieras indexar.</li>
+      <li><b>Exportar SQL</b> genera CREATE TABLE + CREATE INDEX listo para pegar en phpgabyadmin → tab SQL.</li>
+    </ol>
+  </aside>
+
+  <div id="canvas">
+    <svg class="relations" id="rel-svg"></svg>
+  </div>
+</main>
+
+<!-- modal -->
+<div class="modal-bg" id="modal-bg">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="modal-title">SQL generado</h2>
+      <span class="spacer"></span>
+      <button id="modal-close" class="ghost">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <pre id="modal-content">-- vacío --</pre>
+    </div>
+    <div class="modal-foot">
+      <button id="btn-copy">📋 Copiar al portapapeles</button>
+      <button id="btn-download" class="primary">⬇ Descargar .sql</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =========================================================
+   gabymodeler — ER → DDL gabysql, vanilla JS, sin deps.
+   Estado:  { dbName, ifNotExists, entities: [{ id, name, x, y, columns: [...] }] }
+   Columnas: { id, name, type, pk, idx }
+   ========================================================= */
+
+const TYPES = ["INT","TEXT","BOOL","FLOAT","DATE","DATETIME","JSON"];
+const STORAGE_KEY = "gabymodeler.v1";
+const SAMPLE = {
+  dbName: "shop",
+  ifNotExists: true,
+  entities: [
+    { id: id_(), name:"users", x:80, y:80, columns:[
+      {id:id_(),name:"id",   type:"INT",  pk:true,  idx:false},
+      {id:id_(),name:"email",type:"TEXT", pk:false, idx:true},
+      {id:id_(),name:"name", type:"TEXT", pk:false, idx:false},
+    ]},
+    { id: id_(), name:"orders", x:430, y:80, columns:[
+      {id:id_(),name:"id",         type:"INT",   pk:true,  idx:false},
+      {id:id_(),name:"customer_id",type:"INT",   pk:false, idx:true},
+      {id:id_(),name:"status",     type:"TEXT",  pk:false, idx:true},
+      {id:id_(),name:"total",      type:"FLOAT", pk:false, idx:false},
+    ]}
+  ]
+};
+
+let state = load() || { dbName:"modeler_demo", ifNotExists:true, entities:[] };
+
+/* ---------- utils ---------- */
+function id_(){ return "e"+Math.random().toString(36).slice(2,9); }
+function $(sel){ return document.querySelector(sel); }
+function el(tag, attrs={}, ...children){
+  const n = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs)){
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const c of children){
+    if (c == null) continue;
+    n.append(c.nodeType ? c : document.createTextNode(c));
+  }
+  return n;
+}
+function save(){
+  state.dbName     = $("#db-name").value.trim() || "modeler_demo";
+  state.ifNotExists = $("#opt-ifnotexists").checked;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  flash("Modelo guardado en este navegador.");
+}
+function load(){
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function flash(msg){
+  const f = el("div", { class:"pill", style:"position:fixed;right:16px;top:68px;background:#2d7a66;border-color:#2d7a66;color:#dffaee;z-index:60" }, msg);
+  document.body.append(f);
+  setTimeout(() => f.remove(), 2000);
+}
+
+/* ---------- render ---------- */
+function render(){
+  $("#db-name").value = state.dbName;
+  $("#opt-ifnotexists").checked = !!state.ifNotExists;
+
+  const canvas = $("#canvas");
+  // wipe entity nodes (keep svg)
+  [...canvas.querySelectorAll(".entity")].forEach(n => n.remove());
+
+  for (const ent of state.entities){
+    canvas.append(renderEntity(ent));
+  }
+  renderEntityList();
+  renderRelations();
+}
+
+function renderEntityList(){
+  const ul = $("#entity-list");
+  ul.innerHTML = "";
+  if (state.entities.length === 0){
+    ul.append(el("li", { class:"muted", style:"font-size:12px" }, "Sin entidades. Crea una con ＋."));
+    return;
+  }
+  for (const ent of state.entities){
+    const pkCount = ent.columns.filter(c => c.pk).length;
+    ul.append(el("li", { style:"padding:4px 0;border-bottom:1px solid #1a2536" },
+      el("b", {}, ent.name || "(sin nombre)"),
+      " ",
+      el("span", { class:"muted", style:"font-size:11px" },
+        `${ent.columns.length} cols · ${pkCount === 1 ? "PK ok" : "❗ PK falta o duplicada"}`)
+    ));
+  }
+}
+
+function renderEntity(ent){
+  const card = el("div", {
+    class:"entity",
+    "data-id": ent.id,
+    style:`left:${ent.x}px;top:${ent.y}px`
+  });
+
+  const head = el("div", { class:"entity-head" },
+    el("input", {
+      type:"text",
+      value: ent.name,
+      onchange: e => { ent.name = sanitizeIdent(e.target.value); save(); render(); }
+    }),
+    el("button", { class:"danger", title:"Eliminar entidad",
+      onclick: () => { state.entities = state.entities.filter(e=>e.id!==ent.id); save(); render(); }
+    }, "✕")
+  );
+  // drag entity
+  let dragging = null;
+  head.addEventListener("mousedown", e => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
+    dragging = { dx: e.clientX - ent.x, dy: e.clientY - ent.y };
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", e => {
+    if (!dragging) return;
+    ent.x = Math.max(0, e.clientX - dragging.dx);
+    ent.y = Math.max(0, e.clientY - dragging.dy);
+    card.style.left = ent.x + "px";
+    card.style.top  = ent.y + "px";
+    renderRelations();
+  });
+  document.addEventListener("mouseup", () => { if (dragging) { dragging = null; save(); } });
+
+  const tbl = el("table");
+  const thead = el("thead", {}, el("tr", {},
+    el("th", {}, "Columna"),
+    el("th", { style:"width:90px" }, "Tipo"),
+    el("th", { style:"width:62px;text-align:right" }, "Flags")
+  ));
+  const tbody = el("tbody");
+  for (const col of ent.columns) tbody.append(renderColumnRow(ent, col));
+  tbl.append(thead, tbody);
+
+  const foot = el("div", { class:"entity-foot" },
+    el("button", { onclick: () => {
+      ent.columns.push({ id:id_(), name:"col"+(ent.columns.length+1), type:"TEXT", pk:false, idx:false });
+      save(); render();
+    }}, "＋ columna"),
+    el("button", { class:"ghost",
+      onclick: () => {
+        const ref = prompt("Nombre de columna FK que apunta a otra entidad (formato 'tabla.columna')\nEjemplo: users.id", "");
+        if (!ref) return;
+        const [t,c] = ref.split(".");
+        if (!t || !c) return alert("Formato esperado: tabla.columna");
+        ent.columns.push({ id:id_(), name:t+"_"+c, type:"INT", pk:false, idx:true, fk:{table:t, column:c} });
+        save(); render();
+      }}, "↪ FK")
+  );
+
+  card.append(head, el("div", { class:"entity-body" }, tbl), foot);
+  return card;
+}
+
+function renderColumnRow(ent, col){
+  return el("tr", {},
+    el("td", {}, el("input", {
+      type:"text", value: col.name,
+      onchange: e => { col.name = sanitizeIdent(e.target.value); save(); render(); }
+    })),
+    el("td", {}, (() => {
+      const sel = el("select", { onchange: e => { col.type = e.target.value; save(); render(); }});
+      for (const t of TYPES) sel.append(el("option", { value:t, ...(t===col.type?{selected:""}:{ }) }, t));
+      return sel;
+    })()),
+    el("td", { style:"text-align:right;white-space:nowrap" },
+      el("span", { class:"colflag"+(col.pk?" on":""), title:"PRIMARY KEY",
+        onclick: () => {
+          // solo una PK por entidad
+          if (!col.pk) ent.columns.forEach(c => c.pk = false);
+          col.pk = !col.pk;
+          if (col.pk) col.type = "INT";
+          save(); render();
+        }
+      }, "PK"),
+      " ",
+      el("span", { class:"colflag idx"+(col.idx?" on":""), title:"índice secundario",
+        onclick: () => { col.idx = !col.idx; save(); render(); }
+      }, "idx"),
+      " ",
+      el("button", { class:"ghost", title:"eliminar columna",
+        onclick: () => {
+          ent.columns = ent.columns.filter(c=>c.id!==col.id);
+          save(); render();
+        }
+      }, "✕")
+    )
+  );
+}
+
+function renderRelations(){
+  const svg = $("#rel-svg");
+  svg.innerHTML = "";
+  // FKs
+  for (const e of state.entities){
+    for (const c of e.columns){
+      if (!c.fk) continue;
+      const target = state.entities.find(x => x.name === c.fk.table);
+      if (!target) continue;
+      const a = entityCenter(e), b = entityCenter(target);
+      const line = document.createElementNS("http://www.w3.org/2000/svg","path");
+      const dx = (b.x - a.x)/2;
+      line.setAttribute("d", `M ${a.x} ${a.y} C ${a.x+dx} ${a.y}, ${b.x-dx} ${b.y}, ${b.x} ${b.y}`);
+      line.setAttribute("fill","none");
+      line.setAttribute("stroke","#3c5d96");
+      line.setAttribute("stroke-width","2");
+      line.setAttribute("stroke-dasharray","4 4");
+      svg.append(line);
+    }
+  }
+}
+function entityCenter(ent){
+  const node = document.querySelector(`.entity[data-id="${ent.id}"]`);
+  if (!node) return { x: ent.x+120, y: ent.y+30 };
+  return { x: ent.x + node.offsetWidth/2, y: ent.y + node.offsetHeight/2 };
+}
+
+/* ---------- DDL generator ---------- */
+function sanitizeIdent(s){
+  return (s||"").trim().replace(/[^A-Za-z0-9_]/g,"_").replace(/^[^A-Za-z_]/, "_");
+}
+function generateSQL(){
+  const lines = [];
+  const dbName = sanitizeIdent($("#db-name").value || "modeler_demo");
+  const ifne = $("#opt-ifnotexists").checked ? " IF NOT EXISTS" : "";
+
+  lines.push(`-- Generado por gabymodeler · ${new Date().toISOString()}`);
+  lines.push(`CREATE DATABASE${ifne} ${dbName};`);
+  lines.push(``);
+
+  for (const ent of state.entities){
+    if (!ent.name) continue;
+    const cols = ent.columns.filter(c => c.name);
+    if (cols.length === 0) continue;
+    const colDefs = cols.map(c => {
+      let s = `  ${c.name} ${c.type}`;
+      if (c.pk) s += " PRIMARY KEY";
+      return s;
+    }).join(",\n");
+    lines.push(`CREATE TABLE ${ent.name} (`);
+    lines.push(colDefs);
+    lines.push(`);`);
+    for (const c of cols){
+      if (c.idx && !c.pk && c.type !== "JSON"){
+        lines.push(`CREATE INDEX idx_${ent.name}_${c.name} ON ${ent.name} (${c.name});`);
+      }
+    }
+    lines.push(``);
+  }
+
+  // Comentarios FK (no soportado declarativo todavía)
+  const fks = [];
+  for (const ent of state.entities){
+    for (const c of ent.columns){
+      if (c.fk) fks.push(`-- FK: ${ent.name}.${c.name} -> ${c.fk.table}.${c.fk.column} (no enforced en VERSION 4)`);
+    }
+  }
+  if (fks.length){
+    lines.push(`-- FOREIGN KEYS (informativas, no implementadas en gabysql v0.1.x):`);
+    lines.push(...fks);
+  }
+
+  return lines.join("\n");
+}
+
+/* ---------- modal ---------- */
+function openModal(title, content){
+  $("#modal-title").textContent = title;
+  $("#modal-content").textContent = content;
+  $("#modal-bg").classList.add("show");
+}
+function closeModal(){ $("#modal-bg").classList.remove("show"); }
+
+/* ---------- bindings ---------- */
+$("#btn-new-entity").onclick = () => {
+  state.entities.push({
+    id:id_(), name:"tabla"+(state.entities.length+1),
+    x: 60 + (state.entities.length*30) % 400,
+    y: 60 + (state.entities.length*30) % 250,
+    columns:[{ id:id_(), name:"id", type:"INT", pk:true, idx:false }]
+  });
+  save(); render();
+};
+$("#btn-export").onclick = () => openModal("SQL generado", generateSQL());
+$("#btn-save").onclick   = save;
+$("#btn-load").onclick   = () => {
+  const s = load();
+  if (!s){ flash("No hay modelo guardado en este navegador."); return; }
+  state = s; render(); flash("Modelo recargado.");
+};
+$("#btn-clear").onclick  = () => {
+  if (!confirm("¿Borrar el modelo actual? localStorage también se vacía.")) return;
+  state = { dbName:"modeler_demo", ifNotExists:true, entities:[] };
+  localStorage.removeItem(STORAGE_KEY);
+  render();
+};
+$("#btn-load-sample").onclick = () => { state = JSON.parse(JSON.stringify(SAMPLE)); save(); render(); };
+$("#modal-close").onclick = closeModal;
+$("#modal-bg").addEventListener("click", e => { if (e.target.id === "modal-bg") closeModal(); });
+$("#btn-copy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("#modal-content").textContent); flash("SQL copiado."); }
+  catch { flash("No se pudo copiar (¿permisos?)."); }
+};
+$("#btn-download").onclick = () => {
+  const blob = new Blob([$("#modal-content").textContent], { type:"text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href:url, download:`${sanitizeIdent($("#db-name").value)||"model"}.sql` });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$("#db-name").addEventListener("change", save);
+$("#opt-ifnotexists").addEventListener("change", save);
+
+render();
+</script>
+</body>
+</html>
