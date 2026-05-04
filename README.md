@@ -12,6 +12,23 @@
 
 ---
 
+## 📚 Documentos clave del producto
+
+> **Atajos a los 7 documentos estratégicos.** El resto del repo está enlazado más abajo en *Mapa documental*.
+
+| 📄 | Documento | Para qué sirve |
+| :---: | :--- | :--- |
+| 🎯 | [POSITIONING](docs/POSITIONING.md) | qué problema resuelve, ICP, ejemplos de uso reales |
+| 💼 | [COMMERCIAL_ROADMAP](docs/COMMERCIAL_ROADMAP.md) | los 3 caminos A/B/C para llegar a producto comercial |
+| 🥊 | [COMPETITIVE_ANALYSIS](docs/COMPETITIVE_ANALYSIS.md) | comparativa honesta vs SQLite/DuckDB/Postgres/MySQL/etc. |
+| 📋 | [STATUS](docs/STATUS.md) | madurez por subsistema (🟢/🟡/🔴 fila por fila) |
+| 🧪 | [USE_CASES](docs/USE_CASES.md) | 17 recetas concretas listas para copiar |
+| 📐 | [SQL_REFERENCE](docs/SQL_REFERENCE.md) | gramática con railroad diagrams + EBNF + ejemplos |
+| 🛡️ | [SECURITY_LAYERS](docs/SECURITY_LAYERS.md) | mapa completo de las 6 capas de seguridad |
+| 📜 | [ADRs](docs/adr/) | decisiones arquitectónicas (contexto, alternativas, consecuencias) |
+
+---
+
 ## 🚦 Estado actual del producto
 
 > **Estado**: 🟢 Base estable  
