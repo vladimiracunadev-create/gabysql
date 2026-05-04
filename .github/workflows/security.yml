@@ -251,15 +251,25 @@ jobs:
       - name: Install grype (pinned)
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin v0.110.0
-      - name: Scan with grype (table to log + summary, fail on critical)
+      - name: Scan with grype (full report to summary)
         run: |
           set -o pipefail
-          /usr/local/bin/grype scan-target:ci -o table | tee /tmp/grype-report.txt
+          # Full inventory (sin filtros) al log y al summary, para que la
+          # superficie de CVEs no-fixable (debian (won't fix)) quede a la
+          # vista aunque no rompa el job.
+          /usr/local/bin/grype scan-target:ci -o table | tee /tmp/grype-full.txt
           {
-            echo "## Grype Container Scan"
+            echo "## Grype Container Scan (full inventory)"
             echo ""
             echo '```'
-            cat /tmp/grype-report.txt
+            cat /tmp/grype-full.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          /usr/local/bin/grype scan-target:ci --fail-on critical -o table
+      - name: Enforce policy (fail only on fixable critical)
+        run: |
+          # Política: bloquear merge SOLO si hay un Critical con fix
+          # disponible. .grype.yaml define only-fixed=true +
+          # fail-on-severity=critical. Las CVEs marcadas (won't fix) por
+          # Debian no son remediables dentro de la imagen y no detienen
+          # el release. Ver docs/SECURITY_LAYERS.md §Capa 5.
+          /usr/local/bin/grype scan-target:ci -c .grype.yaml

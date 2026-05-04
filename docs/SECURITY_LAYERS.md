@@ -72,9 +72,26 @@ Y en cada workflow:
 
 | Amenaza | Mitigación | Implementación |
 | :--- | :--- | :--- |
-| CVEs en la base `debian:bookworm-slim` o en paquetes del runtime | `grype 0.110.0` con `--fail-on critical` sobre la imagen final, ejecutado en cada PR y push a `main` | `security.yml :: container_scan` |
+| CVEs **fixeables** en la base `debian:bookworm-slim` o en paquetes del runtime | `grype 0.110.0` con política `only-fixed: true` + `fail-on-severity: critical` sobre la imagen final, ejecutado en cada PR y push a `main` | `security.yml :: container_scan` + [`.grype.yaml`](../.grype.yaml) |
+| CVEs aplicables que ya tienen parche en repos Debian | `apt-get upgrade` en el stage runtime del [`Dockerfile`](../Dockerfile) trae los fixes publicados al momento del build | [`Dockerfile`](../Dockerfile) |
 | Ejecución como root dentro del container | `Dockerfile` crea usuario `gabysql` y hace `USER gabysql` antes de `CMD` | [`Dockerfile`](../Dockerfile) |
 | Datos persistidos sin volumen explícito | `VOLUME ["/data"]` declarado en el Dockerfile; `docker-compose.yml` usa volume nombrado | [`Dockerfile`](../Dockerfile), [`docker-compose.yml`](../docker-compose.yml) |
+
+### Política frente a CVEs `(won't fix)`
+
+`debian:bookworm-slim` reporta decenas de CVEs (incluyendo Critical y High) en `libc6`, `libpam`, `ncurses`, `util-linux`, `gpgv`, etc. que Debian marca **`(won't fix)` para esta major release**: no hay parche aguas arriba.
+
+Decisión de proyecto: **el merge se bloquea solo cuando hay un Critical con fix disponible** (política estándar Anchore/Snyk/Trivy). Las CVEs no-fixable:
+
+- siguen apareciendo en el reporte completo del job (`grype ... -o table | tee` + `$GITHUB_STEP_SUMMARY`),
+- son auditables en cada run sin necesidad de re-correr nada localmente,
+- son el motivo principal por el que el ROADMAP contempla migrar a `gcr.io/distroless/cc-debian12` (superficie radicalmente menor) cuando el binario y `phpgabyadmin` lo permitan.
+
+Esta postura es deliberada y se prefiere a:
+
+- **Ignorar lista hardcodeada de CVEs**: produce drift silencioso cada vez que una nueva CVE no-fixable se publica.
+- **`--fail-on high`**: produce falsos positivos permanentes que el equipo aprende a ignorar (security fatigue).
+- **Cambiar a `alpine`**: no menos CVEs, solo distintas — y rompe glibc compat con el binario `cargo build --release` actual.
 
 ---
 

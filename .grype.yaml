@@ -1,0 +1,21 @@
+# grype configuration — política de severidad para el container scan.
+#
+# Postura: bloquear el merge SOLO ante vulnerabilidades que tengan fix
+# disponible aguas arriba. Las CVEs marcadas `(won't fix)` por la
+# distribución base (Debian para `bookworm-slim`) no tienen parche y por
+# definición no son remediable dentro de la imagen actual; reportarlas
+# como "blocker" obliga a falsos positivos permanentes.
+#
+# Esta política es la que usan los pipelines maduros de Anchore/Snyk/
+# Trivy: "fail on fixable critical". Las CVEs no-fixable siguen apareciendo
+# en el reporte (capa 5 del modelo de amenaza, ver docs/SECURITY_LAYERS.md)
+# y son auditables, pero no detienen el release.
+
+# Solo considerar vulnerabilidades con un fix publicado.
+only-fixed: true
+
+# Severidad mínima para fallar el job.
+fail-on-severity: critical
+
+# Salida en tabla legible.
+output: table

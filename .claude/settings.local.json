@@ -23,7 +23,10 @@
       "Bash(gh api *)",
       "Bash(grep -iE '\\\\.md$|^LICENSE|^CODE_OF_CONDUCT|^FUNDING|^ACKNOW|\\\\.editorconfig|\\\\.gitattributes')",
       "Bash(git commit -m 'docs: import scaffolding present in other repos of this profile *)",
-      "Bash(git commit -m 'docs: final sweep — secondary indexes + security layers map *)"
+      "Bash(git commit -m 'docs: final sweep — secondary indexes + security layers map *)",
+      "Bash(docker build *)",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/var/run/docker.sock:/var/run/docker.sock\" -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/work\" -w /work anchore/grype:v0.110.0 gabysql-scan-local -c .grype.yaml)",
+      "Bash(git commit -m 'ci\\(security\\): grype --only-fixed policy + apt upgrade in runtime image *)"
     ]
   }
 }
