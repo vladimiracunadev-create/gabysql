@@ -9,12 +9,13 @@
 ## 🚦 Estado actual
 
 - Core reescrito en Rust
-- Pager con header, páginas fijas y formato en disco **versión `3`**
+- Pager con header, páginas fijas y formato en disco **versión `4`**
 - Cada página persistida lleva trailer CRC32-IEEE (4 bytes); corrupción se detecta al leer y al replay del WAL
 - WAL after-image con replay por `COMMIT` y verificación CRC del payload de cada página
 - **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits
 - Catálogo de tablas persistente con hashing FNV-1a-64 (estable entre versiones de Rust)
-- SQL estable: `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE` (todos por PK), `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`
+- **Índices secundarios** sobre una columna escalar (no JSON), con backfill automático y mantenimiento en `INSERT`/`UPDATE`/`DELETE`
+- SQL estable: `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`, `WHERE col_indexada = val`
 - Server HTTP/JSON para single DB y multi DB con tope de conexiones simultáneas (default 64, configurable con `-max-connections`)
 - `Pager::create` rehúsa sobrescribir un archivo existente; `gabysql init --force` para reset intencional
 - Admin web `phpgabyadmin` sobre la API HTTP
@@ -38,8 +39,11 @@
 - política más clara de compatibilidad del formato en disco (changelog explícito por bump de VERSION)
 
 ### Fase 2 — Storage y consulta
-- índices secundarios
-- `WHERE` por columnas no PK
+- ~~índices secundarios (una columna, equality)~~ ✅ entregado
+- ~~`WHERE` por columnas no PK (cuando hay índice)~~ ✅ entregado
+- índices compuestos
+- índices `UNIQUE` declarativos
+- range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)
 - `ORDER BY`
 - checkpoint/compaction del WAL
 - locking simple entre procesos

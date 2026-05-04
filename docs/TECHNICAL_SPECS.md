@@ -9,12 +9,13 @@
 | Campo | Valor |
 |---|---|
 | Magic | `GABYSQL1` |
-| Versión de formato | `3` |
+| Versión de formato | `4` |
 | Tamaño de página | `4096` bytes (fijo en esta versión) |
 | Trailer de checksum por página | `4` bytes (CRC32-IEEE) |
-| Hashing del catálogo | FNV-1a-64 (estable entre versiones de Rust) |
+| Hashing del catálogo y de claves de índice | FNV-1a-64 (estable entre versiones de Rust) |
+| Tipos de página B+Tree | `LEAF` (1), `INTERNAL` (2) |
 
-> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay. Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios. Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
 
 ---
 
@@ -23,7 +24,7 @@
 | Offset | Significado |
 |---|---|
 | `0..7` | magic |
-| `8..11` | versión `u32` little-endian (debe ser `3`) |
+| `8..11` | versión `u32` little-endian (debe ser `4`) |
 | `12..13` | page size `u16` little-endian (debe ser `4096`) |
 | `16..19` | page count `u32` little-endian |
 | `20..23` | `catalog_root_page` `u32` little-endian |
@@ -89,8 +90,35 @@ Cada `TableMeta` contiene:
 - nombre de PK
 - columnas y tipos
 - página raíz de la tabla (root de su B+Tree)
+- lista de `IndexMeta { name, column, root_page }` (vacía si la tabla no tiene índices secundarios)
 
 El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowercase). Una colisión de hash devuelve error explícito al abrir.
+
+---
+
+## 🔍 Índices secundarios
+
+Un índice secundario es un B+Tree paralelo cuya **clave** es el FNV-1a-64 del valor de la columna y cuyo **valor** es un *bucket* (lista) de `(value_bytes, pk)`:
+
+| Campo | Encoding |
+| :--- | :--- |
+| Bucket | `[count:u16] + count × ([vlen:u16][value_bytes][pk:i64])` |
+| `value_bytes` | Representación canónica del valor (`encode_column_value`): NULL = `[0]`, otros = `[1] + bytes_específicos_del_tipo` |
+
+Operaciones:
+- `CREATE INDEX`: aloca un root leaf; recorre todas las filas existentes y hace upsert en el bucket correspondiente; al final publica `IndexMeta` en el `TableMeta`.
+- `INSERT`: para cada índice de la tabla, calcula `(value_bytes, pk)` e inserta en el bucket. Idempotente.
+- `UPDATE`: si la columna afectada está indexada y el valor cambia, remueve `(old, pk)` del bucket viejo y agrega `(new, pk)` al bucket nuevo. Si la columna no está afectada, no toca el índice.
+- `DELETE`: lee la fila antes de borrarla; remueve `(value, pk)` de cada índice. Si el bucket queda vacío, se elimina la entrada del B+Tree.
+- `SELECT WHERE col = val` con `col` indexada: hash → bucket → filtra entradas cuyos `value_bytes` matchean exacto → hidrata filas por PK desde la tabla principal.
+- `DROP INDEX`: remueve `IndexMeta` del `TableMeta`. **No libera páginas** — el reclaim es trabajo de un futuro `vacuum`.
+
+Restricciones de la versión actual:
+- Una columna por índice (no compuestos).
+- Solo equality (`=`); sin range scan ni `BETWEEN` por índice secundario.
+- Sin `UNIQUE` declarativo.
+- `JSON` no es indexable.
+- El nombre del índice es único en toda la base de datos.
 
 ---
 
@@ -124,18 +152,24 @@ El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowerca
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ...`
 - `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)
+- `WHERE <col_indexada> = <valor>` (solo en `SELECT`)
 - `WHERE <pk> BETWEEN ... AND ...` (solo en `SELECT`)
 - `LIMIT` / `OFFSET`
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N`
 - `DELETE FROM <tabla> WHERE <pk> = N`
+- `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
+- `DROP INDEX <nombre>`
 
 ### No soportado todavía
 - `JOIN`
 - `ORDER BY`
 - `GROUP BY`
 - `LIKE`
-- `WHERE` sobre columnas no PK
-- `UPDATE` / `DELETE` por rango
+- `WHERE` por columnas no PK ni indexadas
+- `WHERE` sobre columna indexada con operador distinto a `=` (no `BETWEEN`, no `<`/`>`)
+- Índices compuestos
+- Índices `UNIQUE` declarativos
+- `UPDATE` / `DELETE` por columnas no PK ni por rango
 
 ---
 

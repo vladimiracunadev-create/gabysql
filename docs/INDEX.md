@@ -20,6 +20,7 @@
 - [SUPPORT](../SUPPORT.md)
 - [COMPATIBILITY](../COMPATIBILITY.md)
 - [SECURITY](../SECURITY.md)
+- [Capas de seguridad](SECURITY_LAYERS.md)
 
 ### Reclutamiento / evaluación
 - [RECRUITER](../RECRUITER.md)
@@ -71,6 +72,7 @@
 | Roadmap | Todos | dirección futura del producto | [Abrir](../ROADMAP.md) |
 | Release | Maintainers | proceso de versionado y entrega | [Abrir](../RELEASE.md) |
 | Security | DevSecOps / operadores | postura de seguridad y hardening | [Abrir](../SECURITY.md) |
+| Security Layers | DevSecOps / arquitectura | mapa completo de capas con archivos exactos | [Abrir](SECURITY_LAYERS.md) |
 | Support | Todos | cómo pedir ayuda y reportar bugs | [Abrir](../SUPPORT.md) |
 | Compatibility | Operadores / IT | matriz de OS, toolchain, Docker, formato en disco | [Abrir](../COMPATIBILITY.md) |
 | Contributing | Colaboradores | flujo de contribución y validaciones | [Abrir](../CONTRIBUTING.md) |

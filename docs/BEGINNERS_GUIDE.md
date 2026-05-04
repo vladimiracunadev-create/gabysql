@@ -64,6 +64,14 @@ cargo run --release --bin gabysql -- exec demo.db "DELETE FROM users WHERE id = 
 
 > `UPDATE` y `DELETE` siempre se filtran por la PK. Esta versión rechaza filtros por otras columnas y no permite cambiar la PK con `UPDATE`.
 
+### 6b. Índices secundarios — buscar por columna no-PK
+```powershell
+cargo run --release --bin gabysql -- exec demo.db "CREATE INDEX idx_users_name ON users (name);"
+cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users WHERE name = 'Ana M';"
+```
+
+Con el índice creado, los `SELECT WHERE name = ...` ya no requieren full scan.
+
 ### 7. Levantar API
 ```powershell
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080

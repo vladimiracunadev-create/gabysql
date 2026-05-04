@@ -22,7 +22,8 @@
       "Bash(git commit -m 'feat\\(sql\\): SELECT consults secondary index on WHERE col = val *)",
       "Bash(gh api *)",
       "Bash(grep -iE '\\\\.md$|^LICENSE|^CODE_OF_CONDUCT|^FUNDING|^ACKNOW|\\\\.editorconfig|\\\\.gitattributes')",
-      "Bash(git commit -m 'docs: import scaffolding present in other repos of this profile *)"
+      "Bash(git commit -m 'docs: import scaffolding present in other repos of this profile *)",
+      "Bash(git commit -m 'docs: final sweep — secondary indexes + security layers map *)"
     ]
   }
 }

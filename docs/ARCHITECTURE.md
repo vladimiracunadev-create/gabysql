@@ -81,15 +81,24 @@ Responsable de:
 - registrar tablas usando hashing **FNV-1a-64** (estable entre versiones de Rust)
 - leer schema y resolver páginas raíz de cada tabla
 - validar `CREATE TABLE` (PK obligatoria, escalar `INT`)
+- persistir la lista de `IndexMeta { name, column, root_page }` en `TableMeta`
 - exponer `insert_row`, `upsert_row`, `delete_row`, `get_row`, `scan_rows`, `range_rows`
+
+### `src/index.rs`
+Responsable de los **índices secundarios**:
+- `hash_value` (FNV-1a-64 fijado, distinto del catálogo solo por dominio de uso, mismo algoritmo)
+- `encode_column_value` — representación canónica del valor (NULL = `[0]`, valor presente = `[1] + bytes_del_tipo`)
+- codec del bucket: `[count:u16] + N × ([vlen:u16][value][pk:i64])`
+- `bucket_insert / bucket_remove / bucket_lookup` con semántica idempotente para multivalor
+- `validate_indexable` — rechaza columnas `JSON` (sin semántica canónica de igualdad)
 
 ### `src/sql.rs`
 Responsable de:
 - tokenizar SQL
-- parsear `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
-- validar tipos y filtros (todos los WHERE actuales son sobre la PK)
+- parsear `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`
+- validar tipos y filtros (`WHERE pk = ...`, `WHERE pk BETWEEN ...`, `WHERE col_indexada = ...`)
 - serializar y deserializar filas
-- ejecutar las sentencias contra el `Engine`: `UPDATE` re-codifica la fila completa y rechaza mutar la PK; `DELETE` retorna error si la PK no existe
+- ejecutar las sentencias contra el `Engine`: `UPDATE` re-codifica la fila completa y rechaza mutar la PK; `DELETE` retorna error si la PK no existe; `CREATE INDEX` hace backfill antes de publicar el índice; `INSERT/UPDATE/DELETE` mantienen automáticamente todos los índices secundarios afectados
 
 ### `src/server.rs`
 Responsable de:
@@ -133,8 +142,11 @@ Las mejoras naturales siguientes son:
 - ~~`UPDATE` y `DELETE`~~ ✅ entregado (por PK)
 - ~~checksums por página~~ ✅ entregado (CRC32-IEEE en trailer)
 - ~~B+Tree multinivel real~~ ✅ entregado (LEAF + INTERNAL con root estable)
+- ~~índices secundarios (una columna, equality)~~ ✅ entregado
+- índices compuestos y `UNIQUE` declarativo
+- range scan por índice secundario
 - comando `integrity_check` que recorra el B+Tree y revalide CRCs
-- índices secundarios
-- planner básico
+- planner básico (decidir entre PK lookup, índice, full scan)
+- `ORDER BY` y `GROUP BY`
 - mejor locking entre procesos
 - política formal de migración entre versiones del formato en disco

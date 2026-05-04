@@ -158,7 +158,12 @@ Ejemplo:
 
 ## `POST /exec`
 
-Ejecuta una o más sentencias SQL dentro de una transacción. Acepta `CREATE`, `INSERT`, `SELECT`, `UPDATE` y `DELETE` (los dos últimos solo con filtro `WHERE <pk> = N`).
+Ejecuta una o más sentencias SQL dentro de una transacción. Acepta:
+- `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill)
+- `DROP INDEX <nombre>`
+
+`UPDATE` y `DELETE` solo aceptan `WHERE pk = N`; `SELECT` también acepta `WHERE col_indexada = val`.
 
 Request:
 ```json

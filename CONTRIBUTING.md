@@ -38,19 +38,33 @@ Si tu entorno Windows todavía no tiene toolchain nativo completo, valida al men
 docker build -t gabysql .
 ```
 
+### Validaciones de seguridad (recomendadas localmente, obligatorias en CI)
+
+```powershell
+cargo install cargo-audit --version 0.22.1 --locked
+cargo install cargo-deny  --version 0.19.4 --locked
+cargo audit
+cargo deny --all-features check
+```
+
+CI corre además `detect-secrets`, Trojan Source, `grype` (container scan), `actionlint`, `zizmor` y `pin-check` sobre los workflows. Ver [docs/SECURITY_LAYERS.md](docs/SECURITY_LAYERS.md) para el mapa completo.
+
 ---
 
 ## 🗺️ Dónde tocar cada cosa
 
 | Área | Archivo principal |
 |---|---|
-| Pager, header, WAL y recovery | `src/storage.rs` |
-| Índice persistente por PK | `src/bptree.rs` |
-| Catálogo de tablas | `src/catalog.rs` |
+| Pager, header, WAL, CRC y recovery | `src/storage.rs` |
+| B+Tree (LEAF + INTERNAL, splits, root estable) | `src/bptree.rs` |
+| Catálogo de tablas + `IndexMeta` | `src/catalog.rs` |
+| Helpers de índices secundarios (hash, codec de bucket) | `src/index.rs` |
 | SQL parser, engine y row codec | `src/sql.rs` |
 | API HTTP/JSON | `src/server.rs` |
 | Admin web | `web/phpgabyadmin/index.php` |
 | Pruebas del core | `tests/integration_test.rs` |
+| Workflows CI / seguridad | `.github/workflows/` |
+| Política de licencias / advisories | `deny.toml` |
 
 ---
 

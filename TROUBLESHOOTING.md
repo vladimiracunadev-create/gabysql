@@ -115,14 +115,45 @@ Restringe `WHERE` a la PK con `=` o `BETWEEN`. Recordá que `UPDATE` y `DELETE` 
 
 ---
 
-## 🛑 `WHERE solo soporta PK (...)`
+## 🛑 `WHERE solo soporta PK (...) o columnas con índice secundario; '<col>' no está indexada`
 
 ### Causa
-Filtraste por una columna no PK. Esta versión solo indexa por PK.
+Hiciste `SELECT ... WHERE col = val` sobre una columna que no es PK y no tiene índice secundario.
 
 ### Solución
-- usa la PK para localizar el row
-- si necesitas filtros por otras columnas, materializa los datos por full scan en cliente o espera a la fase de índices secundarios del ROADMAP
+- crear el índice: `CREATE INDEX idx_<tabla>_<col> ON <tabla> (<col>);`
+- o filtrar por la PK
+- en `UPDATE` / `DELETE`, el filtro siempre debe ser `WHERE pk = N` (no se admite por columna no-PK aunque tenga índice).
+
+---
+
+## 🔍 `ya existe un índice llamado '<name>' en la tabla '<table>'`
+
+### Causa
+Los nombres de índice son únicos en toda la base de datos (no solo por tabla).
+
+### Solución
+- usa otro nombre, idealmente con prefijo de tabla: `idx_users_name`, `idx_orders_status`.
+
+---
+
+## 🔍 `la columna '<col>' ya tiene un índice secundario`
+
+### Causa
+Esta versión soporta solo un índice secundario por columna.
+
+### Solución
+- si quieres reemplazarlo, primero `DROP INDEX <viejo>` y luego `CREATE INDEX`.
+
+---
+
+## 🚫 `no se admiten índices sobre columnas JSON en esta versión`
+
+### Causa
+`JSON` no tiene una semántica canónica de igualdad (dos representaciones distintas pueden ser equivalentes).
+
+### Solución
+- indexa una columna escalar derivada del JSON (`status TEXT`, `category INT`, etc.) y mantenla sincronizada en cliente.
 
 ---
 

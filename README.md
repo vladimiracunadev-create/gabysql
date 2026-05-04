@@ -15,9 +15,9 @@
 ## 🚦 Estado actual del producto
 
 > **Estado**: 🟢 Base estable  
-> **Superficie SQL**: `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE` (todos por PK), `WHERE PK`, `LIMIT/OFFSET`  
+> **Superficie SQL**: `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `WHERE PK`, **`WHERE col = val` por columna indexada**, `LIMIT/OFFSET`  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página  
-> **Formato en disco**: `VERSION = 3` (B+Tree real con nodos internos, hash de catálogo FNV-1a-64 estable)  
+> **Formato en disco**: `VERSION = 4` (B+Tree real, hash de catálogo FNV-1a-64 estable, índices secundarios persistidos)  
 > **Portabilidad**: Windows, Linux y macOS por CI  
 > **Runtime opcional**: Docker + `docker compose`
 
@@ -40,7 +40,7 @@
 | Operación | [RUNBOOK.md](RUNBOOK.md) | health checks, backup, recovery |
 | Técnico / maintainer | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | capas del motor y flujo interno |
 | API / integración | [docs/API.md](docs/API.md) | endpoints, auth y payloads |
-| Seguridad | [SECURITY.md](SECURITY.md) | postura actual y hardening |
+| Seguridad | [SECURITY.md](SECURITY.md) + [docs/SECURITY_LAYERS.md](docs/SECURITY_LAYERS.md) | postura, capas y hardening |
 
 ---
 
@@ -60,8 +60,11 @@
 - `SELECT columnas FROM tabla LIMIT/OFFSET`
 - `SELECT ... WHERE <pk> = valor`
 - `SELECT ... WHERE <pk> BETWEEN a AND b`
-- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (no permite mutar la PK)
-- `DELETE FROM <tabla> WHERE <pk> = N`
+- `SELECT ... WHERE <col_indexada> = valor` *(usa índice secundario)*
+- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (no permite mutar la PK; mantiene índices)
+- `DELETE FROM <tabla> WHERE <pk> = N` (mantiene índices)
+- `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
+- `DROP INDEX <nombre>`
 
 ### Tipos soportados
 - `INT`
@@ -145,7 +148,8 @@ php -S localhost:8000 -t web
 
 - `src/storage.rs`: header, pager, WAL, checksums CRC32 y recovery.
 - `src/bptree.rs`: B+Tree real (hojas + nodos internos) con root estable.
-- `src/catalog.rs`: metadatos de tablas y catálogo.
+- `src/catalog.rs`: metadatos de tablas y catálogo (incluye `IndexMeta`).
+- `src/index.rs`: hashing FNV-1a-64, codec de bucket y helpers de índice secundario.
 - `src/sql.rs`: tokenizer, parser, row codec y engine.
 - `src/server.rs`: server HTTP/JSON.
 - `src/bin/gabysql.rs`: CLI y REPL.
@@ -170,10 +174,11 @@ El repositorio ya fue validado con:
 
 ## ⚠️ Limitaciones deliberadas
 
-- `UPDATE` y `DELETE` solo soportan filtro por PK (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
+- `UPDATE` y `DELETE` solo aceptan filtro `WHERE <pk> = N` (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
+- Los índices secundarios soportan **una sola columna por índice** y solo equality lookup. Sin índices compuestos, sin `UNIQUE`, sin `partial`, sin range scan por índice secundario.
 - No hay `JOIN`, `ORDER BY`, `GROUP BY` ni planner cost-based.
 - La PK debe ser una sola columna `INT`.
-- No hay índices secundarios.
+- `JSON` no es indexable.
 - No hay MVCC ni locking fuerte entre procesos.
 - El servidor cap por defecto a 64 conexiones simultáneas (`-max-connections N` para ajustar).
 

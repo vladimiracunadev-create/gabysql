@@ -65,6 +65,26 @@ UPDATE users SET name = 'Ana M', active = FALSE WHERE id = 1;
 DELETE FROM users WHERE id = 1;
 ```
 
+### Índices secundarios
+```sql
+-- Crear un índice secundario sobre una columna no-PK.
+-- Si la tabla ya tiene filas, el índice se backfillea automáticamente.
+CREATE INDEX idx_users_name ON users (name);
+
+-- Una vez creado, las búsquedas por igualdad sobre la columna usan el índice.
+SELECT * FROM users WHERE name = 'Ana';
+
+-- Eliminar el índice. Vuelve a fallar el SELECT por esa columna.
+DROP INDEX idx_users_name;
+```
+
+Reglas de los índices secundarios:
+- una sola columna por índice (no compuestos).
+- soportan equality (`=`), no rangos ni `BETWEEN`.
+- se mantienen automáticamente al `INSERT`, `UPDATE` (cuando cambia la columna indexada) y `DELETE`.
+- **no admiten** columnas `JSON` (sin semántica canónica de igualdad).
+- el nombre del índice debe ser único en toda la base de datos.
+
 ### Tipos soportados
 - `INT`
 - `TEXT`
@@ -79,7 +99,9 @@ DELETE FROM users WHERE id = 1;
 - La PK debe ser **una sola columna `INT`**. Esta versión no soporta PKs compuestas ni de otros tipos.
 - `PRIMARY KEY` no puede ser `NULL`.
 - PK duplicada se rechaza al `INSERT`.
-- `WHERE` solo soporta `=` (en SELECT/UPDATE/DELETE) y `BETWEEN` (solo en SELECT) sobre la columna PK.
+- `WHERE col = val` funciona sobre la PK siempre, y sobre cualquier otra columna **solo si tiene un índice secundario**.
+- `WHERE col BETWEEN a AND b` solo funciona sobre la PK (sin range scan en índices secundarios todavía).
+- `UPDATE` y `DELETE` solo aceptan `WHERE pk = N`, no por columna no-PK.
 - `UPDATE` no permite cambiar la PK; intentarlo devuelve error explícito.
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error (no son no-ops silenciosos).
 

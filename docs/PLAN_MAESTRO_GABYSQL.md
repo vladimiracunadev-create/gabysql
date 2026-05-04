@@ -183,13 +183,17 @@ Completar las operaciones esenciales del motor y dejar reglas de datos más seri
 
 ## Fase 3 — Índices y consultas usables
 
+> **Estado**: arrancada (2026-05-04). Índices secundarios simples + `WHERE` por columna no-PK ya están en main; quedan los compuestos y `ORDER BY`.
+
 ### Objetivo
 Quitar a la PK la carga de ser la única vía eficiente de consulta.
 
 ### Alcance
-- índices secundarios simples
-- índices compuestos después
-- `WHERE` por columnas no PK
+- ~~índices secundarios simples~~ ✅ entregado (una columna, equality, backfill, mantenimiento en INSERT/UPDATE/DELETE)
+- ~~`WHERE` por columnas no PK~~ ✅ entregado (cuando la columna tiene índice)
+- índices compuestos
+- `UNIQUE` declarativo (índice + constraint)
+- range scan por índice secundario (`WHERE col_indexada BETWEEN ...`)
 - `ORDER BY` básico
 
 ### Trabajo paso a paso

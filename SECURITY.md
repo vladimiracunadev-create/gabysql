@@ -1,6 +1,8 @@
 ﻿# 🔐 SECURITY
 
 > **Postura de seguridad actual y hardening recomendado para `gabysql`.**
+>
+> 📑 Para el **mapa completo de capas de seguridad** (storage, acceso, SDLC, workflows, container, operación) con archivos exactos de cada control, ver [docs/SECURITY_LAYERS.md](docs/SECURITY_LAYERS.md). Este documento se enfoca en política de disclosure y postura general.
 
 ---
 
