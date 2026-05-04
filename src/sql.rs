@@ -1,8 +1,8 @@
 use crate::bptree::{init_leaf_page, Tree};
 use crate::catalog::{validate_create_table, Catalog, Column, ColumnType, IndexMeta, TableMeta};
 use crate::index::{
-    bucket_insert, bucket_remove, decode_bucket, encode_bucket, encode_column_value, hash_value,
-    validate_indexable,
+    bucket_insert, bucket_lookup, bucket_remove, decode_bucket, encode_bucket, encode_column_value,
+    hash_value, validate_indexable,
 };
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
@@ -78,7 +78,7 @@ pub struct SelectStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereClause {
-    Eq { column: String, value: i64 },
+    Eq { column: String, value: Value },
     Between { column: String, from: i64, to: i64 },
 }
 
@@ -220,10 +220,12 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
-        let mut catalog = Catalog::open(self.pager);
-        let meta = catalog
-            .get_table(&stmt.table)?
-            .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?;
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
 
         let selected_columns = resolve_selected_columns(&meta, &stmt.columns)?;
         let output_columns: Vec<String> = selected_columns
@@ -231,22 +233,66 @@ impl<'a> Engine<'a> {
             .map(|(name, _)| name.clone())
             .collect();
 
-        let rows_bytes = match stmt.where_clause.clone() {
-            None => catalog.scan_rows(meta.root_page, stmt.offset, stmt.limit)?,
+        // First decide what list of PKs we need (or whether we need a full
+        // scan), without holding the Catalog borrow. Then we open Catalog
+        // again to actually read each row's bytes. This keeps the borrow
+        // checker happy when the index path needs &mut self.pager.
+        enum Plan {
+            FullScan,
+            ByPks(Vec<i64>),
+            Range { from: i64, to: i64 },
+        }
+
+        let plan = match stmt.where_clause.clone() {
+            None => Plan::FullScan,
             Some(WhereClause::Eq { column, value }) => {
-                ensure_pk_filter(&meta, &column)?;
-                let mut rows = Vec::new();
-                if let Some(bytes) = catalog.get_row(meta.root_page, value)? {
-                    rows.push(crate::bptree::KeyValue {
-                        key: value,
-                        value: bytes,
-                    });
+                let normalized = normalize_ident(&column);
+                if normalized == normalize_ident(&meta.primary_key) {
+                    let pk = match value {
+                        Value::Integer(n) => n,
+                        _ => {
+                            return Err(DbError::new(format!(
+                                "PRIMARY KEY '{}' es INT; valor incompatible en WHERE",
+                                meta.primary_key
+                            )))
+                        }
+                    };
+                    Plan::ByPks(vec![pk])
+                } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                    let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
+                    Plan::ByPks(pks)
+                } else {
+                    return Err(DbError::new(format!(
+                        "WHERE solo soporta PK ({}) o columnas con índice secundario; \
+                         '{}' no está indexada",
+                        meta.primary_key, column
+                    )));
                 }
-                window_rows(rows, stmt.offset, stmt.limit)
             }
             Some(WhereClause::Between { column, from, to }) => {
                 ensure_pk_filter(&meta, &column)?;
+                Plan::Range { from, to }
+            }
+        };
+
+        let mut catalog = Catalog::open(self.pager);
+        let rows_bytes = match plan {
+            Plan::FullScan => catalog.scan_rows(meta.root_page, stmt.offset, stmt.limit)?,
+            Plan::Range { from, to } => {
                 let rows = catalog.range_rows(meta.root_page, from, to)?;
+                window_rows(rows, stmt.offset, stmt.limit)
+            }
+            Plan::ByPks(pks) => {
+                let mut rows = Vec::with_capacity(pks.len());
+                for pk in pks {
+                    if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
+                        rows.push(crate::bptree::KeyValue {
+                            key: pk,
+                            value: bytes,
+                        });
+                    }
+                }
+                rows.sort_by_key(|kv| kv.key);
                 window_rows(rows, stmt.offset, stmt.limit)
             }
         };
@@ -759,6 +805,32 @@ fn window_rows<T: Clone>(rows: Vec<T>, offset: usize, limit: Option<usize>) -> V
     rows[offset..end].to_vec()
 }
 
+/// Translate `WHERE col = value` into the list of PKs that match, by
+/// going through the secondary index `idx`. Returns an empty Vec when no
+/// row matches.
+fn lookup_pks_via_index(
+    pager: &mut Pager,
+    meta: &TableMeta,
+    idx: &IndexMeta,
+    value: &Value,
+) -> DbResult<Vec<i64>> {
+    let column = meta.column(&idx.column).ok_or_else(|| {
+        DbError::new(format!(
+            "índice apunta a columna inexistente: {}",
+            idx.column
+        ))
+    })?;
+    let value_bytes = encode_column_value(column, value)?;
+    let key = hash_value(&value_bytes);
+    let mut tree = Tree::new(pager);
+    let bucket_bytes = match tree.get(idx.root_page, key)? {
+        Some(b) => b,
+        None => return Ok(Vec::new()),
+    };
+    let bucket = decode_bucket(&bucket_bytes)?;
+    Ok(bucket_lookup(&bucket, &value_bytes))
+}
+
 /// Add `(value_bytes, pk)` to the bucket at `hash(value_bytes)` in the
 /// secondary-index B+Tree rooted at `idx_root`. Idempotent — re-inserting
 /// the same `(value, pk)` is a no-op.
@@ -1079,7 +1151,7 @@ impl Parser {
         if self.match_keyword("WHERE") {
             let column = self.expect_ident()?;
             if self.match_symbol("=") {
-                let value = self.expect_integer()?;
+                let value = self.expect_value()?;
                 where_clause = Some(WhereClause::Eq { column, value });
             } else if self.match_keyword("BETWEEN") {
                 let from = self.expect_integer()?;

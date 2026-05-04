@@ -148,6 +148,86 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn secondary_index_lookup_and_maintenance() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("idx-secondary");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT, score INT);",
+    )?;
+    for i in 0..200i64 {
+        let name = if i % 5 == 0 { "Ana" } else { "Other" };
+        let sql = format!(
+            "INSERT INTO u (id,name,score) VALUES ({},'{}',{});",
+            i,
+            name,
+            i * 2
+        );
+        run_sql(&db, &sql)?;
+    }
+
+    // Index built AFTER the data is in: must backfill all 40 'Ana' rows.
+    run_sql(&db, "CREATE INDEX idx_u_name ON u (name);")?;
+
+    let res = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';")?;
+    assert_eq!(res[0].rows.len(), 40);
+    // Returned PKs sorted ascending.
+    let first = match &res[0].rows[0][0] {
+        Value::Integer(n) => *n,
+        other => panic!("expected Integer, got {:?}", other),
+    };
+    assert_eq!(first, 0);
+
+    // INSERT after index creation: must update the index live.
+    run_sql(&db, "INSERT INTO u (id,name,score) VALUES (999,'Ana',1);")?;
+    let res = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';")?;
+    assert_eq!(res[0].rows.len(), 41);
+
+    // UPDATE on the indexed column: old bucket loses the entry, new bucket
+    // gains it.
+    run_sql(&db, "UPDATE u SET name = 'Beto' WHERE id = 999;")?;
+    let ana = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';")?;
+    let beto = run_sql(&db, "SELECT id FROM u WHERE name = 'Beto';")?;
+    assert_eq!(ana[0].rows.len(), 40);
+    assert_eq!(beto[0].rows.len(), 1);
+
+    // DELETE removes from the index too.
+    run_sql(&db, "DELETE FROM u WHERE id = 999;")?;
+    let beto_after = run_sql(&db, "SELECT id FROM u WHERE name = 'Beto';")?;
+    assert_eq!(beto_after[0].rows.len(), 0);
+
+    // Indexed column with INT type also works.
+    run_sql(&db, "CREATE INDEX idx_u_score ON u (score);")?;
+    let res = run_sql(&db, "SELECT id FROM u WHERE score = 100;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(50));
+
+    // Non-indexed and non-PK column still rejected explicitly.
+    let err = run_sql(&db, "SELECT id FROM u WHERE name = 'X' AND score = 1;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    // (Parser doesn't support AND yet — verify the parser, not the
+    // index path; the WHERE col=val by an indexed column already
+    // succeeded above. This sub-assertion just guards against the parser
+    // silently accepting AND in the future without us noticing.)
+    assert!(err.contains("token") || err.contains("WHERE") || !err.is_empty());
+
+    // DROP INDEX falls back to "column not indexed" error on next lookup.
+    run_sql(&db, "DROP INDEX idx_u_name;")?;
+    let err = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';").unwrap_err();
+    assert!(err.to_string().contains("no está indexada"));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn update_and_delete_by_pk_roundtrip() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("upd-del");
     let wal = wal_path(&db);
