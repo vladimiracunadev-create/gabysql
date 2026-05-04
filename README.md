@@ -32,7 +32,7 @@
 ## 🚦 Estado actual del producto
 
 > **Estado**: 🟢 Base estable  
-> **Superficie SQL**: `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `WHERE PK`, **`WHERE col = val` por columna indexada**, `LIMIT/OFFSET`  
+> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `WHERE PK`, **`WHERE col = val` por columna indexada**, `LIMIT/OFFSET`  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página  
 > **Formato en disco**: `VERSION = 4` (B+Tree real, hash de catálogo FNV-1a-64 estable, índices secundarios persistidos)  
 > **Portabilidad**: Windows, Linux y macOS por CI  
@@ -75,6 +75,9 @@
 - `Pager::create` rehúsa sobrescribir un archivo existente (use `gabysql init --force` para reset intencional).
 
 ### SQL soportado
+- `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI)*
+- `DROP DATABASE [IF EXISTS] <name>`
+- `SHOW DATABASES`
 - `CREATE TABLE`
 - `INSERT`
 - `SELECT * FROM tabla`
@@ -100,7 +103,8 @@
 ### Runtime y acceso
 - CLI `gabysql`
 - API `gabysql-server`
-- Admin web `phpgabyadmin`
+- Admin web `phpgabyadmin` (browse / structure / SQL)
+- **Modelador web `gabymodeler`** (ER → SQL DDL, vanilla HTML+JS, sin npm) — ver [web/modeler/README.md](web/modeler/README.md)
 - Docker y `docker compose`
 
 ---

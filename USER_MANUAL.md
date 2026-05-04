@@ -55,6 +55,15 @@ CREATE TABLE users (
 );
 ```
 
+### DDL de bases de datos (server multi-DB / CLI)
+```sql
+CREATE DATABASE shop;
+CREATE DATABASE IF NOT EXISTS analytics;
+SHOW DATABASES;            -- lista las DBs en el directorio
+DROP DATABASE IF EXISTS analytics;
+```
+> Estas sentencias **no se ejecutan contra una `.db` específica**. Se procesan a nivel del directorio configurado (`gabysql-server -dir ./dbs` o el directorio padre del path en CLI). En modo single-DB (`-db`) se rechazan con HTTP 405. No se admite mezclarlas con sentencias de tabla en el mismo `/exec`.
+
 ### DML
 ```sql
 INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);
@@ -151,7 +160,35 @@ cargo run --release --bin gabysql-server -- -dir ./dbs -max-connections 32
 
 ---
 
-## 5. 🧭 `phpgabyadmin`
+## 5. 📐 `gabymodeler` — modelador web
+
+`gabymodeler` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) para diseñar esquemas y exportarlos como SQL DDL listo para `gabysql`.
+
+### Levantarlo
+```bash
+docker compose up -d --build
+# Modeler:        http://localhost:8000/modeler/
+# phpgabyadmin:   http://localhost:8000/phpgabyadmin/
+```
+o con `php -S`:
+```bash
+php -S localhost:8000 -t web
+```
+
+### Flujo
+1. Click en `＋ Nueva entidad` para cada tabla.
+2. Define columnas con su tipo, marca `PK` (que se fija a `INT` automáticamente) y `idx` para indexar.
+3. (Opcional) Botón `↪ FK` agrega una columna que apunta a `tabla.columna` de otra entidad — se dibuja una línea Bezier y se documenta como comentario en el SQL (FK declarativas no son enforced en `VERSION 4`).
+4. `Exportar SQL` → modal con `CREATE DATABASE [IF NOT EXISTS]` + `CREATE TABLE` + `CREATE INDEX`.
+5. Copia o descarga el `.sql` y pégalo en `phpgabyadmin → tab SQL` para ejecutarlo.
+
+El modelo se persiste en `localStorage` (clave `gabymodeler.v1`); botón `📦 Cargar ejemplo` carga un schema `users + orders` con FK indexada para evaluar el flujo en 1 click.
+
+Detalle completo en [web/modeler/README.md](web/modeler/README.md).
+
+---
+
+## 6. 🧭 `phpgabyadmin`
 
 Es un cliente PHP del API HTTP, no un motor separado.
 
@@ -179,13 +216,13 @@ php -S localhost:8000 -t web
 
 ---
 
-## 6. 🧪 Ejemplos incluidos
+## 7. 🧪 Ejemplos incluidos
 
 Consulta [examples/README.md](examples/README.md) para ejemplos de clientes Python y PHP contra CLI y HTTP.
 
 ---
 
-## 7. ✅ Buenas prácticas de uso
+## 8. ✅ Buenas prácticas de uso
 
 - Usa `gabysql` para operaciones locales y pruebas rápidas
 - Usa `gabysql-server` cuando necesites UI web o integración HTTP

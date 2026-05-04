@@ -55,15 +55,20 @@
 
 > Cada bump de `VERSION` se publica con changelog explícito. No hay migración automática en esta etapa.
 
-## 6. 🌐 Navegadores para `phpgabyadmin`
+## 6. 🌐 Navegadores para `phpgabyadmin` y `gabymodeler`
 
-`phpgabyadmin` es UI sencilla (HTML server-side rendered + JS mínimo). Soportado:
+Ambas UIs son HTML + CSS + JS vanilla (sin frameworks ni npm). Soportado:
 
 - Chrome / Edge (Chromium) `100+`
 - Firefox `100+`
 - Safari `15+`
 
 No se prueba contra IE11 ni navegadores legacy.
+
+| Cliente | Necesita PHP | Persistencia | Ejecuta SQL contra el motor |
+| :--- | :---: | :--- | :---: |
+| `phpgabyadmin` | sí (8.2+) | en el server gabysql | ✅ vía `/exec` |
+| `gabymodeler` | no (HTML estático) | `localStorage` del browser | ❌ produce DDL para pegar en phpgabyadmin |
 
 ## 7. 📡 Drivers / clientes
 

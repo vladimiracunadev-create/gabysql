@@ -77,7 +77,15 @@ Con el índice creado, los `SELECT WHERE name = ...` ya no requieren full scan.
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080
 ```
 
-### 8. Abrir admin web
+### 8. Abrir el modelador ER
+```powershell
+# Si ya tienes php -S corriendo o docker compose up:
+# http://localhost:8000/modeler/
+```
+
+`gabymodeler` te deja diseñar entidades drag&drop y exportar el DDL completo (`CREATE DATABASE` + `CREATE TABLE` + `CREATE INDEX`) listo para pegar en `phpgabyadmin`. Click `📦 Cargar ejemplo` para ver el formato esperado.
+
+### 9. Abrir admin web
 En otra terminal:
 ```powershell
 php -S localhost:8000 -t web

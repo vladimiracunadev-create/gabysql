@@ -119,6 +119,9 @@ docker compose down
 
 | Incidente | Significado |
 |---|---|
+| `base de datos 'X' ya existe` / `no existe` | `CREATE/DROP DATABASE` sin `IF [NOT] EXISTS` cuando aplicaba |
+| `CREATE/DROP/SHOW DATABASE requieren modo -dir` | server arrancado con `-db`; volver a arrancar con `-dir` |
+| `no se admite mezclar CREATE/DROP/SHOW DATABASE con sentencias de tabla` | separar en dos `/exec` distintos |
 | `bad magic (not gabysql db)` | el archivo no es una DB válida |
 | `unsupported gabysql file format: version=N` | la DB fue creada con una versión anterior del formato; recrearla |
 | `page N corrupt: checksum mismatch` | corrupción detectada al leer; restaurar desde backup |

@@ -15,7 +15,8 @@
 - **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits
 - Catálogo de tablas persistente con hashing FNV-1a-64 (estable entre versiones de Rust)
 - **Índices secundarios** sobre una columna escalar (no JSON), con backfill automático y mantenimiento en `INSERT`/`UPDATE`/`DELETE`
-- SQL estable: `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`, `WHERE col_indexada = val`
+- SQL estable: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`, `WHERE col_indexada = val`
+- Modelador web `gabymodeler` (vanilla HTML/JS) + admin web `phpgabyadmin`, ambos en `web/`
 - Server HTTP/JSON para single DB y multi DB con tope de conexiones simultáneas (default 64, configurable con `-max-connections`)
 - `Pager::create` rehúsa sobrescribir un archivo existente; `gabysql init --force` para reset intencional
 - Admin web `phpgabyadmin` sobre la API HTTP

@@ -35,6 +35,7 @@
 ### Aprendizaje / referencia
 - [USE_CASES](USE_CASES.md) — recetas
 - [SQL_REFERENCE](SQL_REFERENCE.md) — railroad diagrams + EBNF
+- [Modelador web `gabymodeler`](../web/modeler/README.md) — ER drag&drop → SQL DDL
 
 ### Técnico / maintainer
 - [ARCHITECTURE](ARCHITECTURE.md)

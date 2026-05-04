@@ -159,11 +159,16 @@ Ejemplo:
 ## `POST /exec`
 
 Ejecuta una o más sentencias SQL dentro de una transacción. Acepta:
+- `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB)*
+- `DROP DATABASE [IF EXISTS] <name>`
+- `SHOW DATABASES`
 - `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill)
 - `DROP INDEX <nombre>`
 
 `UPDATE` y `DELETE` solo aceptan `WHERE pk = N`; `SELECT` también acepta `WHERE col_indexada = val`.
+
+> Las sentencias **DATABASE-level** (`CREATE/DROP/SHOW DATABASE`) **no** abren un `Pager` — el server las despacha contra el directorio configurado con `-dir`. **No se admite mezclarlas con sentencias de tabla en el mismo `/exec`**: el server retorna `400` si lo intentas. En modo single-DB (`-db`) responden `405`.
 
 Request:
 ```json

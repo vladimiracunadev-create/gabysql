@@ -13,8 +13,11 @@ Revisa primero, en este orden:
 3. [INSTALL.md](INSTALL.md) — build nativo y Docker.
 4. [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — errores frecuentes (formato de archivo, checksums, refusing-to-overwrite, server busy, fila no existe).
 5. [docs/API.md](docs/API.md) — endpoints HTTP/JSON.
-6. [docs/TECHNICAL_SPECS.md](docs/TECHNICAL_SPECS.md) — formato en disco, WAL, B+Tree, índices, gramática SQL.
-7. [RUNBOOK.md](RUNBOOK.md) — recovery, backup/restore, smoke checks.
+6. [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) — gramática completa con railroad diagrams.
+7. [docs/TECHNICAL_SPECS.md](docs/TECHNICAL_SPECS.md) — formato en disco, WAL, B+Tree, índices, gramática SQL.
+8. [docs/USE_CASES.md](docs/USE_CASES.md) — 19 recetas concretas listas para copiar.
+9. [web/modeler/README.md](web/modeler/README.md) — modelador ER web.
+10. [RUNBOOK.md](RUNBOOK.md) — recovery, backup/restore, smoke checks.
 
 ## 📨 Cómo pedir ayuda
 

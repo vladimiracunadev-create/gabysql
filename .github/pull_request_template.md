@@ -10,6 +10,8 @@
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test --all-targets`
 - [ ] `docker build -t gabysql .` (si toca runtime, server o `Dockerfile`)
+- [ ] `php -l web/index.php` y `php -l web/phpgabyadmin/index.php` (si toca PHP)
+- [ ] Si toca `web/modeler/`: smoke en navegador — `📦 Cargar ejemplo` + `Exportar SQL` produce DDL no vacío
 
 ## Riesgo y compatibilidad
 

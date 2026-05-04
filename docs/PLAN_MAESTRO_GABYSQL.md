@@ -149,6 +149,7 @@ Completar las operaciones esenciales del motor y dejar reglas de datos más seri
 ### Alcance
 - ~~`UPDATE` por PK~~ ✅ entregado
 - ~~`DELETE` por PK~~ ✅ entregado
+- ~~DDL de DATABASE (`CREATE/DROP/SHOW DATABASE`)~~ ✅ entregado (despachado por server/CLI)
 - `NOT NULL` — pendiente
 - `DEFAULT` — pendiente
 - `UNIQUE` — pendiente

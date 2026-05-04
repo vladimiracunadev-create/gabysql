@@ -62,6 +62,8 @@ CI corre además `detect-secrets`, Trojan Source, `grype` (container scan), `act
 | SQL parser, engine y row codec | `src/sql.rs` |
 | API HTTP/JSON | `src/server.rs` |
 | Admin web | `web/phpgabyadmin/index.php` |
+| Modelador ER web | `web/modeler/index.html` (HTML+JS vanilla, sin npm) |
+| Landing PHP | `web/index.php` |
 | Pruebas del core | `tests/integration_test.rs` |
 | Workflows CI / seguridad | `.github/workflows/` |
 | Política de licencias / advisories | `deny.toml` |

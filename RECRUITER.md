@@ -14,7 +14,8 @@
 | **Pager / WAL** | Páginas de 4096 B con CRC32-IEEE en trailer, after-image WAL con replay validado por checksum. |
 | **B+Tree** | Hojas + nodos internos, root-stable splits con técnica copy-up. Lookup O(log N). |
 | **Catálogo** | Persistente, hashing FNV-1a-64 fijado en código (estable entre versiones de Rust). |
-| **SQL** | Parser, AST y engine para `CREATE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE/DROP INDEX`. |
+| **SQL** | Parser, AST y engine para `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE/DROP INDEX`, **`CREATE/DROP DATABASE`, `SHOW DATABASES`** (estos despachados por server/CLI). |
+| **Modelador web** | `gabymodeler`: single-page HTML+JS vanilla (sin npm) para diseñar ER y exportar DDL gabysql. Pareja con `phpgabyadmin`. |
 | **Índices secundarios** | Equality lookup `WHERE col = val` resuelto por bucket hash → filtro exacto → hidratación por PK. |
 | **Server HTTP/JSON** | Hand-rolled (zero deps), token auth opcional, cap de conexiones, mutex de escritura. |
 | **CI / Supply chain** | `cargo fmt + clippy + test` multi-OS, `cargo audit + cargo deny`, `detect-secrets` (FS + historial), Trojan Source detection, `grype` container scan, `actionlint + zizmor + pin-check` para los workflows mismos. |

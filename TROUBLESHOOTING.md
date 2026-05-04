@@ -60,6 +60,48 @@ La verificación CRC32 detectó que la página leída del `.db` o del `.wal` no 
 
 ---
 
+## 🛢️ `base de datos 'X' ya existe` / `base de datos 'X' no existe`
+
+### Causa
+Salidas de `CREATE DATABASE` / `DROP DATABASE` cuando la operación no es idempotente.
+
+### Solución
+- Para crear: `CREATE DATABASE IF NOT EXISTS <name>;`
+- Para borrar: `DROP DATABASE IF EXISTS <name>;`
+
+---
+
+## 🚦 `CREATE/DROP/SHOW DATABASE requieren modo -dir`
+
+### Causa
+El server fue arrancado con `-db <archivo.db>` (single-DB) y se mandó una sentencia que opera sobre el directorio.
+
+### Solución
+Reiniciar el server con `-dir <carpeta>`:
+```bash
+gabysql-server -dir ./dbs -addr :8080
+```
+o usar `gabysql exec` directamente desde la CLI sobre cualquier path dentro del directorio objetivo.
+
+---
+
+## 🔀 `no se admite mezclar CREATE/DROP/SHOW DATABASE con sentencias de tabla en el mismo /exec`
+
+### Causa
+En un `/exec` mandaste un combo como:
+```sql
+CREATE DATABASE shop;
+CREATE TABLE shop_items (id INT PRIMARY KEY);
+```
+Esos statements no comparten transacción (uno opera sobre el directorio, el otro sobre la `.db` recién creada que aún no existe en el momento del parse).
+
+### Solución
+Separar en dos llamadas:
+1. `CREATE DATABASE shop;` (sin `db` en el body, server lo despacha al directorio).
+2. `CREATE TABLE ...;` (con `"db":"shop.db"` en el body).
+
+---
+
 ## 🚫 `refusing to overwrite existing database`
 
 ### Causa

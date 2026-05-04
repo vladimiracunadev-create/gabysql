@@ -69,6 +69,8 @@ Y en el [análisis ejecutivo](tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md
 | # | Bloque | Entregable concreto | Esfuerzo (1 dev) |
 | :---: | :--- | :--- | :---: |
 | 1 | ✅ Índices secundarios | `CREATE INDEX`, `DROP INDEX`, `WHERE col_indexada = val` | **Entregado** |
+| 1b | ✅ DDL de DATABASE | `CREATE DATABASE [IF NOT EXISTS]`, `DROP DATABASE [IF EXISTS]`, `SHOW DATABASES` despachados por server/CLI | **Entregado** |
+| 1c | ✅ Modelador web `gabymodeler` | Single-page HTML+JS vanilla; ER drag&drop → DDL gabysql → phpgabyadmin | **Entregado** |
 | 2 | Constraints declarativas | `NOT NULL`, `UNIQUE`, `DEFAULT` con validación en parser+engine | 4–6 sem |
 | 3 | `ORDER BY` por columna indexada | descender por el chain `next` del leaf con la dirección correcta | 3–5 sem |
 | 4 | `integrity_check` operacional | comando `gabysql integrity-check <db>` que recorre B+Tree, valida CRCs, detecta huérfanos | 2–3 sem |

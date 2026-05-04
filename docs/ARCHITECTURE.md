@@ -106,6 +106,7 @@ Responsable de:
 - resolver single DB o multi DB
 - aplicar autenticación por token
 - limitar conexiones simultáneas (default 64, configurable con `-max-connections`); las que exceden el techo reciben `503`
+- **interceptar `CREATE DATABASE` / `DROP DATABASE` / `SHOW DATABASES`** en `/exec` antes de abrir cualquier `Pager` (esos statements no operan sobre `TableMeta` sino sobre el directorio configurado con `-dir`); rechazar mezclarlos con sentencias de tabla en el mismo `/exec`
 - serializar resultados
 
 ### `web/phpgabyadmin/index.php`

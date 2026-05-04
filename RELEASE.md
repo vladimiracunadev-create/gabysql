@@ -76,6 +76,7 @@ El tag dispara los binarios firmados que se publican en la página de Releases. 
 - [ ] Probado que una DB de la versión anterior es **rechazada con mensaje explícito** (no abierta silenciosamente).
 - [ ] [USER_MANUAL.md](USER_MANUAL.md) y [docs/API.md](docs/API.md) reflejan los cambios visibles al usuario.
 - [ ] `phpgabyadmin` smoke en local (`docker compose up -d --build` + `http://localhost:8000/phpgabyadmin/`).
+- [ ] `gabymodeler` smoke: `http://localhost:8000/modeler/` → `📦 Cargar ejemplo` → `Exportar SQL` produce un DDL no vacío.
 - [ ] Ningún token / credencial / archivo `.env` ha entrado al repo (CI lo verifica con `detect-secrets`, pero se confirma manualmente igual).
 - [ ] Tag firmado o al menos atribuido al maintainer correcto.
 

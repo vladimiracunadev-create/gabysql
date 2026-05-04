@@ -31,7 +31,8 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Range scan por índice secundario | 🔴 | En [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | ORDER BY / GROUP BY / JOIN | 🔴 | En [Camino A/B/C](COMMERCIAL_ROADMAP.md) según madurez. | — |
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
-| Parser SQL | 🟡 | CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX. Sin ALTER, sin prepared statements. | [src/sql.rs](../src/sql.rs) |
+| Parser SQL | 🟡 | CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, **CREATE/DROP DATABASE, SHOW DATABASES**. Sin ALTER, sin prepared statements. | [src/sql.rs](../src/sql.rs) |
+| `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
 | Engine (executor) | 🟡 | Sin iterator pattern, sin spill-to-disk, sin plan lógico/físico. | [src/sql.rs](../src/sql.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
 | `EXPLAIN` | 🔴 | Camino A.5+. | — |
@@ -43,6 +44,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | TLS nativo en server | 🔴 | Reverse proxy en Camino A; nativo en Camino B. | — |
 | Authz por usuario / rol | 🔴 | Solo token compartido. Camino B. | — |
 | `phpgabyadmin` | 🟢 | Browse / Structure (con índices CRUD inline) / SQL con snippets. | [web/phpgabyadmin/index.php](../web/phpgabyadmin/index.php) |
+| `gabymodeler` (modelador web) | 🟢 | Vanilla HTML+JS, drag&drop entidades, FK Bezier, exporta DDL gabysql. | [web/modeler/index.html](../web/modeler/index.html) |
 | Backup / restore con verificación | 🔴 | Solo `cp` informal hoy. Camino A. | — |
 | `integrity_check` operacional | 🔴 | Camino A. | — |
 | Suite de benchmarks reproducible | 🔴 | `gabybench` especificado pero no implementado. | [GABYBENCH_SPEC.md](GABYBENCH_SPEC.md) |

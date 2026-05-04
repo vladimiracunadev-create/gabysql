@@ -12,7 +12,7 @@
 |---|---|---|
 | Nativo con Rust | desarrollo, depuración, cambios al motor | binarios locales + tests |
 | Docker | validación reproducible, demo rápida, server + admin | stack listo con API y web |
-| PHP local | uso de `phpgabyadmin` fuera de Docker | interfaz web sobre API |
+| PHP local | uso de `phpgabyadmin` y `gabymodeler` fuera de Docker | interfaces web sobre API y modelador ER |
 
 ---
 
@@ -100,7 +100,7 @@ cargo run --release --bin gabysql-server -- -dir ./dbs -addr :8080
 
 ---
 
-## 🧪 Levantar `phpgabyadmin`
+## 🧪 Levantar las interfaces web (`phpgabyadmin` y `gabymodeler`)
 
 Con el server ya corriendo:
 ```powershell
@@ -108,7 +108,11 @@ php -S localhost:8000 -t web
 ```
 
 Abrir:
-- `http://localhost:8000/phpgabyadmin/`
+- Landing: `http://localhost:8000/`
+- Admin web: `http://localhost:8000/phpgabyadmin/`
+- Modelador ER: `http://localhost:8000/modeler/`
+
+> El **modelador** es HTML estático puro (sin PHP necesario); cualquier servidor de archivos sirve, p.ej. `python3 -m http.server 8000 --directory web`. El **admin** sí necesita PHP para validar token y proxy a la API.
 
 Variables útiles:
 - `GABYADMIN_TOKEN`: exige login para entrar al admin
@@ -132,7 +136,9 @@ docker compose up -d --build
 
 Entradas principales:
 - API: `http://localhost:8080`
+- Landing: `http://localhost:8000/`
 - Admin web: `http://localhost:8000/phpgabyadmin/`
+- Modelador ER: `http://localhost:8000/modeler/`
 
 ---
 

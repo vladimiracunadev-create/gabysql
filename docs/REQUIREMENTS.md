@@ -46,6 +46,10 @@ Ese soporte se resuelve en tres niveles:
 - PHP 8.2 validado en este repo
 - navegador web
 
+### Para `gabymodeler` (modelador ER)
+- navegador web moderno (Chrome 100+, Firefox 100+, Safari 15+, Edge 100+)
+- **no requiere PHP**: cualquier servidor de archivos sirve (`python3 -m http.server`, `caddy`, etc.)
+
 ### Para Docker
 - Docker Engine o Docker Desktop
 - Docker Compose v2

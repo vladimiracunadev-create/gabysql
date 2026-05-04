@@ -32,6 +32,7 @@
 - el motor hace rollback ante errores de ejecución SQL dentro de la transacción activa
 - `Pager::create` rehúsa sobrescribir un archivo existente (mitiga pérdida de datos por uso accidental de `init`)
 - cada página persistida valida CRC32-IEEE al leerse y al replay del WAL (mitiga corrupción silenciosa, no es protección contra adversarios con acceso al disco)
+- el modelador web `gabymodeler` es **zero-coupling** (no llama a la API ni lee tokens; el usuario copia el SQL al portapapeles y lo pega en `phpgabyadmin`), evitando exposición de credenciales en el front
 
 ---
 

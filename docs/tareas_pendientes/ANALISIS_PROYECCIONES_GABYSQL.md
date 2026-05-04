@@ -3,7 +3,7 @@
 > **Fuente**: `gabysql_roadmap_rdbms.pdf` + `tabla_desafios_bases_datos_priorizada_gabysql.pdf`  
 > **Objetivo**: traducir ambos documentos a una dirección realista para el producto actual.
 >
-> **Nota de actualización (2026-05-03)**: parte de los riesgos identificados como prioritarios ya fueron entregados (B+Tree real con nodos internos, hashing del catálogo estable, CRC32 por página, `UPDATE`/`DELETE` por PK, tope de conexiones del server). Ver [CHANGELOG](../../CHANGELOG.md) y [PLAN_MAESTRO_GABYSQL](../PLAN_MAESTRO_GABYSQL.md) para el estado actual; este documento se mantiene como lectura ejecutiva original.
+> **Nota de actualización (2026-05-05)**: parte de los riesgos identificados como prioritarios ya fueron entregados (B+Tree real con nodos internos, hashing del catálogo estable, CRC32 por página, `UPDATE`/`DELETE` por PK, índices secundarios, `CREATE/DROP/SHOW DATABASE`, modelador web `gabymodeler`, tope de conexiones del server). Ver [CHANGELOG](../../CHANGELOG.md) y [PLAN_MAESTRO_GABYSQL](../PLAN_MAESTRO_GABYSQL.md) para el estado actual; este documento se mantiene como lectura ejecutiva original.
 
 ---
 

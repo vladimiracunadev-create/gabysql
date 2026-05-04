@@ -18,6 +18,15 @@
 | 8 | [Cliente Python contra la API HTTP](#8-cliente-python) | Python |
 | 9 | [Cliente Node.js contra la API HTTP](#9-cliente-nodejs) | Node.js |
 | 10 | [Detectar corrupción intencionalmente y verificar el CRC32](#10-corrupcion-y-crc) | shell + xxd |
+| 11 | [Modelador web → DDL → ejecutar en phpgabyadmin](#11-modelador-web--ddl--ejecutar-en-phpgabyadmin-zero-sql-para-empezar) | navegador (sin SQL) |
+| 12 | [`CREATE/DROP/SHOW DATABASE` desde la API](#12-create--drop--show-database-desde-la-api) | curl |
+| 13 | [Stress test rápido (inserts/segundo)](#13-stress-test-rapido-medir-insertssegundo) | python + CLI |
+| 14 | [Query exploratoria con phpgabyadmin (zero-SQL)](#14-query-exploratoria-con-phpgabyadmin-zero-sql) | navegador |
+| 15 | [Validar schema antes de migrar](#15-validar-schema-antes-de-migrar-smoke-pre-deploy) | shell |
+| 16 | [Smoke test de release](#16-smoke-test-de-un-release-recien-buildeado) | shell |
+| 17 | [Comparativa side-by-side con SQLite](#17-comparativa-side-by-side-con-sqlite) | shell |
+| 18 | [Auditar imagen Docker antes de desplegar](#18-auditar-la-imagen-docker-antes-de-desplegarla) | grype |
+| 19 | [Rotar token del server (blue-green)](#19-generar-credenciales-y-rotar-token-del-server) | shell |
 
 ---
 
@@ -365,7 +374,60 @@ Acción recomendada al ver este error en producción: **restaurar desde backup m
 
 ---
 
-## 11. Stress test rápido (medir inserts/segundo)
+## 11. Modelador web → DDL → ejecutar en phpgabyadmin (zero-SQL para empezar)
+
+**Escenario**: arrancar un schema completo sin escribir SQL a mano.
+
+```bash
+docker compose up -d --build
+# Modeler:        http://localhost:8000/modeler/
+# phpgabyadmin:   http://localhost:8000/phpgabyadmin/
+```
+
+Pasos en el browser:
+
+1. Abre `gabymodeler` → click en **📦 Cargar ejemplo** para ver `users + orders`.
+2. Modifica nombres / tipos / flags `PK`/`idx` a tu gusto.
+3. Pulsa **Exportar SQL** → modal con todo el DDL listo (incluye `CREATE DATABASE IF NOT EXISTS shop;`).
+4. **📋 Copiar al portapapeles**.
+5. Cambia a la pestaña abierta de `phpgabyadmin` → tab **SQL** → pega → **Ejecutar**.
+6. Verifica en tab **Browse** que las tablas y los índices aparecen.
+
+> El modelador **no se conecta** al server por sí mismo (zero-coupling con CORS / token). Toda la ejecución pasa por `/exec` mediante phpgabyadmin, dentro de la misma transacción.
+
+---
+
+## 12. CREATE / DROP / SHOW DATABASE desde la API
+
+```bash
+# Server multi-DB
+gabysql-server -dir ./dbs -addr :8080 -token "$TOKEN" &
+
+# Crear varias DBs en una transacción
+curl -s -X POST http://localhost:8080/exec \
+  -H "X-Gabysql-Token: $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"sql":"CREATE DATABASE shop; CREATE DATABASE IF NOT EXISTS analytics; SHOW DATABASES;"}'
+
+# {"ok":true,"results":[
+#   {"columns":[],"rows":[],"message":"OK","db":"shop"},
+#   {"columns":[],"rows":[],"message":"OK","db":"analytics"},
+#   {"columns":["database"],"rows":[["analytics"],["shop"]],"message":null}
+# ]}
+
+# Drop con guardrail
+curl -s -X POST http://localhost:8080/exec \
+  -H "X-Gabysql-Token: $TOKEN" \
+  -d '{"sql":"DROP DATABASE IF EXISTS analytics;"}'
+```
+
+Limitaciones:
+- En modo `-db` (single-DB), estos statements responden `405`.
+- No se admite mezclar `CREATE DATABASE` con `CREATE TABLE` en el mismo `/exec`: el server rechaza la mezcla con error explícito (no compartirían transacción de todos modos).
+
+---
+
+## 13. Stress test rápido (medir inserts/segundo)
 
 **Escenario**: cuantificar cuántos inserts/segundo aguanta el motor en tu hardware.
 
@@ -392,7 +454,7 @@ gabysql info bench.db   # mostrará pageCount alto, prueba que hubo splits
 
 ---
 
-## 12. Query exploratoria con `phpgabyadmin` (zero-SQL)
+## 14. Query exploratoria con `phpgabyadmin` (zero-SQL)
 
 **Escenario**: alguien no técnico (analista, QA) necesita ver los pedidos pendientes.
 
@@ -413,7 +475,7 @@ Sin que el usuario tenga que recordar la sintaxis exacta. La sintaxis válida es
 
 ---
 
-## 13. Validar schema antes de migrar (smoke pre-deploy)
+## 15. Validar schema antes de migrar (smoke pre-deploy)
 
 **Escenario**: estás por publicar una nueva versión del schema y quieres verificar que la DB existente no quedó inconsistente.
 
@@ -439,7 +501,7 @@ curl -s "http://localhost:8080/schema?db=prod.db&table=orders" \
 
 ---
 
-## 14. Smoke test de un release recién buildeado
+## 16. Smoke test de un release recién buildeado
 
 **Escenario**: tras `cargo build --release`, validar que el binario hace lo prometido antes de subirlo.
 
@@ -482,7 +544,7 @@ Este script es exactamente el patrón que `RELEASE.md` define como pre-release m
 
 ---
 
-## 15. Comparativa side-by-side con SQLite
+## 17. Comparativa side-by-side con SQLite
 
 **Escenario**: medir diferencias y similitudes con el mismo dataset.
 
@@ -514,7 +576,7 @@ Comparativa cualitativa completa en [docs/COMPETITIVE_ANALYSIS.md](COMPETITIVE_A
 
 ---
 
-## 16. Auditar la imagen Docker antes de desplegarla
+## 18. Auditar la imagen Docker antes de desplegarla
 
 **Escenario**: tu pipeline interno requiere scan de CVEs antes de aprobar un push de imagen.
 
@@ -536,7 +598,7 @@ Esto replica exactamente el job `container_scan` del workflow `security.yml` ([A
 
 ---
 
-## 17. Generar credenciales y rotar token del server
+## 19. Generar credenciales y rotar token del server
 
 **Escenario**: rotar el token compartido sin downtime largo.
 

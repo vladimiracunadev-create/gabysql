@@ -30,6 +30,8 @@ Este documento es el ancla central. Las políticas (cómo reportar, qué está i
 | Path traversal en modo multi-DB (`-dir`) | Normalización del nombre de DB y rechazo de paths no aceptados | [`src/server.rs:normalize_db_name`](../src/server.rs) | [SECURITY.md](../SECURITY.md) |
 | Race entre escrituras concurrentes | Mutex de proceso compartido por todas las rutas que escriben | [`src/server.rs:write_lock`](../src/server.rs) | [docs/ARCHITECTURE.md §Flujo por HTTP](ARCHITECTURE.md) |
 | Inyección SQL (gramática soportada) | Parser tipado con AST y `expect_value`/`expect_integer` validados; sin `eval` ni interpolación dinámica | [`src/sql.rs:Parser`](../src/sql.rs) | [docs/TECHNICAL_SPECS.md §Gramática SQL soportada](TECHNICAL_SPECS.md) |
+| Mezcla de DDL `DATABASE`-level con DDL/DML de tabla en `/exec` | Pre-parse del SQL en `/exec` rechaza la combinación con `400` antes de abrir Pager | [`src/server.rs::exec_sql`](../src/server.rs) | [docs/API.md §POST /exec](API.md) |
+| Modelador web acoplado al server (CORS / token leakage) | `gabymodeler` es **zero-coupling**: HTML+JS estático que NO llama a la API. El usuario copia el SQL al portapapeles y lo pega en `phpgabyadmin`. Esto evita exposición de tokens y CORS arbitrario. | [`web/modeler/`](../web/modeler/) | [web/modeler/README.md](../web/modeler/README.md) |
 
 ---
 

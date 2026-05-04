@@ -10,6 +10,9 @@
 
 | Comando | Categoría | Estado |
 | :--- | :--- | :---: |
+| [`CREATE DATABASE`](#create-database) | DDL · server multi-DB | 🟢 |
+| [`DROP DATABASE`](#drop-database) | DDL · server multi-DB | 🟢 |
+| [`SHOW DATABASES`](#show-databases) | DDL · server multi-DB | 🟢 |
 | [`CREATE TABLE`](#create-table) | DDL | 🟢 |
 | [`CREATE INDEX`](#create-index) | DDL | 🟢 |
 | [`DROP INDEX`](#drop-index) | DDL | 🟢 |
@@ -45,6 +48,105 @@ flowchart LR
 | `DATETIME` | texto | ✅ | Idem |
 | `JSON` | texto | ❌ | Sin semántica de igualdad canónica |
 | `NULL` | tag de presencia | n/a | No admitido en columnas PK |
+
+---
+
+## CREATE DATABASE
+
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 4`. En modo single-DB (`-db`) responde `405`.
+
+### 🛤️ Railroad
+
+```mermaid
+flowchart LR
+    S([▶]) --> C[CREATE] --> D[DATABASE]
+    D --> IFNE{IF NOT EXISTS?}
+    IFNE -- "no" --> N[/db_name/]
+    IFNE -- "sí" --> IF[IF] --> NOT[NOT] --> EX[EXISTS] --> N
+    N --> SEMI[";"] --> E([■])
+```
+
+### 📜 EBNF
+
+```
+create_database ::= "CREATE" "DATABASE" ("IF" "NOT" "EXISTS")? identifier
+```
+
+### ✅ Ejemplos
+
+```sql
+CREATE DATABASE shop;
+CREATE DATABASE IF NOT EXISTS analytics;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `base de datos 'X' ya existe` | falta `IF NOT EXISTS` |
+| `CREATE/DROP/SHOW DATABASE requieren modo -dir` | el server fue arrancado con `-db` |
+| `nombre de DB inválido: solo [A-Za-z0-9_-]` | identificador con caracteres prohibidos |
+
+---
+
+## DROP DATABASE
+
+> Elimina el archivo `.db` y su `.wal` si quedó. **Acción irreversible**, sin respaldo.
+
+### 🛤️ Railroad
+
+```mermaid
+flowchart LR
+    S([▶]) --> D[DROP] --> DB[DATABASE]
+    DB --> IFE{IF EXISTS?}
+    IFE -- "no" --> N[/db_name/]
+    IFE -- "sí" --> IF[IF] --> EX[EXISTS] --> N
+    N --> SEMI[";"] --> E([■])
+```
+
+### 📜 EBNF
+
+```
+drop_database ::= "DROP" "DATABASE" ("IF" "EXISTS")? identifier
+```
+
+### ✅ Ejemplos
+
+```sql
+DROP DATABASE analytics;
+DROP DATABASE IF EXISTS legacy;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `base de datos 'X' no existe` | falta `IF EXISTS` y la DB no estaba |
+
+---
+
+## SHOW DATABASES
+
+### 🛤️ Railroad
+
+```mermaid
+flowchart LR
+    S([▶]) --> SH[SHOW] --> DBS[DATABASES] --> SEMI[";"] --> E([■])
+```
+
+### 📜 EBNF
+
+```
+show_databases ::= "SHOW" "DATABASES"
+```
+
+### ✅ Resultado
+
+Devuelve una `ResultSet` con una columna `database`, un row por DB ordenado alfabéticamente:
+
+```json
+{ "columns": ["database"], "rows": [["analytics"], ["shop"]], "message": null }
+```
 
 ---
 

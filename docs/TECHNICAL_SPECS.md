@@ -148,6 +148,9 @@ Restricciones de la versión actual:
 ## 🧠 Gramática SQL soportada
 
 ### Soportado
+- `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI; intercept antes de abrir Pager)*
+- `DROP DATABASE [IF EXISTS] <name>`
+- `SHOW DATABASES`
 - `CREATE TABLE`
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ...`

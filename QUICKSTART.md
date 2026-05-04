@@ -71,9 +71,13 @@ Para admin web: `php -S localhost:8000 -t web` y abre `http://localhost:8000/php
 
 ```bash
 docker compose up -d --build
-# server: http://localhost:8080
-# admin web: http://localhost:8000/phpgabyadmin/
+# server:        http://localhost:8080
+# landing:       http://localhost:8000/
+# admin web:     http://localhost:8000/phpgabyadmin/
+# modelador ER:  http://localhost:8000/modeler/
 ```
+
+> El modelador (`gabymodeler`) genera DDL listo para gabysql desde una UI drag&drop — incluye `CREATE DATABASE`, `CREATE TABLE` y `CREATE INDEX`. Pegas la salida en `phpgabyadmin → tab SQL` y se ejecuta.
 
 ---
 

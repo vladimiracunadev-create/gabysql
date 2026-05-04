@@ -184,7 +184,17 @@ xxd -l 32 demo.db
 
 Cada uno de esos 32 bytes está documentado en [TECHNICAL_SPECS.md §Header](TECHNICAL_SPECS.md). Útil para enseñar cómo se diseña un formato en disco real.
 
-### Ejemplo 5 — phpgabyadmin como banco de pruebas visual
+### Ejemplo 5 — Modelador web (`gabymodeler`) → SQL → phpgabyadmin
+
+```bash
+docker compose up -d --build
+# Modelador:   http://localhost:8000/modeler/
+# Admin web:   http://localhost:8000/phpgabyadmin/
+```
+
+En el modelador: drag&drop entidades + columnas + flags (PK / idx). `Exportar SQL` produce `CREATE DATABASE`, `CREATE TABLE` y `CREATE INDEX` listos para pegar en `phpgabyadmin → tab SQL`. Single-page HTML+JS vanilla, cero deps, persistencia en `localStorage`.
+
+### Ejemplo 6 — phpgabyadmin como banco de pruebas visual
 
 ```bash
 docker compose up -d --build

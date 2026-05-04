@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-05-05 — Quinta intervención: DDL de DATABASE + modelador web
+
+### ✨ Funcionalidad SQL
+- **`CREATE DATABASE [IF NOT EXISTS] <name>;`** — crea un archivo `.db` en el directorio de `-dir` (server) o junto al path objetivo (CLI).
+- **`DROP DATABASE [IF EXISTS] <name>;`** — borra el archivo `.db` y su `.wal` si quedó.
+- **`SHOW DATABASES;`** — lista las DBs presentes en el directorio.
+
+Estas sentencias **no se ejecutan contra una `.db` específica** (no operan sobre `TableMeta`). Las despacha el caller — `gabysql-server` para HTTP `/exec` y la CLI `gabysql exec` — antes de abrir el `Pager`. Mezclar DB-level con table-level en un mismo `/exec` se rechaza con error explícito.
+
+### 🌐 Modelador web `gabymodeler`
+- Nueva carpeta [`web/modeler/`](web/modeler/) — single-page HTML+CSS+JS vanilla, sin frameworks, sin npm, sin backend acoplado.
+- Drag & drop de entidades sobre canvas con grid; SVG para líneas FK Bezier.
+- Columnas con tipos (`INT/TEXT/BOOL/FLOAT/DATE/DATETIME/JSON`), flag `PK` (auto-fija `INT`), flag `idx` (índice secundario).
+- Botón "↪ FK" para columnas que apuntan a otra entidad — la FK se documenta como comentario en el SQL (las FOREIGN KEY declarativas no se enforced en `VERSION 4`).
+- **Exporta SQL** con `CREATE DATABASE [IF NOT EXISTS]` + `CREATE TABLE` + `CREATE INDEX`, copia al clipboard o descarga `.sql`.
+- Persiste el modelo en `localStorage` (`gabymodeler.v1`).
+- Botón "📦 Cargar ejemplo" trae un schema `users + orders` con FK indexada para evaluar el flujo en 1 click.
+
+### 🧭 Landing `web/index.php` rediseñada
+- Reemplaza la tarjeta única de phpgabyadmin por **dos tarjetas lado a lado**: `gabymodeler` y `phpgabyadmin`. Cada una con CTA propio.
+- Documenta el flujo recomendado: **modeler → SQL → phpgabyadmin → ejecutar**.
+
+### 🧪 Validación
+- 11/11 tests de integración (incluye nuevo `database_level_statements_parse_and_engine_rejects`).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `php -l web/index.php` y `php -l web/phpgabyadmin/index.php`: clean.
+
+---
+
 ## 2026-05-04 — Cuarta intervención: índices secundarios + scaffolding profesional
 
 > **On-disk format jump: VERSION 3 → 4.** `TableMeta` ahora persiste una lista de índices secundarios; las DBs creadas con la entrega anterior son rechazadas explícitamente al abrir.

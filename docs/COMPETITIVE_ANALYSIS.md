@@ -45,6 +45,8 @@ Leyenda: 🟢 = gana / 🟡 = empate o aceptable / 🔴 = pierde / ⚪ = no apli
 | **WAL con verificación de integridad en replay** | 🟢 | 🟢 | ⚪ | ⚪ | 🟢 | 🟢 | 🟡 |
 | **Embebido (lib in-process)** | 🟢 | 🟢 | 🟢 | 🟢 | 🔴 | 🔴 | 🟡 |
 | **Server HTTP/JSON nativo** | 🟢 | 🔴 | 🔴 | 🔴 | 🔴 | 🔴 | 🟢 |
+| **Modelador ER web included (sin npm)** | 🟢 | 🔴 | 🔴 | 🔴 | 🔴 | 🔴 | 🟡 |
+| **`CREATE/DROP/SHOW DATABASE`** | 🟢 | 🔴 (un archivo = una DB) | 🟢 | 🔴 | 🟢 | 🟢 | 🟢 |
 | **Wire protocol (Postgres/MySQL)** | 🔴 | 🔴 | 🟡 | ⚪ | 🟢 | 🟢 | 🟡 |
 | **CRUD básico (INSERT/UPDATE/DELETE)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Índices secundarios (equality)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
