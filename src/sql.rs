@@ -1,5 +1,9 @@
-﻿use crate::bptree::init_leaf_page;
-use crate::catalog::{validate_create_table, Catalog, Column, ColumnType, TableMeta};
+use crate::bptree::{init_leaf_page, Tree};
+use crate::catalog::{validate_create_table, Catalog, Column, ColumnType, IndexMeta, TableMeta};
+use crate::index::{
+    bucket_insert, decode_bucket, encode_bucket, encode_column_value, hash_value,
+    validate_indexable,
+};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::{HashMap, HashSet};
@@ -110,12 +114,8 @@ impl<'a> Engine<'a> {
             Statement::Select(stmt) => self.exec_select(stmt),
             Statement::Update(stmt) => self.exec_update(stmt),
             Statement::Delete(stmt) => self.exec_delete(stmt),
-            Statement::CreateIndex(_) | Statement::DropIndex(_) => {
-                // Implemented in the next milestone (exec_create_index /
-                // exec_drop_index). Returning an explicit error keeps the
-                // parser tested independently of the executor.
-                Err(DbError::new("CREATE/DROP INDEX aún no ejecutable"))
-            }
+            Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
+            Statement::DropIndex(stmt) => self.exec_drop_index(stmt),
         }
     }
 
@@ -277,6 +277,122 @@ impl<'a> Engine<'a> {
         }
         catalog.upsert_row(meta.root_page, pk, row_bytes)?;
 
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("OK".to_string()),
+        })
+    }
+
+    fn exec_create_index(&mut self, stmt: CreateIndexStmt) -> DbResult<ResultSet> {
+        // 1. Resolve the table.
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
+
+        // 2. Validate column + type.
+        validate_indexable(&meta, &stmt.column)?;
+
+        // 3. Reject duplicate index name within this table; also reject
+        //    duplicate index *over the same column* (one secondary index
+        //    per column is enough for this version's equality lookups).
+        if meta.index_by_name(&stmt.name).is_some() {
+            return Err(DbError::new(format!(
+                "ya existe un índice llamado '{}' en la tabla '{}'",
+                stmt.name, meta.name
+            )));
+        }
+        if meta.index_for_column(&stmt.column).is_some() {
+            return Err(DbError::new(format!(
+                "la columna '{}' ya tiene un índice secundario",
+                stmt.column
+            )));
+        }
+
+        // Reject duplicate index name across the whole catalog.
+        {
+            let mut catalog = Catalog::open(self.pager);
+            for other in catalog.list_tables()? {
+                if other.name.eq_ignore_ascii_case(&meta.name) {
+                    continue;
+                }
+                if other.index_by_name(&stmt.name).is_some() {
+                    return Err(DbError::new(format!(
+                        "ya existe un índice llamado '{}' en la tabla '{}'",
+                        stmt.name, other.name
+                    )));
+                }
+            }
+        }
+
+        // 4. Allocate a fresh leaf page as the index root.
+        let idx_root = self.pager.new_page()?;
+        let mut leaf = vec![0; self.pager.page_size()];
+        init_leaf_page(&mut leaf);
+        self.pager.write_page(idx_root, &leaf, true)?;
+
+        // 5. Backfill: walk every existing row and insert it into the
+        //    index. We do this *before* we publish the index in the catalog
+        //    so a backfill failure leaves no half-built metadata behind
+        //    (the page leak is acceptable; the txn rollback would also
+        //    discard everything).
+        let column = meta
+            .column(&stmt.column)
+            .ok_or_else(|| DbError::new(format!("columna no existe: {}", stmt.column)))?
+            .clone();
+        let table_root = meta.root_page;
+        let rows = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(table_root, 0, None)?
+        };
+        for kv in rows {
+            let decoded = decode_row(&meta, &kv.value)?;
+            let value = decoded
+                .get(&normalize_ident(&column.name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let value_bytes = encode_column_value(&column, &value)?;
+            index_upsert_pk(self.pager, idx_root, &value_bytes, kv.key)?;
+        }
+
+        // 6. Publish the index in the catalog.
+        meta.indexes.push(IndexMeta {
+            name: stmt.name,
+            column: stmt.column,
+            root_page: idx_root,
+        });
+        let mut catalog = Catalog::open(self.pager);
+        catalog.put_table(&meta)?;
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("OK".to_string()),
+        })
+    }
+
+    fn exec_drop_index(&mut self, stmt: DropIndexStmt) -> DbResult<ResultSet> {
+        let mut catalog = Catalog::open(self.pager);
+        let tables = catalog.list_tables()?;
+        let mut hit: Option<TableMeta> = None;
+        for table in tables {
+            if table.index_by_name(&stmt.name).is_some() {
+                hit = Some(table);
+                break;
+            }
+        }
+        let mut owner =
+            hit.ok_or_else(|| DbError::new(format!("índice no existe: {}", stmt.name)))?;
+        owner
+            .indexes
+            .retain(|idx| !idx.name.eq_ignore_ascii_case(&stmt.name));
+        catalog.put_table(&owner)?;
+        // We intentionally don't free the index pages: the page allocator
+        // has no free-list yet, so dropping the catalog reference is the
+        // safest thing to do. A future `vacuum` will reclaim the space.
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -549,6 +665,27 @@ fn window_rows<T: Clone>(rows: Vec<T>, offset: usize, limit: Option<usize>) -> V
         None => rows.len(),
     };
     rows[offset..end].to_vec()
+}
+
+/// Add `(value_bytes, pk)` to the bucket at `hash(value_bytes)` in the
+/// secondary-index B+Tree rooted at `idx_root`. Idempotent — re-inserting
+/// the same `(value, pk)` is a no-op.
+pub(crate) fn index_upsert_pk(
+    pager: &mut Pager,
+    idx_root: u32,
+    value_bytes: &[u8],
+    pk: i64,
+) -> DbResult<()> {
+    let key = hash_value(value_bytes);
+    let mut tree = Tree::new(pager);
+    let mut bucket = match tree.get(idx_root, key)? {
+        Some(bytes) => decode_bucket(&bytes)?,
+        None => Vec::new(),
+    };
+    bucket_insert(&mut bucket, value_bytes.to_vec(), pk);
+    let payload = encode_bucket(&bucket)?;
+    tree.upsert(idx_root, key, payload)?;
+    Ok(())
 }
 
 fn normalize_ident(value: &str) -> String {
