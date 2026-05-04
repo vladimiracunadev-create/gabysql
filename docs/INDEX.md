@@ -9,6 +9,7 @@
 
 ### Principiante
 - [README](../README.md)
+- [QUICKSTART](../QUICKSTART.md)
 - [INSTALL](../INSTALL.md)
 - [BEGINNERS_GUIDE](BEGINNERS_GUIDE.md)
 - [USER_MANUAL](../USER_MANUAL.md)
@@ -16,7 +17,12 @@
 ### Operación / soporte
 - [RUNBOOK](../RUNBOOK.md)
 - [TROUBLESHOOTING](../TROUBLESHOOTING.md)
+- [SUPPORT](../SUPPORT.md)
+- [COMPATIBILITY](../COMPATIBILITY.md)
 - [SECURITY](../SECURITY.md)
+
+### Reclutamiento / evaluación
+- [RECRUITER](../RECRUITER.md)
 
 ### Técnico / maintainer
 - [ARCHITECTURE](ARCHITECTURE.md)
@@ -63,5 +69,10 @@
 |---|---|---|---|
 | Changelog | Todos | historial de cambios relevantes | [Abrir](../CHANGELOG.md) |
 | Roadmap | Todos | dirección futura del producto | [Abrir](../ROADMAP.md) |
+| Release | Maintainers | proceso de versionado y entrega | [Abrir](../RELEASE.md) |
 | Security | DevSecOps / operadores | postura de seguridad y hardening | [Abrir](../SECURITY.md) |
+| Support | Todos | cómo pedir ayuda y reportar bugs | [Abrir](../SUPPORT.md) |
+| Compatibility | Operadores / IT | matriz de OS, toolchain, Docker, formato en disco | [Abrir](../COMPATIBILITY.md) |
 | Contributing | Colaboradores | flujo de contribución y validaciones | [Abrir](../CONTRIBUTING.md) |
+| Code of Conduct | Comunidad | estándares de comportamiento | [Abrir](../CODE_OF_CONDUCT.md) |
+| Recruiter | Reclutadores / hiring | pitch técnico para evaluación profesional | [Abrir](../RECRUITER.md) |

@@ -1,0 +1,29 @@
+# EditorConfig — mantiene estilo consistente entre editores y SOs.
+# https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Rust usa 4 espacios (default de rustfmt).
+[*.rs]
+indent_size = 4
+
+# YAML, JSON, TOML, JS, CSS, HTML usan 2 espacios.
+[*.{yml,yaml,json,toml,js,ts,css,html}]
+indent_size = 2
+
+# Markdown puede requerir trailing whitespace para saltos de línea.
+[*.md]
+trim_trailing_whitespace = false
+indent_size = 2
+
+# Makefile siempre con tab.
+[{Makefile,*.mk}]
+indent_style = tab

@@ -1,0 +1,46 @@
+# Normalización de fin de línea: git decide por contenido.
+* text=auto
+
+# Shell scripts deben ser LF — CRLF rompe bash dentro de contenedores Linux.
+*.sh         text eol=lf
+*.bash       text eol=lf
+
+# Source code Rust + config: LF para que Docker (Linux) y CI multi-OS coincidan.
+*.rs         text eol=lf
+*.toml       text eol=lf
+*.lock       text eol=lf
+Dockerfile   text eol=lf
+
+# YAML / JSON / Markdown: LF.
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.json       text eol=lf
+*.md         text eol=lf
+
+# Archivos Windows-only: CRLF.
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+*.ps1        text eol=crlf
+
+# Binarios — git no debe normalizar.
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.ico        binary
+*.pdf        binary
+*.db         binary
+
+# Archivos que NO deben incluirse en los .zip de Release (export-ignore).
+/.github/                 export-ignore
+/.claude/                 export-ignore
+/.gitignore               export-ignore
+/.gitattributes           export-ignore
+/.editorconfig            export-ignore
+/.secrets.baseline        export-ignore
+/tests/                   export-ignore
+/docs/tareas_pendientes/  export-ignore
+
+# Linguist: marcar PDFs y .lock como auto-detectables solo como vendored.
+*.pdf        linguist-vendored
+Cargo.lock   linguist-generated

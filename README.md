@@ -123,12 +123,18 @@ php -S localhost:8000 -t web
 
 | Documento | Rol |
 |---|---|
+| [QUICKSTART.md](QUICKSTART.md) | arranque en 3 pasos |
 | [INSTALL.md](INSTALL.md) | instalación y build por sistema operativo |
 | [USER_MANUAL.md](USER_MANUAL.md) | uso diario del producto |
 | [RUNBOOK.md](RUNBOOK.md) | operación, backup y recovery |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | resolución de fallos frecuentes |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | matriz de compatibilidad (OS, toolchain, Docker, formato) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | reglas de colaboración |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | normas de comportamiento en la comunidad |
 | [SECURITY.md](SECURITY.md) | postura de seguridad y hardening |
+| [SUPPORT.md](SUPPORT.md) | cómo pedir ayuda |
+| [RELEASE.md](RELEASE.md) | proceso de versionado y entrega |
+| [RECRUITER.md](RECRUITER.md) | pitch técnico para evaluación profesional |
 | [CHANGELOG.md](CHANGELOG.md) | cambios relevantes aplicados |
 | [ROADMAP.md](ROADMAP.md) | dirección técnica y fases futuras |
 | [docs/INDEX.md](docs/INDEX.md) | índice técnico completo |

@@ -19,7 +19,10 @@
       "Bash(echo \"exit=$?\")",
       "Bash(git commit -m 'ci\\(security\\): swap sed indent for bash parameter expansion \\(SC2001\\) *)",
       "Bash(git commit -m 'feat\\(sql\\): maintain secondary indexes on INSERT, UPDATE, DELETE *)",
-      "Bash(git commit -m 'feat\\(sql\\): SELECT consults secondary index on WHERE col = val *)"
+      "Bash(git commit -m 'feat\\(sql\\): SELECT consults secondary index on WHERE col = val *)",
+      "Bash(gh api *)",
+      "Bash(grep -iE '\\\\.md$|^LICENSE|^CODE_OF_CONDUCT|^FUNDING|^ACKNOW|\\\\.editorconfig|\\\\.gitattributes')",
+      "Bash(git commit -m 'docs: import scaffolding present in other repos of this profile *)"
     ]
   }
 }
