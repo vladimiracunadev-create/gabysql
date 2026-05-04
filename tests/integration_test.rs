@@ -148,6 +148,47 @@ fn wal_recovery_replays_committed_pages() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn database_level_statements_parse_and_engine_rejects() -> Result<(), Box<dyn Error>> {
+    use gabysql::sql::Statement;
+
+    // Parser accepts the three forms.
+    let stmts = parse(
+        "CREATE DATABASE foo; \
+         CREATE DATABASE IF NOT EXISTS bar; \
+         DROP DATABASE foo; \
+         DROP DATABASE IF EXISTS bar; \
+         SHOW DATABASES;",
+    )?;
+    assert_eq!(stmts.len(), 5);
+    assert!(matches!(stmts[0], Statement::CreateDatabase(_)));
+    assert!(matches!(stmts[1], Statement::CreateDatabase(_)));
+    if let Statement::CreateDatabase(s) = &stmts[1] {
+        assert!(s.if_not_exists);
+    }
+    assert!(matches!(stmts[2], Statement::DropDatabase(_)));
+    assert!(matches!(stmts[3], Statement::DropDatabase(_)));
+    if let Statement::DropDatabase(s) = &stmts[3] {
+        assert!(s.if_exists);
+    }
+    assert!(matches!(stmts[4], Statement::ShowDatabases));
+
+    // Engine refuses to execute them — they are caller-dispatched.
+    let db = temp_db_path("dbstmts");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let err = run_sql(&db, "CREATE DATABASE other;").unwrap_err();
+    assert!(
+        err.to_string().contains("CREATE/DROP/SHOW DATABASE"),
+        "got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn secondary_index_lookup_and_maintenance() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("idx-secondary");
     let wal = wal_path(&db);

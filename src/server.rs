@@ -1,5 +1,5 @@
 use crate::catalog::{Catalog, TableMeta};
-use crate::sql::{decode_row, parse, Engine, ResultSet, Value};
+use crate::sql::{decode_row, parse, Engine, ResultSet, Statement, Value};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::HashMap;
@@ -384,11 +384,39 @@ fn exec_sql(
     let _guard = write_lock
         .lock()
         .map_err(|_| DbError::new("mutex poisoned"))?;
+
+    // Pre-parse to detect DB-level statements that don't operate on a
+    // single .db file but on the directory. They are dispatched here
+    // BEFORE we open any Pager. Mixing them with table-level statements
+    // in the same /exec call is rejected: their semantics are
+    // incompatible (no shared transaction).
+    let statements = match parse(&sql) {
+        Ok(v) => v,
+        Err(err) => {
+            return Ok(Response::json(
+                400,
+                format!(
+                    "{{\"ok\":false,\"error\":{}}}",
+                    json_string(&err.to_string())
+                ),
+            ));
+        }
+    };
+    let has_db_level = statements.iter().any(is_db_level_stmt);
+    if has_db_level {
+        if statements.iter().any(|s| !is_db_level_stmt(s)) {
+            return Ok(Response::json(
+                400,
+                "{\"ok\":false,\"error\":\"no se admite mezclar CREATE/DROP/SHOW DATABASE con sentencias de tabla en el mismo /exec\"}".to_string(),
+            ));
+        }
+        return exec_db_level(statements, config);
+    }
+
     let (mut pager, _) = open_pager_from_request(config, requested_db.as_ref())?;
     pager.begin()?;
 
     let response = (|| -> DbResult<Response> {
-        let statements = parse(&sql)?;
         let mut engine = Engine::new(&mut pager);
         let mut results = Vec::new();
         for statement in statements {
@@ -419,6 +447,110 @@ fn exec_sql(
             ))
         }
     }
+}
+
+fn is_db_level_stmt(s: &Statement) -> bool {
+    matches!(
+        s,
+        Statement::CreateDatabase(_) | Statement::DropDatabase(_) | Statement::ShowDatabases
+    )
+}
+
+/// Dispatch CREATE DATABASE / DROP DATABASE / SHOW DATABASES against the
+/// directory configured with `-dir`. Refused outright in single-DB mode.
+fn exec_db_level(stmts: Vec<Statement>, config: &ServerConfig) -> DbResult<Response> {
+    if config.single_db.is_some() {
+        return Ok(Response::json(
+            405,
+            "{\"ok\":false,\"error\":\"CREATE/DROP/SHOW DATABASE requieren modo -dir\"}"
+                .to_string(),
+        ));
+    }
+    let dir = config
+        .dir
+        .as_ref()
+        .ok_or_else(|| DbError::new("servidor sin directorio configurado"))?;
+
+    let mut results = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            Statement::CreateDatabase(s) => {
+                let name = normalize_db_name(&s.name)?;
+                let path = dir.join(&name);
+                if path.exists() {
+                    if s.if_not_exists {
+                        results.push(format!(
+                            "{{\"columns\":[],\"rows\":[],\"message\":\"OK (already exists)\",\"db\":{}}}",
+                            json_string(&name)
+                        ));
+                        continue;
+                    }
+                    return Ok(Response::json(
+                        409,
+                        format!(
+                            "{{\"ok\":false,\"error\":{}}}",
+                            json_string(&format!("base de datos '{}' ya existe", name))
+                        ),
+                    ));
+                }
+                let mut pager = Pager::create(&path)?;
+                pager.close()?;
+                results.push(format!(
+                    "{{\"columns\":[],\"rows\":[],\"message\":\"OK\",\"db\":{}}}",
+                    json_string(&name)
+                ));
+            }
+            Statement::DropDatabase(s) => {
+                let name = normalize_db_name(&s.name)?;
+                let path = dir.join(&name);
+                let wal = {
+                    let mut p = path.clone().into_os_string();
+                    p.push(".wal");
+                    std::path::PathBuf::from(p)
+                };
+                if !path.exists() {
+                    if s.if_exists {
+                        results.push(format!(
+                            "{{\"columns\":[],\"rows\":[],\"message\":\"OK (did not exist)\",\"db\":{}}}",
+                            json_string(&name)
+                        ));
+                        continue;
+                    }
+                    return Ok(Response::json(
+                        404,
+                        format!(
+                            "{{\"ok\":false,\"error\":{}}}",
+                            json_string(&format!("base de datos '{}' no existe", name))
+                        ),
+                    ));
+                }
+                fs::remove_file(&path)?;
+                let _ = fs::remove_file(&wal);
+                results.push(format!(
+                    "{{\"columns\":[],\"rows\":[],\"message\":\"OK\",\"db\":{}}}",
+                    json_string(&name)
+                ));
+            }
+            Statement::ShowDatabases => {
+                let dbs = list_dbs(dir)?;
+                let rows = dbs
+                    .iter()
+                    .map(|name| format!("[{}]", json_string(name)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                results.push(format!(
+                    "{{\"columns\":[\"database\"],\"rows\":[{}],\"message\":null}}",
+                    rows
+                ));
+            }
+            _ => unreachable!("filtered by is_db_level_stmt"),
+        }
+    }
+
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"results\":[{}]}}", results.join(",")),
+    ))
 }
 
 fn open_pager_from_request(

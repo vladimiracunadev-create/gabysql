@@ -17,6 +17,25 @@ pub enum Statement {
     Delete(DeleteStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    /// Database-level statements. They do NOT operate on a single DB file
+    /// but on the directory that hosts multiple DBs. The engine returns an
+    /// explicit error if it sees them — they are meant to be intercepted
+    /// by the caller (gabysql-server / CLI) BEFORE a Pager is opened.
+    CreateDatabase(CreateDatabaseStmt),
+    DropDatabase(DropDatabaseStmt),
+    ShowDatabases,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateDatabaseStmt {
+    pub name: String,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropDatabaseStmt {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +135,12 @@ impl<'a> Engine<'a> {
             Statement::Delete(stmt) => self.exec_delete(stmt),
             Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
             Statement::DropIndex(stmt) => self.exec_drop_index(stmt),
+            Statement::CreateDatabase(_)
+            | Statement::DropDatabase(_)
+            | Statement::ShowDatabases => Err(DbError::new(
+                "CREATE/DROP/SHOW DATABASE no se ejecutan contra una DB; \
+                 deben ser interceptados por el caller antes de abrir el Pager",
+            )),
         }
     }
 
@@ -1022,8 +1047,11 @@ impl Parser {
         if self.match_keyword("DROP") {
             return self.parse_drop();
         }
+        if self.match_keyword("SHOW") {
+            return self.parse_show();
+        }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/SHOW)",
         ))
     }
 
@@ -1081,14 +1109,50 @@ impl Parser {
     }
 
     fn parse_drop(&mut self) -> DbResult<Statement> {
+        if self.match_keyword("DATABASE") {
+            let if_exists = if self.match_keyword("IF") {
+                self.expect_keyword("EXISTS")?;
+                true
+            } else {
+                false
+            };
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropDatabase(DropDatabaseStmt {
+                name,
+                if_exists,
+            }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
     }
 
+    fn parse_create_database(&mut self) -> DbResult<Statement> {
+        let if_not_exists = if self.match_keyword("IF") {
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok(Statement::CreateDatabase(CreateDatabaseStmt {
+            name,
+            if_not_exists,
+        }))
+    }
+
+    fn parse_show(&mut self) -> DbResult<Statement> {
+        self.expect_keyword("DATABASES")?;
+        Ok(Statement::ShowDatabases)
+    }
+
     fn parse_create(&mut self) -> DbResult<Statement> {
         if self.match_keyword("INDEX") {
             return self.parse_create_index();
+        }
+        if self.match_keyword("DATABASE") {
+            return self.parse_create_database();
         }
         self.expect_keyword("TABLE")?;
         let name = self.expect_ident()?;

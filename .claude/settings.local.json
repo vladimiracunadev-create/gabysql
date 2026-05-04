@@ -35,7 +35,8 @@
       "Bash(git commit -m 'ci: silence '\\\\''Multiple search paths detected'\\\\'' in upload-artifact *)",
       "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/app\" -v gabysql-target:/app/target -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm sh -c \"cargo test --test integration_test --quiet 2>&1 | tail -5\")",
       "Bash(git commit -m 'docs: positioning, commercial roadmap, competitive analysis, ADRs, SQL reference *)",
-      "Bash(git commit -m 'docs\\(readme\\): pin strategic docs panel at the top *)"
+      "Bash(git commit -m 'docs\\(readme\\): pin strategic docs panel at the top *)",
+      "Bash(git commit -m 'feat\\(sql\\): CREATE/DROP DATABASE + SHOW DATABASES \\(server + CLI dispatch\\) *)"
     ]
   }
 }

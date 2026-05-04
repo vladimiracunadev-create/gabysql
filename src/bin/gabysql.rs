@@ -1,9 +1,10 @@
-use gabysql::sql::{parse, Engine, ResultSet, Value};
+use gabysql::sql::{parse, Engine, ResultSet, Statement, Value};
 use gabysql::storage::Pager;
-use gabysql::DbResult;
+use gabysql::{DbError, DbResult};
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(err) = run() {
@@ -76,10 +77,24 @@ fn run() -> DbResult<()> {
 }
 
 fn run_exec(db_path: PathBuf, query: &str) -> DbResult<()> {
+    let statements = parse(query)?;
+
+    // CLI mode treats the directory containing db_path as the "multi-DB
+    // directory" so CREATE/DROP/SHOW DATABASE work the same way they do
+    // through the HTTP server.
+    if statements.iter().any(is_db_level_stmt) {
+        if statements.iter().any(|s| !is_db_level_stmt(s)) {
+            return Err(DbError::new(
+                "no se admite mezclar CREATE/DROP/SHOW DATABASE con sentencias de tabla",
+            ));
+        }
+        let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+        return run_db_level_cli(dir, statements);
+    }
+
     let mut pager = Pager::open(db_path)?;
     pager.begin()?;
     let response = (|| -> DbResult<Vec<ResultSet>> {
-        let statements = parse(query)?;
         let mut engine = Engine::new(&mut pager);
         let mut results = Vec::new();
         for statement in statements {
@@ -101,6 +116,86 @@ fn run_exec(db_path: PathBuf, query: &str) -> DbResult<()> {
             Err(err)
         }
     }
+}
+
+fn is_db_level_stmt(s: &Statement) -> bool {
+    matches!(
+        s,
+        Statement::CreateDatabase(_) | Statement::DropDatabase(_) | Statement::ShowDatabases
+    )
+}
+
+fn run_db_level_cli(dir: &Path, stmts: Vec<Statement>) -> DbResult<()> {
+    fs::create_dir_all(dir)?;
+    for stmt in stmts {
+        match stmt {
+            Statement::CreateDatabase(s) => {
+                let path = dir.join(format!("{}.db", normalize_db_ident(&s.name)?));
+                if path.exists() {
+                    if s.if_not_exists {
+                        println!("OK (ya existía: {})", path.display());
+                        continue;
+                    }
+                    return Err(DbError::new(format!(
+                        "base de datos '{}' ya existe",
+                        path.display()
+                    )));
+                }
+                let mut pager = Pager::create(&path)?;
+                pager.close()?;
+                println!("OK ({})", path.display());
+            }
+            Statement::DropDatabase(s) => {
+                let path = dir.join(format!("{}.db", normalize_db_ident(&s.name)?));
+                let mut wal = path.clone().into_os_string();
+                wal.push(".wal");
+                let wal = PathBuf::from(wal);
+                if !path.exists() {
+                    if s.if_exists {
+                        println!("OK (no existía: {})", path.display());
+                        continue;
+                    }
+                    return Err(DbError::new(format!(
+                        "base de datos '{}' no existe",
+                        path.display()
+                    )));
+                }
+                fs::remove_file(&path)?;
+                let _ = fs::remove_file(&wal);
+                println!("OK ({} eliminada)", path.display());
+            }
+            Statement::ShowDatabases => {
+                let mut entries: Vec<String> = fs::read_dir(dir)?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        name.strip_suffix(".db").map(|s| s.to_string())
+                    })
+                    .collect();
+                entries.sort();
+                println!("database");
+                for name in entries {
+                    println!("{}", name);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+fn normalize_db_ident(value: &str) -> DbResult<String> {
+    let trimmed = value.trim();
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || trimmed.is_empty()
+    {
+        return Err(DbError::new(
+            "nombre de DB inválido: solo [A-Za-z0-9_-], no vacío",
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn run_repl(db_path: PathBuf) -> DbResult<()> {
