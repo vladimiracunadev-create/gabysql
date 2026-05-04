@@ -493,12 +493,27 @@ fn table_meta_json(meta: &TableMeta) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
+    let indexes = meta
+        .indexes
+        .iter()
+        .map(|idx| {
+            format!(
+                "{{\"name\":{},\"column\":{},\"rootPage\":{}}}",
+                json_string(&idx.name),
+                json_string(&idx.column),
+                idx.root_page
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
     format!(
-        "{{\"name\":{},\"primaryKey\":{},\"rootPage\":{},\"columns\":[{}]}}",
+        "{{\"name\":{},\"primaryKey\":{},\"rootPage\":{},\"columns\":[{}],\"indexes\":[{}]}}",
         json_string(&meta.name),
         json_string(&meta.primary_key),
         meta.root_page,
-        columns
+        columns,
+        indexes
     )
 }
 

@@ -153,7 +153,7 @@ $apiToken = trim((string)($_GET['token'] ?? ''));
 $db = trim((string)($_GET['db'] ?? ''));
 $table = trim((string)($_GET['table'] ?? ''));
 $tab = $_GET['tab'] ?? 'browse';
-$sql = $_POST['sql'] ?? "SELECT * FROM users LIMIT 10;";
+$sql = $_POST['sql'] ?? "-- Sentencias soportadas en gabysql (formato VERSION 4):\n--   CREATE TABLE | INSERT | SELECT | UPDATE | DELETE\n--   CREATE INDEX | DROP INDEX\n-- WHERE soporta: pk = N, pk BETWEEN a AND b, columna_indexada = valor\n\nSELECT * FROM users LIMIT 10;";
 
 [$dbsResp, $dbsErr] = http_get_json($server . '/dbs', $apiToken);
 $dbs = [];
@@ -246,6 +246,24 @@ if (isset($_GET['export']) && $db !== '' && $table !== '') {
   }
   fclose($out);
   exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_index']) && $db !== '') {
+  $idxTable = trim((string)($_POST['create_index_table'] ?? ''));
+  $idxName  = trim((string)($_POST['create_index_name']  ?? ''));
+  $idxCol   = trim((string)($_POST['create_index_column']?? ''));
+  // Validación mínima: solo identificadores SQL ([A-Za-z_][A-Za-z0-9_]*).
+  $ident = '/^[A-Za-z_][A-Za-z0-9_]*$/';
+  if (!preg_match($ident, $idxTable) || !preg_match($ident, $idxName) || !preg_match($ident, $idxCol)) {
+    $execErr = 'Nombres inválidos: solo se admiten identificadores [A-Za-z_][A-Za-z0-9_]*';
+  } else {
+    $createSql = "CREATE INDEX {$idxName} ON {$idxTable} ({$idxCol});";
+    [$execJson, $execErr] = http_post_json($server . '/exec', ['db' => $db, 'sql' => $createSql], $apiToken);
+    if (!$execErr && !($execJson['ok'] ?? false)) {
+      $execErr = $execJson['error'] ?? 'Error';
+    }
+    $sql = $createSql; // reflejarlo en el textarea para auditoría
+  }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['run_sql'])) {
@@ -390,18 +408,69 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
           <?php if ($schemaErr || !($schemaResp['ok'] ?? false)): ?>
             <div class="error" style="margin-top:12px"><?= htmlspecialchars($schemaErr ?: ($schemaResp['error'] ?? 'Error')) ?></div>
           <?php else: $meta = $schemaResp['table'] ?? []; ?>
+            <h3 style="margin-top:14px">Columnas</h3>
             <table>
-              <thead><tr><th>Columna</th><th>Tipo</th><th>PK</th></tr></thead>
+              <thead><tr><th>Columna</th><th>Tipo</th><th>PK</th><th>Indexada</th></tr></thead>
               <tbody>
+                <?php
+                  $indexedCols = [];
+                  foreach (($meta['indexes'] ?? []) as $idx) {
+                    $indexedCols[strtolower((string)($idx['column'] ?? ''))] = (string)($idx['name'] ?? '');
+                  }
+                ?>
                 <?php foreach (($meta['columns'] ?? []) as $column): ?>
+                  <?php $colName = (string)($column['name'] ?? ''); $colKey = strtolower($colName); ?>
                   <tr>
-                    <td><?= htmlspecialchars((string)($column['name'] ?? '')) ?></td>
+                    <td><?= htmlspecialchars($colName) ?></td>
                     <td><?= htmlspecialchars((string)($column['type'] ?? '')) ?></td>
                     <td><?= !empty($column['pk']) ? 'si' : '' ?></td>
+                    <td><?= isset($indexedCols[$colKey]) ? '<code>' . htmlspecialchars($indexedCols[$colKey]) . '</code>' : '<span class="muted">-</span>' ?></td>
                   </tr>
                 <?php endforeach; ?>
               </tbody>
             </table>
+
+            <h3 style="margin-top:18px">Índices secundarios</h3>
+            <?php $indexes = $meta['indexes'] ?? []; ?>
+            <?php if (empty($indexes)): ?>
+              <div class="muted">Esta tabla no tiene índices secundarios.</div>
+            <?php else: ?>
+              <table>
+                <thead><tr><th>Nombre</th><th>Columna</th><th>Root page</th><th>Acción</th></tr></thead>
+                <tbody>
+                  <?php foreach ($indexes as $idx): ?>
+                    <?php $idxName = (string)($idx['name'] ?? ''); ?>
+                    <tr>
+                      <td><code><?= htmlspecialchars($idxName) ?></code></td>
+                      <td><?= htmlspecialchars((string)($idx['column'] ?? '')) ?></td>
+                      <td><?= htmlspecialchars((string)($idx['rootPage'] ?? '')) ?></td>
+                      <td>
+                        <form method="post" style="display:inline" onsubmit="return confirm('Eliminar índice <?= htmlspecialchars($idxName, ENT_QUOTES) ?>?');">
+                          <input type="hidden" name="sql" value="DROP INDEX <?= htmlspecialchars($idxName, ENT_QUOTES) ?>;"/>
+                          <button name="run_sql" type="submit" class="pill" style="background:#5a2030;color:#ffd6e0;border-color:#7a2c44">DROP</button>
+                        </form>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            <?php endif; ?>
+
+            <h4 style="margin-top:14px">Crear nuevo índice</h4>
+            <form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <input type="hidden" name="create_index_table" value="<?= htmlspecialchars((string)$table) ?>"/>
+              <input name="create_index_name" placeholder="idx_<?= htmlspecialchars((string)$table) ?>_col" required/>
+              <select name="create_index_column">
+                <?php foreach (($meta['columns'] ?? []) as $column): ?>
+                  <?php if (!empty($column['pk'])) continue; ?>
+                  <?php $cName = (string)($column['name'] ?? ''); $cType = (string)($column['type'] ?? ''); ?>
+                  <?php if (strcasecmp($cType, 'JSON') === 0) continue; /* JSON no es indexable */ ?>
+                  <option value="<?= htmlspecialchars($cName) ?>"><?= htmlspecialchars($cName . ' (' . $cType . ')') ?></option>
+                <?php endforeach; ?>
+              </select>
+              <button name="create_index" type="submit">CREATE INDEX</button>
+              <span class="muted">Una columna por índice, equality lookup. PK / JSON no se indexan.</span>
+            </form>
           <?php endif; ?>
 
         <?php elseif ($tab === 'browse'): ?>
@@ -443,11 +512,31 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
           <?php endif; ?>
 
         <?php else: ?>
+          <div class="muted" style="margin-top:8px">Snippets — clic para precargar:</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+            <?php
+              $snippets = [
+                'SELECT'        => "SELECT * FROM {$table} LIMIT 25;",
+                'SELECT por PK' => "SELECT * FROM {$table} WHERE id = 1;",
+                'SELECT por columna indexada' => "SELECT * FROM {$table} WHERE name = 'Ana';",
+                'INSERT'        => "INSERT INTO {$table} (id, name) VALUES (1, 'Ana');",
+                'UPDATE por PK' => "UPDATE {$table} SET name = 'Ana M' WHERE id = 1;",
+                'DELETE por PK' => "DELETE FROM {$table} WHERE id = 1;",
+                'CREATE INDEX'  => "CREATE INDEX idx_{$table}_name ON {$table} (name);",
+                'DROP INDEX'    => "DROP INDEX idx_{$table}_name;",
+              ];
+            ?>
+            <?php foreach ($snippets as $label => $tpl): ?>
+              <a class="pill" href="?server=<?= urlencode($server) ?>&token=<?= urlencode($apiToken) ?>&db=<?= urlencode($db) ?>&table=<?= urlencode($table) ?>&tab=sql&prefill=<?= urlencode($tpl) ?>"><?= htmlspecialchars($label) ?></a>
+            <?php endforeach; ?>
+          </div>
+          <?php if (isset($_GET['prefill'])) { $sql = (string)$_GET['prefill']; } ?>
+
           <form method="post" style="margin-top:12px">
             <textarea name="sql"><?= htmlspecialchars((string)$sql) ?></textarea>
             <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
               <button name="run_sql" type="submit">Ejecutar</button>
-              <span class="muted">Cada ejecución pasa por Begin → Exec → Commit</span>
+              <span class="muted">Cada ejecución pasa por Begin → Exec → Commit. Múltiples sentencias separadas por <code>;</code> entran en la misma transacción.</span>
             </div>
           </form>
 

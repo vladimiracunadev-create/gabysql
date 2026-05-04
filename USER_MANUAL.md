@@ -166,6 +166,11 @@ php -S localhost:8000 -t web
 3. Entra a `http://localhost:8000/phpgabyadmin/`
 4. Selecciona DB, tabla o ejecuta SQL
 
+### Pestañas disponibles
+- **Browse** — paginación de filas, export CSV, import CSV.
+- **Structure** — columnas + tipos + PK + columna marcada como indexada; **lista de índices secundarios** con botón `DROP` por índice y formulario inline `CREATE INDEX` que filtra automáticamente PK y JSON.
+- **SQL** — editor con snippets de un click para `SELECT` / `SELECT por PK` / `SELECT por columna indexada` / `INSERT` / `UPDATE` / `DELETE` / `CREATE INDEX` / `DROP INDEX`. Cada ejecución es Begin → Exec → Commit; múltiples sentencias separadas por `;` entran en la misma transacción.
+
 ### Seguridad del admin
 - Si defines `GABYADMIN_TOKEN`, el admin pedirá login
 - La cookie de login está firmada
