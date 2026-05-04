@@ -118,6 +118,7 @@ impl<'a> Engine<'a> {
             primary_key,
             columns,
             root_page: 0,
+            indexes: Vec::new(),
         };
         validate_create_table(&meta)?;
 

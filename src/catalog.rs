@@ -77,11 +77,19 @@ pub struct Column {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMeta {
+    pub name: String,
+    pub column: String,
+    pub root_page: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMeta {
     pub name: String,
     pub primary_key: String,
     pub columns: Vec<Column>,
     pub root_page: u32,
+    pub indexes: Vec<IndexMeta>,
 }
 
 impl TableMeta {
@@ -89,6 +97,18 @@ impl TableMeta {
         self.columns
             .iter()
             .find(|column| column.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn index_for_column(&self, column: &str) -> Option<&IndexMeta> {
+        self.indexes
+            .iter()
+            .find(|idx| idx.column.eq_ignore_ascii_case(column))
+    }
+
+    pub fn index_by_name(&self, name: &str) -> Option<&IndexMeta> {
+        self.indexes
+            .iter()
+            .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
@@ -100,6 +120,13 @@ impl TableMeta {
         for column in &self.columns {
             push_string(&mut out, &column.name)?;
             out.push(column.column_type.code());
+        }
+        // Secondary indexes (added in format VERSION = 4).
+        out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
+        for idx in &self.indexes {
+            push_string(&mut out, &idx.name)?;
+            push_string(&mut out, &idx.column)?;
+            out.extend_from_slice(&idx.root_page.to_le_bytes());
         }
         Ok(out)
     }
@@ -125,11 +152,32 @@ impl TableMeta {
             offset += 1;
             columns.push(Column { name, column_type });
         }
+        let mut indexes = Vec::new();
+        if offset + 2 <= data.len() {
+            let idx_count =
+                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            for _ in 0..idx_count {
+                let name = take_string(data, &mut offset)?;
+                let column = take_string(data, &mut offset)?;
+                if offset + 4 > data.len() {
+                    return Err(DbError::new("meta de índice corrupta"));
+                }
+                let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+                indexes.push(IndexMeta {
+                    name,
+                    column,
+                    root_page,
+                });
+            }
+        }
         Ok(Self {
             name,
             primary_key,
             columns,
             root_page,
+            indexes,
         })
     }
 }

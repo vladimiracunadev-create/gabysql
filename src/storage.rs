@@ -10,7 +10,9 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //   2 -> moved catalog hashing from DefaultHasher to FNV-1a-64.
 //   3 -> reserved last 4 bytes of every page for a CRC32-IEEE checksum
 //        and added a per-record CRC to the WAL.
-pub const VERSION: u32 = 3;
+//   4 -> TableMeta carries a list of secondary indexes; their on-disk
+//        B+Tree pages live alongside the table's own root page.
+pub const VERSION: u32 = 4;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

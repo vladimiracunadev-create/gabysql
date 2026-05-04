@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 
 pub mod bptree;
 pub mod catalog;
+pub mod index;
 pub mod server;
 pub mod sql;
 pub mod storage;
