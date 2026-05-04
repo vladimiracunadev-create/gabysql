@@ -200,13 +200,13 @@ jobs:
             hits=$(echo "$rust_files" | xargs grep -lE 'std::mem::transmute|mem::transmute' 2>/dev/null || true)
             if [ -n "$hits" ]; then
               echo "::warning::std::mem::transmute detectado (revisar):"
-              echo "$hits" | sed 's/^/  /'
+              echo "  ${hits//$'\n'/$'\n  '}"
             fi
             # std::process::Command con interpolación de format!/concat.
             hits=$(echo "$rust_files" | xargs grep -lE 'Command::new\([^)]*(format!|\+\s*&)' 2>/dev/null || true)
             if [ -n "$hits" ]; then
               echo "::error::Command::new con interpolación dinámica:"
-              echo "$hits" | sed 's/^/  /'
+              echo "  ${hits//$'\n'/$'\n  '}"
               status=1
             fi
           fi
@@ -215,7 +215,7 @@ jobs:
             hits=$(echo "$php_files" | xargs grep -lE '\beval\s*\(|\bsystem\s*\(.*\.|\bexec\s*\(.*\.' 2>/dev/null || true)
             if [ -n "$hits" ]; then
               echo "::error::eval/system/exec con interpolación en PHP:"
-              echo "$hits" | sed 's/^/  /'
+              echo "  ${hits//$'\n'/$'\n  '}"
               status=1
             fi
           fi
