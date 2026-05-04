@@ -46,22 +46,28 @@ jobs:
         run: cargo test --all-targets
       - name: cargo build release
         run: cargo build --release --bin gabysql --bin gabysql-server
-      - name: Upload release binaries (Unix)
-        if: runner.os != 'Windows'
+      - name: Stage release binaries
+        # Copying to a dedicated folder gives upload-artifact a single
+        # root path. That avoids the noisy 'Multiple search paths
+        # detected. Calculating the least common ancestor...' line that
+        # the action prints when it receives two paths, and lets us drop
+        # the OS-conditional split (one step instead of two).
+        shell: bash
+        run: |
+          mkdir -p artifact-staging
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/gabysql.exe        artifact-staging/
+            cp target/release/gabysql-server.exe artifact-staging/
+          else
+            cp target/release/gabysql        artifact-staging/
+            cp target/release/gabysql-server artifact-staging/
+          fi
+      - name: Upload release binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: gabysql-${{ runner.os }}-release
-          path: |
-            target/release/gabysql
-            target/release/gabysql-server
-      - name: Upload release binaries (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: gabysql-${{ runner.os }}-release
-          path: |
-            target/release/gabysql.exe
-            target/release/gabysql-server.exe
+          path: artifact-staging
+          if-no-files-found: error
 
   docker:
     runs-on: ubuntu-latest
