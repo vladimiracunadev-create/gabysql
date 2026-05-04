@@ -35,12 +35,16 @@
 
 | Perfil | Documento de entrada | Qué mirar primero |
 |---|---|---|
-| Principiante | [docs/BEGINNERS_GUIDE.md](docs/BEGINNERS_GUIDE.md) | recorrido de 10 minutos |
+| Principiante | [docs/BEGINNERS_GUIDE.md](docs/BEGINNERS_GUIDE.md) + [QUICKSTART.md](QUICKSTART.md) | recorrido de 10 minutos |
 | Usuario / operador | [USER_MANUAL.md](USER_MANUAL.md) | CLI, server y admin web |
 | Operación | [RUNBOOK.md](RUNBOOK.md) | health checks, backup, recovery |
 | Técnico / maintainer | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | capas del motor y flujo interno |
 | API / integración | [docs/API.md](docs/API.md) | endpoints, auth y payloads |
 | Seguridad | [SECURITY.md](SECURITY.md) + [docs/SECURITY_LAYERS.md](docs/SECURITY_LAYERS.md) | postura, capas y hardening |
+| **Producto / negocio** | [docs/POSITIONING.md](docs/POSITIONING.md) + [docs/COMMERCIAL_ROADMAP.md](docs/COMMERCIAL_ROADMAP.md) | qué problema resuelve y caminos comerciales A/B/C |
+| **Comparativa** | [docs/COMPETITIVE_ANALYSIS.md](docs/COMPETITIVE_ANALYSIS.md) | dónde gana / pierde vs SQLite/Postgres/DuckDB/etc. |
+| **Estado actual** | [docs/STATUS.md](docs/STATUS.md) | madurez por subsistema (qué está 🟢/🟡/🔴) |
+| **Decisiones técnicas** | [docs/adr/](docs/adr/) | ADRs numeradas con contexto, alternativas y consecuencias |
 
 ---
 
@@ -122,6 +126,14 @@ php -S localhost:8000 -t web
 
 ---
 
+## 🧪 Ejemplos de uso
+
+> **15+ recetas concretas listas para copiar** — CLI, HTTP, crate embebido en Rust, clientes Python/Node.js, importar CSV, multi-DB, backup/restore, demostrar la detección de corrupción por CRC, stress test, comparativa con SQLite.
+>
+> 👉 **[docs/USE_CASES.md](docs/USE_CASES.md)** — todo en un solo documento.
+
+---
+
 ## 📚 Mapa documental
 
 | Documento | Rol |
@@ -140,6 +152,13 @@ php -S localhost:8000 -t web
 | [RECRUITER.md](RECRUITER.md) | pitch técnico para evaluación profesional |
 | [CHANGELOG.md](CHANGELOG.md) | cambios relevantes aplicados |
 | [ROADMAP.md](ROADMAP.md) | dirección técnica y fases futuras |
+| [POSITIONING](docs/POSITIONING.md) | qué problema resuelve, ICP y ejemplos de uso |
+| [COMMERCIAL_ROADMAP](docs/COMMERCIAL_ROADMAP.md) | tres caminos A/B/C para llegar a producto comercial |
+| [COMPETITIVE_ANALYSIS](docs/COMPETITIVE_ANALYSIS.md) | comparativa honesta con SQLite, DuckDB, Postgres, etc. |
+| [STATUS](docs/STATUS.md) | snapshot de madurez por subsistema |
+| [USE_CASES](docs/USE_CASES.md) | 17 recetas concretas listas para copiar |
+| [SQL_REFERENCE](docs/SQL_REFERENCE.md) | esquema de cada comando con railroad diagram + EBNF |
+| [ADRs](docs/adr/) | decisiones arquitectónicas con contexto y alternativas |
 | [docs/INDEX.md](docs/INDEX.md) | índice técnico completo |
 
 ---

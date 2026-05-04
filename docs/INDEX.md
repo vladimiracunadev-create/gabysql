@@ -25,6 +25,17 @@
 ### Reclutamiento / evaluación
 - [RECRUITER](../RECRUITER.md)
 
+### Producto / negocio / decisiones
+- [POSITIONING](POSITIONING.md)
+- [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md) — caminos A/B/C
+- [COMPETITIVE_ANALYSIS](COMPETITIVE_ANALYSIS.md)
+- [STATUS](STATUS.md) — madurez por subsistema
+- [ADRs](adr/) — decisiones arquitectónicas
+
+### Aprendizaje / referencia
+- [USE_CASES](USE_CASES.md) — recetas
+- [SQL_REFERENCE](SQL_REFERENCE.md) — railroad diagrams + EBNF
+
 ### Técnico / maintainer
 - [ARCHITECTURE](ARCHITECTURE.md)
 - [TECHNICAL_SPECS](TECHNICAL_SPECS.md)
