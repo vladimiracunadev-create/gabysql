@@ -1,7 +1,7 @@
 use crate::bptree::{init_leaf_page, Tree};
 use crate::catalog::{validate_create_table, Catalog, Column, ColumnType, IndexMeta, TableMeta};
 use crate::index::{
-    bucket_insert, decode_bucket, encode_bucket, encode_column_value, hash_value,
+    bucket_insert, bucket_remove, decode_bucket, encode_bucket, encode_column_value, hash_value,
     validate_indexable,
 };
 use crate::storage::Pager;
@@ -169,10 +169,12 @@ impl<'a> Engine<'a> {
         if stmt.columns.len() != stmt.values.len() {
             return Err(DbError::new("cantidad columnas != valores"));
         }
-        let mut catalog = Catalog::open(self.pager);
-        let meta = catalog
-            .get_table(&stmt.table)?
-            .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?;
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
 
         let mut seen = HashSet::new();
         let mut values = HashMap::new();
@@ -188,7 +190,28 @@ impl<'a> Engine<'a> {
         }
 
         let (pk, row_bytes) = encode_row(&meta, &values)?;
-        catalog.insert_row(meta.root_page, pk, row_bytes)?;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.insert_row(meta.root_page, pk, row_bytes)?;
+        }
+
+        // Maintain every secondary index: hash the new column value and
+        // upsert (value_bytes, pk) into the index bucket.
+        for idx in &meta.indexes {
+            let column = meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let value = values
+                .get(&normalize_ident(&column.name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let value_bytes = encode_column_value(column, &value)?;
+            index_upsert_pk(self.pager, idx.root_page, &value_bytes, pk)?;
+        }
+
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -242,10 +265,12 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_update(&mut self, stmt: UpdateStmt) -> DbResult<ResultSet> {
-        let mut catalog = Catalog::open(self.pager);
-        let meta = catalog
-            .get_table(&stmt.table)?
-            .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?;
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
         ensure_pk_filter(&meta, &stmt.where_column)?;
 
         let mut overrides: HashMap<String, Value> = HashMap::new();
@@ -264,18 +289,50 @@ impl<'a> Engine<'a> {
             }
         }
 
-        let existing = catalog
-            .get_row(meta.root_page, stmt.where_pk)?
-            .ok_or_else(|| DbError::new(format!("fila no existe: PK={}", stmt.where_pk)))?;
-        let mut current = decode_row(&meta, &existing)?;
-        for (key, value) in overrides {
-            current.insert(key, value);
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_row(meta.root_page, stmt.where_pk)?
+                .ok_or_else(|| DbError::new(format!("fila no existe: PK={}", stmt.where_pk)))?
+        };
+        let old_row = decode_row(&meta, &existing)?;
+        let mut current = old_row.clone();
+        for (key, value) in &overrides {
+            current.insert(key.clone(), value.clone());
         }
         let (pk, row_bytes) = encode_row(&meta, &current)?;
         if pk != stmt.where_pk {
             return Err(DbError::new("PK derivada del row no coincide con WHERE"));
         }
-        catalog.upsert_row(meta.root_page, pk, row_bytes)?;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.upsert_row(meta.root_page, pk, row_bytes)?;
+        }
+
+        // Maintain only the indexes whose column was actually mutated, and
+        // only when the new value differs from the old one. That keeps
+        // UPDATEs that don't touch indexed columns free of index work.
+        for idx in &meta.indexes {
+            let normalized = normalize_ident(&idx.column);
+            if !overrides.contains_key(&normalized) {
+                continue;
+            }
+            let column = meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let old_value = old_row.get(&normalized).cloned().unwrap_or(Value::Null);
+            let new_value = current.get(&normalized).cloned().unwrap_or(Value::Null);
+            if old_value == new_value {
+                continue;
+            }
+            let old_bytes = encode_column_value(column, &old_value)?;
+            let new_bytes = encode_column_value(column, &new_value)?;
+            index_remove_pk(self.pager, idx.root_page, &old_bytes, pk)?;
+            index_upsert_pk(self.pager, idx.root_page, &new_bytes, pk)?;
+        }
 
         Ok(ResultSet {
             columns: Vec::new(),
@@ -401,18 +458,53 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_delete(&mut self, stmt: DeleteStmt) -> DbResult<ResultSet> {
-        let mut catalog = Catalog::open(self.pager);
-        let meta = catalog
-            .get_table(&stmt.table)?
-            .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?;
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
         ensure_pk_filter(&meta, &stmt.where_column)?;
-        let removed = catalog.delete_row(meta.root_page, stmt.where_pk)?;
-        if !removed {
-            return Err(DbError::new(format!(
-                "fila no existe: PK={}",
-                stmt.where_pk
-            )));
+
+        // Read the row first so we know which (value, pk) entries to evict
+        // from each secondary index. If the row is absent we error out
+        // before touching anything (consistent with UPDATE).
+        let row_bytes = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_row(meta.root_page, stmt.where_pk)?
+                .ok_or_else(|| DbError::new(format!("fila no existe: PK={}", stmt.where_pk)))?
+        };
+        let row = decode_row(&meta, &row_bytes)?;
+
+        {
+            let mut catalog = Catalog::open(self.pager);
+            let removed = catalog.delete_row(meta.root_page, stmt.where_pk)?;
+            if !removed {
+                // Should not happen given the get_row above, but cover the race
+                // for completeness.
+                return Err(DbError::new(format!(
+                    "fila no existe: PK={}",
+                    stmt.where_pk
+                )));
+            }
         }
+
+        for idx in &meta.indexes {
+            let column = meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let value = row
+                .get(&normalize_ident(&column.name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let bytes = encode_column_value(column, &value)?;
+            index_remove_pk(self.pager, idx.root_page, &bytes, stmt.where_pk)?;
+        }
+
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -686,6 +778,35 @@ pub(crate) fn index_upsert_pk(
     let payload = encode_bucket(&bucket)?;
     tree.upsert(idx_root, key, payload)?;
     Ok(())
+}
+
+/// Remove `(value_bytes, pk)` from the bucket at `hash(value_bytes)`. If
+/// the bucket becomes empty after the removal we delete the leaf entry
+/// outright; otherwise we re-write the smaller bucket. Returns whether
+/// an entry was actually removed.
+pub(crate) fn index_remove_pk(
+    pager: &mut Pager,
+    idx_root: u32,
+    value_bytes: &[u8],
+    pk: i64,
+) -> DbResult<bool> {
+    let key = hash_value(value_bytes);
+    let mut tree = Tree::new(pager);
+    let Some(bytes) = tree.get(idx_root, key)? else {
+        return Ok(false);
+    };
+    let mut bucket = decode_bucket(&bytes)?;
+    let removed = bucket_remove(&mut bucket, value_bytes, pk);
+    if !removed {
+        return Ok(false);
+    }
+    if bucket.is_empty() {
+        tree.delete(idx_root, key)?;
+    } else {
+        let payload = encode_bucket(&bucket)?;
+        tree.upsert(idx_root, key, payload)?;
+    }
+    Ok(true)
 }
 
 fn normalize_ident(value: &str) -> String {

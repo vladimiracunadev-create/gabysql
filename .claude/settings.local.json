@@ -17,7 +17,8 @@
       "Bash(git commit -m 'ci\\(security\\): harden CI and add security/workflow-security/stale pipelines *)",
       "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/app\" -w /app rhysd/actionlint:1.7.7 -color)",
       "Bash(echo \"exit=$?\")",
-      "Bash(git commit -m 'ci\\(security\\): swap sed indent for bash parameter expansion \\(SC2001\\) *)"
+      "Bash(git commit -m 'ci\\(security\\): swap sed indent for bash parameter expansion \\(SC2001\\) *)",
+      "Bash(git commit -m 'feat\\(sql\\): maintain secondary indexes on INSERT, UPDATE, DELETE *)"
     ]
   }
 }
