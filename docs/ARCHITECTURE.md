@@ -60,7 +60,7 @@ graph LR
 ### `src/storage.rs`
 Responsable de:
 - crear (sin sobrescribir) y abrir archivos `.db`; expone `create_force` para reset explícito
-- mantener el header del formato `VERSION=3`
+- mantener el header del formato `VERSION=6` (rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md))
 - gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
 - finalizar el checksum antes de cada flush y verificarlo al leer
 - escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`
@@ -80,9 +80,12 @@ Responsable de:
 Responsable de:
 - registrar tablas usando hashing **FNV-1a-64** (estable entre versiones de Rust)
 - leer schema y resolver páginas raíz de cada tabla
-- validar `CREATE TABLE` (PK obligatoria, escalar `INT`)
-- persistir la lista de `IndexMeta { name, column, root_page }` en `TableMeta`
-- exponer `insert_row`, `upsert_row`, `delete_row`, `get_row`, `scan_rows`, `range_rows`
+- validar `CREATE TABLE` (PK obligatoria, escalar `INT`; identificadores `[A-Za-z_][A-Za-z0-9_]*`, ≤ 64 chars, no reservados)
+- persistir `Column { name, type, not_null, default?, references? }` con flags por bit (`0x01` NOT NULL, `0x02` HAS_DEFAULT, `0x04` HAS_FK) — VERSION 6
+- persistir la lista de `IndexMeta { name, column, root_page, unique }` en `TableMeta`
+- persistir `ForeignKeyMeta { table, column, on_delete: RESTRICT|CASCADE }` por columna
+- validar FK targets al DDL (target table existe o es self-ref, target column es la PK del target, tipos coinciden)
+- exponer `insert_row`, `upsert_row`, `delete_row`, `get_row`, `scan_rows`, `range_rows`, `remove_table`
 
 ### `src/index.rs`
 Responsable de los **índices secundarios**:
@@ -90,15 +93,21 @@ Responsable de los **índices secundarios**:
 - `encode_column_value` — representación canónica del valor (NULL = `[0]`, valor presente = `[1] + bytes_del_tipo`)
 - codec del bucket: `[count:u16] + N × ([vlen:u16][value][pk:i64])`
 - `bucket_insert / bucket_remove / bucket_lookup` con semántica idempotente para multivalor
+- `bucket_unique_conflict` — usado por el path UNIQUE para detectar colisiones (NULL no colisiona)
 - `validate_indexable` — rechaza columnas `JSON` (sin semántica canónica de igualdad)
 
 ### `src/sql.rs`
 Responsable de:
 - tokenizar SQL
-- parsear `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`
+- parsear `CREATE TABLE` (con constraints inline), `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `INSERT`, `SELECT` (con `ORDER BY`), `UPDATE`, `DELETE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INTEGRITY CHECK`
 - validar tipos y filtros (`WHERE pk = ...`, `WHERE pk BETWEEN ...`, `WHERE col_indexada = ...`)
-- serializar y deserializar filas
-- ejecutar las sentencias contra el `Engine`: `UPDATE` re-codifica la fila completa y rechaza mutar la PK; `DELETE` retorna error si la PK no existe; `CREATE INDEX` hace backfill antes de publicar el índice; `INSERT/UPDATE/DELETE` mantienen automáticamente todos los índices secundarios afectados
+- serializar y deserializar filas (con tolerancia a EOF para columnas trailing ausentes — habilita `ALTER ADD COLUMN` sin reescritura)
+- ejecutar las sentencias contra el `Engine`:
+    - `INSERT` aplica DEFAULTs, valida NOT NULL, pre-check de UNIQUE y FK antes de tocar disco; mantiene índices secundarios.
+    - `UPDATE` re-codifica la fila, valida NOT NULL/UNIQUE/FK sobre las columnas cambiadas, rechaza mutar la PK.
+    - `DELETE` resuelve cascade/restrict (`delete_with_cascade` con worklist + visited set para cycles); mantiene índices.
+    - `CREATE [UNIQUE] INDEX` hace backfill antes de publicar el índice; UNIQUE aborta en duplicados.
+    - `INTEGRITY CHECK` barre páginas (CRC), filas (decode), entradas de índice (PK existe), FKs (parent existe).
 
 ### `src/server.rs`
 Responsable de:
@@ -144,10 +153,15 @@ Las mejoras naturales siguientes son:
 - ~~checksums por página~~ ✅ entregado (CRC32-IEEE en trailer)
 - ~~B+Tree multinivel real~~ ✅ entregado (LEAF + INTERNAL con root estable)
 - ~~índices secundarios (una columna, equality)~~ ✅ entregado
-- índices compuestos y `UNIQUE` declarativo
+- ~~`NOT NULL` / `DEFAULT` / `UNIQUE` declarativos~~ ✅ entregado (VERSION 5)
+- ~~`DROP TABLE` + `ALTER TABLE ADD COLUMN`~~ ✅ entregado
+- ~~`FOREIGN KEY` declarativas + enforced (RESTRICT / CASCADE)~~ ✅ entregado (VERSION 6)
+- ~~`INTEGRITY CHECK` operacional~~ ✅ entregado
+- ~~`ORDER BY <col> [ASC|DESC]`~~ ✅ entregado
+- ~~crash tests dirigidos (kill -9 entre WAL y file flush)~~ ✅ entregado
+- índices compuestos
 - range scan por índice secundario
-- comando `integrity_check` que recorra el B+Tree y revalide CRCs
-- planner básico (decidir entre PK lookup, índice, full scan)
-- `ORDER BY` y `GROUP BY`
+- planner básico (decidir entre PK lookup, índice, full scan; hoy es deterministic dispatch)
+- `JOIN` y `GROUP BY`
 - mejor locking entre procesos
 - política formal de migración entre versiones del formato en disco

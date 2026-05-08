@@ -14,9 +14,11 @@
 | **Pager / WAL** | Páginas de 4096 B con CRC32-IEEE en trailer, after-image WAL con replay validado por checksum. |
 | **B+Tree** | Hojas + nodos internos, root-stable splits con técnica copy-up. Lookup O(log N). |
 | **Catálogo** | Persistente, hashing FNV-1a-64 fijado en código (estable entre versiones de Rust). |
-| **SQL** | Parser, AST y engine para `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE/DROP INDEX`, **`CREATE/DROP DATABASE`, `SHOW DATABASES`** (estos despachados por server/CLI). |
-| **Modelador web** | `gabymodeler`: single-page HTML+JS vanilla (sin npm) para diseñar ER y exportar DDL gabysql. Pareja con `phpgabyadmin`. |
-| **Índices secundarios** | Equality lookup `WHERE col = val` resuelto por bucket hash → filtro exacto → hidratación por PK. |
+| **SQL** | Parser, AST y engine para `CREATE TABLE` (con `PK`/`NOT NULL`/`UNIQUE`/`DEFAULT`/`REFERENCES … ON DELETE RESTRICT\|CASCADE` inline), `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `INSERT`/`SELECT` (con `ORDER BY [ASC\|DESC]`)/`UPDATE`/`DELETE` (con cascade), `CREATE [UNIQUE] INDEX`/`DROP INDEX`, `CREATE/DROP DATABASE`, `SHOW DATABASES`, `INTEGRITY CHECK`. **Todas las constraints son enforced por el engine** — no son meros decoradores. |
+| **Modelador web** | `gabymodeler v2`: single-page HTML+JS vanilla (sin npm) layout **PowerDesigner-style** con Object Browser + Canvas + Result List + Status bar. Check Model continuo con 14 reglas (espejo del validador del engine), SQL Preview en vivo, **reverse-engineering** vía `GET /tables`. Manual con screenshots: [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md). |
+| **FOREIGN KEY enforced** | Single-column FK con validación al DDL (target = PK del parent), pre-check en `INSERT`/`UPDATE`, cascade/restrict en `DELETE` con worklist + cycle protection. |
+| **Índices secundarios** | Equality lookup `WHERE col = val` resuelto por bucket hash → filtro exacto → hidratación por PK. `UNIQUE` con pre-check sin efectos colaterales. |
+| **Crash recovery validado** | 3 tests sintéticos cubren kill-9 entre WAL flush y file flush (replay correcto, WAL sin COMMIT ignorado, replay idempotente). |
 | **Server HTTP/JSON** | Hand-rolled (zero deps), token auth opcional, cap de conexiones, mutex de escritura. |
 | **CI / Supply chain** | `cargo fmt + clippy + test` multi-OS, `cargo audit + cargo deny`, `detect-secrets` (FS + historial), Trojan Source detection, `grype` container scan, `actionlint + zizmor + pin-check` para los workflows mismos. |
 

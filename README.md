@@ -31,11 +31,11 @@
 
 ## 🚦 Estado actual del producto
 
-> **Estado**: 🟢 Base estable  
-> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`, `WHERE PK`, **`WHERE col = val` por columna indexada**, `LIMIT/OFFSET`  
-> **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página  
-> **Formato en disco**: `VERSION = 4` (B+Tree real, hash de catálogo FNV-1a-64 estable, índices secundarios persistidos)  
-> **Portabilidad**: Windows, Linux y macOS por CI  
+> **Estado**: 🟢 Fase 1 (Robustez funcional) cerrada · Fase 2 arrancada  
+> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT … [WHERE …] [ORDER BY <col> [ASC|DESC]] [LIMIT n] [OFFSET n]`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
+> **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página, crash tests dirigidos  
+> **Formato en disco**: `VERSION = 6` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
+> **Portabilidad**: Windows, Linux y macOS por CI · 37/37 tests de integración verdes  
 > **Runtime opcional**: Docker + `docker compose`
 
 ## 🎯 Qué resuelve hoy este repositorio
@@ -78,17 +78,21 @@
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI)*
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
-- `CREATE TABLE`
-- `INSERT`
+- `CREATE TABLE` con constraints inline: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]`
+- `DROP TABLE [IF EXISTS] <name>`
+- `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
+- `INSERT` (aplica DEFAULTs, valida NOT NULL, pre-check de UNIQUE y FK)
 - `SELECT * FROM tabla`
-- `SELECT columnas FROM tabla LIMIT/OFFSET`
+- `SELECT columnas FROM tabla [ORDER BY <col> [ASC|DESC]] LIMIT/OFFSET`
 - `SELECT ... WHERE <pk> = valor`
 - `SELECT ... WHERE <pk> BETWEEN a AND b`
 - `SELECT ... WHERE <col_indexada> = valor` *(usa índice secundario)*
-- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (no permite mutar la PK; mantiene índices)
-- `DELETE FROM <tabla> WHERE <pk> = N` (mantiene índices)
+- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (valida NOT NULL/UNIQUE/FK; mantiene índices)
+- `DELETE FROM <tabla> WHERE <pk> = N` (cascade/restrict según FKs entrantes; mantiene índices)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
+- `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` (backfill aborta en duplicados)
 - `DROP INDEX <nombre>`
+- `INTEGRITY CHECK` (sweep operacional: CRCs + filas + índices + FKs)
 
 ### Tipos soportados
 - `INT`
@@ -104,7 +108,7 @@
 - CLI `gabysql`
 - API `gabysql-server`
 - Admin web `phpgabyadmin` (browse / structure / SQL)
-- **Modelador web `gabymodeler`** (ER → SQL DDL, vanilla HTML+JS, sin npm) — ver [web/modeler/README.md](web/modeler/README.md)
+- **Modelador web `gabymodeler` v2** (ER → SQL DDL, layout PowerDesigner-style, Check Model con 14 reglas, reverse engineering vía `/tables`) — ver [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) (con screenshots) y [web/modeler/README.md](web/modeler/README.md)
 - Docker y `docker compose`
 
 ---
@@ -130,9 +134,10 @@ Entradas principales:
 ```powershell
 cargo build --release --bin gabysql --bin gabysql-server
 cargo run --release --bin gabysql -- init demo.db
-cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);"
-cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);"
-cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users;"
+cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT, active BOOL DEFAULT TRUE);"
+cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,email,name) VALUES (1,'ana@x','Ana');"
+cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users ORDER BY name ASC;"
+cargo run --release --bin gabysql -- exec demo.db "INTEGRITY CHECK;"
 ```
 
 Levantar API:
@@ -161,7 +166,9 @@ php -S localhost:8000 -t web
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | arranque en 3 pasos |
 | [INSTALL.md](INSTALL.md) | instalación y build por sistema operativo |
-| [USER_MANUAL.md](USER_MANUAL.md) | uso diario del producto |
+| [USER_MANUAL.md](USER_MANUAL.md) | uso diario del producto (CLI + server + admin web) |
+| [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) | manual de usuario del modelador ER `gabymodeler v2` (con screenshots) |
+| [web/modeler/README.md](web/modeler/README.md) | overview técnico de `gabymodeler v2` |
 | [RUNBOOK.md](RUNBOOK.md) | operación, backup y recovery |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | resolución de fallos frecuentes |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | matriz de compatibilidad (OS, toolchain, Docker, formato) |
@@ -215,10 +222,12 @@ El repositorio ya fue validado con:
 ## ⚠️ Limitaciones deliberadas
 
 - `UPDATE` y `DELETE` solo aceptan filtro `WHERE <pk> = N` (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
-- Los índices secundarios soportan **una sola columna por índice** y solo equality lookup. Sin índices compuestos, sin `UNIQUE`, sin `partial`, sin range scan por índice secundario.
-- No hay `JOIN`, `ORDER BY`, `GROUP BY` ni planner cost-based.
-- La PK debe ser una sola columna `INT`.
-- `JSON` no es indexable.
+- Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); índices compuestos y range scan por índice secundario quedan para Fase 2.
+- `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
+- `ORDER BY` ya está soportado; **`JOIN` y `GROUP BY` no** (Fase 2/3).
+- Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).
+- La PK debe ser una sola columna `INT`. `ALTER TABLE ADD COLUMN` no admite agregar PK.
+- `JSON` no es indexable (sin semántica de igualdad canónica).
 - No hay MVCC ni locking fuerte entre procesos.
 - El servidor cap por defecto a 64 conexiones simultáneas (`-max-connections N` para ajustar).
 

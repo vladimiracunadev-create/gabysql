@@ -35,7 +35,8 @@
 ### Aprendizaje / referencia
 - [USE_CASES](USE_CASES.md) — recetas
 - [SQL_REFERENCE](SQL_REFERENCE.md) — railroad diagrams + EBNF
-- [Modelador web `gabymodeler`](../web/modeler/README.md) — ER drag&drop → SQL DDL
+- [Modelador web `gabymodeler v2` — Manual de usuario](../web/modeler/USER_MANUAL.md) — walkthrough con screenshots
+- [Modelador web `gabymodeler v2` — Overview técnico](../web/modeler/README.md) — ER drag&drop → SQL DDL
 
 ### Técnico / maintainer
 - [ARCHITECTURE](ARCHITECTURE.md)
@@ -57,6 +58,7 @@
 | Beginner Guide | Principiantes | recorrido corto para levantar `gabysql` | [Abrir](BEGINNERS_GUIDE.md) |
 | Install | Todos | instalación y build por sistema operativo | [Abrir](../INSTALL.md) |
 | User Manual | Usuarios y técnicos | uso de CLI, server y admin web | [Abrir](../USER_MANUAL.md) |
+| Modeler User Manual | Usuarios | manual visual del modelador `gabymodeler v2` con screenshots | [Abrir](../web/modeler/USER_MANUAL.md) |
 | Runbook | Operadores | arranque, smoke, backup y recovery | [Abrir](../RUNBOOK.md) |
 | Troubleshooting | Todos | fallos frecuentes y resolución | [Abrir](../TROUBLESHOOTING.md) |
 

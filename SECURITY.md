@@ -14,8 +14,8 @@
 
 | Línea | Estado | Formato en disco |
 |---|---|---|
-| `0.1.x` (último binario en `main`) | soportada | `VERSION = 3` |
-| `0.1.x` previo al cierre de hallazgos críticos del MVP | sin soporte de seguridad | `VERSION = 1` o `2` |
+| `0.1.x` (último binario en `main`) | soportada | `VERSION = 6` |
+| `0.1.x` previos | sin soporte de seguridad | `VERSION = 1` a `5` (cada bump rechaza explícitamente las DBs anteriores; ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco)) |
 | implementación previa al rewrite en Rust | no soportada | n/a |
 
 > Cualquier reporte de vulnerabilidad debe estar reproducido contra el `HEAD` de `main` o el último release publicado. No se publicarán parches retroactivos para versiones anteriores del formato en disco.

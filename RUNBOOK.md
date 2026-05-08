@@ -40,13 +40,25 @@ Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' 
 
 ### Ejecutar SQL
 ```powershell
-Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body '{"db":"demo.db","sql":"CREATE TABLE users (id INT PRIMARY KEY, name TEXT);"}' http://localhost:8080/exec
+Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body '{"db":"demo.db","sql":"CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT);"}' http://localhost:8080/exec
 ```
 
 ### Leer filas
 ```powershell
 Invoke-WebRequest -UseBasicParsing "http://localhost:8080/rows?db=demo.db&table=users&limit=25&offset=0"
 ```
+
+### Inspeccionar schema completo (constraints + FKs + índices)
+```powershell
+Invoke-WebRequest -UseBasicParsing "http://localhost:8080/tables?db=demo.db"
+Invoke-WebRequest -UseBasicParsing "http://localhost:8080/schema?db=demo.db&table=users"
+```
+
+### Sweep de integridad (post-restore o periódico)
+```powershell
+Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body '{"db":"demo.db","sql":"INTEGRITY CHECK;"}' http://localhost:8080/exec
+```
+Devuelve un ResultSet con filas `(kind, object, detail)` por hallazgo y `message` resumen `OK · ... | FAIL · ...`. Si hay `page_corrupt` o `row_decode`, restore desde backup.
 
 ---
 

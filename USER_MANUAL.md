@@ -34,8 +34,8 @@ gabysql repl <file.db>
 ```powershell
 cargo run --release --bin gabysql -- init demo.db
 cargo run --release --bin gabysql -- info demo.db
-cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);"
-cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);"
+cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT, active BOOL DEFAULT TRUE);"
+cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,email,name) VALUES (1,'ana@x','Ana');"
 cargo run --release --bin gabysql -- exec demo.db "SELECT id,name FROM users WHERE id = 1;"
 ```
 
@@ -43,17 +43,40 @@ cargo run --release --bin gabysql -- exec demo.db "SELECT id,name FROM users WHE
 
 ## 2. 🧾 SQL soportado
 
-### DDL
+### DDL — `CREATE TABLE` con constraints inline
 ```sql
 CREATE TABLE users (
-  id INT PRIMARY KEY,
-  name TEXT,
-  active BOOL,
-  score FLOAT,
-  born DATE,
-  meta JSON
+  id     INT  PRIMARY KEY,
+  email  TEXT NOT NULL UNIQUE,
+  name   TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  active BOOL DEFAULT TRUE,
+  born   DATE,
+  meta   JSON
+);
+
+CREATE TABLE orders (
+  id      INT   PRIMARY KEY,
+  user_id INT   REFERENCES users(id) ON DELETE CASCADE,
+  total   FLOAT,
+  tries   INT   DEFAULT 0
 );
 ```
+
+Constraints disponibles por columna (gabysql `VERSION 6+`):
+- `PRIMARY KEY` — una sola, debe ser `INT`, implícitamente `NOT NULL`.
+- `NOT NULL` — rechaza `NULL` literal y omisión sin DEFAULT.
+- `UNIQUE` — auto-genera índice unique `uq_<tabla>_<col>`. Múltiples NULL permitidos.
+- `DEFAULT <literal>` — INT/FLOAT/BOOL/TEXT/DATE/DATETIME/JSON o `NULL`. Tipo validado al CREATE.
+- `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]` — single-column FK; el target debe ser la PK del parent.
+
+### DDL — `DROP TABLE` y `ALTER TABLE`
+```sql
+DROP TABLE [IF EXISTS] <name>;
+ALTER TABLE <name> ADD [COLUMN] <coldef>;
+```
+- `DROP TABLE` quita la entrada del catálogo (las páginas backing no se liberan; reclamo futuro vía `vacuum`).
+- `ALTER TABLE ADD COLUMN` no reescribe filas previas; éstas se decodifican con el `DEFAULT` de la columna nueva (o `NULL`). El rewrite ocurre naturalmente en el siguiente `UPDATE`. Restricciones: no admite `PRIMARY KEY`; `NOT NULL` requiere `DEFAULT` no nulo; `UNIQUE` con DEFAULT no nulo se rechaza si la tabla tiene > 1 fila.
 
 ### DDL de bases de datos (server multi-DB / CLI)
 ```sql
@@ -66,33 +89,43 @@ DROP DATABASE IF EXISTS analytics;
 
 ### DML
 ```sql
-INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);
+INSERT INTO users (id,email,name) VALUES (1,'ana@x','Ana');
+INSERT INTO orders (id,user_id,total) VALUES (10,1,99.5);
+
 SELECT * FROM users;
 SELECT id,name FROM users WHERE id = 1;
 SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;
+
+-- ORDER BY (cualquier columna, sort en memoria post-scan)
+SELECT id,name FROM users ORDER BY name ASC;
+SELECT id,name FROM users ORDER BY score DESC LIMIT 10;
+
 UPDATE users SET name = 'Ana M', active = FALSE WHERE id = 1;
-DELETE FROM users WHERE id = 1;
+DELETE FROM users WHERE id = 1;       -- cascade si hay FKs entrantes
 ```
+
+`INSERT` aplica DEFAULTs para columnas omitidas, valida `NOT NULL`, hace pre-check de `UNIQUE` y `FK` antes de tocar disco. `UPDATE` revalida sólo las constraints cuyas columnas cambiaron. `DELETE` resuelve cascade/restrict según FKs entrantes (worklist con cycle protection).
 
 ### Índices secundarios
 ```sql
--- Crear un índice secundario sobre una columna no-PK.
--- Si la tabla ya tiene filas, el índice se backfillea automáticamente.
-CREATE INDEX idx_users_name ON users (name);
-
--- Una vez creado, las búsquedas por igualdad sobre la columna usan el índice.
-SELECT * FROM users WHERE name = 'Ana';
-
--- Eliminar el índice. Vuelve a fallar el SELECT por esa columna.
-DROP INDEX idx_users_name;
+CREATE INDEX        idx_users_name ON users (name);
+CREATE UNIQUE INDEX uq_users_email ON users (email);   -- aborta si hay duplicados
+DROP   INDEX        idx_users_name;
 ```
 
-Reglas de los índices secundarios:
+Reglas:
 - una sola columna por índice (no compuestos).
 - soportan equality (`=`), no rangos ni `BETWEEN`.
 - se mantienen automáticamente al `INSERT`, `UPDATE` (cuando cambia la columna indexada) y `DELETE`.
-- **no admiten** columnas `JSON` (sin semántica canónica de igualdad).
+- **no admiten** columnas `JSON`.
 - el nombre del índice debe ser único en toda la base de datos.
+- `UNIQUE` permite múltiples `NULL` (consistente con SQL estándar).
+
+### Operacional — `INTEGRITY CHECK`
+```sql
+INTEGRITY CHECK;
+```
+Sweep de solo lectura: valida CRCs de cada página, decodifica cada fila, verifica que cada entrada de índice apunte a una PK existente y que cada FK no nula tenga su parent. Devuelve un ResultSet `(kind, object, detail)` con los hallazgos y un `message` resumen `OK · ... | FAIL · ...`. Recomendado tras un crash, restore o como sanity check periódico.
 
 ### Tipos soportados
 - `INT`
@@ -104,15 +137,21 @@ Reglas de los índices secundarios:
 - `JSON`
 - `NULL` para columnas no PK
 
+### Identificadores
+- Forma léxica: `[A-Za-z_][A-Za-z0-9_]*`
+- Longitud máxima: **64**
+- No pueden ser palabras reservadas del parser (lista completa en [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md#-identificadores)).
+
 ### Reglas importantes
 - La PK debe ser **una sola columna `INT`**. Esta versión no soporta PKs compuestas ni de otros tipos.
-- `PRIMARY KEY` no puede ser `NULL`.
+- `PRIMARY KEY` no puede ser `NULL` y es implícitamente `NOT NULL`.
 - PK duplicada se rechaza al `INSERT`.
 - `WHERE col = val` funciona sobre la PK siempre, y sobre cualquier otra columna **solo si tiene un índice secundario**.
-- `WHERE col BETWEEN a AND b` solo funciona sobre la PK (sin range scan en índices secundarios todavía).
+- `WHERE col BETWEEN a AND b` solo funciona sobre la PK (range scan secundario es Fase 2).
 - `UPDATE` y `DELETE` solo aceptan `WHERE pk = N`, no por columna no-PK.
 - `UPDATE` no permite cambiar la PK; intentarlo devuelve error explícito.
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error (no son no-ops silenciosos).
+- `DELETE` en una tabla con FKs entrantes aplica cascade/restrict según `ON DELETE` declarado.
 
 ---
 
@@ -160,9 +199,9 @@ cargo run --release --bin gabysql-server -- -dir ./dbs -max-connections 32
 
 ---
 
-## 5. 📐 `gabymodeler` — modelador web
+## 5. 📐 `gabymodeler v2` — modelador web (PowerDesigner-style)
 
-`gabymodeler` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) para diseñar esquemas y exportarlos como SQL DDL listo para `gabysql`.
+`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 6`.
 
 ### Levantarlo
 ```bash
@@ -175,16 +214,15 @@ o con `php -S`:
 php -S localhost:8000 -t web
 ```
 
-### Flujo
-1. Click en `＋ Nueva entidad` para cada tabla.
-2. Define columnas con su tipo, marca `PK` (que se fija a `INT` automáticamente) y `idx` para indexar.
-3. (Opcional) Botón `↪ FK` agrega una columna que apunta a `tabla.columna` de otra entidad — se dibuja una línea Bezier y se documenta como comentario en el SQL (FK declarativas no son enforced en `VERSION 4`).
-4. `Exportar SQL` → modal con `CREATE DATABASE [IF NOT EXISTS]` + `CREATE TABLE` + `CREATE INDEX`.
-5. Copia o descarga el `.sql` y pégalo en `phpgabyadmin → tab SQL` para ejecutarlo.
+### Capacidades
+- **Constraints inline por columna**: `PK`, `NOT NULL` (NN), `UNIQUE` (UN), `DEFAULT <literal>`, `FOREIGN KEY` (FK con `ON DELETE RESTRICT|CASCADE`).
+- **Check Model continuo** con 14 reglas (PK ausente, identificador inválido o reservado, NOT NULL+DEFAULT NULL, FK rota, type mismatch, etc.). Cada hallazgo es clickeable y selecciona la entidad/columna.
+- **SQL Preview en vivo** (panel inferior) + modal `Ver SQL` con copiar/descargar. El DDL emitido respeta orden topológico (parents antes que children) e incluye todas las constraints inline.
+- **↘ Importar de gabysql**: dado URL del server + DB, hace `GET /tables?db=<db>` y reconstruye entidades, columnas, constraints y FKs. CORS habilitado en el server desde VERSION 6.
+- **Persistencia local** (`localStorage` con clave `gabymodeler.v2`; migración automática desde la v1 vieja).
 
-El modelo se persiste en `localStorage` (clave `gabymodeler.v1`); botón `📦 Cargar ejemplo` carga un schema `users + orders` con FK indexada para evaluar el flujo en 1 click.
-
-Detalle completo en [web/modeler/README.md](web/modeler/README.md).
+### Manual completo con screenshots
+👉 **[web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md)** — walkthrough end-to-end de cada surface con capturas reales.
 
 ---
 

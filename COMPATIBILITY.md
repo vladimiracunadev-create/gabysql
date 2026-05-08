@@ -48,8 +48,10 @@
 
 | `VERSION` del header | Estado | Notas |
 | :--- | :--- | :--- |
-| `4` | 🟢 Actual | B+Tree + CRC32 + FNV-1a-64 + índices secundarios (TableMeta extendido). |
-| `3` | 🔴 Rechazado | Sin índices secundarios. Recrear DB con binario actual. |
+| `6` | 🟢 Actual | Agrega `FOREIGN KEY` por columna (target table + column + ON DELETE RESTRICT/CASCADE). |
+| `5` | 🔴 Rechazado | Agregaba `NOT NULL` + `DEFAULT` por columna y `unique` por índice. Recrear DB con binario actual. |
+| `4` | 🔴 Rechazado | Sin constraints declarativas. Recrear DB. |
+| `3` | 🔴 Rechazado | Sin índices secundarios. Recrear DB. |
 | `2` | 🔴 Rechazado | Sin CRC. Recrear DB. |
 | `1` | 🔴 Rechazado | Hash `DefaultHasher` no estable. Recrear DB. |
 

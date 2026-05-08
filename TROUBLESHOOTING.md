@@ -37,14 +37,70 @@ cargo run --release --bin gabysql -- init demo.db
 
 ---
 
-## 🔢 `unsupported gabysql file format: version=N (expected 3)`
+## 🔢 `unsupported gabysql file format: version=N (expected 6)`
 
 ### Causa
-Intentas abrir un archivo con una versión de formato anterior. Las versiones `1` y `2` quedaron explícitamente fuera de la versión actual (`1` usaba `DefaultHasher` no estable; `2` no tenía CRC por página).
+Intentas abrir un archivo con una versión de formato anterior. La versión actual es `6`. Las versiones `1` a `5` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
 
 ### Solución
 - Re-crear la base con el binario actual: `gabysql init <file.db>`.
 - Si tenías datos en la DB vieja, exportarlos antes con la versión que la creó (no hay aún herramienta automatizada de migración).
+
+---
+
+## 🛡️ `columna 'X' es NOT NULL; INSERT no la cubre`
+
+### Causa
+Una columna declarada `NOT NULL` quedó ausente del `INSERT` y no tiene `DEFAULT`, o se le pasó `NULL` literal.
+
+### Solución
+- Pasar un valor explícito en el `INSERT`, o
+- Declarar `DEFAULT <literal>` en el `CREATE TABLE` para que el motor rellene la columna cuando se omita.
+
+---
+
+## 🔁 `violación de UNIQUE en índice 'uq_t_c' (PK existente: N)`
+
+### Causa
+El `INSERT`/`UPDATE` intenta colocar un valor que ya existe en otra fila para una columna `UNIQUE` (inline o `CREATE UNIQUE INDEX`). El pre-check del motor lo rechaza **antes de tocar disco**, así que la transacción queda intacta.
+
+### Solución
+- Cambiar el valor a uno único, o
+- Buscar la PK ofensora (`N`) y decidir si se actualiza o se borra esa fila.
+
+---
+
+## 🔗 `violación de FK: 'X.col' = N no existe en 'Y'`
+
+### Causa
+El `INSERT`/`UPDATE` apunta a un parent que no existe en la tabla referenciada. Las FKs no se autocompletan ni se ignoran.
+
+### Solución
+- Verificar que el parent exista con `SELECT * FROM <parent> WHERE id = N`.
+- Si la columna debe poder estar vacía, declararla nullable y dejar `NULL`.
+
+---
+
+## 🚫 `violación de FK: 'X.col' referencia 'Y' (ON DELETE RESTRICT, M fila(s) afectadas)`
+
+### Causa
+Estás intentando borrar un parent que todavía tiene filas hijas, y la FK fue declarada (o tomó el default) `ON DELETE RESTRICT`.
+
+### Solución
+- Borrar primero las filas hijas, o
+- Re-declarar la FK con `ON DELETE CASCADE` (requiere recrear la tabla; en esta versión no hay `ALTER TABLE ... DROP CONSTRAINT`).
+
+---
+
+## 🩺 `INTEGRITY CHECK` reporta hallazgos
+
+### Causa
+El sweep operacional detectó algo: CRC inválido, fila no decodificable, entrada de índice huérfana o FK colgada. Los `kind` posibles están en [docs/SQL_REFERENCE.md §INTEGRITY CHECK](docs/SQL_REFERENCE.md#integrity-check).
+
+### Solución
+- `page_corrupt` o `row_decode` → restore desde backup; el archivo está físicamente comprometido.
+- `orphan_index_entry` → suele indicar un crash entre escritura del índice y la fila; `DROP INDEX` + `CREATE INDEX` reconstruye limpio.
+- `fk_target_missing` o `fk_orphan` → datos inconsistentes; arreglar manualmente con `INSERT` del parent o `DELETE` de las hijas.
 
 ---
 

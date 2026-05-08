@@ -40,20 +40,23 @@ cargo build --release --bin gabysql --bin gabysql-server
 cargo run --release --bin gabysql -- init demo.db
 ```
 
-### 3. Crear tabla
+### 3. Crear tabla con constraints
 ```powershell
-cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);"
+cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT, active BOOL DEFAULT TRUE);"
 ```
+
+> Acabás de declarar `NOT NULL`, `UNIQUE` y `DEFAULT` inline. El motor los enforza al `INSERT`/`UPDATE`. Para FOREIGN KEYs ver paso 7b.
 
 ### 4. Insertar datos
 ```powershell
-cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);"
-cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,name,active) VALUES (2,'Beto',FALSE);"
+cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,email,name) VALUES (1,'ana@x','Ana');"
+cargo run --release --bin gabysql -- exec demo.db "INSERT INTO users (id,email,name,active) VALUES (2,'beto@x','Beto',FALSE);"
 ```
 
 ### 5. Consultar
 ```powershell
 cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users;"
+cargo run --release --bin gabysql -- exec demo.db "SELECT id,name FROM users ORDER BY name ASC LIMIT 10;"
 ```
 
 ### 6. Modificar y borrar
@@ -72,18 +75,33 @@ cargo run --release --bin gabysql -- exec demo.db "SELECT * FROM users WHERE nam
 
 Con el índice creado, los `SELECT WHERE name = ...` ya no requieren full scan.
 
-### 7. Levantar API
+### 7. Tabla hija con FOREIGN KEY
+```powershell
+cargo run --release --bin gabysql -- exec demo.db "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id) ON DELETE CASCADE, total FLOAT, tries INT DEFAULT 0);"
+cargo run --release --bin gabysql -- exec demo.db "INSERT INTO orders (id,user_id,total) VALUES (10,1,99.5);"
+```
+
+Ahora `DELETE FROM users WHERE id = 1` arrastra automáticamente la order 10 (cascade). Sin la FK, podrías borrar el usuario y dejar orders huérfanas.
+
+### 7b. Verificar consistencia
+```powershell
+cargo run --release --bin gabysql -- exec demo.db "INTEGRITY CHECK;"
+```
+
+Sweep operacional: valida CRCs, decodifica filas, chequea índices y FKs. Devuelve `OK · ...` o lista los hallazgos.
+
+### 8. Levantar API
 ```powershell
 cargo run --release --bin gabysql-server -- -db demo.db -addr :8080
 ```
 
-### 8. Abrir el modelador ER
+### 9. Abrir el modelador ER
 ```powershell
 # Si ya tienes php -S corriendo o docker compose up:
 # http://localhost:8000/modeler/
 ```
 
-`gabymodeler` te deja diseñar entidades drag&drop y exportar el DDL completo (`CREATE DATABASE` + `CREATE TABLE` + `CREATE INDEX`) listo para pegar en `phpgabyadmin`. Click `📦 Cargar ejemplo` para ver el formato esperado.
+`gabymodeler v2` (PowerDesigner-style) te deja diseñar entidades drag&drop con todas las constraints (PK, NOT NULL, UNIQUE, DEFAULT, FK con ON DELETE) y exportar el DDL completo. También importa schemas existentes desde el server real con **↘ Importar de gabysql**. Manual completo con screenshots: [web/modeler/USER_MANUAL.md](../web/modeler/USER_MANUAL.md).
 
 ### 9. Abrir admin web
 En otra terminal:
