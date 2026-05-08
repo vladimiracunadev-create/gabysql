@@ -11,10 +11,13 @@
 //!   reusando su `write_lock`, su tope de conexiones y su authz por bearer.
 
 use std::env;
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:7878";
 const PROTO_VERSION: &str = "2024-11-05";
@@ -54,6 +57,11 @@ fn print_help() {
            --server URL    URL del gabysql-server (default {DEFAULT_SERVER})\n\
            --token T       Bearer token para el server. Override de GABYSQL_TOKEN.\n\
            --read-only     Rechaza la tool gabysql_execute (mutaciones) sin tocar la red.\n\
+           --audit-log P   Ruta a un archivo JSONL donde anexar cada llamada\n\
+                           mutadora (gabysql_execute, INTEGRITY CHECK). Captura\n\
+                           clientInfo de initialize y el campo 'reason' que el\n\
+                           agente puede pasar como justificación semántica.\n\
+                           Override de GABYSQL_AUDIT_LOG. Ver ADR-0012.\n\
            --help, -h      Imprime este texto y sale.\n\
          \n\
          Habla MCP (JSON-RPC 2.0, mensajes delimitados por '\\n') sobre stdio.\n\
@@ -72,12 +80,17 @@ struct Config {
     token: Option<String>,
     read_only: bool,
     show_help: bool,
+    audit_log: Option<PathBuf>,
 }
 
 impl Config {
     fn from_args(argv: &[String]) -> Result<Self, String> {
         let mut server_url = env::var("GABYSQL_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.into());
         let mut token = env::var("GABYSQL_TOKEN").ok().filter(|t| !t.is_empty());
+        let mut audit_log = env::var("GABYSQL_AUDIT_LOG")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(PathBuf::from);
         let mut read_only = false;
         let mut show_help = false;
         let mut i = 1;
@@ -101,6 +114,14 @@ impl Config {
                             .ok_or_else(|| "--token requiere valor".to_string())?,
                     );
                 }
+                "--audit-log" => {
+                    i += 1;
+                    audit_log = Some(PathBuf::from(
+                        argv.get(i)
+                            .cloned()
+                            .ok_or_else(|| "--audit-log requiere ruta".to_string())?,
+                    ));
+                }
                 other => return Err(format!("flag desconocida: {other}")),
             }
             i += 1;
@@ -110,8 +131,24 @@ impl Config {
             token,
             read_only,
             show_help,
+            audit_log,
         })
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Estado runtime (mutable a través del loop) — ADR-0012
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone)]
+struct RuntimeState {
+    client_info: Option<ClientInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientInfo {
+    name: String,
+    version: String,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -482,6 +519,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn run_stdio(cfg: &Config) -> Result<(), String> {
+    let state = Mutex::new(RuntimeState::default());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -497,14 +535,14 @@ fn run_stdio(cfg: &Config) -> Result<(), String> {
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(reply) = dispatch(trimmed, cfg) {
+        if let Some(reply) = dispatch(trimmed, cfg, &state) {
             writeln!(output, "{reply}").map_err(|e| e.to_string())?;
             output.flush().ok();
         }
     }
 }
 
-fn dispatch(raw: &str, cfg: &Config) -> Option<String> {
+fn dispatch(raw: &str, cfg: &Config, state: &Mutex<RuntimeState>) -> Option<String> {
     let req = match json_parse(raw) {
         Ok(j) => j,
         Err(e) => return Some(rpc_error_no_id(-32700, &format!("parse error: {e}"))),
@@ -521,10 +559,10 @@ fn dispatch(raw: &str, cfg: &Config) -> Option<String> {
     }
     let params = req.get("params").cloned().unwrap_or(Json::Obj(Json::obj()));
     let result = match method.as_str() {
-        "initialize" => Ok(handle_initialize()),
+        "initialize" => Ok(handle_initialize(&params, state)),
         "ping" => Ok(Json::Obj(Json::obj())),
         "tools/list" => Ok(handle_tools_list(cfg)),
-        "tools/call" => handle_tools_call(&params, cfg),
+        "tools/call" => handle_tools_call(&params, cfg, state),
         "resources/list" => Ok(handle_resources_list()),
         "resources/read" => handle_resources_read(&params, cfg),
         other => Err(format!("método no soportado: {other}")),
@@ -565,7 +603,25 @@ fn rpc_error_no_id(code: i64, message: &str) -> String {
 // MCP handlers
 // ────────────────────────────────────────────────────────────────────────────
 
-fn handle_initialize() -> Json {
+fn handle_initialize(params: &Json, state: &Mutex<RuntimeState>) -> Json {
+    // Capturamos clientInfo para enriquecer el audit log (ADR-0012). Si el
+    // cliente no manda clientInfo, seguimos — el audit log usa "unknown".
+    if let Some(ci) = params.get("clientInfo") {
+        let name = ci
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let version = ci
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if let Ok(mut s) = state.lock() {
+            s.client_info = Some(ClientInfo { name, version });
+        }
+    }
+
     let mut info = Json::obj();
     info.push(("name".into(), Json::Str(SERVER_NAME.into())));
     info.push(("version".into(), Json::Str(SERVER_VERSION.into())));
@@ -655,8 +711,21 @@ fn handle_tools_list(cfg: &Config) -> Json {
                 "string",
                 "Sentencia DDL/DML (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP)",
             ),
+            (
+                "reason",
+                "string",
+                "Justificación semántica opcional. Si --audit-log está activo, queda registrada con el SQL en el JSONL. Ver ADR-0012.",
+            ),
         ],
         &["sql"],
+    );
+    let audit_tail_schema = schema_object(
+        vec![(
+            "n",
+            "integer",
+            "Cuántas entradas recientes devolver (default 50)",
+        )],
+        &[],
     );
 
     let mut tools = vec![
@@ -694,6 +763,13 @@ fn handle_tools_list(cfg: &Config) -> Json {
          Hace SELECT completo + cálculo de distancia en el gateway (no toca el motor). Métricas: \
          cosine (default), euclidean, dot. Adecuada hasta decenas de miles de filas; ver ADR-0011.",
         vector_search_schema(),
+    ));
+    tools.push(tool_def(
+        "gabysql_audit_tail",
+        "Devuelve las últimas N entradas del audit log (JSONL del gateway). \
+         Útil para que el agente revise qué mutaciones realizó. Sin efecto si \
+         no se lanzó con --audit-log. Ver ADR-0012.",
+        audit_tail_schema,
     ));
 
     let mut out = Json::obj();
@@ -751,7 +827,11 @@ fn vector_search_schema() -> Json {
     Json::Obj(s)
 }
 
-fn handle_tools_call(params: &Json, cfg: &Config) -> Result<Json, String> {
+fn handle_tools_call(
+    params: &Json,
+    cfg: &Config,
+    state: &Mutex<RuntimeState>,
+) -> Result<Json, String> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -769,26 +849,64 @@ fn handle_tools_call(params: &Json, cfg: &Config) -> Result<Json, String> {
         .get("sql")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let body = match name.as_str() {
+    let exec_result = match name.as_str() {
         "gabysql_list_databases" => {
             let resp = http_request(&cfg.server_url, "GET", "/dbs", None, cfg.token.as_deref())?;
             check_http_ok(&resp)?;
-            resp.body
+            Ok(resp.body)
         }
-        "gabysql_describe_database" => describe_database(cfg, db.as_deref())?,
-        "gabysql_query" => exec_via_server(cfg, db.as_deref(), &sql_arg.unwrap_or_default())?,
+        "gabysql_describe_database" => describe_database(cfg, db.as_deref()),
+        "gabysql_query" => {
+            exec_via_server(cfg, db.as_deref(), &sql_arg.clone().unwrap_or_default())
+        }
         "gabysql_execute" => {
             if cfg.read_only {
                 return Err("gabysql_execute deshabilitada (--read-only)".into());
             }
-            exec_via_server(cfg, db.as_deref(), &sql_arg.unwrap_or_default())?
+            exec_via_server(cfg, db.as_deref(), &sql_arg.clone().unwrap_or_default())
         }
-        "gabysql_integrity_check" => exec_via_server(cfg, db.as_deref(), "INTEGRITY CHECK")?,
-        "gabysql_vector_search" => vector_search(cfg, db.as_deref(), &args)?,
+        "gabysql_integrity_check" => exec_via_server(cfg, db.as_deref(), "INTEGRITY CHECK"),
+        "gabysql_vector_search" => vector_search(cfg, db.as_deref(), &args),
+        "gabysql_audit_tail" => {
+            let n = args
+                .get("n")
+                .and_then(|v| if let Json::Num(n) = v { Some(*n as usize) } else { None })
+                .unwrap_or(50);
+            return audit_tail(cfg, n).map(|s| content_text(&s));
+        }
         other => return Err(format!("tool desconocida: {other}")),
     };
 
+    // Audit log para mutaciones — sin efecto si --audit-log no está activo.
+    if matches!(
+        name.as_str(),
+        "gabysql_execute" | "gabysql_integrity_check"
+    ) {
+        let entry = AuditEntry {
+            ts_unix: now_unix(),
+            tool: name.clone(),
+            db: db.clone(),
+            sql: sql_arg.clone(),
+            reason: reason.clone(),
+            client: state.lock().ok().and_then(|s| s.client_info.clone()),
+            ok: exec_result.is_ok(),
+            error: exec_result.as_ref().err().cloned(),
+        };
+        // Append best-effort: si falla escribir el log, no rompemos el flujo
+        // de la tool (el agente ya hizo la llamada al motor).
+        if let Some(path) = cfg.audit_log.as_ref() {
+            if let Err(e) = audit_append(path, &entry) {
+                eprintln!("gabysql-mcp: audit append falló: {e}");
+            }
+        }
+    }
+
+    let body = exec_result?;
     Ok(content_text(&body))
 }
 
@@ -1171,6 +1289,140 @@ fn safe_ident(s: &str) -> Result<(), String> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Audit log enriquecido (ADR-0012)
+//
+// Cada llamada mutadora (gabysql_execute, gabysql_integrity_check) puede
+// dejar una entrada JSON en un archivo JSONL. La entrada lleva:
+//
+//   - ts_unix       (epoch seconds)
+//   - tool          (nombre de la tool MCP)
+//   - db, sql       (qué se ejecutó)
+//   - reason        ("por qué" semántico que el agente puede pasar)
+//   - client        (clientInfo capturado en initialize)
+//   - ok / error    (resultado)
+//
+// El append es best-effort: si el filesystem rompe, el agente ya pegó al
+// motor y no podemos deshacer eso — solo loggeamos a stderr.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct AuditEntry {
+    ts_unix: u64,
+    tool: String,
+    db: Option<String>,
+    sql: Option<String>,
+    reason: Option<String>,
+    client: Option<ClientInfo>,
+    ok: bool,
+    error: Option<String>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn audit_entry_to_json(e: &AuditEntry) -> Json {
+    let mut o = Json::obj();
+    o.push(("ts_unix".into(), Json::Num(e.ts_unix as f64)));
+    o.push(("tool".into(), Json::Str(e.tool.clone())));
+    o.push((
+        "db".into(),
+        match &e.db {
+            Some(s) => Json::Str(s.clone()),
+            None => Json::Null,
+        },
+    ));
+    o.push((
+        "sql".into(),
+        match &e.sql {
+            Some(s) => Json::Str(s.clone()),
+            None => Json::Null,
+        },
+    ));
+    o.push((
+        "reason".into(),
+        match &e.reason {
+            Some(s) => Json::Str(s.clone()),
+            None => Json::Null,
+        },
+    ));
+    o.push((
+        "client".into(),
+        match &e.client {
+            Some(c) => {
+                let mut ci = Json::obj();
+                ci.push(("name".into(), Json::Str(c.name.clone())));
+                ci.push(("version".into(), Json::Str(c.version.clone())));
+                Json::Obj(ci)
+            }
+            None => Json::Null,
+        },
+    ));
+    o.push(("ok".into(), Json::Bool(e.ok)));
+    o.push((
+        "error".into(),
+        match &e.error {
+            Some(s) => Json::Str(s.clone()),
+            None => Json::Null,
+        },
+    ));
+    Json::Obj(o)
+}
+
+fn audit_append(path: &std::path::Path, entry: &AuditEntry) -> Result<(), String> {
+    let line = json_to_string(&audit_entry_to_json(entry));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    writeln!(file, "{line}").map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn audit_tail(cfg: &Config, n: usize) -> Result<String, String> {
+    let path = match cfg.audit_log.as_ref() {
+        Some(p) => p,
+        None => {
+            // Sin audit log activo. Devolvemos respuesta válida y vacía,
+            // no es un error — simplemente no hay nada que mostrar.
+            let mut o = Json::obj();
+            o.push(("ok".into(), Json::Bool(true)));
+            o.push(("enabled".into(), Json::Bool(false)));
+            o.push(("entries".into(), Json::Arr(vec![])));
+            return Ok(json_to_string(&Json::Obj(o)));
+        }
+    };
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("leer {}: {e}", path.display())),
+    };
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    let take = n.min(lines.len());
+    let start = lines.len() - take;
+    let mut entries = Vec::with_capacity(take);
+    for line in &lines[start..] {
+        match json_parse(line) {
+            Ok(j) => entries.push(j),
+            Err(_) => continue, // línea corrupta — la saltamos sin romper
+        }
+    }
+    let mut o = Json::obj();
+    o.push(("ok".into(), Json::Bool(true)));
+    o.push(("enabled".into(), Json::Bool(true)));
+    o.push((
+        "path".into(),
+        Json::Str(path.display().to_string()),
+    ));
+    o.push(("entries".into(), Json::Arr(entries)));
+    Ok(json_to_string(&Json::Obj(o)))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1201,9 +1453,11 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
+        let state = Mutex::new(RuntimeState::default());
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let reply = dispatch(req, &cfg).unwrap();
+        let reply = dispatch(req, &cfg, &state).unwrap();
         let parsed = json_parse(&reply).unwrap();
         assert_eq!(parsed.get("id"), Some(&Json::Num(1.0)));
         let result = parsed.get("result").unwrap();
@@ -1220,8 +1474,11 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
-        let reply = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &cfg).unwrap();
+        let state = Mutex::new(RuntimeState::default());
+        let reply =
+            dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &cfg, &state).unwrap();
         assert!(reply.contains("gabysql_execute"));
         assert!(reply.contains("gabysql_query"));
         assert!(reply.contains("gabysql_integrity_check"));
@@ -1234,8 +1491,11 @@ mod tests {
             token: None,
             read_only: true,
             show_help: false,
+            audit_log: None,
         };
-        let reply = dispatch(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, &cfg).unwrap();
+        let state = Mutex::new(RuntimeState::default());
+        let reply =
+            dispatch(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, &cfg, &state).unwrap();
         assert!(!reply.contains("gabysql_execute"));
         assert!(reply.contains("gabysql_query"));
     }
@@ -1247,10 +1507,13 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
+        let state = Mutex::new(RuntimeState::default());
         let reply = dispatch(
             r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#,
             &cfg,
+            &state,
         )
         .unwrap();
         assert!(reply.contains("gabysql://catalog"));
@@ -1264,8 +1527,11 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
-        let reply = dispatch(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#, &cfg).unwrap();
+        let state = Mutex::new(RuntimeState::default());
+        let reply =
+            dispatch(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#, &cfg, &state).unwrap();
         let parsed = json_parse(&reply).unwrap();
         assert_eq!(parsed.get("id"), Some(&Json::Num(5.0)));
         assert!(matches!(parsed.get("result"), Some(Json::Obj(_))));
@@ -1278,10 +1544,13 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
+        let state = Mutex::new(RuntimeState::default());
         let reply = dispatch(
             r#"{"jsonrpc":"2.0","id":6,"method":"definitely/not/a/method"}"#,
             &cfg,
+            &state,
         )
         .unwrap();
         let parsed = json_parse(&reply).unwrap();
@@ -1295,10 +1564,13 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
+        let state = Mutex::new(RuntimeState::default());
         let reply = dispatch(
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             &cfg,
+            &state,
         );
         assert!(reply.is_none());
     }
@@ -1414,10 +1686,13 @@ mod tests {
             token: None,
             read_only: false,
             show_help: false,
+            audit_log: None,
         };
+        let state = Mutex::new(RuntimeState::default());
         let reply = dispatch(
             r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#,
             &cfg,
+            &state,
         )
         .unwrap();
         assert!(reply.contains("gabysql_vector_search"));
@@ -1433,5 +1708,144 @@ mod tests {
         assert!(parse_vector_json(&bad).is_err());
         let not_arr = json_parse("42").unwrap();
         assert!(parse_vector_json(&not_arr).is_err());
+    }
+
+    #[test]
+    fn initialize_captures_client_info() {
+        let cfg = Config {
+            server_url: DEFAULT_SERVER.into(),
+            token: None,
+            read_only: false,
+            show_help: false,
+            audit_log: None,
+        };
+        let state = Mutex::new(RuntimeState::default());
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "clientInfo":{"name":"claude-desktop","version":"1.2.3"}
+        }}"#;
+        let _ = dispatch(req, &cfg, &state).unwrap();
+        let captured = state.lock().unwrap().client_info.clone().unwrap();
+        assert_eq!(captured.name, "claude-desktop");
+        assert_eq!(captured.version, "1.2.3");
+    }
+
+    #[test]
+    fn audit_append_and_tail_roundtrip() {
+        // Usamos un path único en temp para no chocar con paralelismo de tests.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "gabysql-mcp-audit-{}-{}.jsonl",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config {
+            server_url: DEFAULT_SERVER.into(),
+            token: None,
+            read_only: false,
+            show_help: false,
+            audit_log: Some(path.clone()),
+        };
+
+        let entry = AuditEntry {
+            ts_unix: 1730000000,
+            tool: "gabysql_execute".into(),
+            db: Some("rag.db".into()),
+            sql: Some("INSERT INTO docs VALUES (1, '...')".into()),
+            reason: Some("backfill inicial del corpus".into()),
+            client: Some(ClientInfo {
+                name: "claude-desktop".into(),
+                version: "1.2.3".into(),
+            }),
+            ok: true,
+            error: None,
+        };
+        audit_append(&path, &entry).unwrap();
+
+        let raw = audit_tail(&cfg, 10).unwrap();
+        let parsed = json_parse(&raw).unwrap();
+        assert_eq!(parsed.get("ok"), Some(&Json::Bool(true)));
+        assert_eq!(parsed.get("enabled"), Some(&Json::Bool(true)));
+        let entries = match parsed.get("entries") {
+            Some(Json::Arr(a)) => a.clone(),
+            _ => panic!("entries no es array"),
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].get("reason").and_then(|j| j.as_str()),
+            Some("backfill inicial del corpus")
+        );
+        assert_eq!(
+            entries[0]
+                .get("client")
+                .and_then(|c| c.get("name"))
+                .and_then(|j| j.as_str()),
+            Some("claude-desktop")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_tail_returns_disabled_when_no_log_configured() {
+        let cfg = Config {
+            server_url: DEFAULT_SERVER.into(),
+            token: None,
+            read_only: false,
+            show_help: false,
+            audit_log: None,
+        };
+        let raw = audit_tail(&cfg, 50).unwrap();
+        let parsed = json_parse(&raw).unwrap();
+        assert_eq!(parsed.get("enabled"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn tools_list_includes_audit_tail() {
+        let cfg = Config {
+            server_url: DEFAULT_SERVER.into(),
+            token: None,
+            read_only: false,
+            show_help: false,
+            audit_log: None,
+        };
+        let state = Mutex::new(RuntimeState::default());
+        let reply =
+            dispatch(r#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#, &cfg, &state).unwrap();
+        assert!(reply.contains("gabysql_audit_tail"));
+        assert!(reply.contains("ADR-0012"));
+    }
+
+    #[test]
+    fn audit_append_is_jsonl_one_entry_per_line() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "gabysql-mcp-audit-multi-{}-{}.jsonl",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        for i in 0..3 {
+            let e = AuditEntry {
+                ts_unix: 1730000000 + i,
+                tool: "gabysql_execute".into(),
+                db: None,
+                sql: Some(format!("INSERT INTO t VALUES ({i})")),
+                reason: None,
+                client: None,
+                ok: true,
+                error: None,
+            };
+            audit_append(&path, &e).unwrap();
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            // Cada línea debe ser JSON válido por sí misma.
+            json_parse(line).unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

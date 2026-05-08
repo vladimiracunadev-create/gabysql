@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-05-08 — Decimoctava intervención: audit log enriquecido en el gateway (Fase 5 — AI-native, cierre del trío)
+
+> **Sin bump de formato. Sin cambios al motor.** Tercera y última pieza del trío AI-native sobre el gateway. Justificación completa: [ADR-0012](docs/adr/0012-audit-log-enriquecido.md).
+
+### ✨ Cambio
+- Nuevo flag `--audit-log <ruta>` (también `GABYSQL_AUDIT_LOG`) en [src/bin/gabysql-mcp.rs](src/bin/gabysql-mcp.rs). Si no se pasa, sin log y overhead cero.
+- Nuevo argumento opcional `reason` en `gabysql_execute`: el "por qué" semántico que el agente puede pasar para que quede en el audit.
+- Captura de `clientInfo` (`name` + `version`) en el handshake `initialize` → guardado en `RuntimeState` interno y emitido en cada entrada del log.
+- Cada llamada a `gabysql_execute` y `gabysql_integrity_check` anexa una línea JSON al archivo (formato JSONL):
+  ```json
+  {"ts_unix":1730000000,"tool":"gabysql_execute","db":"rag.db",
+   "sql":"INSERT INTO docs ...","reason":"backfill inicial del corpus",
+   "client":{"name":"claude-desktop","version":"1.2.3"},
+   "ok":true,"error":null}
+  ```
+- Nueva tool **`gabysql_audit_tail(n)`** que devuelve las últimas N entradas. Permite que **el propio agente** revise su historial dentro de la sesión. Si el log no está activo, devuelve `{"enabled":false,"entries":[]}` sin error.
+- Append best-effort: si escribir al archivo falla, va a stderr y la tool sigue devolviendo el resultado del motor (mejor perder una entrada que bloquear escrituras por disco lleno).
+- 5 tests nuevos: captura de clientInfo, append+tail roundtrip con `reason`+`client`, comportamiento con log desactivado, presencia de `gabysql_audit_tail` en `tools/list`, formato JSONL (una entrada por línea, JSON válido por línea).
+
+### 🎯 Por qué este cambio
+Cuando un agente puede escribir en una base, el log del motor responde **el qué** (qué SQL corrió) pero no **el por qué** (qué pidió el usuario, qué identidad tenía el agente, qué razonamiento lo llevó allí). Meter eso en el motor implica bump de formato y que el motor entienda conceptos MCP que no le pertenecen.
+
+Mover el audit al gateway captura el "por qué" exactamente donde el conocimiento existe — el gateway ya sabe quién es el cliente, qué tool se invocó, qué `reason` pasó el agente. Y cierra el loop dándole al propio agente la tool para releer sus acciones. Eso permite patrones de auto-corrección dentro de la misma sesión.
+
+### 🛡️ Cómo se respeta el motor
+- **Cero líneas tocadas en `storage.rs`/`bptree.rs`/`sql.rs`/`catalog.rs`/`server.rs`/`lib.rs`.** Solo crece `src/bin/gabysql-mcp.rs`.
+- **Sin bump de formato.** Sin nuevas deps. `Cargo.toml`/`Cargo.lock` sin tocar.
+- **Opt-in puro.** Sin `--audit-log` el comportamiento es idéntico al gateway pre-ADR — ni un syscall extra.
+- **Retrocompatible**: clientes MCP que no pasan `reason` siguen funcionando sin cambios.
+
+### 📐 ADR
+- [ADR-0012 — Audit log enriquecido en el gateway, no en el motor](docs/adr/0012-audit-log-enriquecido.md). Cierra el trío con [ADR-0010](docs/adr/0010-mcp-gateway.md) (gateway base) y [ADR-0011](docs/adr/0011-vector-search-gateway-side.md) (vectores).
+
+### 🧪 Ejemplo de uso desde un agente MCP
+```bash
+# Server + gateway con audit activo
+gabysql-server -dir ./dbs -token MI_TOKEN
+gabysql-mcp --token MI_TOKEN --audit-log /var/log/gabysql/agent-audit.jsonl
+```
+```json
+{ "method":"tools/call", "params":{
+    "name":"gabysql_execute",
+    "arguments":{
+      "db":"rag.db",
+      "sql":"UPDATE users SET email='nuevo@x.com' WHERE id=42",
+      "reason":"el usuario reportó que su email anterior ya no funciona"
+}}}
+```
+La línea correspondiente del JSONL queda con `reason`, `client`, `sql`, `ok`. Procesable con `jq '.[] | select(.tool=="gabysql_execute")'` o ingestable a cualquier sink.
+
+---
+
 ## 2026-05-07 — Decimoséptima intervención: búsqueda vectorial del lado del gateway (Fase 5 — AI-native, parte 2)
 
 > **Sin bump de formato. Sin cambios al motor.** Esta intervención añade búsqueda vectorial top-k a `gabysql-mcp`. Los vectores se guardan como `TEXT` (`'[0.1,0.2,...]'`); el cómputo ocurre en el binario del gateway. Justificación completa: [ADR-0011](docs/adr/0011-vector-search-gateway-side.md).

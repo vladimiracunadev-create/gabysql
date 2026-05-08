@@ -85,7 +85,12 @@
   - tool `gabysql_vector_search` con métricas cosine/euclidean/dot, top-k configurable
   - **cero bump de formato** — los vectores son `TEXT`, el cómputo ocurre en `gabysql-mcp` en Rust
   - condiciones de salida hacia un `VECTOR(n)` nativo documentadas en el ADR (>100K vectores, demanda de operadores SQL, índice ANN)
-- **Audit log enriquecido** (cada escritura registra el agente y el "por qué" semántico además del SQL) — exploratoria, depende de Fase 5.1
+- ~~**Audit log enriquecido** (cada escritura registra el agente, el "por qué" semántico y el clientInfo además del SQL)~~ ✅ entregado en el gateway (ADR-0012)
+  - flag `--audit-log <path>` (también `GABYSQL_AUDIT_LOG`); opt-in, sin overhead si no se activa
+  - captura `clientInfo` de `initialize` + argumento `reason` opcional en `gabysql_execute`
+  - tool `gabysql_audit_tail(n)` para que el propio agente revise sus acciones
+  - JSONL append-only, procesable con `jq`/`tail`/ingest a S3/ELK
+  - **cero impacto en el motor** — sin bump de formato, sin tocar `storage.rs`/`bptree.rs`/`sql.rs`/`catalog.rs`/`server.rs`
 
 ---
 
