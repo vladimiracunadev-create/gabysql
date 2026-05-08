@@ -15,7 +15,7 @@
 | Hashing del catálogo y de claves de índice | FNV-1a-64 (estable entre versiones de Rust) |
 | Tipos de página B+Tree | `LEAF` (1), `INTERNAL` (2) |
 
-> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios. Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice. Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
 
 ---
 
@@ -88,9 +88,11 @@ Formato actual:
 Cada `TableMeta` contiene:
 - nombre de tabla
 - nombre de PK
-- columnas y tipos
+- columnas con `{ name, type, not_null, default? }`
 - página raíz de la tabla (root de su B+Tree)
-- lista de `IndexMeta { name, column, root_page }` (vacía si la tabla no tiene índices secundarios)
+- lista de `IndexMeta { name, column, root_page, unique }` (vacía si la tabla no tiene índices secundarios)
+
+Layout binario v5 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`. El default se serializa como `[kind:u8] + payload` (kinds: 0 Null, 1 Int, 2 Float, 3 Bool, 4 String).
 
 El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowercase). Una colisión de hash devuelve error explícito al abrir.
 
@@ -116,9 +118,14 @@ Operaciones:
 Restricciones de la versión actual:
 - Una columna por índice (no compuestos).
 - Solo equality (`=`); sin range scan ni `BETWEEN` por índice secundario.
-- Sin `UNIQUE` declarativo.
 - `JSON` no es indexable.
 - El nombre del índice es único en toda la base de datos.
+
+Modo `UNIQUE`:
+- `CREATE UNIQUE INDEX` o constraint inline `column UNIQUE` setean `IndexMeta.unique = true`.
+- En `INSERT`/`UPDATE` se hace pre-check (`bucket_unique_conflict`) antes de tocar disco; si el valor ya está en la tabla con otra PK, se rechaza con error explícito (no se persiste nada).
+- Múltiples `NULL` se permiten (consistente con SQL estándar; `NULL` no es igual a `NULL` para uniqueness).
+- En `CREATE UNIQUE INDEX` el backfill aborta apenas detecta el primer duplicado, sin publicar el índice en el catálogo.
 
 ---
 
@@ -136,12 +143,15 @@ Restricciones de la versión actual:
 
 ## 🧱 Reglas de fila
 
-- la PK debe ser una sola columna `INT` escalar (no se admiten PKs compuestas ni de otros tipos en esta versión)
+- la PK debe ser una sola columna `INT` escalar (no se admiten PKs compuestas ni de otros tipos en esta versión); es implícitamente `NOT NULL`
 - la PK no puede ser `NULL`
 - una PK duplicada devuelve error en `INSERT`
 - `UPDATE` no permite mutar la PK
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error explícito
-- columnas no presentes en `INSERT` quedan en `NULL` cuando aplica
+- columnas no presentes en `INSERT` toman su `DEFAULT` si lo tienen; si no, quedan en `NULL`
+- `NOT NULL`: rechazo en `INSERT` (columna ausente sin DEFAULT, o `NULL` literal) y en `UPDATE` (asignación a `NULL`)
+- `DEFAULT NULL` y `NOT NULL` en la misma columna se rechazan en `CREATE TABLE`
+- el literal de `DEFAULT` debe coincidir con el tipo de la columna (validado en `CREATE TABLE`)
 
 ---
 
@@ -151,7 +161,7 @@ Restricciones de la versión actual:
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI; intercept antes de abrir Pager)*
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
-- `CREATE TABLE`
+- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>`
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ...`
 - `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)
@@ -161,6 +171,7 @@ Restricciones de la versión actual:
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N`
 - `DELETE FROM <tabla> WHERE <pk> = N`
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
+- `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` (backfill aborta en duplicados)
 - `DROP INDEX <nombre>`
 
 ### No soportado todavía
@@ -170,8 +181,7 @@ Restricciones de la versión actual:
 - `LIKE`
 - `WHERE` por columnas no PK ni indexadas
 - `WHERE` sobre columna indexada con operador distinto a `=` (no `BETWEEN`, no `<`/`>`)
-- Índices compuestos
-- Índices `UNIQUE` declarativos
+- Índices compuestos (multi-columna)
 - `UPDATE` / `DELETE` por columnas no PK ni por rango
 
 ---

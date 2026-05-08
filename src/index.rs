@@ -154,6 +154,28 @@ pub fn bucket_lookup(entries: &[(Vec<u8>, i64)], value: &[u8]) -> Vec<i64> {
         .collect()
 }
 
+/// Returns the PK that already owns `value` in a UNIQUE bucket, if any —
+/// excluding `exclude_pk` so callers can skip themselves during UPDATE.
+/// `None` means the value is free and the caller may proceed to insert.
+///
+/// NULL is a special case: SQL UNIQUE allows multiple NULLs, so a bucket
+/// hit on the NULL marker is *not* treated as a conflict here. Callers
+/// pass the canonical encoding produced by `encode_column_value`; the
+/// NULL marker is the single byte `0x00`.
+pub fn bucket_unique_conflict(
+    entries: &[(Vec<u8>, i64)],
+    value: &[u8],
+    exclude_pk: Option<i64>,
+) -> Option<i64> {
+    if value == [0u8] {
+        return None;
+    }
+    entries
+        .iter()
+        .find(|(v, pk)| v.as_slice() == value && Some(*pk) != exclude_pk)
+        .map(|(_, pk)| *pk)
+}
+
 /// Validate that the column type can be used as an index key in this
 /// version. (Today: any of the supported scalar types except JSON, which
 /// has no canonical equality semantics.)

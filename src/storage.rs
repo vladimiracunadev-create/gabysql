@@ -12,7 +12,11 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        and added a per-record CRC to the WAL.
 //   4 -> TableMeta carries a list of secondary indexes; their on-disk
 //        B+Tree pages live alongside the table's own root page.
-pub const VERSION: u32 = 4;
+//   5 -> Column carries `not_null` + optional `DEFAULT` literal; IndexMeta
+//        carries a `unique` flag (auto-set by inline UNIQUE column
+//        constraints and by `CREATE UNIQUE INDEX`). V4 files are rejected
+//        on open — no automatic upgrade.
+pub const VERSION: u32 = 5;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

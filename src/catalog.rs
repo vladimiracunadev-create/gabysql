@@ -70,10 +70,99 @@ impl ColumnType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Literal value usable as a column DEFAULT. Mirrors the variants of
+/// `sql::Value` but lives in the catalog layer so the on-disk encoding
+/// of the catalog is independent of the SQL frontend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefaultLiteral {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+impl DefaultLiteral {
+    fn kind_code(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Integer(_) => 1,
+            Self::Float(_) => 2,
+            Self::Bool(_) => 3,
+            Self::String(_) => 4,
+        }
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) -> DbResult<()> {
+        out.push(self.kind_code());
+        match self {
+            Self::Null => {}
+            Self::Integer(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Self::Float(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Self::Bool(b) => out.push(u8::from(*b)),
+            Self::String(s) => push_string(out, s)?,
+        }
+        Ok(())
+    }
+
+    fn decode(data: &[u8], offset: &mut usize) -> DbResult<Self> {
+        if *offset >= data.len() {
+            return Err(DbError::new("default corrupto (kind)"));
+        }
+        let kind = data[*offset];
+        *offset += 1;
+        Ok(match kind {
+            0 => Self::Null,
+            1 => {
+                if *offset + 8 > data.len() {
+                    return Err(DbError::new("default corrupto (int)"));
+                }
+                let n = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+                *offset += 8;
+                Self::Integer(n)
+            }
+            2 => {
+                if *offset + 8 > data.len() {
+                    return Err(DbError::new("default corrupto (float)"));
+                }
+                let n = f64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+                *offset += 8;
+                Self::Float(n)
+            }
+            3 => {
+                if *offset >= data.len() {
+                    return Err(DbError::new("default corrupto (bool)"));
+                }
+                let b = data[*offset] != 0;
+                *offset += 1;
+                Self::Bool(b)
+            }
+            4 => Self::String(take_string(data, offset)?),
+            _ => return Err(DbError::new("default corrupto (kind desconocido)")),
+        })
+    }
+}
+
+const COLUMN_FLAG_NOT_NULL: u8 = 0x01;
+const COLUMN_FLAG_HAS_DEFAULT: u8 = 0x02;
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
     pub column_type: ColumnType,
+    pub not_null: bool,
+    pub default: Option<DefaultLiteral>,
+}
+
+impl Column {
+    pub fn plain(name: impl Into<String>, column_type: ColumnType) -> Self {
+        Self {
+            name: name.into(),
+            column_type,
+            not_null: false,
+            default: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +170,10 @@ pub struct IndexMeta {
     pub name: String,
     pub column: String,
     pub root_page: u32,
+    pub unique: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
     pub name: String,
     pub primary_key: String,
@@ -111,6 +201,16 @@ impl TableMeta {
             .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
+    /// VERSION = 5 on-disk layout for a TableMeta record:
+    ///
+    ///     [name][primary_key][root_page:u32]
+    ///     [col_count:u16] · col_count × {
+    ///         [name][type_code:u8][flags:u8]
+    ///         flags & 0x02 ? DefaultLiteral payload : ∅
+    ///     }
+    ///     [idx_count:u16] · idx_count × {
+    ///         [name][column][root_page:u32][unique:u8]
+    ///     }
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
         push_string(&mut out, &self.name)?;
@@ -120,13 +220,24 @@ impl TableMeta {
         for column in &self.columns {
             push_string(&mut out, &column.name)?;
             out.push(column.column_type.code());
+            let mut flags = 0u8;
+            if column.not_null {
+                flags |= COLUMN_FLAG_NOT_NULL;
+            }
+            if column.default.is_some() {
+                flags |= COLUMN_FLAG_HAS_DEFAULT;
+            }
+            out.push(flags);
+            if let Some(default) = &column.default {
+                default.encode_into(&mut out)?;
+            }
         }
-        // Secondary indexes (added in format VERSION = 4).
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
         for idx in &self.indexes {
             push_string(&mut out, &idx.name)?;
             push_string(&mut out, &idx.column)?;
             out.extend_from_slice(&idx.root_page.to_le_bytes());
+            out.push(u8::from(idx.unique));
         }
         Ok(out)
     }
@@ -145,32 +256,48 @@ impl TableMeta {
         let mut columns = Vec::with_capacity(count);
         for _ in 0..count {
             let name = take_string(data, &mut offset)?;
-            if offset >= data.len() {
-                return Err(DbError::new("meta de tabla corrupta"));
+            if offset + 2 > data.len() {
+                return Err(DbError::new("meta de tabla corrupta (column header)"));
             }
             let column_type = ColumnType::from_code(data[offset])?;
             offset += 1;
-            columns.push(Column { name, column_type });
+            let flags = data[offset];
+            offset += 1;
+            let not_null = flags & COLUMN_FLAG_NOT_NULL != 0;
+            let default = if flags & COLUMN_FLAG_HAS_DEFAULT != 0 {
+                Some(DefaultLiteral::decode(data, &mut offset)?)
+            } else {
+                None
+            };
+            columns.push(Column {
+                name,
+                column_type,
+                not_null,
+                default,
+            });
         }
-        let mut indexes = Vec::new();
-        if offset + 2 <= data.len() {
-            let idx_count =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
-            for _ in 0..idx_count {
-                let name = take_string(data, &mut offset)?;
-                let column = take_string(data, &mut offset)?;
-                if offset + 4 > data.len() {
-                    return Err(DbError::new("meta de índice corrupta"));
-                }
-                let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-                indexes.push(IndexMeta {
-                    name,
-                    column,
-                    root_page,
-                });
+        if offset + 2 > data.len() {
+            return Err(DbError::new("meta de tabla corrupta (index count)"));
+        }
+        let idx_count = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let mut indexes = Vec::with_capacity(idx_count);
+        for _ in 0..idx_count {
+            let name = take_string(data, &mut offset)?;
+            let column = take_string(data, &mut offset)?;
+            if offset + 5 > data.len() {
+                return Err(DbError::new("meta de índice corrupta"));
             }
+            let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let unique = data[offset] != 0;
+            offset += 1;
+            indexes.push(IndexMeta {
+                name,
+                column,
+                root_page,
+                unique,
+            });
         }
         Ok(Self {
             name,
@@ -315,11 +442,53 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
                     column.name
                 )));
             }
+            if column.default.is_some() {
+                return Err(DbError::new(format!(
+                    "PRIMARY KEY '{}' no admite DEFAULT en esta versión",
+                    column.name
+                )));
+            }
             pk_ok = true;
+        }
+
+        // NOT NULL + DEFAULT NULL is contradictory.
+        if column.not_null && matches!(column.default, Some(DefaultLiteral::Null)) {
+            return Err(DbError::new(format!(
+                "columna '{}': NOT NULL incompatible con DEFAULT NULL",
+                column.name
+            )));
+        }
+
+        // The DEFAULT literal must be compatible with the declared type.
+        if let Some(default) = &column.default {
+            validate_default_against_type(&column.name, &column.column_type, default)?;
         }
     }
     if !pk_ok {
         return Err(DbError::new("PRIMARY KEY debe existir en columnas"));
+    }
+    Ok(())
+}
+
+fn validate_default_against_type(
+    column: &str,
+    column_type: &ColumnType,
+    default: &DefaultLiteral,
+) -> DbResult<()> {
+    let ok = match (column_type, default) {
+        (_, DefaultLiteral::Null) => true,
+        (ColumnType::Int, DefaultLiteral::Integer(_)) => true,
+        (ColumnType::Float, DefaultLiteral::Float(_) | DefaultLiteral::Integer(_)) => true,
+        (ColumnType::Bool, DefaultLiteral::Bool(_)) => true,
+        (ct, DefaultLiteral::String(_)) if ct.stores_as_text() => true,
+        _ => false,
+    };
+    if !ok {
+        return Err(DbError::new(format!(
+            "columna '{}': DEFAULT incompatible con tipo {}",
+            column,
+            column_type.as_sql()
+        )));
     }
     Ok(())
 }

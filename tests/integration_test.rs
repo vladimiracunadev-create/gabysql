@@ -433,6 +433,199 @@ fn btree_splits_leaves_and_promotes_internal_root() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+#[test]
+fn not_null_rejects_missing_and_explicit_null() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("notnull");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT);",
+    )?;
+
+    // Happy path: name supplied.
+    run_sql(&db, "INSERT INTO u (id,name,email) VALUES (1,'Ana','a@x');")?;
+
+    // Missing NOT NULL column → reject.
+    let err = run_sql(&db, "INSERT INTO u (id,email) VALUES (2,'b@x');").unwrap_err();
+    assert!(err.to_string().contains("NOT NULL"), "got: {}", err);
+
+    // Explicit NULL into NOT NULL column → reject.
+    let err = run_sql(&db, "INSERT INTO u (id,name,email) VALUES (3,NULL,'c@x');").unwrap_err();
+    assert!(err.to_string().contains("NOT NULL"), "got: {}", err);
+
+    // UPDATE that lands NULL into NOT NULL → reject.
+    let err = run_sql(&db, "UPDATE u SET name = NULL WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("NOT NULL"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn default_fills_missing_and_can_be_overridden() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("default");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'new', tries INT DEFAULT 0, active BOOL DEFAULT TRUE);",
+    )?;
+
+    // All defaults fire when columns are omitted.
+    run_sql(&db, "INSERT INTO t (id) VALUES (1);")?;
+    let res = run_sql(&db, "SELECT id,status,tries,active FROM t WHERE id = 1;")?;
+    assert_eq!(
+        res[0].rows[0],
+        vec![
+            Value::Integer(1),
+            Value::String("new".to_string()),
+            Value::Integer(0),
+            Value::Bool(true),
+        ]
+    );
+
+    // Explicit value wins over default.
+    run_sql(
+        &db,
+        "INSERT INTO t (id,status,tries,active) VALUES (2,'done',5,FALSE);",
+    )?;
+    let res = run_sql(&db, "SELECT status,tries,active FROM t WHERE id = 2;")?;
+    assert_eq!(
+        res[0].rows[0],
+        vec![
+            Value::String("done".to_string()),
+            Value::Integer(5),
+            Value::Bool(false),
+        ]
+    );
+
+    // Explicit NULL wins over default too (column has no NOT NULL).
+    run_sql(&db, "INSERT INTO t (id,status) VALUES (3,NULL);")?;
+    let res = run_sql(&db, "SELECT status FROM t WHERE id = 3;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn default_with_not_null_combination() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("notnull-default");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE q (id INT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending');",
+    )?;
+
+    // Omitted → default fills, NOT NULL satisfied.
+    run_sql(&db, "INSERT INTO q (id) VALUES (1);")?;
+    let res = run_sql(&db, "SELECT status FROM q WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("pending".to_string()));
+
+    // Explicit NULL still rejected even with a default present.
+    let err = run_sql(&db, "INSERT INTO q (id,status) VALUES (2,NULL);").unwrap_err();
+    assert!(err.to_string().contains("NOT NULL"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn default_type_mismatch_rejected_at_create() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("default-mismatch");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    let err = run_sql(
+        &db,
+        "CREATE TABLE bad (id INT PRIMARY KEY, name TEXT DEFAULT 1);",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("DEFAULT"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn inline_unique_rejects_duplicates() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("unique-inline");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, email TEXT UNIQUE);",
+    )?;
+
+    run_sql(&db, "INSERT INTO u (id,email) VALUES (1,'a@x');")?;
+    run_sql(&db, "INSERT INTO u (id,email) VALUES (2,'b@x');")?;
+
+    // Duplicate email rejected.
+    let err = run_sql(&db, "INSERT INTO u (id,email) VALUES (3,'a@x');").unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
+
+    // UPDATE that creates a duplicate → reject.
+    let err = run_sql(&db, "UPDATE u SET email = 'a@x' WHERE id = 2;").unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
+
+    // UPDATE to the same value (no-op) → allowed.
+    run_sql(&db, "UPDATE u SET email = 'a@x' WHERE id = 1;")?;
+
+    // Multiple NULLs allowed under UNIQUE.
+    run_sql(&db, "INSERT INTO u (id) VALUES (10);")?;
+    run_sql(&db, "INSERT INTO u (id) VALUES (11);")?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn create_unique_index_backfill_aborts_on_duplicates() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("unique-backfill");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, email TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,email) VALUES (1,'a@x');")?;
+    run_sql(&db, "INSERT INTO u (id,email) VALUES (2,'a@x');")?;
+
+    let err = run_sql(&db, "CREATE UNIQUE INDEX uq_u_email ON u (email);").unwrap_err();
+    assert!(
+        err.to_string().contains("UNIQUE INDEX") || err.to_string().contains("duplicad"),
+        "got: {}",
+        err
+    );
+
+    // After fixing the duplicate, the unique index can be created.
+    run_sql(&db, "UPDATE u SET email = 'b@x' WHERE id = 2;")?;
+    run_sql(&db, "CREATE UNIQUE INDEX uq_u_email ON u (email);")?;
+
+    // And it now enforces uniqueness on subsequent INSERTs.
+    let err = run_sql(&db, "INSERT INTO u (id,email) VALUES (3,'a@x');").unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

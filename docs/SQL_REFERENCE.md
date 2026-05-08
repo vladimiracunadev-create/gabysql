@@ -53,7 +53,7 @@ flowchart LR
 
 ## CREATE DATABASE
 
-> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 4`. En modo single-DB (`-db`) responde `405`.
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 5`. En modo single-DB (`-db`) responde `405`.
 
 ### 🛤️ Railroad
 
@@ -172,33 +172,50 @@ flowchart LR
 flowchart LR
     S([ColumnDef]) --> N[/identifier/]
     N --> T[/type/]
-    T --> PK{PRIMARY KEY?}
-    PK -- "no" --> E([fin])
-    PK -- "sí" --> PKW["PRIMARY"] --> PKK["KEY"] --> E
+    T --> CST{constraint?}
+    CST -- "no" --> E([fin])
+    CST -- "PRIMARY KEY" --> CST
+    CST -- "NOT NULL" --> CST
+    CST -- "UNIQUE" --> CST
+    CST -- "DEFAULT lit" --> CST
 ```
 
 ### 📜 EBNF
 
 ```
-create_table  ::= "CREATE" "TABLE" identifier "(" column_def ("," column_def)* ")"
-column_def    ::= identifier type ("PRIMARY" "KEY")?
-type          ::= "INT" | "TEXT" | "BOOL" | "FLOAT" | "DATE" | "DATETIME" | "JSON"
-identifier    ::= [A-Za-z_][A-Za-z0-9_]*
+create_table   ::= "CREATE" "TABLE" identifier "(" column_def ("," column_def)* ")"
+column_def     ::= identifier type column_constraint*
+column_constraint ::= "PRIMARY" "KEY"
+                    | "NOT" "NULL"
+                    | "UNIQUE"
+                    | "DEFAULT" literal
+type           ::= "INT" | "TEXT" | "BOOL" | "FLOAT" | "DATE" | "DATETIME" | "JSON"
+literal        ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
+identifier     ::= [A-Za-z_][A-Za-z0-9_]*
 ```
+
+Notas:
+- `PRIMARY KEY` implica `NOT NULL`. Sigue habiendo una sola PK por tabla y debe ser `INT`.
+- `UNIQUE` inline auto-genera un índice unique con nombre `uq_<tabla>_<col>` (ver `CREATE UNIQUE INDEX`).
+- `DEFAULT NULL` es válido pero incompatible con `NOT NULL` en la misma columna.
+- `DEFAULT` no se admite sobre la PK.
+- El literal de `DEFAULT` debe coincidir con el tipo de la columna; `name TEXT DEFAULT 1` se rechaza en `CREATE TABLE`.
 
 ### ✅ Ejemplos válidos
 
 ```sql
 CREATE TABLE users (
   id INT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
   name TEXT,
-  active BOOL,
+  active BOOL DEFAULT TRUE,
   score FLOAT,
+  status TEXT NOT NULL DEFAULT 'pending',
   born DATE,
   meta JSON
 );
 
-CREATE TABLE orders (id INT PRIMARY KEY, total FLOAT);
+CREATE TABLE orders (id INT PRIMARY KEY, total FLOAT, tries INT DEFAULT 0);
 ```
 
 ### ❌ Errores típicos
@@ -207,6 +224,9 @@ CREATE TABLE orders (id INT PRIMARY KEY, total FLOAT);
 | :--- | :--- |
 | `PRIMARY KEY 'pk' debe ser INT (...)` | la columna marcada como PK no es `INT` |
 | `PRIMARY KEY requerida (...)` | no se declaró ninguna columna como PK |
+| `PRIMARY KEY 'pk' no admite DEFAULT en esta versión` | `DEFAULT` aplicado sobre la PK |
+| `columna 'X': NOT NULL incompatible con DEFAULT NULL` | combinación contradictoria de constraints |
+| `columna 'X': DEFAULT incompatible con tipo TEXT` | el literal de DEFAULT no coincide con el tipo declarado |
 | `nombre de columna duplicado` | dos columnas con el mismo nombre |
 | `tabla X ya existe` | hay otra tabla con ese nombre en el catálogo |
 | `tipo no soportado: BIGINT` | tipos fuera de la lista anterior |
@@ -227,7 +247,7 @@ flowchart LR
 ### 📜 EBNF
 
 ```
-create_index ::= "CREATE" "INDEX" identifier "ON" identifier "(" identifier ")"
+create_index ::= "CREATE" "UNIQUE"? "INDEX" identifier "ON" identifier "(" identifier ")"
 ```
 
 ### ✅ Ejemplos
@@ -236,6 +256,10 @@ create_index ::= "CREATE" "INDEX" identifier "ON" identifier "(" identifier ")"
 -- Crear índice (backfill automático sobre las filas ya existentes)
 CREATE INDEX idx_users_name ON users (name);
 CREATE INDEX idx_orders_status ON orders (status);
+
+-- Índice único: el backfill aborta si existen duplicados; en caliente
+-- INSERT/UPDATE conflictivos se rechazan antes de tocar disco.
+CREATE UNIQUE INDEX uq_users_email ON users (email);
 ```
 
 ### ❌ Errores típicos
@@ -246,8 +270,10 @@ CREATE INDEX idx_orders_status ON orders (status);
 | `la columna 'X' ya tiene un índice secundario` | esta versión soporta solo un índice por columna |
 | `no se admiten índices sobre columnas JSON en esta versión` | `JSON` no es indexable (ver tabla de tipos) |
 | `columna no existe: X` | la columna no aparece en el `CREATE TABLE` |
+| `CREATE UNIQUE INDEX rechazado: columna 'X' tiene valores duplicados existentes` | la tabla ya tenía duplicados al pedir el índice unique |
+| `violación de UNIQUE en índice 'uq_t_c' (PK existente: N)` | INSERT/UPDATE intenta colocar un valor ya presente en otra fila |
 
-> Reglas: una sola columna por índice, solo equality (`=`), sin `UNIQUE` declarativo. Ver [ADR-0005](adr/0005-secondary-index-bucket.md).
+> Reglas: una sola columna por índice, solo equality (`=`). `UNIQUE` permite múltiples `NULL`. Ver [ADR-0005](adr/0005-secondary-index-bucket.md).
 
 ---
 

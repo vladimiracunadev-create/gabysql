@@ -1,8 +1,10 @@
 use crate::bptree::{init_leaf_page, Tree};
-use crate::catalog::{validate_create_table, Catalog, Column, ColumnType, IndexMeta, TableMeta};
+use crate::catalog::{
+    validate_create_table, Catalog, Column, ColumnType, DefaultLiteral, IndexMeta, TableMeta,
+};
 use crate::index::{
-    bucket_insert, bucket_lookup, bucket_remove, decode_bucket, encode_bucket, encode_column_value,
-    hash_value, validate_indexable,
+    bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
+    encode_bucket, encode_column_value, hash_value, validate_indexable,
 };
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
@@ -43,6 +45,7 @@ pub struct CreateIndexStmt {
     pub name: String,
     pub table: String,
     pub column: String,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +80,9 @@ pub struct ColumnDef {
     pub name: String,
     pub type_name: String,
     pub primary_key: bool,
+    pub not_null: bool,
+    pub unique: bool,
+    pub default: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,14 +153,32 @@ impl<'a> Engine<'a> {
     fn exec_create(&mut self, stmt: CreateTableStmt) -> DbResult<ResultSet> {
         let mut columns = Vec::with_capacity(stmt.columns.len());
         let mut primary_key = stmt.primary_key.clone();
+        // Remember which inline UNIQUE columns need an auto-created unique
+        // index after the table is published. PK column is excluded — the
+        // B+Tree already enforces PK uniqueness.
+        let mut inline_unique_columns: Vec<String> = Vec::new();
         for column in stmt.columns {
             let column_type = ColumnType::from_sql(&column.type_name)?;
-            if column.primary_key {
+            let is_pk = column.primary_key;
+            if is_pk {
                 primary_key = column.name.clone();
+            }
+            // PK is implicitly NOT NULL; surface it in metadata so the
+            // engine doesn't have to special-case it later.
+            let not_null = column.not_null || is_pk;
+            let default = column.default.as_ref().map(value_to_default);
+            if column.unique && !is_pk {
+                inline_unique_columns.push(column.name.clone());
             }
             columns.push(Column {
                 name: column.name,
                 column_type,
+                not_null,
+                default: match default {
+                    Some(Ok(d)) => Some(d),
+                    Some(Err(err)) => return Err(err),
+                    None => None,
+                },
             });
         }
 
@@ -179,6 +203,25 @@ impl<'a> Engine<'a> {
         init_leaf_page(&mut leaf_page);
         self.pager.write_page(root_page, &leaf_page, true)?;
         meta.root_page = root_page;
+
+        // Materialize inline-UNIQUE columns as named unique indexes so the
+        // rest of the engine can rely on a single uniqueness path.
+        for col_name in &inline_unique_columns {
+            let idx_root = self.pager.new_page()?;
+            let mut leaf = vec![0; self.pager.page_size()];
+            init_leaf_page(&mut leaf);
+            self.pager.write_page(idx_root, &leaf, true)?;
+            meta.indexes.push(IndexMeta {
+                name: format!(
+                    "uq_{}_{}",
+                    meta.name.to_ascii_lowercase(),
+                    col_name.to_ascii_lowercase()
+                ),
+                column: col_name.clone(),
+                root_page: idx_root,
+                unique: true,
+            });
+        }
 
         let mut catalog = Catalog::open(self.pager);
         catalog.put_table(&meta)?;
@@ -212,6 +255,35 @@ impl<'a> Engine<'a> {
                 return Err(DbError::new(format!("columna no existe: {}", column_name)));
             }
             values.insert(normalized, value);
+        }
+
+        // Apply DEFAULT for columns the user omitted, then enforce NOT NULL
+        // on the final view of the row. We do this here (not inside
+        // encode_row) so UPDATE keeps its own simpler "merge into existing"
+        // semantics without re-running defaults.
+        apply_defaults(&meta, &mut values);
+        enforce_not_null_on_insert(&meta, &values)?;
+
+        // UNIQUE pre-check: walk every unique secondary index and refuse
+        // the INSERT before touching disk if a conflicting (value, pk)
+        // already lives in the bucket. This is cheap (one B+Tree get per
+        // unique index) and keeps the failure path side-effect free.
+        for idx in &meta.indexes {
+            if !idx.unique {
+                continue;
+            }
+            let column = meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let value = values
+                .get(&normalize_ident(&column.name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let value_bytes = encode_column_value(column, &value)?;
+            check_unique_conflict(self.pager, idx, &value_bytes, None)?;
         }
 
         let (pk, row_bytes) = encode_row(&meta, &values)?;
@@ -371,6 +443,46 @@ impl<'a> Engine<'a> {
         for (key, value) in &overrides {
             current.insert(key.clone(), value.clone());
         }
+
+        // NOT NULL: any assignment that lands a NULL on a NOT NULL column
+        // must be rejected before we touch storage.
+        for column in &meta.columns {
+            if !column.not_null {
+                continue;
+            }
+            let normalized = normalize_ident(&column.name);
+            if !overrides.contains_key(&normalized) {
+                continue;
+            }
+            if matches!(current.get(&normalized), Some(Value::Null) | None) {
+                return Err(DbError::new(format!(
+                    "columna '{}' es NOT NULL; UPDATE no puede dejarla en NULL",
+                    column.name
+                )));
+            }
+        }
+
+        // UNIQUE pre-check on every changed indexed column (excluding
+        // self pk so updating to the same value is a no-op).
+        for idx in &meta.indexes {
+            if !idx.unique {
+                continue;
+            }
+            let normalized = normalize_ident(&idx.column);
+            if !overrides.contains_key(&normalized) {
+                continue;
+            }
+            let column = meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let new_value = current.get(&normalized).cloned().unwrap_or(Value::Null);
+            let new_bytes = encode_column_value(column, &new_value)?;
+            check_unique_conflict(self.pager, idx, &new_bytes, Some(stmt.where_pk))?;
+        }
+
         let (pk, row_bytes) = encode_row(&meta, &current)?;
         if pk != stmt.where_pk {
             return Err(DbError::new("PK derivada del row no coincide con WHERE"));
@@ -466,7 +578,10 @@ impl<'a> Engine<'a> {
         //    index. We do this *before* we publish the index in the catalog
         //    so a backfill failure leaves no half-built metadata behind
         //    (the page leak is acceptable; the txn rollback would also
-        //    discard everything).
+        //    discard everything). For UNIQUE indexes we additionally
+        //    track which value bytes we've already seen so we abort with
+        //    a clear error when a backfill would violate uniqueness —
+        //    otherwise the conflict would only surface on the next INSERT.
         let column = meta
             .column(&stmt.column)
             .ok_or_else(|| DbError::new(format!("columna no existe: {}", stmt.column)))?
@@ -476,6 +591,7 @@ impl<'a> Engine<'a> {
             let mut catalog = Catalog::open(self.pager);
             catalog.scan_rows(table_root, 0, None)?
         };
+        let mut seen_unique: HashSet<Vec<u8>> = HashSet::new();
         for kv in rows {
             let decoded = decode_row(&meta, &kv.value)?;
             let value = decoded
@@ -483,6 +599,12 @@ impl<'a> Engine<'a> {
                 .cloned()
                 .unwrap_or(Value::Null);
             let value_bytes = encode_column_value(&column, &value)?;
+            if stmt.unique && value_bytes != [0u8] && !seen_unique.insert(value_bytes.clone()) {
+                return Err(DbError::new(format!(
+                    "CREATE UNIQUE INDEX rechazado: columna '{}' tiene valores duplicados existentes",
+                    column.name
+                )));
+            }
             index_upsert_pk(self.pager, idx_root, &value_bytes, kv.key)?;
         }
 
@@ -491,6 +613,7 @@ impl<'a> Engine<'a> {
             name: stmt.name,
             column: stmt.column,
             root_page: idx_root,
+            unique: stmt.unique,
         });
         let mut catalog = Catalog::open(self.pager);
         catalog.put_table(&meta)?;
@@ -906,6 +1029,88 @@ pub(crate) fn index_remove_pk(
     Ok(true)
 }
 
+/// Convert a parser-time `Value` literal into a catalog `DefaultLiteral`.
+/// Type compatibility against the column type is enforced later by
+/// `validate_create_table` — here we only translate the shape.
+fn value_to_default(value: &Value) -> DbResult<DefaultLiteral> {
+    Ok(match value {
+        Value::Null => DefaultLiteral::Null,
+        Value::Integer(n) => DefaultLiteral::Integer(*n),
+        Value::Float(n) => DefaultLiteral::Float(*n),
+        Value::Bool(b) => DefaultLiteral::Bool(*b),
+        Value::String(s) => DefaultLiteral::String(s.clone()),
+    })
+}
+
+fn default_to_value(default: &DefaultLiteral) -> Value {
+    match default {
+        DefaultLiteral::Null => Value::Null,
+        DefaultLiteral::Integer(n) => Value::Integer(*n),
+        DefaultLiteral::Float(n) => Value::Float(*n),
+        DefaultLiteral::Bool(b) => Value::Bool(*b),
+        DefaultLiteral::String(s) => Value::String(s.clone()),
+    }
+}
+
+/// For every column the user did not list in INSERT, apply its DEFAULT (if
+/// any). Columns without a default are left absent — `encode_row` then
+/// stores them as NULL, which `enforce_not_null_on_insert` will catch
+/// downstream when the column is NOT NULL.
+fn apply_defaults(meta: &TableMeta, values: &mut HashMap<String, Value>) {
+    for column in &meta.columns {
+        let normalized = normalize_ident(&column.name);
+        if values.contains_key(&normalized) {
+            continue;
+        }
+        if let Some(default) = &column.default {
+            values.insert(normalized, default_to_value(default));
+        }
+    }
+}
+
+/// After defaults are applied, fail if any NOT NULL column still resolves
+/// to NULL (either explicit `NULL` literal or absent altogether).
+fn enforce_not_null_on_insert(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult<()> {
+    for column in &meta.columns {
+        if !column.not_null {
+            continue;
+        }
+        let normalized = normalize_ident(&column.name);
+        let is_null = matches!(values.get(&normalized), None | Some(Value::Null));
+        if is_null {
+            return Err(DbError::new(format!(
+                "columna '{}' es NOT NULL; INSERT no la cubre",
+                column.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Look the value up in a UNIQUE index bucket and translate any conflict
+/// into a user-facing error. Caller passes `exclude_pk = Some(self_pk)`
+/// during UPDATE so the row's pre-existing entry doesn't false-trigger.
+pub(crate) fn check_unique_conflict(
+    pager: &mut Pager,
+    idx: &IndexMeta,
+    value_bytes: &[u8],
+    exclude_pk: Option<i64>,
+) -> DbResult<()> {
+    let key = hash_value(value_bytes);
+    let mut tree = Tree::new(pager);
+    let bucket = match tree.get(idx.root_page, key)? {
+        Some(bytes) => decode_bucket(&bytes)?,
+        None => return Ok(()),
+    };
+    if let Some(other_pk) = bucket_unique_conflict(&bucket, value_bytes, exclude_pk) {
+        return Err(DbError::new(format!(
+            "violación de UNIQUE en índice '{}' (PK existente: {})",
+            idx.name, other_pk
+        )));
+    }
+    Ok(())
+}
+
 fn normalize_ident(value: &str) -> String {
     value
         .rsplit('.')
@@ -1094,7 +1299,7 @@ impl Parser {
         }))
     }
 
-    fn parse_create_index(&mut self) -> DbResult<Statement> {
+    fn parse_create_index(&mut self, unique: bool) -> DbResult<Statement> {
         let name = self.expect_ident()?;
         self.expect_keyword("ON")?;
         let table = self.expect_ident()?;
@@ -1105,6 +1310,7 @@ impl Parser {
             name,
             table,
             column,
+            unique,
         }))
     }
 
@@ -1148,8 +1354,12 @@ impl Parser {
     }
 
     fn parse_create(&mut self) -> DbResult<Statement> {
+        if self.match_keyword("UNIQUE") {
+            self.expect_keyword("INDEX")?;
+            return self.parse_create_index(true);
+        }
         if self.match_keyword("INDEX") {
-            return self.parse_create_index();
+            return self.parse_create_index(false);
         }
         if self.match_keyword("DATABASE") {
             return self.parse_create_database();
@@ -1163,15 +1373,39 @@ impl Parser {
             let column_name = self.expect_ident()?;
             let type_name = self.expect_ident()?;
             let mut is_pk = false;
-            if self.match_keyword("PRIMARY") {
-                self.expect_keyword("KEY")?;
-                is_pk = true;
-                primary_key = column_name.clone();
+            let mut not_null = false;
+            let mut unique = false;
+            let mut default: Option<Value> = None;
+            // Column constraints can appear in any order after the type.
+            loop {
+                if self.match_keyword("PRIMARY") {
+                    self.expect_keyword("KEY")?;
+                    is_pk = true;
+                    primary_key = column_name.clone();
+                } else if self.match_keyword("NOT") {
+                    self.expect_keyword("NULL")?;
+                    not_null = true;
+                } else if self.match_keyword("UNIQUE") {
+                    unique = true;
+                } else if self.match_keyword("DEFAULT") {
+                    if default.is_some() {
+                        return Err(DbError::new(format!(
+                            "DEFAULT duplicado en columna '{}'",
+                            column_name
+                        )));
+                    }
+                    default = Some(self.expect_value()?);
+                } else {
+                    break;
+                }
             }
             columns.push(ColumnDef {
                 name: column_name,
                 type_name,
                 primary_key: is_pk,
+                not_null,
+                unique,
+                default,
             });
             if self.match_symbol(")") {
                 break;

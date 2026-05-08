@@ -1,10 +1,10 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-04 contra `main` post-`317ee44`.
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-07 contra `main` post-constraints declarativas.
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-4-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-10%2F10-brightgreen)](../tests/integration_test.rs)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-5-2d7a66)](TECHNICAL_SPECS.md)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-17%2F17-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -18,20 +18,20 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Pager (header + caché in-memory) | 🟢 | LRU pendiente, prefetch pendiente. | [src/storage.rs](../src/storage.rs) |
 | WAL after-image + replay | 🟢 | CRC32 verificado por record. Sin checkpoints. | [src/storage.rs](../src/storage.rs) |
 | CRC32 por página | 🟢 | IEEE polynomial, table-based; verifica en lectura y replay. | [src/storage.rs](../src/storage.rs) |
-| Formato en disco versionado | 🟢 | `VERSION = 4`, rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
+| Formato en disco versionado | 🟢 | `VERSION = 5`, rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
 | `Pager::create` no destructivo | 🟢 | Refuses overwrite; `create_force` explícito. | [src/storage.rs](../src/storage.rs) |
 | B+Tree (LEAF + INTERNAL) | 🟡 | Splits OK; falta merge / rebalance al borrar. | [src/bptree.rs](../src/bptree.rs) |
 | Catálogo persistente | 🟢 | FNV-1a-64, estable entre versiones de Rust. | [src/catalog.rs](../src/catalog.rs) |
 | Tipos de columna | 🟡 | INT/TEXT/BOOL/FLOAT/DATE/DATETIME/JSON. Sin DECIMAL ni BIGINT separado. | [src/catalog.rs](../src/catalog.rs) |
-| Constraints declarativas (NOT NULL/UNIQUE/DEFAULT) | 🔴 | Solo PK NOT NULL implícito. | — |
+| Constraints declarativas (NOT NULL/UNIQUE/DEFAULT) | 🟢 | Inline en `CREATE TABLE`; `CREATE UNIQUE INDEX`; pre-check sin efectos colaterales. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
 | Índices secundarios (equality) | 🟢 | Una columna, backfill, mantenimiento INSERT/UPDATE/DELETE. | [src/index.rs](../src/index.rs) |
-| Índices compuestos / UNIQUE | 🔴 | En el [Camino A](COMMERCIAL_ROADMAP.md). | — |
+| Índices compuestos | 🔴 | En el [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | `WHERE col_indexada = val` (no PK) | 🟢 | Plan dispatch: PK vs índice vs error. | [src/sql.rs](../src/sql.rs) |
 | `WHERE BETWEEN` (rango por PK) | 🟢 | Solo en SELECT. | [src/sql.rs](../src/sql.rs) |
 | Range scan por índice secundario | 🔴 | En [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | ORDER BY / GROUP BY / JOIN | 🔴 | En [Camino A/B/C](COMMERCIAL_ROADMAP.md) según madurez. | — |
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
-| Parser SQL | 🟡 | CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, **CREATE/DROP DATABASE, SHOW DATABASES**. Sin ALTER, sin prepared statements. | [src/sql.rs](../src/sql.rs) |
+| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`), INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES. Sin ALTER, sin prepared statements. | [src/sql.rs](../src/sql.rs) |
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
 | Engine (executor) | 🟡 | Sin iterator pattern, sin spill-to-disk, sin plan lógico/físico. | [src/sql.rs](../src/sql.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
@@ -91,8 +91,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque comprometido (Camino A — paso 2)
+## 🔭 Próximo bloque comprometido (Camino A — paso 3)
 
-> **Constraints declarativas: `NOT NULL`, `UNIQUE`, `DEFAULT`** sobre el catálogo y validación en INSERT/UPDATE.
+> **`DROP TABLE` + `ALTER TABLE ADD COLUMN`** para permitir edición incremental de schemas sin recrear la tabla. Sin estos, todo cambio en gabymodeler obliga a un round-trip destructivo.
 
-Esfuerzo estimado: 4–6 semanas. Ver [COMMERCIAL_ROADMAP.md §Camino A](COMMERCIAL_ROADMAP.md#-camino-a--embebido-nicho-comercial) para el contexto y los criterios de "done".
+Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.
