@@ -3,8 +3,8 @@
 > **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-07 contra `main` post-constraints declarativas.
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-5-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-22%2F22-brightgreen)](../tests/integration_test.rs)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-6-2d7a66)](TECHNICAL_SPECS.md)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-28%2F28-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -18,12 +18,13 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Pager (header + caché in-memory) | 🟢 | LRU pendiente, prefetch pendiente. | [src/storage.rs](../src/storage.rs) |
 | WAL after-image + replay | 🟢 | CRC32 verificado por record. Sin checkpoints. | [src/storage.rs](../src/storage.rs) |
 | CRC32 por página | 🟢 | IEEE polynomial, table-based; verifica en lectura y replay. | [src/storage.rs](../src/storage.rs) |
-| Formato en disco versionado | 🟢 | `VERSION = 5`, rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
+| Formato en disco versionado | 🟢 | `VERSION = 6`, rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
 | `Pager::create` no destructivo | 🟢 | Refuses overwrite; `create_force` explícito. | [src/storage.rs](../src/storage.rs) |
 | B+Tree (LEAF + INTERNAL) | 🟡 | Splits OK; falta merge / rebalance al borrar. | [src/bptree.rs](../src/bptree.rs) |
 | Catálogo persistente | 🟢 | FNV-1a-64, estable entre versiones de Rust. | [src/catalog.rs](../src/catalog.rs) |
 | Tipos de columna | 🟡 | INT/TEXT/BOOL/FLOAT/DATE/DATETIME/JSON. Sin DECIMAL ni BIGINT separado. | [src/catalog.rs](../src/catalog.rs) |
 | Constraints declarativas (NOT NULL/UNIQUE/DEFAULT) | 🟢 | Inline en `CREATE TABLE`; `CREATE UNIQUE INDEX`; pre-check sin efectos colaterales. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
+| `FOREIGN KEY` declarativas + enforced | 🟢 | Single-column, target = PK del parent, `ON DELETE RESTRICT/CASCADE`, self-ref OK, cycle protection en cascade. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
 | Índices secundarios (equality) | 🟢 | Una columna, backfill, mantenimiento INSERT/UPDATE/DELETE. | [src/index.rs](../src/index.rs) |
 | Índices compuestos | 🔴 | En el [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | `WHERE col_indexada = val` (no PK) | 🟢 | Plan dispatch: PK vs índice vs error. | [src/sql.rs](../src/sql.rs) |
@@ -31,7 +32,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Range scan por índice secundario | 🔴 | En [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | ORDER BY / GROUP BY / JOIN | 🔴 | En [Camino A/B/C](COMMERCIAL_ROADMAP.md) según madurez. | — |
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
-| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
+| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`/`REFERENCES`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
 | Engine (executor) | 🟡 | Sin iterator pattern, sin spill-to-disk, sin plan lógico/físico. | [src/sql.rs](../src/sql.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
@@ -91,8 +92,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque comprometido (Camino A — paso 5)
+## 🔭 Próximo bloque comprometido (Camino A — paso 6, cierre de Fase 1)
 
-> **`FOREIGN KEY` declarativas y enforced.** Sintaxis `FOREIGN KEY (col) REFERENCES tabla(col) [ON DELETE RESTRICT|CASCADE]`, validación en `INSERT`/`UPDATE`/`DELETE` apoyada en índice secundario, persistencia en catálogo + bump VERSION 5 → 6. Después: `integrity_check` operacional como cierre de Fase 1.
+> **`integrity_check` operacional.** Comando que recorre el B+Tree de cada tabla validando CRCs, que cada índice secundario apunta a filas existentes, y que cada FK del catálogo tiene su parent. Cierra el ciclo de Fase 1 (Robustez funcional) y deja al motor listo para el primer release con SLAs de durabilidad medibles.
 
 Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.

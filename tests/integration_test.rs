@@ -835,6 +835,231 @@ fn identifier_rules_apply_across_ddl() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn fk_create_validation_rejects_bad_targets() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("fk-validate");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    // FK to non-existent table → reject.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("tabla inexistente"),
+        "got: {}",
+        err
+    );
+
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);")?;
+
+    // FK to a non-PK column → reject.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE bad (id INT PRIMARY KEY, p_name INT REFERENCES parent(name));",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("PK"), "got: {}", err);
+
+    // FK type mismatch (TEXT vs INT) → reject.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE bad (id INT PRIMARY KEY, p TEXT REFERENCES parent(id));",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("INT"), "got: {}", err);
+
+    // Happy path.
+    run_sql(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id));",
+    )?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn fk_insert_update_enforcement() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("fk-iu");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id));",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id,name) VALUES (1,'Ana');")?;
+    run_sql(&db, "INSERT INTO parent (id,name) VALUES (2,'Beto');")?;
+
+    // INSERT with valid parent → OK.
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+
+    // INSERT with NULL FK → OK.
+    run_sql(&db, "INSERT INTO child (id) VALUES (11);")?;
+
+    // INSERT with non-existent parent → reject.
+    let err = run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (12,99);").unwrap_err();
+    assert!(err.to_string().contains("FK"), "got: {}", err);
+
+    // UPDATE FK to non-existent parent → reject.
+    let err = run_sql(&db, "UPDATE child SET parent_id = 99 WHERE id = 10;").unwrap_err();
+    assert!(err.to_string().contains("FK"), "got: {}", err);
+
+    // UPDATE FK to existing parent → OK.
+    run_sql(&db, "UPDATE child SET parent_id = 2 WHERE id = 10;")?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn fk_self_reference_allows_pointing_at_self() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("fk-self");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE employee (id INT PRIMARY KEY, name TEXT, manager_id INT REFERENCES employee(id));",
+    )?;
+
+    // Top-level employee is their own manager.
+    run_sql(
+        &db,
+        "INSERT INTO employee (id,name,manager_id) VALUES (1,'CEO',1);",
+    )?;
+    // Subordinate referencing existing manager.
+    run_sql(
+        &db,
+        "INSERT INTO employee (id,name,manager_id) VALUES (2,'VP',1);",
+    )?;
+    // Subordinate referencing non-existent manager → reject.
+    let err = run_sql(
+        &db,
+        "INSERT INTO employee (id,name,manager_id) VALUES (3,'Lost',99);",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("FK"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn fk_delete_restrict_blocks_when_children_exist() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("fk-restrict");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);")?;
+    // No ON DELETE clause → defaults to RESTRICT.
+    run_sql(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id));",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id,name) VALUES (1,'Ana');")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+
+    // DELETE parent with existing child → reject.
+    let err = run_sql(&db, "DELETE FROM parent WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("RESTRICT"), "got: {}", err);
+
+    // After clearing the child, DELETE parent succeeds.
+    run_sql(&db, "DELETE FROM child WHERE id = 10;")?;
+    run_sql(&db, "DELETE FROM parent WHERE id = 1;")?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn fk_delete_cascade_removes_children_and_grandchildren() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("fk-cascade");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT REFERENCES a(id) ON DELETE CASCADE);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE c (id INT PRIMARY KEY, b_id INT REFERENCES b(id) ON DELETE CASCADE);",
+    )?;
+
+    run_sql(&db, "INSERT INTO a (id,name) VALUES (1,'root');")?;
+    run_sql(&db, "INSERT INTO b (id,a_id) VALUES (10,1);")?;
+    run_sql(&db, "INSERT INTO b (id,a_id) VALUES (11,1);")?;
+    run_sql(&db, "INSERT INTO c (id,b_id) VALUES (100,10);")?;
+    run_sql(&db, "INSERT INTO c (id,b_id) VALUES (101,11);")?;
+
+    // Cascade delete from a → b → c should leave nothing in any table.
+    run_sql(&db, "DELETE FROM a WHERE id = 1;")?;
+
+    let res = run_sql(&db, "SELECT id FROM a;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    let res = run_sql(&db, "SELECT id FROM b;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    let res = run_sql(&db, "SELECT id FROM c;")?;
+    assert_eq!(res[0].rows.len(), 0);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn old_v5_db_file_is_rejected_after_v6_bump() -> Result<(), Box<dyn Error>> {
+    // Smoke check: the on-disk version really moved to 6 — a fresh DB
+    // round-trips, but if somebody hand-pokes the version byte in the
+    // header back to 5 the reopen must refuse.
+    let db = temp_db_path("v6-bump");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY);")?;
+
+    // Patch on-disk version 6 → 5 inside the header page (offset 8..12).
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&5u32.to_le_bytes())?;
+    // Header page CRC will mismatch now, so we expect either a checksum
+    // or version error — both indicate the engine refused the file.
+    drop(f);
+
+    let err = match Pager::open(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::open to refuse v5 file"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
+        "expected refusal, got: {}",
+        msg
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

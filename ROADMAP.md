@@ -9,13 +9,13 @@
 ## 🚦 Estado actual
 
 - Core reescrito en Rust
-- Pager con header, páginas fijas y formato en disco **versión `5`**
+- Pager con header, páginas fijas y formato en disco **versión `6`**
 - Cada página persistida lleva trailer CRC32-IEEE (4 bytes); corrupción se detecta al leer y al replay del WAL
 - WAL after-image con replay por `COMMIT` y verificación CRC del payload de cada página
 - **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits
 - Catálogo de tablas persistente con hashing FNV-1a-64 (estable entre versiones de Rust)
 - **Índices secundarios** sobre una columna escalar (no JSON), con backfill automático y mantenimiento en `INSERT`/`UPDATE`/`DELETE`
-- SQL estable: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `NOT NULL` / `DEFAULT` / `UNIQUE` inline), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`, `WHERE col_indexada = val`
+- SQL estable: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `NOT NULL` / `DEFAULT` / `UNIQUE` / `REFERENCES ... [ON DELETE RESTRICT|CASCADE]` inline), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `LIMIT/OFFSET`, `WHERE PK =`, `WHERE PK BETWEEN`, `WHERE col_indexada = val`
 - Modelador web `gabymodeler` (vanilla HTML/JS) + admin web `phpgabyadmin`, ambos en `web/`
 - Server HTTP/JSON para single DB y multi DB con tope de conexiones simultáneas (default 64, configurable con `-max-connections`)
 - `Pager::create` rehúsa sobrescribir un archivo existente; `gabysql init --force` para reset intencional
@@ -42,8 +42,9 @@
 ### Fase 2 — Storage y consulta
 - ~~índices secundarios (una columna, equality)~~ ✅ entregado
 - ~~`WHERE` por columnas no PK (cuando hay índice)~~ ✅ entregado
+- ~~índices `UNIQUE` declarativos~~ ✅ entregado (VERSION 5)
+- ~~`FOREIGN KEY` declarativas + enforced~~ ✅ entregado (VERSION 6)
 - índices compuestos
-- índices `UNIQUE` declarativos
 - range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)
 - `ORDER BY`
 - checkpoint/compaction del WAL

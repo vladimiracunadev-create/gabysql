@@ -77,7 +77,7 @@ flowchart LR
 
 ## CREATE DATABASE
 
-> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 5`. En modo single-DB (`-db`) responde `405`.
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 6`. En modo single-DB (`-db`) responde `405`.
 
 ### 🛤️ Railroad
 
@@ -213,6 +213,8 @@ column_constraint ::= "PRIMARY" "KEY"
                     | "NOT" "NULL"
                     | "UNIQUE"
                     | "DEFAULT" literal
+                    | "REFERENCES" identifier "(" identifier ")" on_delete?
+on_delete      ::= "ON" "DELETE" ("RESTRICT" | "CASCADE")
 type           ::= "INT" | "TEXT" | "BOOL" | "FLOAT" | "DATE" | "DATETIME" | "JSON"
 literal        ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
 identifier     ::= [A-Za-z_][A-Za-z0-9_]*
@@ -224,6 +226,7 @@ Notas:
 - `DEFAULT NULL` es válido pero incompatible con `NOT NULL` en la misma columna.
 - `DEFAULT` no se admite sobre la PK.
 - El literal de `DEFAULT` debe coincidir con el tipo de la columna; `name TEXT DEFAULT 1` se rechaza en `CREATE TABLE`.
+- `REFERENCES <tabla>(<col>)`: el target column debe ser la PK del parent (no se admiten FKs contra `UNIQUE` no-PK en esta versión). El tipo de la FK debe coincidir con el de la PK referenciada (hoy ambos son siempre `INT`). Self-references (`employee.manager_id REFERENCES employee(id)`) son válidas. `ON DELETE` por default es `RESTRICT`.
 
 ### ✅ Ejemplos válidos
 
@@ -239,7 +242,19 @@ CREATE TABLE users (
   meta JSON
 );
 
-CREATE TABLE orders (id INT PRIMARY KEY, total FLOAT, tries INT DEFAULT 0);
+CREATE TABLE orders (
+  id INT PRIMARY KEY,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  total FLOAT,
+  tries INT DEFAULT 0
+);
+
+-- Self-reference: cada empleado puede tener un manager (que también es empleado).
+CREATE TABLE employee (
+  id INT PRIMARY KEY,
+  name TEXT NOT NULL,
+  manager_id INT REFERENCES employee(id)
+);
 ```
 
 ### ❌ Errores típicos
@@ -251,6 +266,9 @@ CREATE TABLE orders (id INT PRIMARY KEY, total FLOAT, tries INT DEFAULT 0);
 | `PRIMARY KEY 'pk' no admite DEFAULT en esta versión` | `DEFAULT` aplicado sobre la PK |
 | `columna 'X': NOT NULL incompatible con DEFAULT NULL` | combinación contradictoria de constraints |
 | `columna 'X': DEFAULT incompatible con tipo TEXT` | el literal de DEFAULT no coincide con el tipo declarado |
+| `FOREIGN KEY 'X.col' referencia tabla inexistente 'Y'` | el target table no existe (ni es self-ref) |
+| `FOREIGN KEY 'X.col' debe referenciar la PK de 'Y' (es 'pk_real'); esta versión no admite REFERENCES contra columnas no-PK` | target column no es la PK del parent |
+| `FOREIGN KEY 'X.col' debe ser INT para coincidir con la PK de 'Y'` | tipo del FK no matchea el tipo de la PK referenciada |
 | `nombre de columna duplicado` | dos columnas con el mismo nombre |
 | `tabla X ya existe` | hay otra tabla con ese nombre en el catálogo |
 | `tipo no soportado: BIGINT` | tipos fuera de la lista anterior |
@@ -601,8 +619,9 @@ DELETE FROM users WHERE id = 5;
 | :--- | :--- |
 | `fila no existe: PK=N` | PK inexistente — explícito, no silent no-op |
 | `WHERE solo soporta PK (pk_name)` | no se admite `DELETE` por columna no-PK |
+| `violación de FK: 'X.col' referencia 'Y' (ON DELETE RESTRICT, N fila(s) afectadas)` | hay filas hijas y la FK fue declarada `ON DELETE RESTRICT` (default) |
 
-> Antes de borrar la fila, el engine la lee para evictar la entrada correspondiente de cada índice secundario.
+> Antes de borrar la fila, el engine la lee para evictar la entrada correspondiente de cada índice secundario. Si la tabla tiene FKs entrantes, el motor resuelve cascade/restrict iterativamente con un worklist y cycle protection (visited set sobre `(tabla, pk)`). Para tablas grandes con FKs entrantes, **se recomienda crear un índice secundario sobre la columna FK del hijo** — el engine lo usa automáticamente para que el lookup de hijos sea O(log n) en vez de full scan.
 
 ---
 

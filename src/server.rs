@@ -626,8 +626,17 @@ fn table_meta_json(meta: &TableMeta) -> String {
                 ),
                 None => ",\"hasDefault\":false,\"default\":null".to_string(),
             };
+            let references_field = match &column.references {
+                Some(fk) => format!(
+                    ",\"references\":{{\"table\":{},\"column\":{},\"onDelete\":{}}}",
+                    json_string(&fk.table),
+                    json_string(&fk.column),
+                    json_string(fk.on_delete.as_sql())
+                ),
+                None => ",\"references\":null".to_string(),
+            };
             format!(
-                "{{\"name\":{},\"type\":{},\"pk\":{},\"notNull\":{},\"unique\":{}{}}}",
+                "{{\"name\":{},\"type\":{},\"pk\":{},\"notNull\":{},\"unique\":{}{}{}}}",
                 json_string(&column.name),
                 json_string(column.column_type.as_sql()),
                 if column.name.eq_ignore_ascii_case(&meta.primary_key) {
@@ -637,7 +646,8 @@ fn table_meta_json(meta: &TableMeta) -> String {
                 },
                 column.not_null,
                 is_unique,
-                default_field
+                default_field,
+                references_field
             )
         })
         .collect::<Vec<_>>()

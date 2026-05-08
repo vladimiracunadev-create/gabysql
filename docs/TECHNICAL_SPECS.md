@@ -15,7 +15,7 @@
 | Hashing del catálogo y de claves de índice | FNV-1a-64 (estable entre versiones de Rust) |
 | Tipos de página B+Tree | `LEAF` (1), `INTERNAL` (2) |
 
-> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice. Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action). Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
 
 ---
 
@@ -88,11 +88,13 @@ Formato actual:
 Cada `TableMeta` contiene:
 - nombre de tabla
 - nombre de PK
-- columnas con `{ name, type, not_null, default? }`
+- columnas con `{ name, type, not_null, default?, references? }`
 - página raíz de la tabla (root de su B+Tree)
 - lista de `IndexMeta { name, column, root_page, unique }` (vacía si la tabla no tiene índices secundarios)
 
-Layout binario v5 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`. El default se serializa como `[kind:u8] + payload` (kinds: 0 Null, 1 Int, 2 Float, 3 Bool, 4 String).
+Layout binario v6 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`.
+- Default: `[kind:u8] + payload` (kinds: 0 Null, 1 Int, 2 Float, 3 Bool, 4 String).
+- FK: `[target_table:string][target_column:string][on_delete:u8]` con `0 = RESTRICT`, `1 = CASCADE`.
 
 El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowercase). Una colisión de hash devuelve error explícito al abrir.
 
@@ -126,6 +128,25 @@ Modo `UNIQUE`:
 - En `INSERT`/`UPDATE` se hace pre-check (`bucket_unique_conflict`) antes de tocar disco; si el valor ya está en la tabla con otra PK, se rechaza con error explícito (no se persiste nada).
 - Múltiples `NULL` se permiten (consistente con SQL estándar; `NULL` no es igual a `NULL` para uniqueness).
 - En `CREATE UNIQUE INDEX` el backfill aborta apenas detecta el primer duplicado, sin publicar el índice en el catálogo.
+
+---
+
+## 🔗 FOREIGN KEY (VERSION 6+)
+
+Cada columna puede declarar como mucho una FK single-column. Se persiste en `Column.references = Some(ForeignKeyMeta { table, column, on_delete })`.
+
+Reglas de validación al DDL (CREATE TABLE / ALTER ADD COLUMN):
+- Target table debe existir (o ser self-ref a la tabla siendo creada).
+- Target column debe ser la PK del target table (no se admite REFERENCES contra UNIQUE no-PK en esta versión).
+- Tipo de la columna FK debe matchear el tipo de la PK del target (hoy ambos son siempre INT).
+
+Enforcement en runtime:
+- `INSERT`: para cada FK no nula, lookup parent.get_row(value); error si no existe. Self-FK que apunta a su propia PK siendo insertada se acepta.
+- `UPDATE`: solo se revalidan FKs cuyo valor cambió.
+- `DELETE`:
+  - `RESTRICT` (default): aborta el DELETE antes de cualquier write si existe alguna fila hija.
+  - `CASCADE`: worklist iterativo. Por cada `(tabla, pk)` enqueada se enumeran las hijas, se aplican RESTRICT/CASCADE recursivamente, se borra la fila del B+Tree y se evictan sus entradas en cada índice secundario. `visited: HashSet<(table, pk)>` corta ciclos.
+- Lookup de hijas: si la columna FK del hijo tiene índice secundario, lookup O(log n) por bucket; si no, full scan filtrando por valor. Recomendación: indexar siempre las columnas FK.
 
 ---
 
@@ -163,7 +184,7 @@ Modo `UNIQUE`:
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI; intercept antes de abrir Pager)*
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
-- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>`
+- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]`
 - `DROP TABLE [IF EXISTS] <name>` (catalog-only; páginas backing no liberadas)
 - `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
 - `INSERT INTO ... VALUES (...)`

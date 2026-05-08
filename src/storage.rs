@@ -16,7 +16,11 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        carries a `unique` flag (auto-set by inline UNIQUE column
 //        constraints and by `CREATE UNIQUE INDEX`). V4 files are rejected
 //        on open — no automatic upgrade.
-pub const VERSION: u32 = 5;
+//   6 -> Column carries an optional `FOREIGN KEY` (target table + target
+//        column + ON DELETE action). Single-column FKs only; target must
+//        be the parent table's PRIMARY KEY. V5 files are rejected on
+//        open — no automatic upgrade.
+pub const VERSION: u32 = 6;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

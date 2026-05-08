@@ -1,7 +1,7 @@
 use crate::bptree::{init_leaf_page, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
-    IndexMeta, TableMeta,
+    ForeignKeyMeta, IndexMeta, OnDelete, TableMeta,
 };
 use crate::index::{
     bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
@@ -98,6 +98,17 @@ pub struct ColumnDef {
     pub not_null: bool,
     pub unique: bool,
     pub default: Option<Value>,
+    pub references: Option<ForeignKeyDef>,
+}
+
+/// Parser-level representation of `REFERENCES <table>(<column>) [ON
+/// DELETE RESTRICT|CASCADE]`. Translated into a catalog
+/// [`ForeignKeyMeta`] inside the executor (see `value_to_fk`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyDef {
+    pub table: String,
+    pub column: String,
+    pub on_delete: OnDelete,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +198,7 @@ impl<'a> Engine<'a> {
             if column.unique && !is_pk {
                 inline_unique_columns.push(column.name.clone());
             }
+            let references = column.references.as_ref().map(fk_def_to_meta);
             columns.push(Column {
                 name: column.name,
                 column_type,
@@ -196,6 +208,7 @@ impl<'a> Engine<'a> {
                     Some(Err(err)) => return Err(err),
                     None => None,
                 },
+                references,
             });
         }
 
@@ -207,6 +220,7 @@ impl<'a> Engine<'a> {
             indexes: Vec::new(),
         };
         validate_create_table(&meta)?;
+        validate_fk_targets(self.pager, &meta)?;
 
         {
             let mut catalog = Catalog::open(self.pager);
@@ -318,6 +332,7 @@ impl<'a> Engine<'a> {
             column_type,
             not_null: stmt.column.not_null,
             default: default.clone(),
+            references: stmt.column.references.as_ref().map(fk_def_to_meta),
         };
         // Run the standard validation against a *prospective* meta so the
         // same DEFAULT/type compatibility rules used by CREATE TABLE
@@ -325,6 +340,7 @@ impl<'a> Engine<'a> {
         let mut prospective = meta.clone();
         prospective.columns.push(new_col.clone());
         validate_create_table(&prospective)?;
+        validate_fk_targets(self.pager, &prospective)?;
 
         // Count existing rows once: needed for the UNIQUE/DEFAULT guard
         // and to decide whether the inline-UNIQUE backfill has to do work.
@@ -464,6 +480,10 @@ impl<'a> Engine<'a> {
         }
 
         let (pk, row_bytes) = encode_row(&meta, &values)?;
+        // FK pre-check uses the *new* PK so a self-referencing INSERT
+        // pointing at itself succeeds (the row will exist after this
+        // statement commits).
+        enforce_fk_on_insert(self.pager, &meta, &values, pk)?;
         {
             let mut catalog = Catalog::open(self.pager);
             catalog.insert_row(meta.root_page, pk, row_bytes)?;
@@ -660,6 +680,11 @@ impl<'a> Engine<'a> {
             check_unique_conflict(self.pager, idx, &new_bytes, Some(stmt.where_pk))?;
         }
 
+        // FK pre-check on every changed FK column. We pass `where_pk`
+        // as the self-ref-allowed pk so updating a self-FK column to
+        // point at the same row stays valid.
+        enforce_fk_on_update(self.pager, &meta, &old_row, &current, stmt.where_pk)?;
+
         let (pk, row_bytes) = encode_row(&meta, &current)?;
         if pk != stmt.where_pk {
             return Err(DbError::new("PK derivada del row no coincide con WHERE"));
@@ -841,44 +866,25 @@ impl<'a> Engine<'a> {
         };
         ensure_pk_filter(&meta, &stmt.where_column)?;
 
-        // Read the row first so we know which (value, pk) entries to evict
-        // from each secondary index. If the row is absent we error out
-        // before touching anything (consistent with UPDATE).
-        let row_bytes = {
+        // Refuse the DELETE up front if the target row doesn't exist,
+        // matching the pre-FK behaviour. The cascade walker tolerates
+        // already-deleted rows (cycles, multi-path), so we have to
+        // gate the entry point ourselves.
+        let exists = {
             let mut catalog = Catalog::open(self.pager);
-            catalog
-                .get_row(meta.root_page, stmt.where_pk)?
-                .ok_or_else(|| DbError::new(format!("fila no existe: PK={}", stmt.where_pk)))?
+            catalog.get_row(meta.root_page, stmt.where_pk)?.is_some()
         };
-        let row = decode_row(&meta, &row_bytes)?;
-
-        {
-            let mut catalog = Catalog::open(self.pager);
-            let removed = catalog.delete_row(meta.root_page, stmt.where_pk)?;
-            if !removed {
-                // Should not happen given the get_row above, but cover the race
-                // for completeness.
-                return Err(DbError::new(format!(
-                    "fila no existe: PK={}",
-                    stmt.where_pk
-                )));
-            }
+        if !exists {
+            return Err(DbError::new(format!(
+                "fila no existe: PK={}",
+                stmt.where_pk
+            )));
         }
 
-        for idx in &meta.indexes {
-            let column = meta.column(&idx.column).ok_or_else(|| {
-                DbError::new(format!(
-                    "índice apunta a columna inexistente: {}",
-                    idx.column
-                ))
-            })?;
-            let value = row
-                .get(&normalize_ident(&column.name))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let bytes = encode_column_value(column, &value)?;
-            index_remove_pk(self.pager, idx.root_page, &bytes, stmt.where_pk)?;
-        }
+        // delete_with_cascade resolves the FK graph, applies RESTRICT
+        // by aborting before any write happens, and on CASCADE
+        // iteratively removes child rows + their secondary-index entries.
+        delete_with_cascade(self.pager, &meta.name, stmt.where_pk)?;
 
         Ok(ResultSet {
             columns: Vec::new(),
@@ -1279,6 +1285,323 @@ fn enforce_not_null_on_insert(meta: &TableMeta, values: &HashMap<String, Value>)
     Ok(())
 }
 
+/// Translate the parser's `ForeignKeyDef` into the catalog-layer
+/// `ForeignKeyMeta`. Lives here (not in catalog) so the SQL frontend
+/// stays the only place that knows about the parser AST.
+fn fk_def_to_meta(def: &ForeignKeyDef) -> ForeignKeyMeta {
+    ForeignKeyMeta {
+        table: def.table.clone(),
+        column: def.column.clone(),
+        on_delete: def.on_delete,
+    }
+}
+
+/// Validate every `FOREIGN KEY` declared on `meta` at DDL time:
+///
+/// * The target table must exist (or be the table being created — that
+///   handles self-referencing FKs in `CREATE TABLE`).
+/// * The target column must be the parent table's `PRIMARY KEY`. This
+///   version doesn't accept `REFERENCES` against arbitrary `UNIQUE`
+///   columns yet — it keeps the lookup path simple (parent PK is always
+///   indexed by the table's own B+Tree) and matches the most common
+///   real-world FK shape.
+/// * The FK column's type must match the parent's PK type (today both
+///   are necessarily `INT`).
+fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
+    for column in &meta.columns {
+        let Some(fk) = &column.references else {
+            continue;
+        };
+        let is_self_ref = fk.table.eq_ignore_ascii_case(&meta.name);
+        let (target_pk_name, target_pk_type, target_name) = if is_self_ref {
+            let pk = meta.column(&meta.primary_key).ok_or_else(|| {
+                DbError::new("FK self-ref: tabla sin PK definida (estado inconsistente)")
+            })?;
+            (
+                meta.primary_key.clone(),
+                pk.column_type.clone(),
+                meta.name.clone(),
+            )
+        } else {
+            let target = {
+                let mut catalog = Catalog::open(pager);
+                catalog.get_table(&fk.table)?.ok_or_else(|| {
+                    DbError::new(format!(
+                        "FOREIGN KEY '{}.{}' referencia tabla inexistente '{}'",
+                        meta.name, column.name, fk.table
+                    ))
+                })?
+            };
+            let pk = target.column(&target.primary_key).ok_or_else(|| {
+                DbError::new(format!(
+                    "FK rota: tabla '{}' no expone su PK '{}'",
+                    target.name, target.primary_key
+                ))
+            })?;
+            (
+                target.primary_key.clone(),
+                pk.column_type.clone(),
+                target.name.clone(),
+            )
+        };
+        if !target_pk_name.eq_ignore_ascii_case(&fk.column) {
+            return Err(DbError::new(format!(
+                "FOREIGN KEY '{}.{}' debe referenciar la PK de '{}' (es '{}'); \
+                 esta versión no admite REFERENCES contra columnas no-PK",
+                meta.name, column.name, target_name, target_pk_name
+            )));
+        }
+        if column.column_type != target_pk_type {
+            return Err(DbError::new(format!(
+                "FOREIGN KEY '{}.{}' debe ser {} para coincidir con la PK de '{}'",
+                meta.name,
+                column.name,
+                target_pk_type.as_sql(),
+                target_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Verify that the given `target_pk` exists in the FK's parent table.
+/// `self_ref_allowed_pk` lets INSERT/UPDATE accept a self-FK that points
+/// at the very row being written (the row will exist as soon as the
+/// statement commits — refusing it would make self-managed entities
+/// impossible to insert in the first place).
+fn check_fk_value(
+    pager: &mut Pager,
+    meta: &TableMeta,
+    column_name: &str,
+    fk: &ForeignKeyMeta,
+    target_pk: i64,
+    self_ref_allowed_pk: i64,
+) -> DbResult<()> {
+    if fk.table.eq_ignore_ascii_case(&meta.name) && target_pk == self_ref_allowed_pk {
+        return Ok(());
+    }
+    let parent_meta = {
+        let mut catalog = Catalog::open(pager);
+        catalog.get_table(&fk.table)?.ok_or_else(|| {
+            DbError::new(format!(
+                "FK rota: tabla '{}' no existe (referida por '{}.{}')",
+                fk.table, meta.name, column_name
+            ))
+        })?
+    };
+    let exists = {
+        let mut catalog = Catalog::open(pager);
+        catalog.get_row(parent_meta.root_page, target_pk)?.is_some()
+    };
+    if !exists {
+        return Err(DbError::new(format!(
+            "violación de FK: '{}.{}' = {} no existe en '{}'",
+            meta.name, column_name, target_pk, fk.table
+        )));
+    }
+    Ok(())
+}
+
+/// Walk every column with a FK and call [`check_fk_value`] when the
+/// final value (after defaults) is non-NULL. INSERT-time entry point.
+fn enforce_fk_on_insert(
+    pager: &mut Pager,
+    meta: &TableMeta,
+    values: &HashMap<String, Value>,
+    new_pk: i64,
+) -> DbResult<()> {
+    for column in &meta.columns {
+        let Some(fk) = &column.references else {
+            continue;
+        };
+        let value = values
+            .get(&normalize_ident(&column.name))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let Value::Integer(target_pk) = value else {
+            continue;
+        };
+        check_fk_value(pager, meta, &column.name, fk, target_pk, new_pk)?;
+    }
+    Ok(())
+}
+
+/// UPDATE-time entry point. Same as INSERT but only revalidates FK
+/// columns whose value actually changed — leaving an FK column
+/// untouched can never break referential integrity.
+fn enforce_fk_on_update(
+    pager: &mut Pager,
+    meta: &TableMeta,
+    old_row: &HashMap<String, Value>,
+    current: &HashMap<String, Value>,
+    pk: i64,
+) -> DbResult<()> {
+    for column in &meta.columns {
+        let Some(fk) = &column.references else {
+            continue;
+        };
+        let normalized = normalize_ident(&column.name);
+        let old_val = old_row.get(&normalized).cloned().unwrap_or(Value::Null);
+        let new_val = current.get(&normalized).cloned().unwrap_or(Value::Null);
+        if old_val == new_val {
+            continue;
+        }
+        let Value::Integer(target_pk) = new_val else {
+            continue;
+        };
+        check_fk_value(pager, meta, &column.name, fk, target_pk, pk)?;
+    }
+    Ok(())
+}
+
+/// Find every child PK whose FK column equals `parent_pk`. Uses the
+/// secondary index on the child column when it exists; falls back to a
+/// full scan otherwise (with the documented O(n) cost — see
+/// `docs/SQL_REFERENCE.md`).
+fn find_child_pks_with_fk_value(
+    pager: &mut Pager,
+    child_table: &TableMeta,
+    fk_column: &str,
+    parent_pk: i64,
+) -> DbResult<Vec<i64>> {
+    let column = child_table.column(fk_column).ok_or_else(|| {
+        DbError::new(format!(
+            "FK incoherente: columna '{}' no existe en '{}'",
+            fk_column, child_table.name
+        ))
+    })?;
+    let value = Value::Integer(parent_pk);
+    let value_bytes = encode_column_value(column, &value)?;
+
+    if let Some(idx) = child_table.index_for_column(fk_column) {
+        let key = hash_value(&value_bytes);
+        let mut tree = Tree::new(pager);
+        let bucket_bytes = match tree.get(idx.root_page, key)? {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let bucket = decode_bucket(&bucket_bytes)?;
+        return Ok(bucket_lookup(&bucket, &value_bytes));
+    }
+
+    let mut catalog = Catalog::open(pager);
+    let rows = catalog.scan_rows(child_table.root_page, 0, None)?;
+    let mut hits = Vec::new();
+    for kv in rows {
+        let row = decode_row(child_table, &kv.value)?;
+        if let Some(Value::Integer(n)) = row.get(&normalize_ident(fk_column)) {
+            if *n == parent_pk {
+                hits.push(kv.key);
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// DELETE one row from `root_table` and propagate to children according
+/// to each child FK's `ON DELETE` action. Iterative worklist plus a
+/// `visited` set on `(table, pk)` to short-circuit cycles in CASCADE
+/// graphs (e.g. two tables that mutually reference each other).
+///
+/// All secondary-index maintenance is performed inline so the caller
+/// (the executor) doesn't need to know which rows ended up disappearing.
+fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbResult<()> {
+    use std::collections::VecDeque;
+
+    // Snapshot the catalog once: cascading deletes mutate row data only,
+    // never schema, so the snapshot stays valid for the whole walk.
+    let snapshot = {
+        let mut catalog = Catalog::open(pager);
+        catalog.list_tables()?
+    };
+    let lookup_meta = |name: &str| -> Option<TableMeta> {
+        snapshot
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+            .cloned()
+    };
+
+    let mut visited: HashSet<(String, i64)> = HashSet::new();
+    let mut queue: VecDeque<(String, i64)> = VecDeque::new();
+    visited.insert((root_table.to_ascii_lowercase(), root_pk));
+    queue.push_back((root_table.to_string(), root_pk));
+
+    while let Some((parent_name, parent_pk)) = queue.pop_front() {
+        let parent_meta = match lookup_meta(&parent_name) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        // 1. Resolve children before touching the parent row, so we can
+        //    refuse the whole DELETE on RESTRICT without partial state.
+        for child_table in &snapshot {
+            for child_col in &child_table.columns {
+                let Some(fk) = &child_col.references else {
+                    continue;
+                };
+                if !fk.table.eq_ignore_ascii_case(&parent_name) {
+                    continue;
+                }
+                let child_pks =
+                    find_child_pks_with_fk_value(pager, child_table, &child_col.name, parent_pk)?;
+                if child_pks.is_empty() {
+                    continue;
+                }
+                match fk.on_delete {
+                    OnDelete::Restrict => {
+                        return Err(DbError::new(format!(
+                            "violación de FK: '{}.{}' referencia '{}' \
+                             (ON DELETE RESTRICT, {} fila(s) afectadas)",
+                            child_table.name,
+                            child_col.name,
+                            parent_name,
+                            child_pks.len()
+                        )));
+                    }
+                    OnDelete::Cascade => {
+                        for cpk in child_pks {
+                            let key = (child_table.name.to_ascii_lowercase(), cpk);
+                            if visited.insert(key) {
+                                queue.push_back((child_table.name.clone(), cpk));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Delete the parent row from disk and from every secondary
+        //    index it participated in. The row may have already vanished
+        //    if a previous cascade step removed it (cycles, multi-path);
+        //    treat that as a no-op.
+        let row_bytes = {
+            let mut catalog = Catalog::open(pager);
+            catalog.get_row(parent_meta.root_page, parent_pk)?
+        };
+        let Some(bytes) = row_bytes else {
+            continue;
+        };
+        let row = decode_row(&parent_meta, &bytes)?;
+        for idx in &parent_meta.indexes {
+            let column = parent_meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let value = row
+                .get(&normalize_ident(&column.name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let value_bytes = encode_column_value(column, &value)?;
+            index_remove_pk(pager, idx.root_page, &value_bytes, parent_pk)?;
+        }
+        let mut catalog = Catalog::open(pager);
+        catalog.delete_row(parent_meta.root_page, parent_pk)?;
+    }
+    Ok(())
+}
+
 /// Look the value up in a UNIQUE index bucket and translate any conflict
 /// into a user-facing error. Caller passes `exclude_pk = Some(self_pk)`
 /// during UPDATE so the row's pre-existing entry doesn't false-trigger.
@@ -1562,6 +1885,7 @@ impl Parser {
         let mut not_null = false;
         let mut unique = false;
         let mut default: Option<Value> = None;
+        let mut references: Option<ForeignKeyDef> = None;
         loop {
             if self.match_keyword("PRIMARY") {
                 self.expect_keyword("KEY")?;
@@ -1579,6 +1903,23 @@ impl Parser {
                     )));
                 }
                 default = Some(self.expect_value()?);
+            } else if self.match_keyword("REFERENCES") {
+                if references.is_some() {
+                    return Err(DbError::new(format!(
+                        "REFERENCES duplicado en columna '{}'",
+                        name
+                    )));
+                }
+                let target_table = self.expect_ident()?;
+                self.expect_symbol("(")?;
+                let target_column = self.expect_ident()?;
+                self.expect_symbol(")")?;
+                let on_delete = self.parse_on_delete()?;
+                references = Some(ForeignKeyDef {
+                    table: target_table,
+                    column: target_column,
+                    on_delete,
+                });
             } else {
                 break;
             }
@@ -1590,7 +1931,28 @@ impl Parser {
             not_null,
             unique,
             default,
+            references,
         })
+    }
+
+    /// Optional `ON DELETE RESTRICT|CASCADE` tail of a `REFERENCES`
+    /// clause. Defaults to `RESTRICT` when omitted — that matches
+    /// PostgreSQL's implicit behaviour and is the safest choice (refuses
+    /// the parent DELETE rather than silently dropping children).
+    fn parse_on_delete(&mut self) -> DbResult<OnDelete> {
+        if !self.match_keyword("ON") {
+            return Ok(OnDelete::Restrict);
+        }
+        self.expect_keyword("DELETE")?;
+        if self.match_keyword("CASCADE") {
+            Ok(OnDelete::Cascade)
+        } else if self.match_keyword("RESTRICT") {
+            Ok(OnDelete::Restrict)
+        } else {
+            Err(DbError::new(
+                "ON DELETE solo admite RESTRICT o CASCADE en esta versión",
+            ))
+        }
     }
 
     fn parse_create_database(&mut self) -> DbResult<Statement> {

@@ -4,6 +4,50 @@
 
 ---
 
+## 2026-05-07 — Novena intervención: FOREIGN KEY enforced (Camino A · paso 5)
+
+> **On-disk format jump: VERSION 5 → 6.** `Column` ahora persiste un FK opcional `(target_table, target_column, on_delete)`. DBs v5 son rechazadas explícitamente al abrir.
+
+### ✨ Funcionalidad SQL
+- **`REFERENCES <table>(<column>) [ON DELETE RESTRICT|CASCADE]`** como constraint de columna en `CREATE TABLE` y `ALTER TABLE ADD COLUMN`. Default `RESTRICT` cuando se omite `ON DELETE`.
+- **Validación al DDL**: target table debe existir (o ser self-ref a la tabla siendo creada), target column debe ser la PK del target, tipos deben coincidir (en esta versión ambos son siempre `INT`).
+- **Enforcement en `INSERT`**: cada FK no nula chequea que exista la fila parent. Self-FK que apunta al PK que se está insertando se acepta (caso CEO/manager-de-sí-mismo).
+- **Enforcement en `UPDATE`**: solo se revalidan FKs cuyo valor cambió.
+- **Enforcement en `DELETE`**:
+  - `RESTRICT` (default) aborta el DELETE si existe alguna fila hija; sin efectos colaterales.
+  - `CASCADE` borra las hijas iterativamente (worklist con `visited` set sobre `(tabla, pk)` para cortar ciclos), incluyendo sus entradas en índices secundarios.
+- **Self-references** soportadas (`employee.manager_id REFERENCES employee(id)`).
+
+### 🧱 Cambios estructurales
+- `catalog::ForeignKeyMeta { table, column, on_delete: OnDelete }` con `OnDelete::{Restrict, Cascade}`.
+- `Column.references: Option<ForeignKeyMeta>` persistido bajo flag `0x04 = HAS_FK`.
+- `RESERVED_WORDS` extendido con `foreign`, `references`, `cascade`, `restrict`.
+- Helpers nuevos en `sql.rs`: `validate_fk_targets`, `check_fk_value`, `enforce_fk_on_insert`, `enforce_fk_on_update`, `find_child_pks_with_fk_value`, `delete_with_cascade`.
+- `find_child_pks_with_fk_value` usa el índice secundario sobre la columna FK si existe; cae en full scan si no — recomendación documentada de indexar columnas FK para DELETEs O(log n).
+- `exec_delete` simplificado: chequea existencia y delega en `delete_with_cascade`, que maneja índices secundarios + cascade + cycle protection.
+
+### 🌐 Endpoint `/schema` extendido
+Cada columna ahora incluye `references: { table, column, onDelete } | null`:
+```json
+{
+  "name": "parent_id", "type": "INT", "pk": false, "notNull": false, "unique": false,
+  "hasDefault": false, "default": null,
+  "references": { "table": "parent", "column": "id", "onDelete": "CASCADE" }
+}
+```
+
+### 🛡️ Restricciones de la versión
+- Solo FK de columna única (no compuestas).
+- Target debe ser la PK del parent — `REFERENCES` contra `UNIQUE` no-PK no está soportado todavía.
+- Solo `RESTRICT` y `CASCADE` (ni `SET NULL`, ni `SET DEFAULT`, ni `NO ACTION`).
+- `ALTER TABLE ADD COLUMN ... REFERENCES ...` reusa los mismos guards que UNIQUE: si la columna es `NOT NULL` necesita un `DEFAULT` que apunte a un parent existente, etc.
+
+### 🧪 Validación
+- 28/28 tests de integración (6 nuevos: `fk_create_validation_rejects_bad_targets`, `fk_insert_update_enforcement`, `fk_self_reference_allows_pointing_at_self`, `fk_delete_restrict_blocks_when_children_exist`, `fk_delete_cascade_removes_children_and_grandchildren`, `old_v5_db_file_is_rejected_after_v6_bump`).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+---
+
 ## 2026-05-07 — Octava intervención: identificadores duros + introspección completa (Camino A · paso 4)
 
 > **Sin bump de formato.** Los datos en disco no cambian; el cambio es de validación (más estricta) y de contrato JSON (más rico).

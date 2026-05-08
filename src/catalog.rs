@@ -145,6 +145,58 @@ impl DefaultLiteral {
 
 const COLUMN_FLAG_NOT_NULL: u8 = 0x01;
 const COLUMN_FLAG_HAS_DEFAULT: u8 = 0x02;
+const COLUMN_FLAG_HAS_FK: u8 = 0x04;
+
+/// Action to take when the parent row a `FOREIGN KEY` points at is
+/// deleted. SQL standard offers more (SET NULL / SET DEFAULT / NO
+/// ACTION); this version supports the two that cover the vast majority
+/// of real schemas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDelete {
+    /// Refuse the parent DELETE if any child row still references it.
+    /// Default behaviour when `ON DELETE` is omitted.
+    Restrict,
+    /// Delete every child row that references the parent. Cascading
+    /// deletes can chain through several tables; the engine guards
+    /// against cycles using a visited set on `(table, pk)`.
+    Cascade,
+}
+
+impl OnDelete {
+    fn code(self) -> u8 {
+        match self {
+            Self::Restrict => 0,
+            Self::Cascade => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> DbResult<Self> {
+        match code {
+            0 => Ok(Self::Restrict),
+            1 => Ok(Self::Cascade),
+            _ => Err(DbError::new("FK on_delete inválido")),
+        }
+    }
+
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Restrict => "RESTRICT",
+            Self::Cascade => "CASCADE",
+        }
+    }
+}
+
+/// Single-column foreign key persisted on a `Column`. The target column
+/// must be the parent table's PRIMARY KEY in this version — the engine
+/// does not yet support REFERENCES against arbitrary UNIQUE columns,
+/// which keeps lookup paths simple (parent PK lookup is already O(log n)
+/// via the table's own B+Tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyMeta {
+    pub table: String,
+    pub column: String,
+    pub on_delete: OnDelete,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
@@ -152,6 +204,7 @@ pub struct Column {
     pub column_type: ColumnType,
     pub not_null: bool,
     pub default: Option<DefaultLiteral>,
+    pub references: Option<ForeignKeyMeta>,
 }
 
 impl Column {
@@ -161,6 +214,7 @@ impl Column {
             column_type,
             not_null: false,
             default: None,
+            references: None,
         }
     }
 }
@@ -201,12 +255,13 @@ impl TableMeta {
             .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
-    /// VERSION = 5 on-disk layout for a TableMeta record:
+    /// VERSION = 6 on-disk layout for a TableMeta record:
     ///
     ///     [name][primary_key][root_page:u32]
     ///     [col_count:u16] · col_count × {
     ///         [name][type_code:u8][flags:u8]
     ///         flags & 0x02 ? DefaultLiteral payload : ∅
+    ///         flags & 0x04 ? [target_table][target_column][on_delete:u8] : ∅
     ///     }
     ///     [idx_count:u16] · idx_count × {
     ///         [name][column][root_page:u32][unique:u8]
@@ -227,9 +282,17 @@ impl TableMeta {
             if column.default.is_some() {
                 flags |= COLUMN_FLAG_HAS_DEFAULT;
             }
+            if column.references.is_some() {
+                flags |= COLUMN_FLAG_HAS_FK;
+            }
             out.push(flags);
             if let Some(default) = &column.default {
                 default.encode_into(&mut out)?;
+            }
+            if let Some(fk) = &column.references {
+                push_string(&mut out, &fk.table)?;
+                push_string(&mut out, &fk.column)?;
+                out.push(fk.on_delete.code());
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -269,11 +332,28 @@ impl TableMeta {
             } else {
                 None
             };
+            let references = if flags & COLUMN_FLAG_HAS_FK != 0 {
+                let target_table = take_string(data, &mut offset)?;
+                let target_column = take_string(data, &mut offset)?;
+                if offset >= data.len() {
+                    return Err(DbError::new("meta de FK corrupta (on_delete)"));
+                }
+                let on_delete = OnDelete::from_code(data[offset])?;
+                offset += 1;
+                Some(ForeignKeyMeta {
+                    table: target_table,
+                    column: target_column,
+                    on_delete,
+                })
+            } else {
+                None
+            };
             columns.push(Column {
                 name,
                 column_type,
                 not_null,
                 default,
+                references,
             });
         }
         if offset + 2 > data.len() {
@@ -527,6 +607,11 @@ pub const RESERVED_WORDS: &[&str] = &[
     "null",
     "true",
     "false",
+    // FOREIGN KEY clause (VERSION 6+)
+    "foreign",
+    "references",
+    "cascade",
+    "restrict",
     // Built-in column types
     "int",
     "text",

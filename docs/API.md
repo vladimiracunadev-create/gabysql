@@ -118,9 +118,9 @@ Lista todas las tablas con su schema completo (mismo shape que `/schema`, pero e
       "primaryKey": "id",
       "rootPage": 2,
       "columns": [
-        { "name": "id",    "type": "INT",  "pk": true,  "notNull": true,  "unique": false, "hasDefault": false, "default": null },
-        { "name": "email", "type": "TEXT", "pk": false, "notNull": true,  "unique": true,  "hasDefault": false, "default": null },
-        { "name": "status","type": "TEXT", "pk": false, "notNull": true,  "unique": false, "hasDefault": true,  "default": "pending" }
+        { "name": "id",    "type": "INT",  "pk": true,  "notNull": true,  "unique": false, "hasDefault": false, "default": null,      "references": null },
+        { "name": "email", "type": "TEXT", "pk": false, "notNull": true,  "unique": true,  "hasDefault": false, "default": null,      "references": null },
+        { "name": "status","type": "TEXT", "pk": false, "notNull": true,  "unique": false, "hasDefault": true,  "default": "pending", "references": null }
       ],
       "indexes": [
         { "name": "uq_users_email", "column": "email", "rootPage": 4, "unique": true }
@@ -148,8 +148,10 @@ Ejemplo:
       { "name": "id",    "type": "INT",  "pk": true,  "notNull": true,  "unique": false, "hasDefault": false, "default": null },
       { "name": "email", "type": "TEXT", "pk": false, "notNull": true,  "unique": true,  "hasDefault": false, "default": null },
       { "name": "status","type": "TEXT", "pk": false, "notNull": true,  "unique": false, "hasDefault": true,  "default": "pending" },
-      { "name": "score", "type": "FLOAT","pk": false, "notNull": false, "unique": false, "hasDefault": true,  "default": 0.0 },
-      { "name": "active","type": "BOOL", "pk": false, "notNull": false, "unique": false, "hasDefault": true,  "default": true }
+      { "name": "score", "type": "FLOAT","pk": false, "notNull": false, "unique": false, "hasDefault": true,  "default": 0.0,  "references": null },
+      { "name": "active","type": "BOOL", "pk": false, "notNull": false, "unique": false, "hasDefault": true,  "default": true, "references": null },
+      { "name": "manager_id", "type": "INT", "pk": false, "notNull": false, "unique": false, "hasDefault": false, "default": null,
+        "references": { "table": "users", "column": "id", "onDelete": "RESTRICT" } }
     ],
     "indexes": [
       { "name": "uq_users_email", "column": "email", "rootPage": 4, "unique": true }
@@ -162,6 +164,10 @@ Reglas del campo `default`:
 - `"hasDefault": false` ⇒ `"default": null` significa **no hay** DEFAULT declarado.
 - `"hasDefault": true` y `"default": null` significa **`DEFAULT NULL` explícito**.
 - En cualquier otro caso `default` lleva el literal con su tipo nativo (`number`, `string`, `boolean`).
+
+Campo `references`:
+- `null` cuando la columna no tiene FK.
+- Objeto `{ table, column, onDelete }` con la FK declarada. `onDelete` es `"RESTRICT"` o `"CASCADE"` (default `"RESTRICT"` cuando se omite en el SQL).
 
 Status posibles: `200` con `ok: true`, `404` con `ok: false, error: "tabla no existe"`.
 
