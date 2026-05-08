@@ -907,10 +907,7 @@ fn handle_tools_call(
     };
 
     // Audit log para mutaciones — sin efecto si --audit-log no está activo.
-    if matches!(
-        name.as_str(),
-        "gabysql_execute" | "gabysql_integrity_check"
-    ) {
+    if matches!(name.as_str(), "gabysql_execute" | "gabysql_integrity_check") {
         let entry = AuditEntry {
             ts_unix: now_unix(),
             tool: name.clone(),
@@ -1133,13 +1130,7 @@ fn vector_search(cfg: &Config, db: Option<&str>, args: &Json) -> Result<String, 
         .ok_or("respuesta sin results[0]")?;
     let rows = result_set
         .get("rows")
-        .and_then(|v| {
-            if let Json::Arr(a) = v {
-                Some(a)
-            } else {
-                None
-            }
-        })
+        .and_then(|v| if let Json::Arr(a) = v { Some(a) } else { None })
         .ok_or("results[0].rows ausente")?;
 
     // Heap de tamaño top_k: distancia, pk_json, vector_json (para devolver verbatim)
@@ -1475,10 +1466,7 @@ fn audit_tail(cfg: &Config, n: usize) -> Result<String, String> {
     let mut o = Json::obj();
     o.push(("ok".into(), Json::Bool(true)));
     o.push(("enabled".into(), Json::Bool(true)));
-    o.push((
-        "path".into(),
-        Json::Str(path.display().to_string()),
-    ));
+    o.push(("path".into(), Json::Str(path.display().to_string())));
     o.push(("entries".into(), Json::Arr(entries)));
     Ok(json_to_string(&Json::Obj(o)))
 }
@@ -1538,8 +1526,12 @@ mod tests {
             audit_log: None,
         };
         let state = Mutex::new(RuntimeState::default());
-        let reply =
-            dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &cfg, &state).unwrap();
+        let reply = dispatch(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &cfg,
+            &state,
+        )
+        .unwrap();
         assert!(reply.contains("gabysql_execute"));
         assert!(reply.contains("gabysql_query"));
         assert!(reply.contains("gabysql_integrity_check"));
@@ -1555,8 +1547,12 @@ mod tests {
             audit_log: None,
         };
         let state = Mutex::new(RuntimeState::default());
-        let reply =
-            dispatch(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, &cfg, &state).unwrap();
+        let reply = dispatch(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+            &cfg,
+            &state,
+        )
+        .unwrap();
         assert!(!reply.contains("gabysql_execute"));
         assert!(reply.contains("gabysql_query"));
     }
@@ -1591,8 +1587,7 @@ mod tests {
             audit_log: None,
         };
         let state = Mutex::new(RuntimeState::default());
-        let reply =
-            dispatch(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#, &cfg, &state).unwrap();
+        let reply = dispatch(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#, &cfg, &state).unwrap();
         let parsed = json_parse(&reply).unwrap();
         assert_eq!(parsed.get("id"), Some(&Json::Num(5.0)));
         assert!(matches!(parsed.get("result"), Some(Json::Obj(_))));
@@ -1877,8 +1872,12 @@ mod tests {
             audit_log: None,
         };
         let state = Mutex::new(RuntimeState::default());
-        let reply =
-            dispatch(r#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#, &cfg, &state).unwrap();
+        let reply = dispatch(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#,
+            &cfg,
+            &state,
+        )
+        .unwrap();
         assert!(reply.contains("gabysql_audit_tail"));
         assert!(reply.contains("ADR-0012"));
     }

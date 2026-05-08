@@ -3,6 +3,13 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
+# Replicamos el orden de CI (.github/workflows/ci.yml) para que un
+# `docker build` local atrape lo mismo: fmt → clippy → test → release.
+# Sin esto, la única validación local era cargo test, y rustfmt/clippy
+# se descubrían tarde en CI con un round-trip extra de push.
+RUN rustup component add rustfmt clippy
+RUN cargo fmt --check
+RUN cargo clippy --all-targets -- -D warnings
 RUN cargo test --all-targets
 RUN cargo build --release --bin gabysql --bin gabysql-server
 
