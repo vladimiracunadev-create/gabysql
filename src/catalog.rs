@@ -612,6 +612,9 @@ pub const RESERVED_WORDS: &[&str] = &[
     "references",
     "cascade",
     "restrict",
+    // Operational sentences (VERSION 6+)
+    "integrity",
+    "check",
     // Built-in column types
     "int",
     "text",

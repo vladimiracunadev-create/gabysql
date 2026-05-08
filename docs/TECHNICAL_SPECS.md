@@ -198,6 +198,7 @@ Enforcement en runtime:
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
 - `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` (backfill aborta en duplicados)
 - `DROP INDEX <nombre>`
+- `INTEGRITY CHECK` (sweep operacional de páginas + índices + FKs)
 
 ### No soportado todavía
 - `JOIN`

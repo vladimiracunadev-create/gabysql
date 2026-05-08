@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-05-07 — Décima intervención: `INTEGRITY CHECK` (cierre de Fase 1)
+
+> **Sin bump de formato.** El comando es de solo lectura — no toca el catálogo ni los datos.
+
+### ✨ Funcionalidad SQL
+- **`INTEGRITY CHECK;`** — barre la DB abierta y devuelve un ResultSet con una fila por hallazgo. Columnas: `kind`, `object`, `detail`. El campo `message` resume con `OK · N tablas · M filas · K índices · F FKs · P páginas` o `FAIL · ...` según el caso.
+
+### 🔍 Qué chequea
+1. **CRC de cada página**: itera de `0..page_count` haciendo `Pager::page_data`. Cualquier falla del CRC se reporta como `kind=page_corrupt`.
+2. **Decodificación de cada fila**: `decode_row` corre sobre cada fila de cada tabla. Falla → `kind=row_decode`.
+3. **Índices secundarios**: walks every bucket de cada índice y verifica que cada `(value_bytes, pk)` apunte a una PK que efectivamente existe en la tabla. Si no → `kind=orphan_index_entry`.
+4. **FOREIGN KEYs**: para cada columna con `references`, verifica que el parent table exista (sino `fk_target_missing`) y que cada valor no nulo de la columna tenga su parent row (sino `fk_orphan`).
+
+### 🧱 Cambios estructurales
+- Nuevo `Statement::IntegrityCheck` y método `Engine::exec_integrity_check`.
+- Reserved words extendidas: `integrity`, `check`.
+- Sin cambios al on-disk format ni al catálogo.
+
+### 🧪 Validación
+- 30/30 tests de integración (2 nuevos: `integrity_check_clean_db_returns_ok`, `integrity_check_reports_corrupted_page`).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+### 🎯 Cierre de Fase 1 (Robustez funcional)
+Con este bloque, los 5 ítems de Fase 1 del [ROADMAP](../ROADMAP.md) están entregados:
+- ~~`UPDATE`/`DELETE` por PK~~
+- ~~Checksums por página + WAL~~
+- ~~`NOT NULL` / `DEFAULT` / `UNIQUE`~~
+- ~~`FOREIGN KEY` + `ON DELETE` enforced~~
+- ~~`INTEGRITY CHECK` operacional~~
+
+El motor está listo para empezar a sumar features de Fase 2 (índices compuestos, range scan secundario, `ORDER BY`) o para una primera publicación con SLAs de durabilidad medibles.
+
+---
+
 ## 2026-05-07 — Novena intervención: FOREIGN KEY enforced (Camino A · paso 5)
 
 > **On-disk format jump: VERSION 5 → 6.** `Column` ahora persiste un FK opcional `(target_table, target_column, on_delete)`. DBs v5 son rechazadas explícitamente al abrir.

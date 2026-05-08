@@ -29,6 +29,12 @@ pub enum Statement {
     CreateDatabase(CreateDatabaseStmt),
     DropDatabase(DropDatabaseStmt),
     ShowDatabases,
+    /// `INTEGRITY CHECK;` — sweeps the open DB and reports any
+    /// detectable corruption: bad page CRCs, secondary-index entries
+    /// that point at non-existent rows, FK values that lost their
+    /// parent. Returns a result set with one row per finding plus a
+    /// summary message.
+    IntegrityCheck,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +175,7 @@ impl<'a> Engine<'a> {
             Statement::Delete(stmt) => self.exec_delete(stmt),
             Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
             Statement::DropIndex(stmt) => self.exec_drop_index(stmt),
+            Statement::IntegrityCheck => self.exec_integrity_check(),
             Statement::CreateDatabase(_)
             | Statement::DropDatabase(_)
             | Statement::ShowDatabases => Err(DbError::new(
@@ -261,6 +268,180 @@ impl<'a> Engine<'a> {
             columns: Vec::new(),
             rows: Vec::new(),
             message: Some("OK".to_string()),
+        })
+    }
+
+    /// `INTEGRITY CHECK;` — sweep every table, every secondary index and
+    /// every FK in the open DB and report anything that doesn't add up.
+    /// Each finding becomes one row in the returned ResultSet:
+    ///
+    ///     columns: ["kind", "object", "detail"]
+    ///
+    /// Possible `kind` values:
+    ///
+    ///   * `page_corrupt` — `page_data(no)` failed (bad CRC, etc.)
+    ///   * `row_decode` — a row's bytes don't match the column schema
+    ///     (rare; only happens if encoder/decoder go out of sync)
+    ///   * `orphan_index_entry` — a secondary-index entry points at a
+    ///     PK that isn't in the table anymore
+    ///   * `fk_target_missing` — a column declares `REFERENCES` against
+    ///     a table that no longer exists
+    ///   * `fk_orphan` — a non-NULL FK value has no parent row
+    ///
+    /// The `message` field is `OK · …` when no findings, or
+    /// `FAIL · N hallazgos · …` otherwise. Counts in the message are
+    /// useful for monitoring even when callers ignore the row payload.
+    fn exec_integrity_check(&mut self) -> DbResult<ResultSet> {
+        let mut issues: Vec<(String, String, String)> = Vec::new();
+
+        // Snapshot the catalog up front so child-table lookups during the
+        // FK sweep don't fight with the table-by-table iteration.
+        let tables = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_tables()?
+        };
+
+        // 1. Page-level CRC sweep. Loading every page through the pager
+        //    triggers verify_page_checksum on each one — that's the whole
+        //    check. We don't try to interpret garbage pages here; their
+        //    CRC either matches what was last committed or it doesn't.
+        let total_pages = self.pager.header().page_count;
+        for page_no in 0..total_pages {
+            if let Err(err) = self.pager.page_data(page_no) {
+                issues.push((
+                    "page_corrupt".into(),
+                    format!("page {}", page_no),
+                    err.to_string(),
+                ));
+            }
+        }
+
+        let mut rows_scanned = 0usize;
+        let mut indexes_scanned = 0usize;
+        let mut fks_checked = 0usize;
+
+        for table in &tables {
+            // 2. Walk every row. Collect the live PK set (used right
+            //    after for the index sweep) and report any decode failure.
+            let kvs = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.scan_rows(table.root_page, 0, None)?
+            };
+            let mut live_pks: HashSet<i64> = HashSet::with_capacity(kvs.len());
+            for kv in &kvs {
+                live_pks.insert(kv.key);
+                if let Err(err) = decode_row(table, &kv.value) {
+                    issues.push((
+                        "row_decode".into(),
+                        format!("{}.pk={}", table.name, kv.key),
+                        err.to_string(),
+                    ));
+                }
+            }
+            rows_scanned += kvs.len();
+
+            // 3. Walk every bucket of every secondary index and verify
+            //    each (value_bytes, pk) pair points at a real row.
+            for idx in &table.indexes {
+                indexes_scanned += 1;
+                let bucket_kvs = {
+                    let mut tree = Tree::new(self.pager);
+                    tree.all(idx.root_page)?
+                };
+                for kv in bucket_kvs {
+                    let bucket = decode_bucket(&kv.value)?;
+                    for (_, pk) in bucket {
+                        if !live_pks.contains(&pk) {
+                            issues.push((
+                                "orphan_index_entry".into(),
+                                format!("{}.{} pk={}", table.name, idx.name, pk),
+                                "PK no existe en la tabla".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // 4. FK sweep: for each column with a FK, walk the table's
+            //    rows and confirm each non-NULL value still resolves
+            //    against the parent.
+            for column in &table.columns {
+                let Some(fk) = &column.references else {
+                    continue;
+                };
+                let parent = tables
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&fk.table))
+                    .cloned();
+                let Some(parent_meta) = parent else {
+                    issues.push((
+                        "fk_target_missing".into(),
+                        format!("{}.{}", table.name, column.name),
+                        format!("tabla parent '{}' no existe", fk.table),
+                    ));
+                    continue;
+                };
+                for kv in &kvs {
+                    let row = decode_row(table, &kv.value)?;
+                    let Some(Value::Integer(parent_pk)) = row.get(&normalize_ident(&column.name))
+                    else {
+                        continue;
+                    };
+                    fks_checked += 1;
+                    let exists = {
+                        let mut catalog = Catalog::open(self.pager);
+                        catalog
+                            .get_row(parent_meta.root_page, *parent_pk)?
+                            .is_some()
+                    };
+                    if !exists {
+                        issues.push((
+                            "fk_orphan".into(),
+                            format!("{}.pk={}.{}={}", table.name, kv.key, column.name, parent_pk),
+                            format!("no existe en '{}'", fk.table),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let issue_count = issues.len();
+        let summary = if issue_count == 0 {
+            format!(
+                "OK · {} tablas · {} filas · {} \u{00ed}ndices · {} FKs · {} p\u{00e1}ginas",
+                tables.len(),
+                rows_scanned,
+                indexes_scanned,
+                fks_checked,
+                total_pages
+            )
+        } else {
+            format!(
+                "FAIL · {} hallazgos · {} tablas · {} filas · {} \u{00ed}ndices · {} FKs · {} p\u{00e1}ginas",
+                issue_count,
+                tables.len(),
+                rows_scanned,
+                indexes_scanned,
+                fks_checked,
+                total_pages
+            )
+        };
+
+        let rows = issues
+            .into_iter()
+            .map(|(kind, object, detail)| {
+                vec![
+                    Value::String(kind),
+                    Value::String(object),
+                    Value::String(detail),
+                ]
+            })
+            .collect();
+
+        Ok(ResultSet {
+            columns: vec!["kind".into(), "object".into(), "detail".into()],
+            rows,
+            message: Some(summary),
         })
     }
 
@@ -1773,8 +1954,12 @@ impl Parser {
         if self.match_keyword("SHOW") {
             return self.parse_show();
         }
+        if self.match_keyword("INTEGRITY") {
+            self.expect_keyword("CHECK")?;
+            return Ok(Statement::IntegrityCheck);
+        }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW/INTEGRITY)",
         ))
     }
 

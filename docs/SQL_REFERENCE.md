@@ -13,6 +13,7 @@
 | [`CREATE DATABASE`](#create-database) | DDL · server multi-DB | 🟢 |
 | [`DROP DATABASE`](#drop-database) | DDL · server multi-DB | 🟢 |
 | [`SHOW DATABASES`](#show-databases) | DDL · server multi-DB | 🟢 |
+| [`INTEGRITY CHECK`](#integrity-check) | Operacional | 🟢 |
 | [`CREATE TABLE`](#create-table) | DDL | 🟢 |
 | [`DROP TABLE`](#drop-table) | DDL | 🟢 |
 | [`ALTER TABLE ADD COLUMN`](#alter-table-add-column) | DDL | 🟢 |
@@ -622,6 +623,53 @@ DELETE FROM users WHERE id = 5;
 | `violación de FK: 'X.col' referencia 'Y' (ON DELETE RESTRICT, N fila(s) afectadas)` | hay filas hijas y la FK fue declarada `ON DELETE RESTRICT` (default) |
 
 > Antes de borrar la fila, el engine la lee para evictar la entrada correspondiente de cada índice secundario. Si la tabla tiene FKs entrantes, el motor resuelve cascade/restrict iterativamente con un worklist y cycle protection (visited set sobre `(tabla, pk)`). Para tablas grandes con FKs entrantes, **se recomienda crear un índice secundario sobre la columna FK del hijo** — el engine lo usa automáticamente para que el lookup de hijos sea O(log n) en vez de full scan.
+
+---
+
+## INTEGRITY CHECK
+
+> Recorre la DB abierta y reporta toda inconsistencia detectable: páginas con CRC inválido, filas no decodificables, entradas de índice secundario huérfanas (apuntan a PKs que ya no existen) y FKs huérfanas (valor no NULL sin parent). De solo lectura — no modifica nada.
+
+### 🛤️ Railroad
+
+```mermaid
+flowchart LR
+    S([▶]) --> I[INTEGRITY] --> C[CHECK] --> SEMI[";"] --> E([■])
+```
+
+### 📜 EBNF
+
+```
+integrity_check ::= "INTEGRITY" "CHECK"
+```
+
+### ✅ Forma del resultado
+
+`INTEGRITY CHECK` devuelve un ResultSet con columnas `kind`, `object`, `detail` — una fila por hallazgo. El campo `message` resume:
+
+- DB sana: `OK · N tablas · M filas · K índices · F FKs · P páginas`
+- DB con hallazgos: `FAIL · H hallazgos · ...`
+
+Ejemplo de respuesta sin hallazgos:
+```json
+{
+  "columns": ["kind", "object", "detail"],
+  "rows": [],
+  "message": "OK · 2 tablas · 4 filas · 1 índices · 2 FKs · 4 páginas"
+}
+```
+
+### 🏷️ Categorías de hallazgo
+
+| `kind` | Significado |
+| :--- | :--- |
+| `page_corrupt` | El pager rechazó la página al cargarla (CRC mismatch o lectura corta). |
+| `row_decode` | Los bytes de la fila no se ajustan al esquema actual de la tabla. Muy raro — solo ocurre si el encoder y el decoder se desincronizan. |
+| `orphan_index_entry` | Una entrada de un índice secundario apunta a una PK que ya no existe en la tabla. |
+| `fk_target_missing` | Una columna declara `REFERENCES` contra una tabla que ya no existe. |
+| `fk_orphan` | Un valor no nulo de una columna FK no tiene parent en la tabla referenciada. |
+
+> Recomendado correrlo después de un crash, después de restaurar un backup, o como sanity check periódico. La complejidad es O(filas + entradas_de_índice + filas_con_FK), totalmente secuencial.
 
 ---
 

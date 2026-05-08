@@ -4,7 +4,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-6-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-28%2F28-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-30%2F30-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -32,7 +32,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Range scan por índice secundario | 🔴 | En [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | ORDER BY / GROUP BY / JOIN | 🔴 | En [Camino A/B/C](COMMERCIAL_ROADMAP.md) según madurez. | — |
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
-| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`/`REFERENCES`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
+| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`/`REFERENCES`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES, INTEGRITY CHECK. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
 | Engine (executor) | 🟡 | Sin iterator pattern, sin spill-to-disk, sin plan lógico/físico. | [src/sql.rs](../src/sql.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
@@ -47,7 +47,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | `phpgabyadmin` | 🟢 | Browse / Structure (con índices CRUD inline) / SQL con snippets. | [web/phpgabyadmin/index.php](../web/phpgabyadmin/index.php) |
 | `gabymodeler` (modelador web) | 🟢 | Vanilla HTML+JS, drag&drop entidades, FK Bezier, exporta DDL gabysql. | [web/modeler/index.html](../web/modeler/index.html) |
 | Backup / restore con verificación | 🔴 | Solo `cp` informal hoy. Camino A. | — |
-| `integrity_check` operacional | 🔴 | Camino A. | — |
+| `INTEGRITY CHECK` operacional | 🟢 | Pages CRC + row decode + index orphans + FK orphans. Devuelve ResultSet con kind/object/detail. | [src/sql.rs](../src/sql.rs) |
 | Suite de benchmarks reproducible | 🔴 | `gabybench` especificado pero no implementado. | [GABYBENCH_SPEC.md](GABYBENCH_SPEC.md) |
 | Replicación / HA / clustering | 🔴 | Camino C. | — |
 | Wire protocol Postgres/MySQL | 🔴 | Camino C. | — |
@@ -92,8 +92,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque comprometido (Camino A — paso 6, cierre de Fase 1)
+## 🔭 Próximo bloque (Fase 2 — Storage y consulta)
 
-> **`integrity_check` operacional.** Comando que recorre el B+Tree de cada tabla validando CRCs, que cada índice secundario apunta a filas existentes, y que cada FK del catálogo tiene su parent. Cierra el ciclo de Fase 1 (Robustez funcional) y deja al motor listo para el primer release con SLAs de durabilidad medibles.
+> **Fase 1 cerrada.** Los 5 ítems de robustez funcional están entregados. El siguiente paso natural es Fase 2: índices compuestos, range scan por índice secundario (`WHERE col_indexada BETWEEN ...`), `ORDER BY`, y checkpoint del WAL. También entra en juego el **relayout PowerDesigner-style de gabymodeler** ahora que el motor expone toda la información (constraints, FKs, introspección completa) que la UI necesita.
 
 Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.

@@ -28,16 +28,16 @@
 
 ## 🎯 Prioridades antes de llamarlo v1 serio
 
-### Fase 1 — Robustez funcional
+### Fase 1 — Robustez funcional ✅ ENTREGADA
 - ~~`UPDATE` y `DELETE` por PK~~ ✅ entregado
 - ~~checksums por página + WAL~~ ✅ entregado (CRC32-IEEE)
 - ~~`NOT NULL`, `DEFAULT` y `UNIQUE` declarativos~~ ✅ entregado (VERSION 5)
-- mejor validación de tipos en parser y engine
-- crash tests dirigidos (kill -9 entre WAL y file flush)
-- comando `integrity_check` que recorra y valide CRCs y la estructura del B+Tree
-- mejoras de full scan para tablas medianas
-- cobertura adicional en parser, storage y server
-- política más clara de compatibilidad del formato en disco (changelog explícito por bump de VERSION)
+- ~~`FOREIGN KEY` declarativas + enforced~~ ✅ entregado (VERSION 6)
+- ~~mejor validación de tipos en parser y engine~~ ✅ entregado (identificadores duros + reserved words + DEFAULT/FK type checks)
+- ~~comando `INTEGRITY CHECK` que recorra y valide CRCs y la estructura del B+Tree~~ ✅ entregado
+- ~~política más clara de compatibilidad del formato en disco (changelog explícito por bump de VERSION)~~ ✅ entregado (1 bloque = 1 push a `main`, CHANGELOG entry por intervención)
+- crash tests dirigidos (kill -9 entre WAL y file flush) — pendiente
+- mejoras de full scan para tablas medianas — pendiente
 
 ### Fase 2 — Storage y consulta
 - ~~índices secundarios (una columna, equality)~~ ✅ entregado
