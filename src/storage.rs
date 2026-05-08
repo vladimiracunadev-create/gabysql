@@ -1,10 +1,22 @@
 use crate::{DbError, DbResult};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const PAGE_SIZE_DEFAULT: usize = 4096;
+
+/// Maximum number of cached pages per Pager when not configured
+/// otherwise. At the default page size of 4 KB this caps the cache
+/// at roughly 4 MB per open DB — bounded enough for a long-running
+/// server with dozens of DBs, generous enough that small workloads
+/// never have to read a hot page twice.
+///
+/// Why this number: SQLite defaults to 2000 pages (~8 MB at 4 KB);
+/// PostgreSQL's `shared_buffers` defaults to 128 MB. We're an embedded
+/// engine biased toward many small DBs co-resident, so a smaller per-DB
+/// cap is the right knob. Tunable via `Pager::set_cache_capacity`.
+pub const DEFAULT_CACHE_PAGES: usize = 1024;
 pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 // File-format version. Bumped to:
 //   2 -> moved catalog hashing from DefaultHasher to FNV-1a-64.
@@ -105,12 +117,133 @@ struct CachedPage {
     dirty: bool,
 }
 
+/// Bounded page cache with clean-only LRU eviction.
+///
+/// The pre-block-10 implementation was a `BTreeMap<u32, CachedPage>`
+/// that grew without bound. In a long-running `gabysql-server` with N
+/// DBs, an `INTEGRITY CHECK` (or any large scan) would touch every
+/// page of every DB and pin it forever in RAM — a silent memory leak
+/// proportional to the working set, not to the configured limit.
+///
+/// This cache is fixed-capacity. On insert when full, it evicts the
+/// least-recently-used **clean** page. Dirty pages are never evicted
+/// — they belong to the open transaction and must reach the WAL
+/// before they can be dropped. If the cache is full of dirty pages
+/// the cache temporarily exceeds capacity rather than risk losing a
+/// pending write; the overflow drains naturally on commit when every
+/// page transitions to clean.
+///
+/// LRU is tracked with a monotonic counter (cheap O(1) update); the
+/// eviction scan is O(N) but only runs when the cache is at capacity
+/// and only over the small fixed cap. For 1024 entries that's a
+/// handful of microseconds per eviction — acceptable for an embedded
+/// engine and far simpler than a doubly-linked list with manual
+/// indices.
+struct PageCache {
+    capacity: usize,
+    map: HashMap<u32, CacheSlot>,
+    counter: u64,
+}
+
+struct CacheSlot {
+    page: CachedPage,
+    last_access: u64,
+}
+
+impl PageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            counter: 0,
+        }
+    }
+
+    fn touch(&mut self, no: u32) {
+        if self.map.contains_key(&no) {
+            self.counter += 1;
+            if let Some(slot) = self.map.get_mut(&no) {
+                slot.last_access = self.counter;
+            }
+        }
+    }
+
+    fn get(&mut self, no: u32) -> Option<&CachedPage> {
+        self.touch(no);
+        self.map.get(&no).map(|s| &s.page)
+    }
+
+    fn get_mut(&mut self, no: u32) -> Option<&mut CachedPage> {
+        self.touch(no);
+        self.map.get_mut(&no).map(|s| &mut s.page)
+    }
+
+    fn contains_key(&self, no: u32) -> bool {
+        self.map.contains_key(&no)
+    }
+
+    /// Insert or replace the cached page for `no`. When the cache is
+    /// at capacity and `no` is new, first attempt to evict the LRU
+    /// clean page; if every cached page is dirty (mid-transaction
+    /// edge case), allow the cache to overflow temporarily — losing
+    /// a dirty page would corrupt the database.
+    fn insert(&mut self, no: u32, page: CachedPage) {
+        if !self.map.contains_key(&no) && self.map.len() >= self.capacity {
+            let victim = self
+                .map
+                .iter()
+                .filter(|(_, slot)| !slot.page.dirty)
+                .min_by_key(|(_, slot)| slot.last_access)
+                .map(|(k, _)| *k);
+            if let Some(k) = victim {
+                self.map.remove(&k);
+            }
+        }
+        self.counter += 1;
+        self.map.insert(
+            no,
+            CacheSlot {
+                page,
+                last_access: self.counter,
+            },
+        );
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Snapshot of (page_no, page) for every dirty entry. Used by
+    /// `commit` to pull the WAL payload before fsync-ing.
+    fn dirty_snapshot(&self) -> Vec<(u32, CachedPage)> {
+        self.map
+            .iter()
+            .filter(|(_, slot)| slot.page.dirty)
+            .map(|(k, slot)| (*k, slot.page.clone()))
+            .collect()
+    }
+
+    fn mark_all_clean(&mut self) {
+        for slot in self.map.values_mut() {
+            slot.page.dirty = false;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 pub struct Pager {
     path: PathBuf,
     file: File,
     wal: Option<Wal>,
     header: Header,
-    cache: BTreeMap<u32, CachedPage>,
+    cache: PageCache,
     in_tx: bool,
 }
 
@@ -161,7 +294,7 @@ impl Pager {
             file,
             wal: None,
             header,
-            cache: BTreeMap::new(),
+            cache: PageCache::new(DEFAULT_CACHE_PAGES),
             in_tx: false,
         })
     }
@@ -200,7 +333,7 @@ impl Pager {
             file,
             wal: None,
             header,
-            cache: BTreeMap::new(),
+            cache: PageCache::new(DEFAULT_CACHE_PAGES),
             in_tx: false,
         })
     }
@@ -235,13 +368,15 @@ impl Pager {
             return Err(DbError::new("no active tx"));
         }
 
-        // Materialize dirty pages and finalize their checksum trailer once,
-        // before they hit either WAL or main file.
+        // Materialize dirty pages and finalize their checksum trailer
+        // once, before they hit either WAL or main file. The cache
+        // returns a Vec snapshot so we don't hold a borrow across
+        // the WAL writes below.
         let mut dirty_pages: Vec<(u32, Vec<u8>)> = self
             .cache
-            .iter()
-            .filter(|(_, page)| page.dirty)
-            .map(|(no, page)| (*no, page.data.clone()))
+            .dirty_snapshot()
+            .into_iter()
+            .map(|(no, page)| (no, page.data))
             .collect();
         for (_, data) in dirty_pages.iter_mut() {
             finalize_page_checksum(data);
@@ -264,9 +399,9 @@ impl Pager {
         }
         self.file.sync_all()?;
 
-        for page in self.cache.values_mut() {
-            page.dirty = false;
-        }
+        // After commit, every cached page is in sync with disk and
+        // becomes evictable by the LRU.
+        self.cache.mark_all_clean();
 
         self.wal = None;
         let _ = fs::remove_file(wal_path_for(&self.path));
@@ -295,7 +430,7 @@ impl Pager {
         self.ensure_page_loaded(no)?;
         Ok(self
             .cache
-            .get(&no)
+            .get(no)
             .ok_or_else(|| DbError::new("page cache inconsistente"))?
             .data
             .clone())
@@ -308,7 +443,7 @@ impl Pager {
         self.ensure_page_loaded(no)?;
         let page = self
             .cache
-            .get_mut(&no)
+            .get_mut(no)
             .ok_or_else(|| DbError::new("page cache inconsistente"))?;
         page.data.copy_from_slice(data);
         page.dirty = dirty;
@@ -319,10 +454,30 @@ impl Pager {
         self.ensure_page_loaded(no)?;
         let page = self
             .cache
-            .get_mut(&no)
+            .get_mut(no)
             .ok_or_else(|| DbError::new("page cache inconsistente"))?;
         page.dirty = true;
         Ok(())
+    }
+
+    /// Reconfigure the LRU cache capacity (in pages). Default is
+    /// [`DEFAULT_CACHE_PAGES`]. Callers can shrink for memory-tight
+    /// embeddings or grow for warm working sets. Eviction kicks in
+    /// the next time `insert` runs against a full cache.
+    pub fn set_cache_capacity(&mut self, capacity: usize) {
+        self.cache.capacity = capacity.max(1);
+    }
+
+    /// Number of cached pages right now. Mostly useful for tests and
+    /// `INTEGRITY CHECK`-style introspection.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Maximum number of cached pages. Hit by `cache_len()` and
+    /// then eviction starts (clean-page LRU first).
+    pub fn cache_capacity(&self) -> usize {
+        self.cache.capacity()
     }
 
     pub fn new_page(&mut self) -> DbResult<u32> {
@@ -352,7 +507,7 @@ impl Pager {
     }
 
     fn refresh_header_page(&mut self) -> DbResult<()> {
-        let mut header_page = if let Some(existing) = self.cache.get(&0) {
+        let mut header_page = if let Some(existing) = self.cache.get(0) {
             existing.data.clone()
         } else {
             let mut data = vec![0; self.page_size()];
@@ -376,7 +531,7 @@ impl Pager {
         if no >= self.header.page_count {
             return Err(DbError::new(format!("page out of range: {}", no)));
         }
-        if self.cache.contains_key(&no) {
+        if self.cache.contains_key(no) {
             return Ok(());
         }
         let mut data = vec![0; self.page_size()];

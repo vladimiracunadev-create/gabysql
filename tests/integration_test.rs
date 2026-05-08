@@ -1506,6 +1506,48 @@ fn crash_recovery_replay_is_idempotent() -> Result<(), Box<dyn Error>> {
 /// cursor's promise is observable through behaviour (correctness),
 /// not direct memory measurement; the resource win is verified by
 /// reading the executor code path.
+/// The Pager's page cache must be bounded and must evict clean pages
+/// LRU-style when at capacity. Pre-block-10 the cache was an
+/// unbounded `BTreeMap` — a long-running server scanning many DBs
+/// would leak memory proportional to the working set.
+#[test]
+fn page_cache_is_bounded_and_evicts_clean_pages() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("lru-cache");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    // Seed enough rows to span several leaves.
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    for i in 0..200i64 {
+        run_sql(
+            &db,
+            &format!("INSERT INTO u (id,name) VALUES ({},'row{:03}');", i, i),
+        )?;
+    }
+
+    // Reopen with a tiny cache and walk every page (no tx open, so
+    // every page is clean and evictable). The cache must respect cap.
+    let mut pager = Pager::open(&db)?;
+    pager.set_cache_capacity(4);
+    assert_eq!(pager.cache_capacity(), 4);
+    let header = pager.header();
+    for no in 0..header.page_count {
+        let _ = pager.page_data(no)?;
+    }
+    assert!(
+        pager.cache_len() <= pager.cache_capacity(),
+        "cache_len={} > cap={}",
+        pager.cache_len(),
+        pager.cache_capacity()
+    );
+    pager.close()?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 #[test]
 fn cursor_limit_returns_only_requested_rows() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("cursor-limit");

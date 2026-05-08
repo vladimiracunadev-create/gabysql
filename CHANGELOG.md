@@ -4,6 +4,56 @@
 
 ---
 
+## 2026-05-08 — Decimoquinta intervención: `PageCache` LRU acotado — cierra fuga de memoria del server
+
+> **Sin bump de formato.** El cambio es interno al Pager. La API pública del Pager se mantiene compatible salvo dos métodos nuevos (`set_cache_capacity`, `cache_len`, `cache_capacity`).
+
+### ✨ Cambio
+- Reemplazo de `cache: BTreeMap<u32, CachedPage>` (que crecía sin límite) por `cache: PageCache` con **capacidad fija** + **eviction LRU sobre páginas clean**.
+- Constante `DEFAULT_CACHE_PAGES = 1024` (~4 MB por DB con páginas de 4 KB). Configurable por instancia con `Pager::set_cache_capacity(n)`.
+- LRU implementada con `HashMap<u32, CacheSlot>` + contador monótono (touch en cada `get/get_mut/insert`). Eviction = scan O(N) sobre el map cuando está lleno; para 1024 entradas son µs por inserción.
+- Política dirty-aware: **las páginas dirty nunca se evictan** — pertenecen a la transacción abierta y deben llegar al WAL antes de poder dropearse. Si el cache llega a capacidad lleno de dirty, se permite overflow temporal: perder una página dirty corromperia la DB. El overflow drena solo en el commit (todas pasan a clean simultáneamente).
+
+### 🎯 Por qué este cambio
+
+**Pre-bloque-10:**
+```rust
+struct Pager {
+    cache: BTreeMap<u32, CachedPage>,  // ← crece sin freno
+}
+```
+Un `INTEGRITY CHECK` o un `SELECT` con full scan sobre una DB de 200 MB cargaba ~50 K páginas en RAM y **nunca las liberaba**. En `gabysql-server -dir ./dbs` con 50 DBs activas y un sweep operacional periódico, la memoria del server crecía a 10 GB y eventualmente lo mataba el OOM killer. Sin error, sin warning, sin recovery — solo `kill` y reiniciar.
+
+**Post-bloque-10:**
+```rust
+struct PageCache {
+    capacity: usize,                       // bounded
+    map: HashMap<u32, CacheSlot>,
+    counter: u64,                          // monotonic for LRU
+}
+```
+Memoria del server acotada por `cache_capacity × #DBs_abiertas × page_size`. Para 50 DBs × 1024 páginas × 4 KB = **200 MB max**, predecible, no swappea.
+
+### 🛡️ Comportamiento bajo casos edge
+- **Workload chico con cache vacío**: idéntico a antes (cache nunca se llena, no evicta nada).
+- **Workload grande de read-only**: evicta clean pages LRU. La página menos usada se cae; si vuelve a pedirse, se relee de disco con CRC verificado (mismo path que cold load).
+- **Mid-transaction con muchas writes**: dirty pages se acumulan; clean pages preexistentes se evictan primero. Si el commit se retrasa y entra más dirty que cap, el cache excede cap **temporalmente** (correctness > strict cap). Drena en commit.
+- **Rollback**: `cache.clear()` libera todo (mismo path que antes).
+
+### 🧪 Validación
+- 39/39 tests de integración (1 nuevo: `page_cache_is_bounded_and_evicts_clean_pages` siembra 200 filas, abre con `set_cache_capacity(4)`, recorre cada página de la DB y asserta que `cache_len() <= 4`).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+### 🔭 `Transaction` (Unit of Work) — pospuesto a bloque futuro
+La recomendación original de bloque 10 incluía un objeto `Transaction` que reemplazara las 40+ aperturas de `Catalog::open(self.pager)` por una unit-of-work compartida con cache de `TableMeta`. Después de medir el impacto real:
+- La fuga de memoria del cache es **inmediata** (problema agudo del server).
+- La memoización de `TableMeta` es **marginal** (lookup hash + decode = µs; el ahorro existe pero no aparece en profiles de workloads reales).
+- El refactor de 40 sitios cuesta ~1500 líneas y rompe muchos diffs en revisiones.
+
+Decisión: **se entrega solo el `PageCache` LRU en este bloque**. El `Transaction` queda como propuesta independiente con su propio análisis cuando aparezca un workload que lo justifique (ej. INSERT masivo medido).
+
+---
+
 ## 2026-05-08 — Decimocuarta intervención: `LeafCursor` (Iterator pattern) — Fase 2 paso 2
 
 > **Sin bump de formato.** El cambio es estructural: cómo se leen los rows del B+Tree.
