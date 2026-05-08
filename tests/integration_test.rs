@@ -780,6 +780,61 @@ fn alter_add_column_unique_then_enforces() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn identifier_rules_apply_across_ddl() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("identifiers");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    // Reserved word as table name → rejected.
+    let err = run_sql(&db, "CREATE TABLE select (id INT PRIMARY KEY);").unwrap_err();
+    assert!(
+        err.to_string().contains("palabra reservada"),
+        "got: {}",
+        err
+    );
+
+    // Reserved word as column name → rejected. (Parser tokenizes 'where'
+    // as an identifier here because it's after the comma; the validator
+    // catches it before the engine does anything.)
+    let err = run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, where TEXT);").unwrap_err();
+    assert!(
+        err.to_string().contains("palabra reservada"),
+        "got: {}",
+        err
+    );
+
+    // Identifier longer than the documented 64-char ceiling is rejected.
+    let long = "a".repeat(65);
+    let sql = format!("CREATE TABLE u (id INT PRIMARY KEY, {} TEXT);", long);
+    let err = run_sql(&db, &sql).unwrap_err();
+    assert!(err.to_string().contains("excede el máximo"), "got: {}", err);
+
+    // Happy path: a normal CREATE still works after all those rejections.
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+
+    // Bad index name (reserved word) is rejected at CREATE INDEX time.
+    let err = run_sql(&db, "CREATE INDEX select ON u (name);").unwrap_err();
+    assert!(
+        err.to_string().contains("palabra reservada"),
+        "got: {}",
+        err
+    );
+
+    // ALTER TABLE ADD COLUMN runs the same validator on the new column.
+    let err = run_sql(&db, "ALTER TABLE u ADD COLUMN where TEXT;").unwrap_err();
+    assert!(
+        err.to_string().contains("palabra reservada"),
+        "got: {}",
+        err
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

@@ -428,9 +428,7 @@ impl<'a> Catalog<'a> {
 }
 
 pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
-    if meta.name.trim().is_empty() {
-        return Err(DbError::new("nombre de tabla vacío"));
-    }
+    validate_identifier(&meta.name, "tabla")?;
     if meta.primary_key.trim().is_empty() {
         return Err(DbError::new(
             "PRIMARY KEY requerida (esta versión solo soporta una PK escalar de tipo INT)",
@@ -443,9 +441,7 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
     let mut seen = HashSet::new();
     let mut pk_ok = false;
     for column in &meta.columns {
-        if column.name.trim().is_empty() {
-            return Err(DbError::new("columna sin nombre"));
-        }
+        validate_identifier(&column.name, "columna")?;
         let normalized = column.name.to_ascii_lowercase();
         if !seen.insert(normalized) {
             return Err(DbError::new("nombre de columna duplicado"));
@@ -481,6 +477,107 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
     }
     if !pk_ok {
         return Err(DbError::new("PRIMARY KEY debe existir en columnas"));
+    }
+    Ok(())
+}
+
+/// Maximum identifier length, matching PostgreSQL's `NAMEDATALEN - 1` and
+/// giving plenty of room for prefixes like `idx_` / `uq_` without
+/// overflowing.
+pub const MAX_IDENT_LEN: usize = 64;
+
+/// Reserved words that the parser already gives meaning to. Banning them
+/// as identifiers prevents ambiguous statements like `CREATE TABLE select
+/// (id INT PRIMARY KEY)` and keeps the gramatical grammar future-proof
+/// when new keywords land. Comparison is case-insensitive.
+pub const RESERVED_WORDS: &[&str] = &[
+    // DDL / DML verbs
+    "create",
+    "drop",
+    "alter",
+    "add",
+    "column",
+    "table",
+    "index",
+    "unique",
+    "database",
+    "databases",
+    "show",
+    "if",
+    "exists",
+    "not",
+    "insert",
+    "into",
+    "select",
+    "update",
+    "delete",
+    "from",
+    "set",
+    "values",
+    // Predicates / clauses
+    "where",
+    "between",
+    "and",
+    "limit",
+    "offset",
+    "on",
+    "primary",
+    "key",
+    "default",
+    "null",
+    "true",
+    "false",
+    // Built-in column types
+    "int",
+    "text",
+    "bool",
+    "float",
+    "date",
+    "datetime",
+    "json",
+];
+
+/// Enforce the canonical identifier shape used everywhere in the engine:
+/// `[A-Za-z_][A-Za-z0-9_]*`, length at most [`MAX_IDENT_LEN`], and not in
+/// the reserved-words list. `kind` shows up in the error (e.g. "tabla",
+/// "columna", "índice") so users can tell which slot rejected the name.
+///
+/// Centralising the rule here means parser frontends, the executor and
+/// any future migration code share the same definition — there is no
+/// "good" identifier in one layer and a "bad" identifier in another.
+pub fn validate_identifier(name: &str, kind: &str) -> DbResult<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(DbError::new(format!("nombre de {} vacío", kind)));
+    }
+    if trimmed.len() > MAX_IDENT_LEN {
+        return Err(DbError::new(format!(
+            "nombre de {} '{}' excede el máximo de {} caracteres",
+            kind, trimmed, MAX_IDENT_LEN
+        )));
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(DbError::new(format!(
+            "nombre de {} '{}' inválido: debe empezar con letra o '_'",
+            kind, trimmed
+        )));
+    }
+    for ch in chars {
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return Err(DbError::new(format!(
+                "nombre de {} '{}' inválido: solo se admiten [A-Za-z0-9_]",
+                kind, trimmed
+            )));
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if RESERVED_WORDS.iter().any(|w| *w == lower) {
+        return Err(DbError::new(format!(
+            "nombre de {} '{}' es palabra reservada",
+            kind, trimmed
+        )));
     }
     Ok(())
 }

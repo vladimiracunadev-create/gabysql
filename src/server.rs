@@ -1,4 +1,4 @@
-use crate::catalog::{Catalog, TableMeta};
+use crate::catalog::{Catalog, DefaultLiteral, TableMeta};
 use crate::sql::{decode_row, parse, Engine, ResultSet, Statement, Value};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
@@ -611,15 +611,33 @@ fn table_meta_json(meta: &TableMeta) -> String {
         .columns
         .iter()
         .map(|column| {
+            // A column is reported as `unique` whenever there is a UNIQUE
+            // secondary index whose single column is this one. PK is also
+            // unique by construction (the B+Tree enforces it) and is
+            // surfaced separately via `pk: true`.
+            let is_unique = meta
+                .indexes
+                .iter()
+                .any(|idx| idx.unique && idx.column.eq_ignore_ascii_case(&column.name));
+            let default_field = match &column.default {
+                Some(default) => format!(
+                    ",\"hasDefault\":true,\"default\":{}",
+                    default_literal_json(default)
+                ),
+                None => ",\"hasDefault\":false,\"default\":null".to_string(),
+            };
             format!(
-                "{{\"name\":{},\"type\":{},\"pk\":{}}}",
+                "{{\"name\":{},\"type\":{},\"pk\":{},\"notNull\":{},\"unique\":{}{}}}",
                 json_string(&column.name),
                 json_string(column.column_type.as_sql()),
                 if column.name.eq_ignore_ascii_case(&meta.primary_key) {
                     "true"
                 } else {
                     "false"
-                }
+                },
+                column.not_null,
+                is_unique,
+                default_field
             )
         })
         .collect::<Vec<_>>()
@@ -630,10 +648,11 @@ fn table_meta_json(meta: &TableMeta) -> String {
         .iter()
         .map(|idx| {
             format!(
-                "{{\"name\":{},\"column\":{},\"rootPage\":{}}}",
+                "{{\"name\":{},\"column\":{},\"rootPage\":{},\"unique\":{}}}",
                 json_string(&idx.name),
                 json_string(&idx.column),
-                idx.root_page
+                idx.root_page,
+                idx.unique
             )
         })
         .collect::<Vec<_>>()
@@ -647,6 +666,25 @@ fn table_meta_json(meta: &TableMeta) -> String {
         columns,
         indexes
     )
+}
+
+/// JSON encoding for catalog `DefaultLiteral` values, mirroring the
+/// `value_json` shape used elsewhere so consumers can treat both the
+/// row-level cells and the column-level defaults uniformly.
+fn default_literal_json(default: &DefaultLiteral) -> String {
+    match default {
+        DefaultLiteral::Null => "null".to_string(),
+        DefaultLiteral::Integer(n) => n.to_string(),
+        DefaultLiteral::Float(n) => {
+            if n.is_finite() {
+                n.to_string()
+            } else {
+                "null".to_string()
+            }
+        }
+        DefaultLiteral::Bool(b) => b.to_string(),
+        DefaultLiteral::String(s) => json_string(s),
+    }
 }
 
 fn result_set_json(result: &ResultSet) -> String {

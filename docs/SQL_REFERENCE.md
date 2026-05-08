@@ -26,6 +26,28 @@
 
 ---
 
+## 🔤 Identificadores
+
+Tablas, columnas e índices comparten una sola regla. Definida en [`catalog::validate_identifier`](../src/catalog.rs).
+
+- Forma léxica: `[A-Za-z_][A-Za-z0-9_]*`
+- Longitud máxima: **64** caracteres (`MAX_IDENT_LEN`)
+- Case-insensitive en comparación, case-preserving en almacenamiento
+- No puede ser una palabra reservada del parser
+
+Palabras reservadas (case-insensitive): `add, alter, and, between, bool, column, create, database, databases, date, datetime, default, delete, drop, exists, false, float, from, if, index, insert, int, into, json, key, limit, not, null, offset, on, primary, select, set, show, table, text, true, unique, update, values, where`.
+
+Errores típicos:
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `nombre de tabla 'X' es palabra reservada` | el nombre coincide con una keyword del parser |
+| `nombre de columna 'X' inválido: debe empezar con letra o '_'` | empieza con dígito o símbolo |
+| `nombre de índice 'X' inválido: solo se admiten [A-Za-z0-9_]` | tiene caracteres no permitidos (guion, espacio, etc.) |
+| `nombre de tabla 'X' excede el máximo de 64 caracteres` | identificador demasiado largo |
+
+---
+
 ## 🧱 Tipos de dato soportados
 
 ```mermaid

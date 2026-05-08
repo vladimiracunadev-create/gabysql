@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-05-07 — Octava intervención: identificadores duros + introspección completa (Camino A · paso 4)
+
+> **Sin bump de formato.** Los datos en disco no cambian; el cambio es de validación (más estricta) y de contrato JSON (más rico).
+
+### ✨ Identificadores
+- Nuevo `catalog::validate_identifier(name, kind)` — única definición de "identificador válido" en el motor: `[A-Za-z_][A-Za-z0-9_]*`, longitud máxima `MAX_IDENT_LEN = 64`, no reservada.
+- Lista `catalog::RESERVED_WORDS` con todas las keywords del parser y los nombres de tipo (`int`, `text`, `bool`, `float`, `date`, `datetime`, `json`, etc.).
+- Aplicado en `CREATE TABLE` (nombre de tabla + cada columna), `ALTER TABLE ADD COLUMN` (nombre de columna nueva, vía `validate_create_table` sobre meta prospectivo) y `CREATE [UNIQUE] INDEX` (nombre de índice).
+
+### 🌐 Endpoint `/schema` extendido
+La respuesta de `GET /schema?db=X&table=Y` (y por tanto también `GET /tables`) ahora incluye lo necesario para reverse-engineering completo desde el frontend:
+
+```json
+{
+  "ok": true,
+  "table": {
+    "name": "users",
+    "primaryKey": "id",
+    "rootPage": 2,
+    "columns": [
+      { "name": "id",    "type": "INT",  "pk": true,  "notNull": true,  "unique": false, "hasDefault": false, "default": null },
+      { "name": "email", "type": "TEXT", "pk": false, "notNull": true,  "unique": true,  "hasDefault": false, "default": null },
+      { "name": "status","type": "TEXT", "pk": false, "notNull": true,  "unique": false, "hasDefault": true,  "default": "pending" }
+    ],
+    "indexes": [
+      { "name": "uq_users_email", "column": "email", "rootPage": 4, "unique": true }
+    ]
+  }
+}
+```
+
+Campos nuevos por columna: `notNull`, `unique` (derivado de los índices unique de una columna), `hasDefault`, `default` (literal con su tipo nativo en JSON; `null` para "no default" o `DEFAULT NULL`). Campo nuevo por índice: `unique`.
+
+### 🧪 Validación
+- 22/22 tests de integración (1 nuevo: `identifier_rules_apply_across_ddl` cubre tabla/columna/índice y los tres rechazos: reservada, longitud, ALTER).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+---
+
 ## 2026-05-07 — Séptima intervención: edición incremental de schemas (Camino A · paso 3)
 
 > **Sin bump de formato.** El layout `VERSION = 5` ya soporta `TableMeta` con cualquier número de columnas; las filas previas se decodifican con un fallback a `DEFAULT` o `NULL` cuando la fila quedó "corta" frente al esquema nuevo.

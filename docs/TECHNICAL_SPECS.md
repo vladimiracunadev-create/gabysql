@@ -143,6 +143,7 @@ Modo `UNIQUE`:
 
 ## 🧱 Reglas de fila
 
+- todos los identificadores (tabla, columna, índice) cumplen `[A-Za-z_][A-Za-z0-9_]*`, longitud ≤ `MAX_IDENT_LEN = 64`, no reservados — definido y enforzado en [`catalog::validate_identifier`](../src/catalog.rs)
 - la PK debe ser una sola columna `INT` escalar (no se admiten PKs compuestas ni de otros tipos en esta versión); es implícitamente `NOT NULL`
 - la PK no puede ser `NULL`
 - una PK duplicada devuelve error en `INSERT`

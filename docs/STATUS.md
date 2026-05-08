@@ -4,7 +4,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-5-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-21%2F21-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-22%2F22-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -91,8 +91,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque comprometido (Camino A — paso 4)
+## 🔭 Próximo bloque comprometido (Camino A — paso 5)
 
-> **Reglas de identificadores + endpoint de introspección completo.** Definir y enforzar `[a-z_][a-z0-9_]*`, longitud máxima y palabras reservadas en parser/engine. Extender `GET /schema/<db>/<tabla>` para incluir constraints (`NOT NULL`, `DEFAULT`, `UNIQUE`) y FKs cuando lleguen — habilita "Importar de gabysql" en gabymodeler.
+> **`FOREIGN KEY` declarativas y enforced.** Sintaxis `FOREIGN KEY (col) REFERENCES tabla(col) [ON DELETE RESTRICT|CASCADE]`, validación en `INSERT`/`UPDATE`/`DELETE` apoyada en índice secundario, persistencia en catálogo + bump VERSION 5 → 6. Después: `integrity_check` operacional como cierre de Fase 1.
 
 Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.

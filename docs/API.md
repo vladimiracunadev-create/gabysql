@@ -107,7 +107,8 @@ Posibles respuestas:
 
 ## `GET /tables?db=demo.db`
 
-Ejemplo:
+Lista todas las tablas con su schema completo (mismo shape que `/schema`, pero embebido en un array). Útil para reverse-engineering one-shot.
+
 ```json
 {
   "ok": true,
@@ -117,8 +118,12 @@ Ejemplo:
       "primaryKey": "id",
       "rootPage": 2,
       "columns": [
-        { "name": "id", "type": "INT", "pk": true },
-        { "name": "name", "type": "TEXT", "pk": false }
+        { "name": "id",    "type": "INT",  "pk": true,  "notNull": true,  "unique": false, "hasDefault": false, "default": null },
+        { "name": "email", "type": "TEXT", "pk": false, "notNull": true,  "unique": true,  "hasDefault": false, "default": null },
+        { "name": "status","type": "TEXT", "pk": false, "notNull": true,  "unique": false, "hasDefault": true,  "default": "pending" }
+      ],
+      "indexes": [
+        { "name": "uq_users_email", "column": "email", "rootPage": 4, "unique": true }
       ]
     }
   ]
@@ -129,7 +134,36 @@ Ejemplo:
 
 ## `GET /schema?db=demo.db&table=users`
 
-Retorna el schema de una tabla.
+Retorna el schema completo de **una** tabla, con la información necesaria para reconstruir el `CREATE TABLE` original (modo reverse-engineering del modeler).
+
+Ejemplo:
+```json
+{
+  "ok": true,
+  "table": {
+    "name": "users",
+    "primaryKey": "id",
+    "rootPage": 2,
+    "columns": [
+      { "name": "id",    "type": "INT",  "pk": true,  "notNull": true,  "unique": false, "hasDefault": false, "default": null },
+      { "name": "email", "type": "TEXT", "pk": false, "notNull": true,  "unique": true,  "hasDefault": false, "default": null },
+      { "name": "status","type": "TEXT", "pk": false, "notNull": true,  "unique": false, "hasDefault": true,  "default": "pending" },
+      { "name": "score", "type": "FLOAT","pk": false, "notNull": false, "unique": false, "hasDefault": true,  "default": 0.0 },
+      { "name": "active","type": "BOOL", "pk": false, "notNull": false, "unique": false, "hasDefault": true,  "default": true }
+    ],
+    "indexes": [
+      { "name": "uq_users_email", "column": "email", "rootPage": 4, "unique": true }
+    ]
+  }
+}
+```
+
+Reglas del campo `default`:
+- `"hasDefault": false` ⇒ `"default": null` significa **no hay** DEFAULT declarado.
+- `"hasDefault": true` y `"default": null` significa **`DEFAULT NULL` explícito**.
+- En cualquier otro caso `default` lleva el literal con su tipo nativo (`number`, `string`, `boolean`).
+
+Status posibles: `200` con `ok: true`, `404` con `ok: false, error: "tabla no existe"`.
 
 ---
 

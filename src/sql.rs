@@ -1,6 +1,7 @@
 use crate::bptree::{init_leaf_page, Tree};
 use crate::catalog::{
-    validate_create_table, Catalog, Column, ColumnType, DefaultLiteral, IndexMeta, TableMeta,
+    validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
+    IndexMeta, TableMeta,
 };
 use crate::index::{
     bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
@@ -701,6 +702,10 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_create_index(&mut self, stmt: CreateIndexStmt) -> DbResult<ResultSet> {
+        // 0. Validate the index name shape up front — same rule as table
+        //    and column identifiers, since `DROP INDEX` and the catalog
+        //    have to be able to address it unambiguously.
+        validate_identifier(&stmt.name, "índice")?;
         // 1. Resolve the table.
         let mut meta = {
             let mut catalog = Catalog::open(self.pager);
