@@ -785,7 +785,11 @@ fn vector_search_schema() -> Json {
         p.push(("description".into(), Json::Str(desc.into())));
         props.push((name.into(), Json::Obj(p)));
     };
-    add("db", "string", "Nombre del archivo .db (opcional en single-db mode)");
+    add(
+        "db",
+        "string",
+        "Nombre del archivo .db (opcional en single-db mode)",
+    );
     add("table", "string", "Tabla a escanear");
     add(
         "pk_column",
@@ -808,7 +812,11 @@ fn vector_search_schema() -> Json {
     items.push(("type".into(), Json::Str("number".into())));
     q.push(("items".into(), Json::Obj(items)));
     props.push(("query".into(), Json::Obj(q)));
-    add("top_k", "integer", "Cuántos resultados devolver (default 10)");
+    add(
+        "top_k",
+        "integer",
+        "Cuántos resultados devolver (default 10)",
+    );
     add(
         "metric",
         "string",
@@ -875,7 +883,13 @@ fn handle_tools_call(
         "gabysql_audit_tail" => {
             let n = args
                 .get("n")
-                .and_then(|v| if let Json::Num(n) = v { Some(*n as usize) } else { None })
+                .and_then(|v| {
+                    if let Json::Num(n) = v {
+                        Some(*n as usize)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(50);
             return audit_tail(cfg, n).map(|s| content_text(&s));
         }
@@ -1061,7 +1075,13 @@ fn vector_search(cfg: &Config, db: Option<&str>, args: &Json) -> Result<String, 
     }
     let top_k = args
         .get("top_k")
-        .and_then(|v| if let Json::Num(n) = v { Some(*n as usize) } else { None })
+        .and_then(|v| {
+            if let Json::Num(n) = v {
+                Some(*n as usize)
+            } else {
+                None
+            }
+        })
         .unwrap_or(10);
     if top_k == 0 {
         return Err("'top_k' debe ser >= 1".into());
@@ -1081,18 +1101,35 @@ fn vector_search(cfg: &Config, db: Option<&str>, args: &Json) -> Result<String, 
     let sql = format!("SELECT {pk_column}, {vector_column} FROM {table}");
     let raw = exec_via_server(cfg, db, &sql)?;
     let parsed = json_parse(&raw).map_err(|e| format!("respuesta del server no es JSON: {e}"))?;
-    if parsed.get("ok").and_then(|v| if let Json::Bool(b) = v { Some(*b) } else { None })
-        != Some(true)
+    if parsed.get("ok").and_then(|v| {
+        if let Json::Bool(b) = v {
+            Some(*b)
+        } else {
+            None
+        }
+    }) != Some(true)
     {
         return Err(format!("server reportó error: {raw}"));
     }
     let result_set = parsed
         .get("results")
-        .and_then(|v| if let Json::Arr(a) = v { a.first() } else { None })
+        .and_then(|v| {
+            if let Json::Arr(a) = v {
+                a.first()
+            } else {
+                None
+            }
+        })
         .ok_or("respuesta sin results[0]")?;
     let rows = result_set
         .get("rows")
-        .and_then(|v| if let Json::Arr(a) = v { Some(a) } else { None })
+        .and_then(|v| {
+            if let Json::Arr(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        })
         .ok_or("results[0].rows ausente")?;
 
     // Heap de tamaño top_k: distancia, pk_json, vector_json (para devolver verbatim)
@@ -1143,12 +1180,24 @@ fn vector_search(cfg: &Config, db: Option<&str>, args: &Json) -> Result<String, 
                 continue;
             }
         };
-        push_top_k(&mut top, top_k, VectorMatch { distance: d, pk: pk.clone(), vector: vec_json });
+        push_top_k(
+            &mut top,
+            top_k,
+            VectorMatch {
+                distance: d,
+                pk: pk.clone(),
+                vector: vec_json,
+            },
+        );
     }
     // Orden ascendente: distancia menor = más parecido (cosine y euclidean).
     // Para "dot" invertimos el signo de la distancia para que también ordene
     // ascendente (mayor producto interno → distancia "más negativa").
-    top.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut matches = Vec::with_capacity(top.len());
     for m in &top {
@@ -1212,7 +1261,9 @@ fn parse_metric(raw: &str) -> Result<Metric, String> {
         "cosine" => Ok(Metric::Cosine),
         "euclidean" | "l2" => Ok(Metric::Euclidean),
         "dot" | "ip" => Ok(Metric::Dot),
-        other => Err(format!("metric desconocida: {other} (usa cosine|euclidean|dot)")),
+        other => Err(format!(
+            "metric desconocida: {other} (usa cosine|euclidean|dot)"
+        )),
     }
 }
 
@@ -1591,7 +1642,10 @@ mod tests {
     fn cosine_identical_vectors_distance_zero() {
         let a = vec![1.0, 2.0, 3.0];
         let d = distance(Metric::Cosine, &a, &a).unwrap();
-        assert!(d.abs() < 1e-9, "cosine de un vector consigo mismo debe ser ~0, fue {d}");
+        assert!(
+            d.abs() < 1e-9,
+            "cosine de un vector consigo mismo debe ser ~0, fue {d}"
+        );
     }
 
     #[test]
@@ -1599,7 +1653,10 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
         let d = distance(Metric::Cosine, &a, &b).unwrap();
-        assert!((d - 1.0).abs() < 1e-9, "cosine de vectores ortogonales = 1, fue {d}");
+        assert!(
+            (d - 1.0).abs() < 1e-9,
+            "cosine de vectores ortogonales = 1, fue {d}"
+        );
     }
 
     #[test]
