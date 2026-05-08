@@ -406,9 +406,17 @@ function loadState(){
     return null;
   } catch { return null; }
 }
-function save(){
-  state.dbName     = $("#db-name").value.trim() || "modeler_demo";
+/**
+ * Pull the two form inputs back into `state`. Used by their change
+ * handlers; deliberately NOT used by `save()` so callers like the
+ * `📦 Ejemplo` button (which replaces `state` wholesale) don't end up
+ * overwriting the new state with the previous form values.
+ */
+function syncFormToState(){
+  state.dbName      = $("#db-name").value.trim() || "modeler_demo";
   state.ifNotExists = $("#opt-ifnotexists").checked;
+}
+function save(){
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 function toast(msg){
@@ -995,8 +1003,8 @@ $("#btn-download").onclick = () => {
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
-$("#db-name").addEventListener("change", () => { save(); rerender(); });
-$("#opt-ifnotexists").addEventListener("change", save);
+$("#db-name").addEventListener("change", () => { syncFormToState(); save(); rerender(); });
+$("#opt-ifnotexists").addEventListener("change", () => { syncFormToState(); save(); });
 
 /* ---------- master rerender ---------- */
 function rerender(){
