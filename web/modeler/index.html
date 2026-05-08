@@ -11,210 +11,360 @@
   body{
     font-family:Georgia,"Times New Roman",serif;
     color:#edf3ff;
-    background:radial-gradient(circle at top,#172131 0%,#0d1117 48%,#090c12 100%);
+    background:#0d1117;
     overflow:hidden;
   }
   a{color:#7cc4ff}
   code,pre{font-family:ui-monospace,Menlo,Consolas,monospace}
-  button,select,input{font-family:inherit;font-size:14px;color:#edf3ff}
-  button{background:#1f2a3a;border:1px solid #2c3b50;border-radius:8px;padding:6px 12px;cursor:pointer}
+  button,select,input{font-family:inherit;font-size:13px;color:#edf3ff}
+  button{background:#1f2a3a;border:1px solid #2c3b50;border-radius:6px;padding:5px 10px;cursor:pointer}
   button:hover{background:#27344a}
   button.primary{background:#2a4470;border-color:#3c5d96}
   button.primary:hover{background:#345287}
   button.danger{background:#5a2030;border-color:#7a2c44;color:#ffd6e0}
   button.ghost{background:transparent;border:1px dashed #2c3b50}
-  input,select{background:#0e1622;border:1px solid #2c3b50;border-radius:6px;padding:4px 8px}
+  input,select{background:#0e1622;border:1px solid #2c3b50;border-radius:5px;padding:3px 7px}
   .muted{color:#90a4c0}
-  .row{display:flex;gap:8px;align-items:center}
+  .row{display:flex;gap:6px;align-items:center}
 
-  /* ---------- layout ---------- */
+  /* ---------- top toolbar ---------- */
   header{
-    position:fixed;inset:0 0 auto 0;height:56px;
-    background:rgba(13,17,23,.92);
-    border-bottom:1px solid #243244;
-    display:flex;align-items:center;gap:10px;
-    padding:0 16px;z-index:5;
-    backdrop-filter:blur(10px);
+    position:fixed;inset:0 0 auto 0;height:48px;
+    background:#0e1622;border-bottom:1px solid #243244;
+    display:flex;align-items:center;gap:8px;padding:0 12px;z-index:5;
   }
-  header h1{margin:0;font-size:18px;letter-spacing:.5px}
+  header h1{margin:0;font-size:16px;letter-spacing:.3px}
   header .spacer{flex:1}
-  main{position:fixed;inset:56px 0 0 0;display:grid;grid-template-columns:300px 1fr}
-  aside{
-    background:rgba(20,27,36,.85);
-    border-right:1px solid #243244;
-    overflow-y:auto;padding:14px;
+
+  /* ---------- main 3-pane layout ---------- */
+  main{
+    position:fixed;inset:48px 0 28px 0;
+    display:grid;grid-template-columns:280px 1fr;grid-template-rows:1fr 220px;
+    grid-template-areas: "browser canvas" "browser results";
   }
-  aside h3{margin:6px 0 4px 0;font-size:13px;letter-spacing:.5px;text-transform:uppercase;color:#a8b9d4}
-  #canvas{position:relative;overflow:auto;background:
+  main.results-collapsed{grid-template-rows:1fr 32px}
+  aside.browser{
+    grid-area:browser;background:#141d2a;border-right:1px solid #243244;
+    overflow-y:auto;padding:10px;
+  }
+  #canvas-wrap{grid-area:canvas;position:relative;overflow:auto;background:
     repeating-linear-gradient(0deg,transparent 0 49px,#1a2434 49px 50px),
     repeating-linear-gradient(90deg,transparent 0 49px,#1a2434 49px 50px),
     #0d1119;
   }
   svg.relations{position:absolute;inset:0;width:5000px;height:3000px;pointer-events:none;z-index:1}
 
+  section.results{
+    grid-area:results;background:#0e1622;border-top:1px solid #243244;
+    display:flex;flex-direction:column;overflow:hidden;
+  }
+  .results-tabs{display:flex;align-items:center;background:#101a26;border-bottom:1px solid #243244;padding:0 8px;height:32px;gap:2px;flex-shrink:0}
+  .results-tab{padding:6px 12px;cursor:pointer;font-size:12px;color:#90a4c0;border-bottom:2px solid transparent}
+  .results-tab.active{color:#edf3ff;border-bottom-color:#3c5d96}
+  .results-spacer{flex:1}
+  .results-tab.collapse{cursor:pointer;color:#90a4c0;padding:4px 8px}
+  .results-body{flex:1;overflow:auto;padding:0;display:none}
+  .results-body.active{display:block}
+  table.findings{width:100%;border-collapse:collapse;font-size:12.5px}
+  table.findings th, table.findings td{text-align:left;padding:5px 10px;border-bottom:1px solid #1a2536}
+  table.findings th{background:#101a26;color:#a8b9d4;font-weight:normal;position:sticky;top:0}
+  table.findings tr.error td:first-child{color:#ff8b9b}
+  table.findings tr.warn td:first-child{color:#f5c46b}
+  table.findings tr.info td:first-child{color:#7be0a3}
+  table.findings tr:hover{background:rgba(60,93,150,.12);cursor:pointer}
+  pre.sql-preview{margin:0;padding:10px 14px;color:#cfe3ff;font-size:12.5px;white-space:pre;overflow:auto}
+
+  /* ---------- status bar ---------- */
+  footer.statusbar{
+    position:fixed;left:0;right:0;bottom:0;height:28px;
+    background:#0a1019;border-top:1px solid #243244;
+    display:flex;align-items:center;gap:14px;padding:0 12px;
+    font-size:12px;color:#a8b9d4;z-index:4;
+  }
+  footer .ok{color:#7be0a3}
+  footer .warn{color:#f5c46b}
+  footer .err{color:#ff8b9b}
+
+  /* ---------- object browser tree ---------- */
+  .tree{font-size:13px;line-height:1.7}
+  .tree details > summary{cursor:pointer;list-style:none;padding:2px 4px;border-radius:4px}
+  .tree details > summary::-webkit-details-marker{display:none}
+  .tree details > summary:hover{background:#1c2738}
+  .tree details > summary::before{content:"▸";display:inline-block;width:14px;color:#90a4c0;transition:transform .1s}
+  .tree details[open] > summary::before{transform:rotate(90deg)}
+  .tree .leaf{padding:2px 4px 2px 22px;cursor:pointer;border-radius:4px;color:#cfe3ff}
+  .tree .leaf:hover{background:#1c2738}
+  .tree .leaf.selected{background:#2a4470;color:#fff}
+  .tree .pkbadge{font-size:10px;color:#7be0a3;margin-left:6px}
+  .tree .fkbadge{font-size:10px;color:#f5c46b;margin-left:6px}
+  .tree .nnbadge{font-size:10px;color:#90a4c0;margin-left:4px}
+  .tree .ublbadge{font-size:10px;color:#7cc4ff;margin-left:4px}
+
   /* ---------- entity card ---------- */
   .entity{
-    position:absolute;min-width:240px;max-width:320px;
-    background:#141d2a;border:1px solid #2c3b50;border-radius:10px;
-    box-shadow:0 8px 28px rgba(0,0,0,.35);
-    z-index:2;
+    position:absolute;min-width:240px;max-width:340px;
+    background:#141d2a;border:1px solid #2c3b50;border-radius:8px;
+    box-shadow:0 6px 22px rgba(0,0,0,.4);z-index:2;
   }
-  .entity.selected{border-color:#3c5d96;box-shadow:0 0 0 2px rgba(60,93,150,.5),0 8px 28px rgba(0,0,0,.35)}
+  .entity.selected{border-color:#3c5d96;box-shadow:0 0 0 2px rgba(60,93,150,.55),0 6px 22px rgba(0,0,0,.4)}
   .entity-head{
-    display:flex;gap:6px;align-items:center;
-    padding:8px 10px;background:#1c2738;border-bottom:1px solid #2c3b50;
-    border-radius:10px 10px 0 0;cursor:move;user-select:none;
+    display:flex;gap:6px;align-items:center;padding:6px 8px;
+    background:#1c2738;border-bottom:1px solid #2c3b50;
+    border-radius:8px 8px 0 0;cursor:move;user-select:none;
   }
-  .entity-head input{flex:1;background:transparent;border:1px solid transparent}
+  .entity-head input{flex:1;background:transparent;border:1px solid transparent;font-size:13px;font-weight:bold}
   .entity-head input:focus{background:#0e1622;border-color:#2c3b50}
-  .entity-body{padding:6px 10px}
-  .entity-body table{width:100%;border-collapse:collapse;font-size:13px}
-  .entity-body th{font-weight:normal;color:#90a4c0;text-align:left;padding:4px 4px;border-bottom:1px solid #243244}
+  .entity-body{padding:4px 8px}
+  .entity-body table{width:100%;border-collapse:collapse;font-size:12px}
+  .entity-body th{font-weight:normal;color:#90a4c0;text-align:left;padding:3px 3px;border-bottom:1px solid #243244;font-size:11px}
   .entity-body td{padding:3px 2px;border-bottom:1px solid #1a2536}
   .entity-body tr:last-child td{border-bottom:0}
-  .entity-body input[type="text"]{width:100%;padding:2px 6px;font-size:13px}
-  .entity-body select{padding:2px 4px;font-size:12px}
-  .entity-foot{padding:6px 10px;display:flex;gap:6px}
-  .entity-foot button{font-size:12px;padding:3px 8px}
-  .colflag{cursor:pointer;font-size:11px;padding:1px 5px;border-radius:4px;border:1px solid #2c3b50;color:#90a4c0;user-select:none}
+  .entity-body input[type="text"]{width:100%;padding:2px 5px;font-size:12px}
+  .entity-body select{padding:2px 3px;font-size:11px}
+  .entity-foot{padding:4px 8px;display:flex;gap:4px;flex-wrap:wrap}
+  .entity-foot button{font-size:11px;padding:2px 6px}
+  .colflag{cursor:pointer;font-size:10px;padding:1px 4px;border-radius:3px;border:1px solid #2c3b50;color:#90a4c0;user-select:none;margin-right:1px}
   .colflag.on{background:#3c5d96;border-color:#3c5d96;color:#fff}
-  .colflag.idx.on{background:#2d7a66;border-color:#2d7a66}
+  .colflag.un.on{background:#7cc4ff;border-color:#7cc4ff;color:#0d1117}
+  .colflag.nn.on{background:#90a4c0;border-color:#90a4c0;color:#0d1117}
+  .colflag.fk.on{background:#f5c46b;border-color:#f5c46b;color:#0d1117}
+  .col-default{width:60px;font-size:11px}
 
   /* ---------- modal ---------- */
   .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)}
   .modal-bg.show{display:flex}
   .modal{
-    background:#141d2a;border:1px solid #2c3b50;border-radius:14px;
-    width:min(820px,92vw);max-height:80vh;display:flex;flex-direction:column;
-    box-shadow:0 24px 64px rgba(0,0,0,.55);
+    background:#141d2a;border:1px solid #2c3b50;border-radius:10px;
+    width:min(560px,92vw);max-height:80vh;display:flex;flex-direction:column;
+    box-shadow:0 20px 56px rgba(0,0,0,.55);
   }
-  .modal-head{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid #243244}
-  .modal-head h2{margin:0;font-size:16px}
-  .modal-body{padding:12px 16px;overflow:auto}
-  .modal-body pre{
-    margin:0;background:#0e1622;border:1px solid #243244;border-radius:8px;
-    padding:12px;color:#cfe3ff;font-size:12.5px;white-space:pre-wrap;word-break:break-word;
-  }
-  .modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 16px;border-top:1px solid #243244}
+  .modal-head{display:flex;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid #243244}
+  .modal-head h2{margin:0;font-size:15px}
+  .modal-body{padding:12px 14px;overflow:auto}
+  .modal-body label{display:block;font-size:12px;color:#a8b9d4;margin-top:8px}
+  .modal-body input,.modal-body select{width:100%;margin-top:4px}
+  .modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;border-top:1px solid #243244}
 
   .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid #2c3b50;color:#a8b9d4}
-  .ok{color:#7be0a3}
-  .err{color:#ff8b9b}
+  .toast{position:fixed;right:14px;top:60px;padding:8px 12px;border-radius:6px;background:#2d7a66;color:#dffaee;font-size:12px;z-index:60}
 </style>
 </head>
 <body>
 <header>
   <h1>📐 gabymodeler</h1>
-  <span class="pill">esquema lógico → físico → SQL</span>
+  <span class="pill">PowerDesigner-style · gabysql VERSION 6</span>
   <span class="spacer"></span>
-  <button id="btn-new-entity" class="primary">＋ Nueva entidad</button>
-  <button id="btn-export">Exportar SQL</button>
-  <button id="btn-save">💾 Guardar</button>
-  <button id="btn-load">📂 Cargar</button>
-  <button id="btn-clear" class="danger">🗑️ Limpiar</button>
+  <button id="btn-new-entity" class="primary">＋ Entidad</button>
+  <button id="btn-import">↘ Importar de gabysql</button>
+  <button id="btn-export">📋 Ver SQL</button>
+  <button id="btn-load-sample">📦 Ejemplo</button>
+  <button id="btn-clear" class="danger">🗑️</button>
   <a href="../" class="pill" style="text-decoration:none">← Landing</a>
 </header>
 
-<main>
-  <aside>
-    <h3>Modelo</h3>
-    <div class="row" style="margin-bottom:10px">
-      <label class="muted" style="font-size:13px">DB:</label>
+<main id="main-grid">
+  <aside class="browser">
+    <div class="row" style="margin-bottom:8px">
+      <label class="muted" style="font-size:12px">DB:</label>
       <input id="db-name" type="text" value="modeler_demo" style="flex:1" />
     </div>
-    <div class="row" style="margin-bottom:14px">
-      <label class="row muted" style="font-size:12px;cursor:pointer">
+    <div class="row" style="margin-bottom:10px">
+      <label class="row muted" style="font-size:11px;cursor:pointer">
         <input id="opt-ifnotexists" type="checkbox" checked /> CREATE DATABASE IF NOT EXISTS
       </label>
     </div>
 
-    <h3>Tipos de columna soportados</h3>
-    <div class="muted" style="font-size:12px;line-height:1.6">
-      <code>INT</code> · <code>TEXT</code> · <code>BOOL</code> · <code>FLOAT</code> ·
-      <code>DATE</code> · <code>DATETIME</code> · <code>JSON</code><br/>
-      <span style="font-size:11px">PK debe ser INT. JSON no es indexable.</span>
-    </div>
-
-    <h3 style="margin-top:14px">Acciones</h3>
-    <div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
-      <button id="btn-load-sample">📦 Cargar ejemplo</button>
-      <a href="../phpgabyadmin/" target="_blank" rel="noopener" class="pill" style="text-align:center;text-decoration:none;padding:6px 12px">↗ Probar en phpgabyadmin</a>
-    </div>
-
-    <h3 style="margin-top:14px">Entidades</h3>
-    <ul id="entity-list" style="list-style:none;padding-left:0;margin:0;font-size:13px"></ul>
-
-    <h3 style="margin-top:14px">Cómo se usa</h3>
-    <ol class="muted" style="font-size:12px;line-height:1.7;padding-left:18px">
-      <li>Click en <b>＋ Nueva entidad</b>.</li>
-      <li>Define columnas; marca PK donde corresponda.</li>
-      <li>Marca el flag <b>idx</b> en columnas que quieras indexar.</li>
-      <li><b>Exportar SQL</b> genera CREATE TABLE + CREATE INDEX listo para pegar en phpgabyadmin → tab SQL.</li>
-    </ol>
+    <div id="object-browser" class="tree"></div>
   </aside>
 
-  <div id="canvas">
+  <div id="canvas-wrap">
     <svg class="relations" id="rel-svg"></svg>
   </div>
+
+  <section class="results">
+    <div class="results-tabs">
+      <div class="results-tab active" data-tab="check">Check Model</div>
+      <div class="results-tab" data-tab="sql">SQL Preview</div>
+      <div class="results-spacer"></div>
+      <div class="results-tab collapse" id="btn-collapse">▼</div>
+    </div>
+    <div class="results-body active" data-tab="check">
+      <table class="findings" id="findings-table">
+        <thead><tr><th style="width:80px">severidad</th><th style="width:240px">objeto</th><th>detalle</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="results-body" data-tab="sql">
+      <pre class="sql-preview" id="sql-preview">-- vacío --</pre>
+    </div>
+  </section>
 </main>
 
-<!-- modal -->
-<div class="modal-bg" id="modal-bg">
-  <div class="modal">
+<footer class="statusbar">
+  <span id="status-target">Target: gabysql VERSION 6</span>
+  <span id="status-counts" class="muted">0 tablas · 0 columnas · 0 índices · 0 FKs</span>
+  <span class="spacer" style="flex:1"></span>
+  <span id="status-findings" class="ok">0 errores · 0 warnings</span>
+</footer>
+
+<!-- modal: SQL output -->
+<div class="modal-bg" id="modal-sql">
+  <div class="modal" style="width:min(820px,92vw)">
     <div class="modal-head">
-      <h2 id="modal-title">SQL generado</h2>
-      <span class="spacer"></span>
-      <button id="modal-close" class="ghost">cerrar</button>
+      <h2>SQL generado</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-sql">cerrar</button>
     </div>
-    <div class="modal-body">
-      <pre id="modal-content">-- vacío --</pre>
+    <div class="modal-body" style="padding:0">
+      <pre id="sql-output" style="margin:0;padding:14px;color:#cfe3ff;font-size:12.5px;white-space:pre;overflow:auto;max-height:55vh">-- vacío --</pre>
     </div>
     <div class="modal-foot">
-      <button id="btn-copy">📋 Copiar al portapapeles</button>
+      <button id="btn-copy">📋 Copiar</button>
       <button id="btn-download" class="primary">⬇ Descargar .sql</button>
+    </div>
+  </div>
+</div>
+
+<!-- modal: import from gabysql -->
+<div class="modal-bg" id="modal-import">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Importar de gabysql</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-import">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <label>API base URL</label>
+      <input id="imp-url" type="text" placeholder="http://localhost:8080" />
+      <label>Token (opcional, si el server pide auth)</label>
+      <input id="imp-token" type="text" placeholder="" />
+      <label>Database (.db)</label>
+      <input id="imp-db" type="text" placeholder="demo.db" />
+      <p class="muted" style="font-size:11px;margin-top:10px">
+        El modeler hace <code>GET /tables?db=&lt;db&gt;</code> y reconstruye entidades, columnas, constraints e índices con la información que devuelve <code>/schema</code>. Necesita CORS habilitado en el server (lo está desde gabysql VERSION 6).
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" data-close="modal-import">cancelar</button>
+      <button id="btn-do-import" class="primary">↘ Importar</button>
+    </div>
+  </div>
+</div>
+
+<!-- modal: edit FK -->
+<div class="modal-bg" id="modal-fk">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>FOREIGN KEY de <code id="fk-col-label"></code></h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-fk">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <label>Tabla referenciada</label>
+      <select id="fk-table"></select>
+      <label>Columna referenciada (debe ser PK INT)</label>
+      <select id="fk-column"></select>
+      <label>ON DELETE</label>
+      <select id="fk-on-delete">
+        <option value="RESTRICT">RESTRICT (default)</option>
+        <option value="CASCADE">CASCADE</option>
+      </select>
+    </div>
+    <div class="modal-foot">
+      <button class="danger" id="btn-fk-clear">Quitar FK</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-fk">cancelar</button>
+      <button id="btn-fk-save" class="primary">Guardar</button>
     </div>
   </div>
 </div>
 
 <script>
 /* =========================================================
-   gabymodeler — ER → DDL gabysql, vanilla JS, sin deps.
-   Estado:  { dbName, ifNotExists, entities: [{ id, name, x, y, columns: [...] }] }
-   Columnas: { id, name, type, pk, idx }
+   gabymodeler v2 — PowerDesigner-style ER → DDL gabysql.
+   Vanilla HTML+CSS+JS, sin frameworks, sin servidor.
+
+   State schema:
+     {
+       dbName, ifNotExists,
+       entities: [{
+         id, name, x, y,
+         columns: [{
+           id, name, type,
+           pk, notNull, unique, hasDefault, defaultValue,
+           fk: null | { table, column, onDelete }
+         }]
+       }]
+     }
+
+   Match con motor gabysql VERSION 6:
+   - Tipos: INT, TEXT, BOOL, FLOAT, DATE, DATETIME, JSON
+   - PK debe ser INT y es implícitamente NOT NULL
+   - DEFAULT permite literal o NULL; rechazado en PK
+   - UNIQUE inline → CREATE TABLE genera el constraint, motor crea uq_<t>_<c>
+   - REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]
+   - Identificadores: [a-z_][a-z0-9_]*, max 64, no reservados
    ========================================================= */
 
 const TYPES = ["INT","TEXT","BOOL","FLOAT","DATE","DATETIME","JSON"];
-const STORAGE_KEY = "gabymodeler.v1";
+const STORAGE_KEY = "gabymodeler.v2";
+const LEGACY_KEY  = "gabymodeler.v1";
+const RESERVED = new Set([
+  "create","drop","alter","add","column","table","index","unique","database","databases",
+  "show","if","exists","not","insert","into","select","update","delete","from","set","values",
+  "where","between","and","limit","offset","on","primary","key","default","null","true","false",
+  "foreign","references","cascade","restrict","integrity","check",
+  "int","text","bool","float","date","datetime","json"
+]);
+const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_IDENT = 64;
+
 const SAMPLE = {
   dbName: "shop",
   ifNotExists: true,
   entities: [
-    { id: id_(), name:"users", x:80, y:80, columns:[
-      {id:id_(),name:"id",   type:"INT",  pk:true,  idx:false},
-      {id:id_(),name:"email",type:"TEXT", pk:false, idx:true},
-      {id:id_(),name:"name", type:"TEXT", pk:false, idx:false},
+    { id:id_(), name:"users", x:80, y:80, columns:[
+      col("id",   "INT",  {pk:true}),
+      col("email","TEXT", {notNull:true, unique:true}),
+      col("name", "TEXT"),
+      col("status","TEXT", {notNull:true, hasDefault:true, defaultValue:"pending"}),
     ]},
-    { id: id_(), name:"orders", x:430, y:80, columns:[
-      {id:id_(),name:"id",         type:"INT",   pk:true,  idx:false},
-      {id:id_(),name:"customer_id",type:"INT",   pk:false, idx:true},
-      {id:id_(),name:"status",     type:"TEXT",  pk:false, idx:true},
-      {id:id_(),name:"total",      type:"FLOAT", pk:false, idx:false},
+    { id:id_(), name:"orders", x:430, y:80, columns:[
+      col("id",         "INT", {pk:true}),
+      col("user_id",    "INT", {fk:{table:"users", column:"id", onDelete:"CASCADE"}}),
+      col("total",      "FLOAT"),
+      col("tries",      "INT", {hasDefault:true, defaultValue:0}),
     ]}
   ]
 };
 
-let state = load() || { dbName:"modeler_demo", ifNotExists:true, entities:[] };
+let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[] };
+let selectedColumnId = null;
+let selectedEntityId = null;
+let activeFkColumn = null;     // { entityId, columnId } during FK modal
+let activeTab = "check";
+let resultsCollapsed = false;
 
-/* ---------- utils ---------- */
-function id_(){ return "e"+Math.random().toString(36).slice(2,9); }
-function $(sel){ return document.querySelector(sel); }
+/* ---------- helpers ---------- */
+function id_(){ return "e" + Math.random().toString(36).slice(2,9); }
+function col(name, type, extra){
+  return Object.assign({
+    id:id_(), name, type,
+    pk:false, notNull:false, unique:false,
+    hasDefault:false, defaultValue:"",
+    fk:null
+  }, extra || {});
+}
+function $(s, root){ return (root||document).querySelector(s); }
+function $$(s, root){ return [...(root||document).querySelectorAll(s)]; }
 function el(tag, attrs={}, ...children){
   const n = document.createElement(tag);
   for (const [k,v] of Object.entries(attrs)){
     if (k === "class") n.className = v;
     else if (k === "html") n.innerHTML = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
-    else n.setAttribute(k, v);
+    else if (v === false || v == null) {} // skip
+    else n.setAttribute(k, v === true ? "" : v);
   }
   for (const c of children){
     if (c == null) continue;
@@ -222,79 +372,140 @@ function el(tag, attrs={}, ...children){
   }
   return n;
 }
+function sanitizeIdent(s){
+  return (s||"").trim().replace(/[^A-Za-z0-9_]/g,"_").replace(/^[^A-Za-z_]/, "_");
+}
+function isValidIdent(s){
+  if (!s) return false;
+  if (s.length > MAX_IDENT) return false;
+  if (!IDENT_RE.test(s)) return false;
+  if (RESERVED.has(s.toLowerCase())) return false;
+  return true;
+}
+function loadState(){
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+    // migrate v1 → v2 if present
+    const legacy = localStorage.getItem(LEGACY_KEY);
+    if (legacy){
+      const v1 = JSON.parse(legacy);
+      const migrated = { dbName: v1.dbName, ifNotExists: v1.ifNotExists, entities: [] };
+      for (const e of v1.entities || []){
+        migrated.entities.push({
+          id: e.id, name: e.name, x: e.x, y: e.y,
+          columns: (e.columns || []).map(c => col(c.name, c.type, {
+            pk: !!c.pk,
+            // v1's "idx" doesn't translate cleanly to a constraint; we drop it (the engine indexes UNIQUE columns automatically and CREATE INDEX is a separate emit)
+            fk: c.fk ? { table:c.fk.table, column:c.fk.column, onDelete:"RESTRICT" } : null
+          }))
+        });
+      }
+      return migrated;
+    }
+    return null;
+  } catch { return null; }
+}
 function save(){
   state.dbName     = $("#db-name").value.trim() || "modeler_demo";
   state.ifNotExists = $("#opt-ifnotexists").checked;
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  flash("Modelo guardado en este navegador.");
 }
-function load(){
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch { return null; }
-}
-function flash(msg){
-  const f = el("div", { class:"pill", style:"position:fixed;right:16px;top:68px;background:#2d7a66;border-color:#2d7a66;color:#dffaee;z-index:60" }, msg);
-  document.body.append(f);
-  setTimeout(() => f.remove(), 2000);
+function toast(msg){
+  const t = el("div", { class:"toast" }, msg);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2200);
 }
 
-/* ---------- render ---------- */
-function render(){
-  $("#db-name").value = state.dbName;
-  $("#opt-ifnotexists").checked = !!state.ifNotExists;
-
-  const canvas = $("#canvas");
-  // wipe entity nodes (keep svg)
-  [...canvas.querySelectorAll(".entity")].forEach(n => n.remove());
-
-  for (const ent of state.entities){
-    canvas.append(renderEntity(ent));
-  }
-  renderEntityList();
-  renderRelations();
-}
-
-function renderEntityList(){
-  const ul = $("#entity-list");
-  ul.innerHTML = "";
+/* ---------- Object Browser tree ---------- */
+function renderBrowser(){
+  const root = $("#object-browser");
+  root.innerHTML = "";
+  const dbBlock = el("details", { open:true });
+  dbBlock.append(el("summary", {}, el("b", {}, state.dbName || "(database)")));
+  const tablesBlock = el("details", { open:true });
+  tablesBlock.append(el("summary", {}, "Tables (" + state.entities.length + ")"));
   if (state.entities.length === 0){
-    ul.append(el("li", { class:"muted", style:"font-size:12px" }, "Sin entidades. Crea una con ＋."));
-    return;
+    tablesBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "Sin tablas todavía."));
   }
   for (const ent of state.entities){
-    const pkCount = ent.columns.filter(c => c.pk).length;
-    ul.append(el("li", { style:"padding:4px 0;border-bottom:1px solid #1a2536" },
-      el("b", {}, ent.name || "(sin nombre)"),
-      " ",
-      el("span", { class:"muted", style:"font-size:11px" },
-        `${ent.columns.length} cols · ${pkCount === 1 ? "PK ok" : "❗ PK falta o duplicada"}`)
-    ));
+    const det = el("details");
+    const sumRow = el("summary", { onclick: e => { e.stopPropagation(); selectEntity(ent.id); } }, ent.name || "(sin nombre)");
+    det.append(sumRow);
+    for (const c of ent.columns){
+      const badges = [];
+      if (c.pk) badges.push(el("span", { class:"pkbadge" }, "PK"));
+      if (c.notNull && !c.pk) badges.push(el("span", { class:"nnbadge" }, "NN"));
+      if (c.unique && !c.pk) badges.push(el("span", { class:"ublbadge" }, "UN"));
+      if (c.fk) badges.push(el("span", { class:"fkbadge" }, "FK"));
+      const leaf = el("div", {
+        class:"leaf" + (selectedColumnId === c.id ? " selected" : ""),
+        onclick: e => { e.stopPropagation(); selectColumn(ent.id, c.id); }
+      }, c.name + " : " + c.type, ...badges);
+      det.append(leaf);
+    }
+    tablesBlock.append(det);
   }
+  dbBlock.append(tablesBlock);
+
+  // Indexes section: collect all uq_<t>_<c> + (no explicit CREATE INDEX in this UI; engine creates them on UNIQUE).
+  const indexBlock = el("details");
+  const indexes = [];
+  for (const ent of state.entities){
+    for (const c of ent.columns){
+      if (c.unique && !c.pk) indexes.push(`uq_${ent.name}_${c.name}`);
+    }
+  }
+  indexBlock.append(el("summary", {}, "Indexes (" + indexes.length + ")"));
+  if (indexes.length === 0){
+    indexBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin índices declarativos)"));
+  }
+  for (const i of indexes){
+    indexBlock.append(el("div", { class:"leaf" }, i, " ", el("span", { class:"ublbadge" }, "UNIQUE")));
+  }
+  dbBlock.append(indexBlock);
+
+  root.append(dbBlock);
+}
+
+/* ---------- canvas: entities + relations ---------- */
+function renderCanvas(){
+  const wrap = $("#canvas-wrap");
+  $$(".entity", wrap).forEach(n => n.remove());
+  for (const ent of state.entities){
+    wrap.append(renderEntity(ent));
+  }
+  renderRelations();
 }
 
 function renderEntity(ent){
   const card = el("div", {
-    class:"entity",
+    class: "entity" + (selectedEntityId === ent.id ? " selected" : ""),
     "data-id": ent.id,
-    style:`left:${ent.x}px;top:${ent.y}px`
+    style: `left:${ent.x}px;top:${ent.y}px`,
+    onclick: e => { if (e.target === card || e.target.classList.contains("entity-body")) selectEntity(ent.id); }
   });
 
   const head = el("div", { class:"entity-head" },
     el("input", {
-      type:"text",
-      value: ent.name,
-      onchange: e => { ent.name = sanitizeIdent(e.target.value); save(); render(); }
+      type:"text", value: ent.name,
+      onchange: e => { ent.name = sanitizeIdent(e.target.value); save(); rerender(); }
     }),
     el("button", { class:"danger", title:"Eliminar entidad",
-      onclick: () => { state.entities = state.entities.filter(e=>e.id!==ent.id); save(); render(); }
+      onclick: () => {
+        if (!confirm(`¿Eliminar la entidad '${ent.name}'?`)) return;
+        state.entities = state.entities.filter(x => x.id !== ent.id);
+        if (selectedEntityId === ent.id) selectedEntityId = null;
+        save(); rerender();
+      }
     }, "✕")
   );
+
   // drag entity
   let dragging = null;
   head.addEventListener("mousedown", e => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
+    selectEntity(ent.id);
     dragging = { dx: e.clientX - ent.x, dy: e.clientY - ent.y };
     e.preventDefault();
   });
@@ -306,78 +517,99 @@ function renderEntity(ent){
     card.style.top  = ent.y + "px";
     renderRelations();
   });
-  document.addEventListener("mouseup", () => { if (dragging) { dragging = null; save(); } });
+  document.addEventListener("mouseup", () => { if (dragging){ dragging = null; save(); } });
 
   const tbl = el("table");
   const thead = el("thead", {}, el("tr", {},
-    el("th", {}, "Columna"),
-    el("th", { style:"width:90px" }, "Tipo"),
-    el("th", { style:"width:62px;text-align:right" }, "Flags")
+    el("th", {}, "col"),
+    el("th", { style:"width:80px" }, "tipo"),
+    el("th", { style:"width:78px" }, "flags"),
+    el("th", { style:"width:70px" }, "default"),
+    el("th", { style:"width:30px" }, "")
   ));
   const tbody = el("tbody");
-  for (const col of ent.columns) tbody.append(renderColumnRow(ent, col));
+  for (const c of ent.columns) tbody.append(renderColumnRow(ent, c));
   tbl.append(thead, tbody);
 
   const foot = el("div", { class:"entity-foot" },
     el("button", { onclick: () => {
-      ent.columns.push({ id:id_(), name:"col"+(ent.columns.length+1), type:"TEXT", pk:false, idx:false });
-      save(); render();
-    }}, "＋ columna"),
-    el("button", { class:"ghost",
-      onclick: () => {
-        const ref = prompt("Nombre de columna FK que apunta a otra entidad (formato 'tabla.columna')\nEjemplo: users.id", "");
-        if (!ref) return;
-        const [t,c] = ref.split(".");
-        if (!t || !c) return alert("Formato esperado: tabla.columna");
-        ent.columns.push({ id:id_(), name:t+"_"+c, type:"INT", pk:false, idx:true, fk:{table:t, column:c} });
-        save(); render();
-      }}, "↪ FK")
+      ent.columns.push(col("col" + (ent.columns.length + 1), "TEXT"));
+      save(); rerender();
+    }}, "＋ columna")
   );
 
   card.append(head, el("div", { class:"entity-body" }, tbl), foot);
   return card;
 }
 
-function renderColumnRow(ent, col){
-  return el("tr", {},
+function renderColumnRow(ent, c){
+  const flagPK = el("span", {
+    class: "colflag pk" + (c.pk?" on":""), title:"PRIMARY KEY",
+    onclick: () => {
+      if (!c.pk) ent.columns.forEach(x => x.pk = false);
+      c.pk = !c.pk;
+      if (c.pk){ c.type = "INT"; c.notNull = true; c.hasDefault = false; c.defaultValue = ""; }
+      save(); rerender();
+    }
+  }, "PK");
+  const flagNN = el("span", {
+    class: "colflag nn" + (c.notNull?" on":""), title:"NOT NULL",
+    onclick: () => { if (c.pk) return; c.notNull = !c.notNull; save(); rerender(); }
+  }, "NN");
+  const flagUN = el("span", {
+    class: "colflag un" + (c.unique?" on":""), title:"UNIQUE",
+    onclick: () => { if (c.pk) return; c.unique = !c.unique; save(); rerender(); }
+  }, "UN");
+  const flagFK = el("span", {
+    class: "colflag fk" + (c.fk?" on":""), title:"FOREIGN KEY",
+    onclick: () => openFkModal(ent.id, c.id)
+  }, "FK");
+
+  return el("tr", { onclick: () => selectColumn(ent.id, c.id) },
     el("td", {}, el("input", {
-      type:"text", value: col.name,
-      onchange: e => { col.name = sanitizeIdent(e.target.value); save(); render(); }
+      type:"text", value: c.name,
+      onchange: e => { c.name = sanitizeIdent(e.target.value); save(); rerender(); }
     })),
     el("td", {}, (() => {
-      const sel = el("select", { onchange: e => { col.type = e.target.value; save(); render(); }});
-      for (const t of TYPES) sel.append(el("option", { value:t, ...(t===col.type?{selected:""}:{ }) }, t));
+      const sel = el("select", { onchange: e => {
+        c.type = e.target.value;
+        if (c.pk && c.type !== "INT") c.type = "INT";
+        save(); rerender();
+      }});
+      for (const t of TYPES) sel.append(el("option", { value:t, ...(t===c.type?{selected:true}:{}) }, t));
       return sel;
     })()),
-    el("td", { style:"text-align:right;white-space:nowrap" },
-      el("span", { class:"colflag"+(col.pk?" on":""), title:"PRIMARY KEY",
-        onclick: () => {
-          // solo una PK por entidad
-          if (!col.pk) ent.columns.forEach(c => c.pk = false);
-          col.pk = !col.pk;
-          if (col.pk) col.type = "INT";
-          save(); render();
-        }
-      }, "PK"),
-      " ",
-      el("span", { class:"colflag idx"+(col.idx?" on":""), title:"índice secundario",
-        onclick: () => { col.idx = !col.idx; save(); render(); }
-      }, "idx"),
-      " ",
-      el("button", { class:"ghost", title:"eliminar columna",
-        onclick: () => {
-          ent.columns = ent.columns.filter(c=>c.id!==col.id);
-          save(); render();
-        }
-      }, "✕")
-    )
+    el("td", { style:"white-space:nowrap" }, flagPK, " ", flagNN, " ", flagUN, " ", flagFK),
+    el("td", {}, el("input", {
+      type:"text", class:"col-default", value: c.hasDefault ? String(c.defaultValue) : "",
+      placeholder: c.pk ? "—" : "literal",
+      disabled: c.pk,
+      onchange: e => {
+        const v = e.target.value;
+        if (v === "") { c.hasDefault = false; c.defaultValue = ""; }
+        else { c.hasDefault = true; c.defaultValue = v; }
+        save(); rerender();
+      }
+    })),
+    el("td", {}, el("button", { class:"ghost", title:"eliminar columna",
+      onclick: e => {
+        e.stopPropagation();
+        ent.columns = ent.columns.filter(x => x.id !== c.id);
+        if (selectedColumnId === c.id) selectedColumnId = null;
+        save(); rerender();
+      }
+    }, "✕"))
   );
 }
 
 function renderRelations(){
   const svg = $("#rel-svg");
   svg.innerHTML = "";
-  // FKs
+  const defs = document.createElementNS("http://www.w3.org/2000/svg","defs");
+  defs.innerHTML = `<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#3c5d96"/>
+  </marker>`;
+  svg.append(defs);
   for (const e of state.entities){
     for (const c of e.columns){
       if (!c.fk) continue;
@@ -390,7 +622,8 @@ function renderRelations(){
       line.setAttribute("fill","none");
       line.setAttribute("stroke","#3c5d96");
       line.setAttribute("stroke-width","2");
-      line.setAttribute("stroke-dasharray","4 4");
+      line.setAttribute("stroke-dasharray", c.fk.onDelete === "CASCADE" ? "" : "4 3");
+      line.setAttribute("marker-end","url(#arrow)");
       svg.append(line);
     }
   }
@@ -401,103 +634,395 @@ function entityCenter(ent){
   return { x: ent.x + node.offsetWidth/2, y: ent.y + node.offsetHeight/2 };
 }
 
-/* ---------- DDL generator ---------- */
-function sanitizeIdent(s){
-  return (s||"").trim().replace(/[^A-Za-z0-9_]/g,"_").replace(/^[^A-Za-z_]/, "_");
+/* ---------- selection ---------- */
+function selectEntity(id){
+  selectedEntityId = id;
+  selectedColumnId = null;
+  rerender();
+  const node = document.querySelector(`.entity[data-id="${id}"]`);
+  if (node) node.scrollIntoView({behavior:"smooth", block:"center", inline:"center"});
 }
+function selectColumn(entId, colId){
+  selectedEntityId = entId;
+  selectedColumnId = colId;
+  rerender();
+}
+
+/* ---------- Check Model ---------- */
+function checkModel(){
+  const findings = [];
+  const tableNames = new Map(); // name → entityId
+
+  for (const ent of state.entities){
+    const ename = (ent.name || "").trim();
+    if (!ename){
+      findings.push(["error", `(entidad sin nombre)`, "toda entidad necesita un nombre", ent.id, null]);
+      continue;
+    }
+    if (!isValidIdent(ename)){
+      findings.push(["error", ename,
+        ename.length > MAX_IDENT ? `nombre excede ${MAX_IDENT} chars` :
+        RESERVED.has(ename.toLowerCase()) ? `'${ename}' es palabra reservada` :
+        `nombre inválido (debe ser [A-Za-z_][A-Za-z0-9_]*)`,
+        ent.id, null]);
+    }
+    if (tableNames.has(ename.toLowerCase())){
+      findings.push(["error", ename, `nombre de tabla duplicado`, ent.id, null]);
+    }
+    tableNames.set(ename.toLowerCase(), ent.id);
+
+    const pks = ent.columns.filter(c => c.pk);
+    if (pks.length === 0){
+      findings.push(["error", ename, "tabla sin PRIMARY KEY", ent.id, null]);
+    } else if (pks.length > 1){
+      findings.push(["error", ename, `${pks.length} PRIMARY KEYs (esta versión solo admite una)`, ent.id, null]);
+    } else if (pks[0].type !== "INT"){
+      findings.push(["error", `${ename}.${pks[0].name}`, `PK debe ser INT (es ${pks[0].type})`, ent.id, pks[0].id]);
+    }
+
+    if (ent.columns.length <= 1){
+      findings.push(["warn", ename, "tabla sin columnas además de la PK", ent.id, null]);
+    }
+
+    const colNames = new Map();
+    for (const c of ent.columns){
+      const cname = (c.name || "").trim();
+      if (!cname){
+        findings.push(["error", `${ename}.(?)`, "columna sin nombre", ent.id, c.id]);
+        continue;
+      }
+      if (!isValidIdent(cname)){
+        findings.push(["error", `${ename}.${cname}`,
+          cname.length > MAX_IDENT ? `nombre excede ${MAX_IDENT} chars` :
+          RESERVED.has(cname.toLowerCase()) ? `'${cname}' es palabra reservada` :
+          `nombre inválido`,
+          ent.id, c.id]);
+      }
+      if (colNames.has(cname.toLowerCase())){
+        findings.push(["error", `${ename}.${cname}`, "columna duplicada", ent.id, c.id]);
+      }
+      colNames.set(cname.toLowerCase(), c.id);
+
+      if (c.notNull && c.hasDefault && (String(c.defaultValue).toUpperCase() === "NULL")){
+        findings.push(["error", `${ename}.${cname}`, "NOT NULL incompatible con DEFAULT NULL", ent.id, c.id]);
+      }
+      if (c.pk && c.hasDefault){
+        findings.push(["error", `${ename}.${cname}`, "PRIMARY KEY no admite DEFAULT", ent.id, c.id]);
+      }
+      if (c.unique && c.type === "JSON"){
+        findings.push(["warn", `${ename}.${cname}`, "índice UNIQUE sobre JSON será rechazado por el motor", ent.id, c.id]);
+      }
+      if (c.hasDefault && !defaultMatchesType(c)){
+        findings.push(["error", `${ename}.${cname}`, `DEFAULT '${c.defaultValue}' incompatible con ${c.type}`, ent.id, c.id]);
+      }
+
+      if (c.fk){
+        const target = state.entities.find(t => t.name.toLowerCase() === c.fk.table.toLowerCase());
+        if (!target){
+          findings.push(["error", `${ename}.${cname}`, `FK apunta a tabla '${c.fk.table}' inexistente`, ent.id, c.id]);
+        } else {
+          const targetCol = target.columns.find(tc => tc.name.toLowerCase() === c.fk.column.toLowerCase());
+          if (!targetCol){
+            findings.push(["error", `${ename}.${cname}`, `FK apunta a '${c.fk.table}.${c.fk.column}' inexistente`, ent.id, c.id]);
+          } else if (!targetCol.pk){
+            findings.push(["error", `${ename}.${cname}`, `FK debe apuntar a la PK de '${c.fk.table}' (es '${targetCol.name}', no PK)`, ent.id, c.id]);
+          } else if (targetCol.type !== c.type){
+            findings.push(["error", `${ename}.${cname}`, `FK type mismatch: ${c.type} vs ${targetCol.type}`, ent.id, c.id]);
+          }
+        }
+      }
+    }
+  }
+
+  return findings;
+}
+
+function defaultMatchesType(c){
+  const v = String(c.defaultValue);
+  if (v.toUpperCase() === "NULL") return true;
+  switch(c.type){
+    case "INT":      return /^-?\d+$/.test(v);
+    case "FLOAT":    return /^-?\d+(\.\d+)?$/.test(v);
+    case "BOOL":     return /^(true|false)$/i.test(v);
+    case "TEXT":
+    case "DATE":
+    case "DATETIME":
+    case "JSON":     return true; // any literal accepted
+    default:         return true;
+  }
+}
+
+function renderFindings(findings){
+  const tbody = $("#findings-table tbody");
+  tbody.innerHTML = "";
+  if (findings.length === 0){
+    tbody.append(el("tr", {}, el("td", { class:"ok", colspan:"3", style:"padding:14px;text-align:center" }, "✓ Sin hallazgos. El esquema es internamente consistente.")));
+  } else {
+    for (const [sev, obj, detail, entId, colId] of findings){
+      tbody.append(el("tr", {
+        class: sev,
+        onclick: () => { if (entId) { selectedEntityId = entId; selectedColumnId = colId; rerender(); } }
+      },
+        el("td", {}, sev === "error" ? "❌ error" : sev === "warn" ? "⚠ warning" : "ℹ info"),
+        el("td", {}, obj),
+        el("td", {}, detail)
+      ));
+    }
+  }
+}
+
+/* ---------- SQL generation ---------- */
 function generateSQL(){
   const lines = [];
-  const dbName = sanitizeIdent($("#db-name").value || "modeler_demo");
-  const ifne = $("#opt-ifnotexists").checked ? " IF NOT EXISTS" : "";
-
+  const dbName = sanitizeIdent(state.dbName || "modeler_demo");
+  const ifne = state.ifNotExists ? " IF NOT EXISTS" : "";
   lines.push(`-- Generado por gabymodeler · ${new Date().toISOString()}`);
+  lines.push(`-- Target: gabysql VERSION 6`);
   lines.push(`CREATE DATABASE${ifne} ${dbName};`);
   lines.push(``);
 
-  for (const ent of state.entities){
+  // Topological order: tables that are referenced first.
+  const ordered = topoOrder(state.entities);
+
+  for (const ent of ordered){
     if (!ent.name) continue;
     const cols = ent.columns.filter(c => c.name);
     if (cols.length === 0) continue;
     const colDefs = cols.map(c => {
       let s = `  ${c.name} ${c.type}`;
       if (c.pk) s += " PRIMARY KEY";
+      if (c.notNull && !c.pk) s += " NOT NULL";
+      if (c.unique && !c.pk) s += " UNIQUE";
+      if (c.hasDefault && !c.pk){
+        s += " DEFAULT " + sqlLiteral(c);
+      }
+      if (c.fk){
+        s += ` REFERENCES ${c.fk.table}(${c.fk.column})`;
+        if (c.fk.onDelete && c.fk.onDelete !== "RESTRICT") s += ` ON DELETE ${c.fk.onDelete}`;
+      }
       return s;
     }).join(",\n");
     lines.push(`CREATE TABLE ${ent.name} (`);
     lines.push(colDefs);
     lines.push(`);`);
-    for (const c of cols){
-      if (c.idx && !c.pk && c.type !== "JSON"){
-        lines.push(`CREATE INDEX idx_${ent.name}_${c.name} ON ${ent.name} (${c.name});`);
-      }
-    }
     lines.push(``);
   }
-
-  // Comentarios FK (no soportado declarativo todavía)
-  const fks = [];
-  for (const ent of state.entities){
-    for (const c of ent.columns){
-      if (c.fk) fks.push(`-- FK: ${ent.name}.${c.name} -> ${c.fk.table}.${c.fk.column} (no enforced en VERSION 4)`);
-    }
-  }
-  if (fks.length){
-    lines.push(`-- FOREIGN KEYS (informativas, no implementadas en gabysql v0.1.x):`);
-    lines.push(...fks);
-  }
-
   return lines.join("\n");
 }
 
-/* ---------- modal ---------- */
-function openModal(title, content){
-  $("#modal-title").textContent = title;
-  $("#modal-content").textContent = content;
-  $("#modal-bg").classList.add("show");
+function sqlLiteral(c){
+  const v = String(c.defaultValue);
+  if (v.toUpperCase() === "NULL") return "NULL";
+  switch(c.type){
+    case "INT":   return /^-?\d+$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`;
+    case "FLOAT": return /^-?\d+(\.\d+)?$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`;
+    case "BOOL":  return /^true$/i.test(v) ? "TRUE" : /^false$/i.test(v) ? "FALSE" : `'${v.replace(/'/g, "''")}'`;
+    default:      return `'${v.replace(/'/g, "''")}'`;
+  }
 }
-function closeModal(){ $("#modal-bg").classList.remove("show"); }
 
-/* ---------- bindings ---------- */
+function topoOrder(entities){
+  const byName = new Map();
+  entities.forEach(e => byName.set(e.name.toLowerCase(), e));
+  const visited = new Set();
+  const result = [];
+  function visit(e){
+    if (!e || visited.has(e.id)) return;
+    visited.add(e.id);
+    for (const c of e.columns){
+      if (c.fk && byName.has(c.fk.table.toLowerCase()) && c.fk.table.toLowerCase() !== e.name.toLowerCase()){
+        visit(byName.get(c.fk.table.toLowerCase()));
+      }
+    }
+    result.push(e);
+  }
+  for (const e of entities) visit(e);
+  return result;
+}
+
+/* ---------- FK modal ---------- */
+function openFkModal(entityId, columnId){
+  activeFkColumn = { entityId, columnId };
+  const ent = state.entities.find(e => e.id === entityId);
+  const c = ent.columns.find(cc => cc.id === columnId);
+  $("#fk-col-label").textContent = `${ent.name}.${c.name}`;
+  const tableSel = $("#fk-table");
+  tableSel.innerHTML = "";
+  tableSel.append(el("option", { value:"" }, "(elegir tabla)"));
+  for (const e of state.entities){
+    if (e.id === entityId) continue; // self-ref allowed but we filter for clarity; user can set it manually
+    tableSel.append(el("option", { value:e.name, ...(c.fk && c.fk.table === e.name ? {selected:true}:{}) }, e.name));
+  }
+  // also offer self-ref
+  tableSel.append(el("option", { value:ent.name, ...(c.fk && c.fk.table === ent.name ? {selected:true}:{}) }, ent.name + " (self)"));
+  populateFkColumns();
+  tableSel.onchange = populateFkColumns;
+  $("#fk-on-delete").value = (c.fk && c.fk.onDelete) || "RESTRICT";
+  $("#modal-fk").classList.add("show");
+}
+function populateFkColumns(){
+  const colSel = $("#fk-column");
+  colSel.innerHTML = "";
+  const tableName = $("#fk-table").value;
+  const target = state.entities.find(e => e.name === tableName);
+  if (!target){ colSel.append(el("option", { value:"" }, "(elegir tabla primero)")); return; }
+  const cur = activeFkColumn && state.entities.find(e=>e.id===activeFkColumn.entityId)?.columns.find(c=>c.id===activeFkColumn.columnId);
+  for (const c of target.columns){
+    if (!c.pk) continue;
+    colSel.append(el("option", { value:c.name, ...(cur && cur.fk && cur.fk.column === c.name ? {selected:true}:{}) }, c.name + " (PK " + c.type + ")"));
+  }
+}
+$("#btn-fk-save").onclick = () => {
+  const ent = state.entities.find(e => e.id === activeFkColumn.entityId);
+  const c = ent.columns.find(cc => cc.id === activeFkColumn.columnId);
+  const tbl = $("#fk-table").value;
+  const col = $("#fk-column").value;
+  const od = $("#fk-on-delete").value;
+  if (!tbl || !col){ toast("Elegí tabla y columna PK."); return; }
+  c.fk = { table: tbl, column: col, onDelete: od };
+  if (c.type !== "INT") c.type = "INT"; // FK must match parent PK type, which is INT in v6
+  save(); rerender(); closeModals();
+};
+$("#btn-fk-clear").onclick = () => {
+  const ent = state.entities.find(e => e.id === activeFkColumn.entityId);
+  const c = ent.columns.find(cc => cc.id === activeFkColumn.columnId);
+  c.fk = null;
+  save(); rerender(); closeModals();
+};
+
+/* ---------- Import from gabysql ---------- */
+async function doImport(){
+  const url = $("#imp-url").value.trim().replace(/\/+$/, "");
+  const tok = $("#imp-token").value.trim();
+  const db  = $("#imp-db").value.trim();
+  if (!url || !db){ toast("Falta URL o DB."); return; }
+  const headers = tok ? { "Authorization": "Bearer " + tok } : {};
+  try {
+    const r = await fetch(`${url}/tables?db=${encodeURIComponent(db)}`, { headers });
+    if (!r.ok){ toast(`Server respondió ${r.status}`); return; }
+    const data = await r.json();
+    if (!data.ok || !Array.isArray(data.tables)){ toast("Respuesta inesperada del server."); return; }
+    importTablesFromJson(data.tables, db);
+    closeModals();
+    toast(`Importadas ${data.tables.length} tablas de ${db}.`);
+  } catch (err){
+    toast("Error de red: " + err.message);
+  }
+}
+function importTablesFromJson(tables, dbName){
+  state.entities = [];
+  let x = 60, y = 60, n = 0;
+  for (const t of tables){
+    const ent = {
+      id: id_(), name: t.name,
+      x: 60 + (n % 4) * 320, y: 60 + Math.floor(n / 4) * 240,
+      columns: (t.columns || []).map(c => ({
+        id: id_(), name: c.name, type: c.type,
+        pk: !!c.pk,
+        notNull: !!c.notNull,
+        unique: !!c.unique,
+        hasDefault: !!c.hasDefault,
+        defaultValue: c.default == null ? "" : String(c.default),
+        fk: c.references ? {
+          table: c.references.table,
+          column: c.references.column,
+          onDelete: c.references.onDelete || "RESTRICT"
+        } : null
+      }))
+    };
+    state.entities.push(ent);
+    n++;
+  }
+  // strip the .db suffix for nicer display
+  state.dbName = dbName.replace(/\.db$/i, "");
+  $("#db-name").value = state.dbName;
+  save(); rerender();
+}
+
+/* ---------- modals + tabs ---------- */
+function closeModals(){ $$(".modal-bg").forEach(m => m.classList.remove("show")); }
+$$("[data-close]").forEach(b => b.onclick = () => $("#" + b.dataset.close).classList.remove("show"));
+$$(".modal-bg").forEach(bg => bg.addEventListener("click", e => { if (e.target === bg) bg.classList.remove("show"); }));
+
+$$(".results-tab[data-tab]").forEach(t => t.onclick = () => {
+  activeTab = t.dataset.tab;
+  $$(".results-tab").forEach(x => x.classList.toggle("active", x.dataset.tab === activeTab));
+  $$(".results-body").forEach(x => x.classList.toggle("active", x.dataset.tab === activeTab));
+});
+$("#btn-collapse").onclick = () => {
+  resultsCollapsed = !resultsCollapsed;
+  $("#main-grid").classList.toggle("results-collapsed", resultsCollapsed);
+  $("#btn-collapse").textContent = resultsCollapsed ? "▲" : "▼";
+};
+
+/* ---------- top toolbar bindings ---------- */
 $("#btn-new-entity").onclick = () => {
-  state.entities.push({
-    id:id_(), name:"tabla"+(state.entities.length+1),
-    x: 60 + (state.entities.length*30) % 400,
-    y: 60 + (state.entities.length*30) % 250,
-    columns:[{ id:id_(), name:"id", type:"INT", pk:true, idx:false }]
-  });
-  save(); render();
+  const e = {
+    id: id_(),
+    name: "tabla" + (state.entities.length + 1),
+    x: 60 + (state.entities.length * 30) % 400,
+    y: 60 + (state.entities.length * 30) % 250,
+    columns: [col("id", "INT", { pk:true })]
+  };
+  state.entities.push(e);
+  save(); rerender(); selectEntity(e.id);
 };
-$("#btn-export").onclick = () => openModal("SQL generado", generateSQL());
-$("#btn-save").onclick   = save;
-$("#btn-load").onclick   = () => {
-  const s = load();
-  if (!s){ flash("No hay modelo guardado en este navegador."); return; }
-  state = s; render(); flash("Modelo recargado.");
+$("#btn-export").onclick = () => {
+  $("#sql-output").textContent = generateSQL();
+  $("#modal-sql").classList.add("show");
 };
-$("#btn-clear").onclick  = () => {
-  if (!confirm("¿Borrar el modelo actual? localStorage también se vacía.")) return;
+$("#btn-import").onclick = () => {
+  if (!$("#imp-url").value) $("#imp-url").value = "http://localhost:8080";
+  if (!$("#imp-db").value) $("#imp-db").value = (state.dbName || "demo") + ".db";
+  $("#modal-import").classList.add("show");
+};
+$("#btn-do-import").onclick = doImport;
+$("#btn-load-sample").onclick = () => { state = JSON.parse(JSON.stringify(SAMPLE)); save(); rerender(); };
+$("#btn-clear").onclick = () => {
+  if (!confirm("¿Borrar el modelo y limpiar localStorage?")) return;
   state = { dbName:"modeler_demo", ifNotExists:true, entities:[] };
   localStorage.removeItem(STORAGE_KEY);
-  render();
+  rerender();
 };
-$("#btn-load-sample").onclick = () => { state = JSON.parse(JSON.stringify(SAMPLE)); save(); render(); };
-$("#modal-close").onclick = closeModal;
-$("#modal-bg").addEventListener("click", e => { if (e.target.id === "modal-bg") closeModal(); });
 $("#btn-copy").onclick = async () => {
-  try { await navigator.clipboard.writeText($("#modal-content").textContent); flash("SQL copiado."); }
-  catch { flash("No se pudo copiar (¿permisos?)."); }
+  try { await navigator.clipboard.writeText($("#sql-output").textContent); toast("SQL copiado."); }
+  catch { toast("No se pudo copiar."); }
 };
 $("#btn-download").onclick = () => {
-  const blob = new Blob([$("#modal-content").textContent], { type:"text/plain" });
+  const blob = new Blob([$("#sql-output").textContent], { type:"text/plain" });
   const url = URL.createObjectURL(blob);
-  const a = el("a", { href:url, download:`${sanitizeIdent($("#db-name").value)||"model"}.sql` });
+  const a = el("a", { href:url, download:`${sanitizeIdent(state.dbName)||"model"}.sql` });
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
-$("#db-name").addEventListener("change", save);
+$("#db-name").addEventListener("change", () => { save(); rerender(); });
 $("#opt-ifnotexists").addEventListener("change", save);
 
-render();
+/* ---------- master rerender ---------- */
+function rerender(){
+  $("#db-name").value = state.dbName;
+  $("#opt-ifnotexists").checked = !!state.ifNotExists;
+
+  renderBrowser();
+  renderCanvas();
+
+  const findings = checkModel();
+  renderFindings(findings);
+
+  $("#sql-preview").textContent = generateSQL();
+
+  const cols = state.entities.reduce((s,e) => s + e.columns.length, 0);
+  const idxs = state.entities.reduce((s,e) => s + e.columns.filter(c => c.unique && !c.pk).length, 0);
+  const fks  = state.entities.reduce((s,e) => s + e.columns.filter(c => !!c.fk).length, 0);
+  $("#status-counts").textContent = `${state.entities.length} tablas · ${cols} columnas · ${idxs} índices · ${fks} FKs`;
+
+  const errs = findings.filter(f => f[0] === "error").length;
+  const warns = findings.filter(f => f[0] === "warn").length;
+  const sf = $("#status-findings");
+  sf.textContent = `${errs} errores · ${warns} warnings`;
+  sf.className = errs > 0 ? "err" : warns > 0 ? "warn" : "ok";
+}
+
+rerender();
 </script>
-</body>
-</html>
+</body></html>

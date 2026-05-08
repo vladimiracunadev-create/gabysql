@@ -1,18 +1,51 @@
-# 📐 gabymodeler
+# 📐 gabymodeler v2
 
-> **Modelador ER → DDL** para `gabysql`. Single-page HTML+CSS+JS vanilla, sin frameworks, sin servidor. Persistencia local en `localStorage`. Pensado como acompañante de [phpgabyadmin](../phpgabyadmin/).
+> **Modelador ER → DDL** para `gabysql`, layout PowerDesigner-style.
+> Single-page HTML+CSS+JS vanilla, sin frameworks, sin servidor obligatorio.
+> Persistencia local en `localStorage`. Espejo del motor `gabysql VERSION 6`.
 
 ---
 
 ## 🎯 Qué hace
 
-1. **Modela** entidades (tablas) con sus columnas, tipos y flags (`PK`, `idx`).
-2. **Exporta** el modelo como SQL DDL listo para `gabysql`:
+1. **Modela** entidades (tablas) con sus columnas, tipos y constraints declarativas:
+   - `PRIMARY KEY` (PK), `NOT NULL` (NN), `UNIQUE` (UN), `FOREIGN KEY` (FK con `ON DELETE`).
+   - `DEFAULT <literal>` editable inline por columna.
+2. **Check Model** continuo (14 reglas) con tabla de hallazgos navegable:
+   - PK ausente / duplicada / no INT, columna duplicada, identificador inválido o reservado, NOT NULL+DEFAULT NULL, UNIQUE sobre JSON, FK rota o con type mismatch, etc.
+3. **Exporta SQL** ordenado topológicamente (parents antes que children) con todas las constraints inline:
    - `CREATE DATABASE [IF NOT EXISTS] <name>;`
-   - `CREATE TABLE <ent> (...);` por cada entidad
-   - `CREATE INDEX idx_<ent>_<col> ON <ent> (<col>);` por cada columna marcada como `idx`
-3. **Persiste** el trabajo en `localStorage` de tu navegador (no necesita backend).
-4. **Probar en phpgabyadmin** — link directo al admin web; pegas el SQL en el tab SQL y se ejecuta dentro de la misma transacción.
+   - `CREATE TABLE <ent> (... PRIMARY KEY / NOT NULL / UNIQUE / DEFAULT / REFERENCES ... ON DELETE ...);` por cada entidad.
+4. **Importa de gabysql**: dado URL del server (default `http://localhost:8080`) + token + nombre de DB, consume `GET /tables?db=<db>` y reconstruye entidades, columnas y FKs. Reverse engineering one-shot.
+5. **Persiste** el trabajo en `localStorage` (`gabymodeler.v2`). Si encuentra un modelo viejo (`gabymodeler.v1`), lo migra al schema nuevo en el primer load.
+
+---
+
+## 🧭 Layout
+
+```
++---- Header (toolbar): + Entidad · ↘ Importar · 📋 Ver SQL · 📦 Ejemplo · 🗑 ----+
++--------+-----------------------------------+
+| Object |                                   |
+| Browser|          Canvas                   |
+| (DB,   |   [Entity boxes + FK lines SVG]   |
+|  Tables|                                   |
+|  Indexes)                                  |
+|        |                                   |
++--------+----- Result List (collapsible) ---+
+|        | [Check Model] [SQL Preview]      |
+|        | severidad | objeto | detalle ...  |
++--------+-----------------------------------+
+| Status: VERSION 6 · N tablas · 0 errores  |
++-------------------------------------------+
+```
+
+- **Object Browser**: árbol jerárquico DB > Tables > [tabla] > columnas con badges (`PK`, `NN`, `UN`, `FK`); también lista los índices auto-derivados de columnas UNIQUE.
+- **Canvas**: drag & drop de entidades. SVG para líneas FK (Bezier; `ON DELETE CASCADE` se dibuja sólida, `RESTRICT` punteada).
+- **Result List**: dos tabs colapsables.
+  - **Check Model**: cada hallazgo es clickeable y selecciona la entidad/columna en el canvas + browser.
+  - **SQL Preview**: el DDL en vivo, sin abrir modal.
+- **Status bar**: target VERSION + counts + indicador `0 errores · 0 warnings`.
 
 ---
 
@@ -29,15 +62,16 @@ docker compose up -d --build
 ### Opción B — `php -S` local
 ```bash
 php -S localhost:8000 -t web
-# Mismas URLs que arriba.
 ```
 
 ### Opción C — sin servidor PHP
-El modeler es HTML estático puro. Cualquier servidor de archivos sirve:
+El modeler es HTML estático puro:
 ```bash
 python3 -m http.server 8000 --directory web
 # http://localhost:8000/modeler/
 ```
+
+> Para usar **↘ Importar de gabysql**, levantá también el server: `gabysql-server -dir ./data -addr :8080`. Desde gabysql VERSION 6 el server emite headers CORS, por lo que el modeler en `:8000` puede leer el API en `:8080` sin proxy.
 
 ---
 
@@ -45,77 +79,59 @@ python3 -m http.server 8000 --directory web
 
 ```mermaid
 flowchart LR
-    A([Modelar]) --> B[Exportar SQL]
-    B --> C[Copiar al portapapeles]
-    C --> D[phpgabyadmin → tab SQL]
-    D --> E[Ejecutar]
-    E --> F([Verificar en Browse])
+    A([Modelar]) --> B[Check Model]
+    B --> C[Ver SQL]
+    C --> D[Copiar al portapapeles]
+    D --> E[phpgabyadmin → tab SQL]
+    E --> F([Ejecutar])
+    F --> G([Verificar en Browse])
 ```
 
-1. Click en `＋ Nueva entidad`.
-2. Define columnas, marca `PK` (debe ser `INT`) y `idx` donde quieras un índice secundario.
-3. (Opcional) Click `↪ FK` para agregar una columna que apunte a otra entidad — el modeler la documenta como comentario en el SQL (las FOREIGN KEYS declarativas no están implementadas en gabysql `VERSION 4` todavía).
-4. Click `Exportar SQL` → copia o descarga el `.sql`.
-5. Abre [phpgabyadmin](../phpgabyadmin/), pestaña SQL, pega y ejecuta.
+Alternativa con reverse engineering:
+
+```mermaid
+flowchart LR
+    A([gabysql tiene un schema]) --> B[↘ Importar de gabysql]
+    B --> C[Editar / extender en el modeler]
+    C --> D[Ver SQL → ALTER manual]
+```
 
 ---
 
-## 🗂️ Tipos soportados
+## 🗂️ Tipos y constraints soportados
 
-| Tipo | Indexable | Notas |
-| :--- | :---: | :--- |
-| `INT` | ✅ | Único tipo válido como PK |
-| `TEXT` | ✅ | Hasta 65 535 bytes |
-| `BOOL` | ✅ | `TRUE` / `FALSE` |
-| `FLOAT` | ✅ | `f64` |
-| `DATE` | ✅ | Texto ISO-8601 |
-| `DATETIME` | ✅ | Texto ISO-8601 |
-| `JSON` | ❌ | Sin semántica de igualdad canónica |
+| Tipo | PK | UNIQUE | DEFAULT | FK |
+| :--- | :---: | :---: | :---: | :---: |
+| `INT` | ✅ | ✅ | ✅ | ✅ (tipo de toda FK) |
+| `TEXT` | ❌ | ✅ | ✅ | ❌ |
+| `BOOL` | ❌ | ✅ | ✅ | ❌ |
+| `FLOAT` | ❌ | ✅ | ✅ | ❌ |
+| `DATE` | ❌ | ✅ | ✅ | ❌ |
+| `DATETIME` | ❌ | ✅ | ✅ | ❌ |
+| `JSON` | ❌ | ⚠ rechazado por motor | ✅ | ❌ |
 
-Para detalles, [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md).
+Notas:
+- PK debe ser INT y es implícitamente NOT NULL.
+- FK debe apuntar a la PK del parent (target column = PK del target).
+- `ON DELETE`: `RESTRICT` (default) o `CASCADE`.
 
----
-
-## 🧪 SQL ejemplo (botón "Cargar ejemplo")
-
-```sql
--- Generado por gabymodeler · 2026-...
-CREATE DATABASE IF NOT EXISTS shop;
-
-CREATE TABLE users (
-  id INT PRIMARY KEY,
-  email TEXT,
-  name TEXT
-);
-CREATE INDEX idx_users_email ON users (email);
-
-CREATE TABLE orders (
-  id INT PRIMARY KEY,
-  customer_id INT,
-  status TEXT,
-  total FLOAT
-);
-CREATE INDEX idx_orders_customer_id ON orders (customer_id);
-CREATE INDEX idx_orders_status ON orders (status);
-
--- FOREIGN KEYS (informativas, no implementadas en gabysql v0.1.x):
--- FK: orders.customer_id -> users.id (no enforced en VERSION 4)
-```
+Ver [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) y [docs/TECHNICAL_SPECS.md](../../docs/TECHNICAL_SPECS.md) para el detalle del motor.
 
 ---
 
 ## ⚠️ Limitaciones conocidas
 
-- Las **FOREIGN KEYS** se documentan como comentarios — no son enforced por el motor en `VERSION 4`.
-- El modeler **no se conecta** a la API HTTP automáticamente: copias/pegas el SQL en `phpgabyadmin`. Esto es deliberado (modeler 100% estático, sin coupling con CORS / token).
-- No hay **importar** desde un `.db` existente; eso requeriría un endpoint de introspección + parser. Está en el ROADMAP del Camino A.
-- Sin **soporte de undo/redo** todavía. `localStorage` mantiene el último estado guardado; usar `Limpiar` es destructivo.
+- No hay **DROP COLUMN** ni **RENAME TABLE/COLUMN** desde el modeler — las edita reemitiendo el `CREATE TABLE` completo. Para edición incremental usar `ALTER TABLE ADD COLUMN` directamente vía phpgabyadmin (el motor lo soporta desde VERSION 5).
+- El reverse engineering (`↘ Importar`) **reemplaza** el modelo actual; no hace merge.
+- Sin **undo/redo** todavía. `localStorage` mantiene el último estado guardado.
+- Sin **auto-layout**: las entidades importadas se acomodan en una grilla 4-columnas.
 
 ---
 
 ## 🧱 Stack y filosofía
 
-- HTML + CSS + JS vanilla. Cero deps. Cero `npm install`.
-- SVG para las relaciones FK (líneas Bezier).
-- `localStorage` con clave `gabymodeler.v1`.
-- Diseño consistente con `phpgabyadmin` y la landing PHP (mismas paletas, tipografía Georgia).
+- HTML + CSS + JS vanilla. Cero deps. Cero `npm install`. Cero build step.
+- SVG para FKs (Bezier con marker arrow + dasharray según `onDelete`).
+- `localStorage` con clave `gabymodeler.v2`. Migración automática desde `gabymodeler.v1` (modelo viejo sin constraints).
+- Diseño consistente con `phpgabyadmin` y la landing PHP (mismas paletas, tipografía Georgia, dark theme `#0d1117`).
+- Las reglas de identificadores y palabras reservadas están **hardcoded** acá pero **espejean** las del motor (`catalog::validate_identifier`, `catalog::RESERVED_WORDS`); cualquier cambio en el motor pide actualización en el modeler.

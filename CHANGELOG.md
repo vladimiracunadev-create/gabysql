@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-05-07 — Undécima intervención: gabymodeler v2 (PowerDesigner-style) + CORS
+
+> **Sin bump de formato.** El motor no cambia; el modeler reescrito y el server gana headers CORS para que el modeler pueda hablarle directo.
+
+### 🌐 gabymodeler v2 (`web/modeler/`)
+Reescritura completa del modelador, espejo del motor `VERSION 6`:
+- **Layout PowerDesigner-style**: header de toolbar + Object Browser izquierdo (árbol DB > Tables > columnas con badges PK/NN/UN/FK + sección Indexes) + Canvas central + Result List inferior colapsable + Status bar.
+- **Schema editor**: cada columna lleva flags inline `PK / NN / UN / FK` y un input `default` editable. PK fuerza INT + NOT NULL automáticamente. FK abre un mini-modal para elegir tabla, columna PK del target y `ON DELETE RESTRICT|CASCADE`.
+- **Check Model** continuo (14 reglas): PK ausente / duplicada / no INT, columna duplicada, identificador inválido o reservado (espejo de `catalog::RESERVED_WORDS`), `NOT NULL + DEFAULT NULL`, `DEFAULT` sobre PK, UNIQUE sobre JSON, FK rota / con type mismatch / target no-PK, etc. Cada hallazgo es clickeable y selecciona la entidad/columna en canvas + browser.
+- **SQL Preview en vivo** (sin abrir modal). El emit ordena tablas topológicamente (parents antes que children) y emite todas las constraints inline (`PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, `REFERENCES ... ON DELETE ...`) — DDL fiel al motor `VERSION 6`.
+- **↘ Importar de gabysql**: dialog que pide URL del server, token opcional y nombre de DB; consume `GET /tables?db=<db>` y reconstruye entidades + columnas + constraints + FKs desde la respuesta enriquecida del bloque 3. Reverse engineering one-shot.
+- **Migración v1 → v2 automática**: si encuentra `gabymodeler.v1` en localStorage, lo lee y produce un `gabymodeler.v2` con las constraints en blanco (los flags se editan a mano).
+- **FK lines**: SVG Bezier con marker arrow; `CASCADE` se dibuja sólida, `RESTRICT` punteada.
+
+### 🔓 CORS en `gabysql-server`
+- Toda respuesta lleva `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Authorization, Content-Type, X-Gabysql-Token` y `Access-Control-Max-Age: 600`.
+- El método `OPTIONS` se contesta con `204 No Content` antes de cualquier auth — los preflights del navegador no llevan credenciales y rechazarlos rompería el modeler en cross-origin.
+- También se agregaron `204 No Content` y `503 Service Unavailable` al mapa de status text del response writer.
+
+### 🧪 Validación
+- 30/30 tests de integración siguen verdes (no se agregaron tests de modeler — es UI vanilla).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+### 📋 web/modeler/README.md
+Reescrito para el layout v2 y el flujo con reverse engineering.
+
+---
+
 ## 2026-05-07 — Décima intervención: `INTEGRITY CHECK` (cierre de Fase 1)
 
 > **Sin bump de formato.** El comando es de solo lectura — no toca el catálogo ni los datos.

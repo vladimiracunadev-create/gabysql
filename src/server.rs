@@ -138,6 +138,14 @@ fn handle_request(
     config: &ServerConfig,
     write_lock: &Arc<Mutex<()>>,
 ) -> DbResult<Response> {
+    // CORS preflight: every browser-originated request that carries
+    // Authorization (which gabymodeler does when a token is set) sends
+    // an OPTIONS first. Always answer 204 with the CORS headers (added
+    // unconditionally in write_response) and skip auth — preflights
+    // never carry credentials.
+    if request.method == "OPTIONS" {
+        return Ok(Response::text(204, ""));
+    }
     if let Some(token) = &config.token {
         let auth_ok = request
             .headers
@@ -856,16 +864,30 @@ fn write_response(stream: &mut TcpStream, response: Response) -> DbResult<()> {
     let status_text = match response.status {
         200 => "OK",
         201 => "Created",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     };
+    // CORS: open the API to browser-side tooling like gabymodeler. The
+    // server has no notion of "this origin only" — anyone with the API
+    // token (when configured) can talk to it; without a token it's
+    // already meant for local trusted networks. Allowing * keeps the
+    // contract honest. Preflight requests are handled in handle_request.
     let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type, X-Gabysql-Token\r\n\
+         Access-Control-Max-Age: 600\r\n\
+         Connection: close\r\n\r\n",
         response.status,
         status_text,
         response.content_type,
