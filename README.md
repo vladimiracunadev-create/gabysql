@@ -73,6 +73,8 @@
 - Catálogo persistente de tablas con hashing FNV-1a-64 (estable entre versiones de Rust).
 - Índice por PK como **B+Tree real** con nodos internos: lookup descendente en O(log N).
 - `Pager::create` rehúsa sobrescribir un archivo existente (use `gabysql init --force` para reset intencional).
+- **`PageCache` LRU acotado** (default 1024 páginas ≈ 4 MB por DB; `Pager::set_cache_capacity` runtime). Memoria del server bounded incluso con docenas de DBs activas. Las páginas dirty nunca se evictan — correctness > strict cap. Ver [ADR-0009](docs/adr/0009-page-cache-lru-bounded.md).
+- **`LeafCursor` lazy** para `SELECT … LIMIT N`: O(N + offset) páginas leídas, no O(filas_totales). Ver [ADR-0008](docs/adr/0008-leaf-cursor-iterator.md).
 
 ### SQL soportado
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI)*

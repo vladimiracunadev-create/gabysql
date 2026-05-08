@@ -15,7 +15,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 
 | Subsistema | Estado | Comentario | Archivo |
 | :--- | :---: | :--- | :--- |
-| Pager (header + caché in-memory) | 🟢 | LRU pendiente, prefetch pendiente. | [src/storage.rs](../src/storage.rs) |
+| Pager (header + caché in-memory) | 🟢 | `PageCache` con cap fija + LRU clean-only (default 1024 páginas ≈ 4 MB; tunable con `set_cache_capacity`). Prefetch pendiente. | [src/storage.rs](../src/storage.rs) |
 | WAL after-image + replay | 🟢 | CRC32 verificado por record. Sin checkpoints. | [src/storage.rs](../src/storage.rs) |
 | CRC32 por página | 🟢 | IEEE polynomial, table-based; verifica en lectura y replay. | [src/storage.rs](../src/storage.rs) |
 | Formato en disco versionado | 🟢 | `VERSION = 6`, rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
@@ -35,7 +35,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
 | Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`/`REFERENCES`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES, INTEGRITY CHECK. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
-| Engine (executor) | 🟡 | Sin iterator pattern, sin spill-to-disk, sin plan lógico/físico. | [src/sql.rs](../src/sql.rs) |
+| Engine (executor) | 🟡 | `LeafCursor` lazy para `SELECT … LIMIT N` sin ORDER BY (O(N+offset) IO). Sin spill-to-disk para sort grande, sin plan lógico/físico explícito. | [src/sql.rs](../src/sql.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
 | `EXPLAIN` | 🔴 | Camino A.5+. | — |
 | Transacciones | 🟡 | Implícita por `exec`; sin savepoints, sin isolation levels explícitos. | [src/storage.rs](../src/storage.rs) |
@@ -93,8 +93,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque (Fase 2 — Storage y consulta)
+## 🔭 Próximo bloque (Fase 2 avanzada)
 
-> **Fase 1 cerrada.** Los 5 ítems de robustez funcional están entregados. El siguiente paso natural es Fase 2: índices compuestos, range scan por índice secundario (`WHERE col_indexada BETWEEN ...`), `ORDER BY`, y checkpoint del WAL. También entra en juego el **relayout PowerDesigner-style de gabymodeler** ahora que el motor expone toda la información (constraints, FKs, introspección completa) que la UI necesita.
+> **Fase 1 cerrada · Fase 2 en marcha.** Entregado: `ORDER BY`, `LeafCursor` (Iterator pattern · ADR-0008), `PageCache` LRU acotado (memoria server bounded · ADR-0009). Lo que sigue de Fase 2: índices compuestos, range scan por índice secundario (`WHERE col_indexada BETWEEN ...`), checkpoint del WAL, y eventualmente `Transaction` (Unit of Work) cuando aparezca un workload de INSERT masivo medible.
 
 Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.

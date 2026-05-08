@@ -64,6 +64,7 @@ Responsable de:
 - gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
 - finalizar el checksum antes de cada flush y verificarlo al leer
 - escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`
+- **`PageCache` con capacidad fija + LRU clean-only**: cap default `DEFAULT_CACHE_PAGES = 1024` (~4 MB con páginas de 4 KB); `Pager::set_cache_capacity(n)` para tunear. Las páginas dirty nunca se evictan (correctness > strict cap; drenan en commit). Ver [ADR-0009](adr/0009-page-cache-lru-bounded.md).
 
 ### `src/bptree.rs`
 **B+Tree real con dos tipos de página:**
@@ -75,6 +76,7 @@ Responsable de:
 - inserción/upsert/delete por PK con splits en cascada
 - mantener `root_page` estable cuando el root necesita splittear (técnica copy-up: el contenido del root se copia a una página nueva y el slot de root se reescribe como nuevo `INTERNAL`)
 - recorrer rangos y full scans descendiendo al leftmost-leaf y siguiendo el chain `next`
+- **`LeafCursor<'a>` lazy** que implementa `Iterator<Item = DbResult<KeyValue>>`: carga páginas leaf on-demand vía la chain `next` y short-circuita con `Iterator::take(n)`. Habilita `SELECT … LIMIT N` en O(N + offset) páginas leídas, no O(filas_totales). Ver [ADR-0008](adr/0008-leaf-cursor-iterator.md).
 
 ### `src/catalog.rs`
 Responsable de:
@@ -159,9 +161,12 @@ Las mejoras naturales siguientes son:
 - ~~`INTEGRITY CHECK` operacional~~ ✅ entregado
 - ~~`ORDER BY <col> [ASC|DESC]`~~ ✅ entregado
 - ~~crash tests dirigidos (kill -9 entre WAL y file flush)~~ ✅ entregado
+- ~~`LeafCursor` lazy iterator (SELECT LIMIT en O(N+offset))~~ ✅ entregado (ADR-0008)
+- ~~`PageCache` LRU acotado (memoria del server bounded)~~ ✅ entregado (ADR-0009)
+- `Transaction` (Unit of Work) con cache de `TableMeta` — pendiente, ROI marginal hoy
 - índices compuestos
 - range scan por índice secundario
-- planner básico (decidir entre PK lookup, índice, full scan; hoy es deterministic dispatch)
+- planner cost-based real (hoy: deterministic dispatch + plan enum cerrado)
 - `JOIN` y `GROUP BY`
 - mejor locking entre procesos
 - política formal de migración entre versiones del formato en disco

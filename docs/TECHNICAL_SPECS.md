@@ -83,6 +83,31 @@ Formato actual:
 
 ---
 
+## 🧠 Cache de páginas (Pager)
+
+El Pager mantiene un `PageCache` con capacidad fija (default `DEFAULT_CACHE_PAGES = 1024`, configurable con `Pager::set_cache_capacity`). Política:
+
+- Cada `get/get_mut/insert` bumpea un contador monótono y lo graba en el slot accedido (LRU bookkeeping O(1)).
+- En `insert` con cache lleno: scan O(N) sobre `HashMap` para encontrar la página clean menos recientemente usada; se evicta.
+- **Las páginas dirty nunca se evictan**: pertenecen a la transacción abierta y deben llegar al WAL antes de poder dropearse. Si el cache está lleno solo de dirty (edge case mid-tx con muchas writes), se permite overflow temporal — drena en commit cuando `mark_all_clean()` vuelve toda la cache evictable.
+
+Implicancia para el server: memoria total acotada por `cache_capacity × #DBs_abiertas × page_size`. Default: 50 DBs × 1024 × 4 KB ≈ 200 MB. Predecible, no swappea, no OOM. Ver [ADR-0009](adr/0009-page-cache-lru-bounded.md).
+
+---
+
+## 🚶 Cursor lazy sobre B+Tree
+
+`bptree::LeafCursor<'a>` implementa `Iterator<Item = DbResult<KeyValue>>`:
+
+- Constructores: `Tree::cursor_full(root)` (full scan en orden de PK) y `Tree::cursor_range(root, from, to)` (range scan inclusive).
+- Carga páginas leaf on-demand vía la chain `next` del B+Tree; cada `next()` avanza dentro del buffer actual o salta a la siguiente leaf.
+- Combinable con `Iterator::skip(offset).take(limit)` — la stdlib short-circuita cuando el inner iterator agota Some, así que la página leaf N+1 ni se lee del disco.
+- Borrow exclusivo: el cursor toma `&mut Pager` por su lifetime. SELECT (read-only) encaja; los call sites read+write (CREATE INDEX backfill, INTEGRITY CHECK, delete cascade) usan los helpers materializadores `Tree::scan / range / all`.
+
+Garantía de complejidad para `SELECT … LIMIT N` sin ORDER BY: **O(N + offset)** páginas leídas, no O(filas_totales). Ver [ADR-0008](adr/0008-leaf-cursor-iterator.md).
+
+---
+
 ## 🗂️ Catálogo
 
 Cada `TableMeta` contiene:

@@ -80,8 +80,19 @@ No se prueba contra IE11 ni navegadores legacy.
 | Ejemplos PHP / Python | 🟢 En [examples/](examples). |
 | Driver oficial Go / Java / Node / Rust como crate | 🔴 No publicado todavía. |
 
-## 8. ⚠️ Restricciones conocidas
+## 8. 🧠 Cache de páginas (Pager)
+
+| Parámetro | Default | Cómo se ajusta | Notas |
+| :--- | :--- | :--- | :--- |
+| `cache_capacity` (páginas) | `1024` (`DEFAULT_CACHE_PAGES`) | `Pager::set_cache_capacity(n)` runtime | A 4 KB/página = ~4 MB por DB. Política: LRU sobre páginas clean; las dirty nunca se evictan. Ver [ADR-0009](docs/adr/0009-page-cache-lru-bounded.md). |
+| `cache_len()` | — | introspección | Tamaño actual; nunca debería superar `cache_capacity` salvo overflow temporal mid-tx con muchas writes pendientes. |
+
+> Para servers long-running con N DBs activas, la memoria del cache total es aproximadamente `N × cache_capacity × page_size`. Con defaults: 50 DBs × 1024 páginas × 4 KB ≈ **200 MB**. Predecible y acotado, vs el comportamiento pre-ADR-0009 que crecía sin freno.
+
+---
+
+## 9. ⚠️ Restricciones conocidas
 
 - El servidor no expone TLS nativo. Para producción se requiere un reverse proxy con TLS.
 - `cargo audit` y `cargo deny` corren en CI (workflow `security.yml`); el grafo de dependencias hoy es vacío, pero la barrera está activa para el día que se introduzcan crates.
-- Las DBs creadas con versiones anteriores del formato no son legibles — ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#-unsupported-gabysql-file-format-versionn-expected-3) (sección reescrita en cada bump).
+- Las DBs creadas con versiones anteriores del formato no son legibles — ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#-unsupported-gabysql-file-format-versionn-expected-6) (sección reescrita en cada bump).

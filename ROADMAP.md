@@ -45,6 +45,8 @@
 - ~~índices `UNIQUE` declarativos~~ ✅ entregado (VERSION 5)
 - ~~`FOREIGN KEY` declarativas + enforced~~ ✅ entregado (VERSION 6)
 - ~~`ORDER BY <col> [ASC|DESC]`~~ ✅ entregado
+- ~~`LeafCursor` lazy para `SELECT … LIMIT N` (O(N+offset) en vez de O(table))~~ ✅ entregado (ADR-0008)
+- ~~`PageCache` LRU acotado (memoria del server bounded)~~ ✅ entregado (ADR-0009)
 - índices compuestos
 - range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)
 - `ORDER BY`

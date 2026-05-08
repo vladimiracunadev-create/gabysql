@@ -100,6 +100,12 @@ SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;
 SELECT id,name FROM users ORDER BY name ASC;
 SELECT id,name FROM users ORDER BY score DESC LIMIT 10;
 
+-- SELECT con LIMIT sin ORDER BY usa cursor lazy: solo se leen
+-- las páginas leaf necesarias para servir el LIMIT, no la tabla
+-- entera (ver ADR-0008). Para tablas grandes la diferencia se nota.
+SELECT id FROM big LIMIT 10;
+SELECT id FROM big WHERE id BETWEEN 100 AND 200 LIMIT 5;
+
 UPDATE users SET name = 'Ana M', active = FALSE WHERE id = 1;
 DELETE FROM users WHERE id = 1;       -- cascade si hay FKs entrantes
 ```

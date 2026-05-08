@@ -60,6 +60,23 @@ Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' 
 ```
 Devuelve un ResultSet con filas `(kind, object, detail)` por hallazgo y `message` resumen `OK · ... | FAIL · ...`. Si hay `page_corrupt` o `row_decode`, restore desde backup.
 
+> **Nota sobre memoria.** `INTEGRITY CHECK` toca cada página de la DB. Desde [ADR-0009](docs/adr/0009-page-cache-lru-bounded.md) el `PageCache` está acotado por defecto a 1024 páginas (~4 MB por DB), así que el sweep no fuga RAM aunque la DB sea grande — las páginas viejas se evictan LRU a medida que entran nuevas. Pre-ADR-0009 este endpoint era un disparador clásico de OOM en server long-running.
+
+### Tuning del cache de páginas
+Default: 1024 páginas (~4 MB) por Pager. Para embebidos con poca RAM, bajar; para servers con working set grande, subir. Solo accesible via API embebida (no hay flag CLI):
+
+```rust
+let mut pager = Pager::open("demo.db")?;
+pager.set_cache_capacity(64);   // ~256 KB para IoT
+// ... o
+pager.set_cache_capacity(8192); // ~32 MB para hot path de queries grandes
+```
+
+Inspección runtime:
+```rust
+println!("cache: {}/{} páginas", pager.cache_len(), pager.cache_capacity());
+```
+
 ---
 
 ## 💾 Backup recomendado

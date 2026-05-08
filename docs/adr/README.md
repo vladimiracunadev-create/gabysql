@@ -13,6 +13,8 @@ Las ADRs se numeran secuencialmente. Una decisión revertida no se borra: se mar
 | 0005 | [Bucket layout para índices secundarios + hash collision tolerante](0005-secondary-index-bucket.md) | ✅ Aceptada | Índices secundarios |
 | 0006 | [`grype --only-fixed` en lugar de `--fail-on critical`](0006-grype-only-fixed.md) | ✅ Aceptada | Política de container scan |
 | 0007 | [Camino A (embebido nicho) antes que B/C](0007-commercial-path-a.md) | ✅ Aceptada | Estrategia de producto |
+| 0008 | [`LeafCursor` (Iterator pattern) para SELECT lazy](0008-leaf-cursor-iterator.md) | ✅ Aceptada | Optimización de recursos en lectura |
+| 0009 | [`PageCache` con capacidad fija + LRU sobre páginas clean](0009-page-cache-lru-bounded.md) | ✅ Aceptada | Memoria del Pager acotada |
 
 ---
 
