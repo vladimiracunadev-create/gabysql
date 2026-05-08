@@ -36,7 +36,7 @@
 - ~~mejor validación de tipos en parser y engine~~ ✅ entregado (identificadores duros + reserved words + DEFAULT/FK type checks)
 - ~~comando `INTEGRITY CHECK` que recorra y valide CRCs y la estructura del B+Tree~~ ✅ entregado
 - ~~política más clara de compatibilidad del formato en disco (changelog explícito por bump de VERSION)~~ ✅ entregado (1 bloque = 1 push a `main`, CHANGELOG entry por intervención)
-- crash tests dirigidos (kill -9 entre WAL y file flush) — pendiente
+- ~~crash tests dirigidos (kill -9 entre WAL y file flush)~~ ✅ entregado (3 escenarios sintéticos en `tests/integration_test.rs`)
 - mejoras de full scan para tablas medianas — pendiente
 
 ### Fase 2 — Storage y consulta

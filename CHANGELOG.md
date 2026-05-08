@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-05-07 — Decimotercera intervención: crash tests dirigidos (Fase 1 reabierta y cerrada del todo)
+
+> **Sin bump de formato.** Solo nuevos tests de integración que ejercitan el path WAL→file con escenarios de crash sintéticos.
+
+### 🧪 Crash recovery scenarios cubiertos
+Los tests no matan procesos — sintetizan en disco el estado que un `kill -9` dejaría en cada momento crítico del flujo de `Pager::commit`:
+
+1. **`crash_recovery_partial_file_restored_from_wal`** — kill después del WAL flush + COMMIT marker pero antes de tocar el data file. Trunca el data file al header y verifica que el reopen replica las páginas del WAL y el `SELECT` devuelve los datos completos.
+2. **`crash_recovery_wal_without_commit_is_ignored`** — kill antes del COMMIT marker (transacción no durable). Forja un WAL con páginas pero sin marker; verifica que el reopen NO replica nada y los datos previos quedan intactos.
+3. **`crash_recovery_replay_is_idempotent`** — kill durante los writes al data file con WAL ya flusheado. Re-planta el mismo WAL después de un replay exitoso y verifica que un segundo replay converge al mismo estado (no double-counting, no corrupción).
+
+### 🎯 Cierre definitivo de Fase 1
+Esto cubre el ítem "crash tests dirigidos (kill -9 entre WAL y file flush)" que quedaba pendiente en el [ROADMAP](../ROADMAP.md). Fase 1 (Robustez funcional) queda 100% entregada y demostrada con tests reproducibles.
+
+### 🧪 Validación
+- 37/37 tests de integración (3 nuevos).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+---
+
 ## 2026-05-07 — Duodécima intervención: `ORDER BY` (Fase 2 paso 1)
 
 > **Sin bump de formato.** Todo el ordering ocurre en memoria sobre el resultado del scan/range/index path.

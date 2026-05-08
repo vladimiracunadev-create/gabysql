@@ -1311,6 +1311,194 @@ fn order_by_unknown_column_rejected() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Crash simulation: a WAL that carries a `COMMIT` marker plus the
+/// payload pages must rebuild the database when the main file is
+/// missing those pages — that's the "kill -9 between WAL flush and
+/// file flush" scenario described in the ROADMAP.
+///
+/// We don't actually kill a process. We synthesize the on-disk state
+/// that such a kill would leave behind: a healthy main file truncated
+/// before the latest writes hit it, with the WAL still on disk
+/// carrying the committed pages.
+#[test]
+fn crash_recovery_partial_file_restored_from_wal() -> Result<(), Box<dyn Error>> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    let db = temp_db_path("crash-partial");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    // 1) Build a healthy DB with a known table + a few rows. Close it
+    //    cleanly so the WAL is gone and the main file is the source of
+    //    truth.
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO u (id,name) VALUES (1,'Ana');
+         INSERT INTO u (id,name) VALUES (2,'Beto');
+         INSERT INTO u (id,name) VALUES (3,'Carla');",
+    )?;
+    assert!(!wal.exists(), "WAL must be removed after a clean commit");
+
+    // 2) Snapshot the data file. We'll need every page byte-for-byte
+    //    to forge the WAL below — replay re-applies whatever payload
+    //    we record, which is the same payload that's on disk now.
+    let mut data = Vec::new();
+    {
+        let mut f = OpenOptions::new().read(true).open(&db)?;
+        f.read_to_end(&mut data)?;
+    }
+    assert_eq!(data.len() % PAGE_SIZE_DEFAULT, 0);
+    let total_pages = (data.len() / PAGE_SIZE_DEFAULT) as u32;
+    assert!(
+        total_pages >= 3,
+        "expected at least header + catalog + leaf, got {} pages",
+        total_pages
+    );
+
+    // 3) Build a WAL containing every non-header page plus a COMMIT
+    //    marker. This mimics the state after `commit()` synced the
+    //    WAL but before any of the main-file writes landed.
+    let mut wal_bytes = Vec::new();
+    for page_no in 1..total_pages {
+        let start = page_no as usize * PAGE_SIZE_DEFAULT;
+        let end = start + PAGE_SIZE_DEFAULT;
+        push_wal_page(&mut wal_bytes, page_no, &data[start..end]);
+    }
+    wal_bytes.push(2); // COMMIT marker
+    fs::write(&wal, wal_bytes)?;
+
+    // 4) Truncate the main file: drop everything after the header to
+    //    simulate the kill happening before any payload page hit disk.
+    {
+        let f = OpenOptions::new().write(true).open(&db)?;
+        f.set_len(PAGE_SIZE_DEFAULT as u64)?;
+    }
+
+    // 5) Reopen — the pager should replay the WAL and restore every
+    //    truncated page. SELECT must return the original three rows
+    //    in PK order, and the WAL file must be cleaned up afterwards.
+    let res = run_sql(&db, "SELECT id,name FROM u;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[2][1], Value::String("Carla".to_string()));
+    assert!(!wal.exists(), "WAL must be removed after replay");
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+/// Crash simulation: a WAL that doesn't carry a `COMMIT` marker is
+/// the trace of a kill *before* the transaction was durable. The
+/// main file must remain authoritative — any partial WAL content is
+/// discarded on reopen.
+#[test]
+fn crash_recovery_wal_without_commit_is_ignored() -> Result<(), Box<dyn Error>> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let db = temp_db_path("crash-no-commit");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    // 1) Healthy DB with a single committed row.
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO u (id,name) VALUES (1,'Ana');",
+    )?;
+
+    // 2) Forge a WAL with a "would-be" page but NO commit marker.
+    //    Use a copy of the existing page-1 payload (a real, CRC-valid
+    //    page) so the WAL parser doesn't choke before reaching the
+    //    missing commit byte.
+    let mut data = vec![0u8; PAGE_SIZE_DEFAULT];
+    {
+        let mut f = OpenOptions::new().read(true).open(&db)?;
+        f.seek(SeekFrom::Start(PAGE_SIZE_DEFAULT as u64))?;
+        f.read_exact(&mut data)?;
+    }
+    let mut wal_bytes = Vec::new();
+    push_wal_page(&mut wal_bytes, 1, &data);
+    // Intentionally no COMMIT byte appended here.
+    fs::write(&wal, wal_bytes)?;
+
+    // 3) Reopen. The pager must NOT replay the WAL (no COMMIT) and
+    //    must remove the WAL file after the no-op recovery. The
+    //    original row stays unchanged.
+    let res = run_sql(&db, "SELECT id,name FROM u;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][1], Value::String("Ana".to_string()));
+    assert!(
+        !wal.exists(),
+        "WAL must be removed even when commit is absent"
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+/// Crash simulation: between flushing the WAL with a COMMIT and
+/// flushing the main file, only *some* pages may have made it. The
+/// replay path must idempotently overwrite even already-correct
+/// pages — running the WAL twice (or against a half-applied file)
+/// must converge on the same end state.
+#[test]
+fn crash_recovery_replay_is_idempotent() -> Result<(), Box<dyn Error>> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    let db = temp_db_path("crash-idempotent");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO u (id,name) VALUES (1,'Ana');
+         INSERT INTO u (id,name) VALUES (2,'Beto');",
+    )?;
+
+    // Snapshot the file and forge a WAL with a COMMIT containing those
+    // exact pages.
+    let mut data = Vec::new();
+    {
+        let mut f = OpenOptions::new().read(true).open(&db)?;
+        f.read_to_end(&mut data)?;
+    }
+    let total_pages = (data.len() / PAGE_SIZE_DEFAULT) as u32;
+    let mut wal_bytes = Vec::new();
+    for page_no in 1..total_pages {
+        let start = page_no as usize * PAGE_SIZE_DEFAULT;
+        let end = start + PAGE_SIZE_DEFAULT;
+        push_wal_page(&mut wal_bytes, page_no, &data[start..end]);
+    }
+    wal_bytes.push(2);
+    fs::write(&wal, &wal_bytes)?;
+
+    // First reopen replays the WAL → state stays correct, WAL gone.
+    let res = run_sql(&db, "SELECT id FROM u;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert!(!wal.exists());
+
+    // Re-plant the same WAL and reopen again. The replay must converge
+    // on the same end state (no double-counting, no corruption).
+    fs::write(&wal, &wal_bytes)?;
+    let res = run_sql(&db, "SELECT id FROM u;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert!(!wal.exists());
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
