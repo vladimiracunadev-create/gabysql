@@ -779,29 +779,49 @@ fn handle_tools_list(cfg: &Config) -> Json {
 
 fn vector_search_schema() -> Json {
     let mut props = Json::obj();
-    let mut add = |name: &str, ty: &str, desc: &str| {
-        let mut p = Json::obj();
-        p.push(("type".into(), Json::Str(ty.into())));
-        p.push(("description".into(), Json::Str(desc.into())));
-        props.push((name.into(), Json::Obj(p)));
-    };
-    add(
-        "db",
-        "string",
-        "Nombre del archivo .db (opcional en single-db mode)",
-    );
-    add("table", "string", "Tabla a escanear");
-    add(
-        "pk_column",
-        "string",
-        "Columna PK a devolver para identificar la fila (default 'id')",
-    );
-    add(
-        "vector_column",
-        "string",
-        "Columna TEXT que contiene el vector como array JSON de floats",
-    );
-    // query es array<number>; describimos type genérico para máxima compat con clientes MCP
+
+    // Agrupamos los campos simples (type+description) bajo una closure
+    // local; al cerrar el scope, el préstamo mutable de `props` se libera
+    // y podemos seguir mutándolo directamente para el campo `query` (que
+    // es más complejo: lleva sub-objeto `items`). Sin el scope explícito
+    // el borrow checker rechaza la segunda mutación de `props`.
+    {
+        let mut add = |name: &str, ty: &str, desc: &str| {
+            let mut p = Json::obj();
+            p.push(("type".into(), Json::Str(ty.into())));
+            p.push(("description".into(), Json::Str(desc.into())));
+            props.push((name.into(), Json::Obj(p)));
+        };
+        add(
+            "db",
+            "string",
+            "Nombre del archivo .db (opcional en single-db mode)",
+        );
+        add("table", "string", "Tabla a escanear");
+        add(
+            "pk_column",
+            "string",
+            "Columna PK a devolver para identificar la fila (default 'id')",
+        );
+        add(
+            "vector_column",
+            "string",
+            "Columna TEXT que contiene el vector como array JSON de floats",
+        );
+        add(
+            "top_k",
+            "integer",
+            "Cuántos resultados devolver (default 10)",
+        );
+        add(
+            "metric",
+            "string",
+            "Distancia: 'cosine' (default), 'euclidean', 'dot'",
+        );
+    }
+
+    // query es array<number>; describimos type genérico para máxima compat
+    // con clientes MCP (algunos validan el inputSchema antes de llamar).
     let mut q = Json::obj();
     q.push(("type".into(), Json::Str("array".into())));
     q.push((
@@ -812,16 +832,6 @@ fn vector_search_schema() -> Json {
     items.push(("type".into(), Json::Str("number".into())));
     q.push(("items".into(), Json::Obj(items)));
     props.push(("query".into(), Json::Obj(q)));
-    add(
-        "top_k",
-        "integer",
-        "Cuántos resultados devolver (default 10)",
-    );
-    add(
-        "metric",
-        "string",
-        "Distancia: 'cosine' (default), 'euclidean', 'dot'",
-    );
 
     let req = vec![
         Json::Str("table".into()),
