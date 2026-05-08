@@ -4,7 +4,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-5-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-17%2F17-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-21%2F21-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -31,7 +31,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Range scan por índice secundario | 🔴 | En [Camino A](COMMERCIAL_ROADMAP.md). | — |
 | ORDER BY / GROUP BY / JOIN | 🔴 | En [Camino A/B/C](COMMERCIAL_ROADMAP.md) según madurez. | — |
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
-| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`), INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES. Sin ALTER, sin prepared statements. | [src/sql.rs](../src/sql.rs) |
+| Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
 | Engine (executor) | 🟡 | Sin iterator pattern, sin spill-to-disk, sin plan lógico/físico. | [src/sql.rs](../src/sql.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
@@ -91,8 +91,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque comprometido (Camino A — paso 3)
+## 🔭 Próximo bloque comprometido (Camino A — paso 4)
 
-> **`DROP TABLE` + `ALTER TABLE ADD COLUMN`** para permitir edición incremental de schemas sin recrear la tabla. Sin estos, todo cambio en gabymodeler obliga a un round-trip destructivo.
+> **Reglas de identificadores + endpoint de introspección completo.** Definir y enforzar `[a-z_][a-z0-9_]*`, longitud máxima y palabras reservadas en parser/engine. Extender `GET /schema/<db>/<tabla>` para incluir constraints (`NOT NULL`, `DEFAULT`, `UNIQUE`) y FKs cuando lleguen — habilita "Importar de gabysql" en gabymodeler.
 
 Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.

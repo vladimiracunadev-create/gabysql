@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-05-07 — Séptima intervención: edición incremental de schemas (Camino A · paso 3)
+
+> **Sin bump de formato.** El layout `VERSION = 5` ya soporta `TableMeta` con cualquier número de columnas; las filas previas se decodifican con un fallback a `DEFAULT` o `NULL` cuando la fila quedó "corta" frente al esquema nuevo.
+
+### ✨ Funcionalidad SQL
+- **`DROP TABLE [IF EXISTS] <name>`** — borra la entrada del catálogo. Las páginas backing (data + índices secundarios) **no** se liberan; el reclaim queda para un futuro `vacuum` (consistente con la política de `DROP INDEX`).
+- **`ALTER TABLE <name> ADD [COLUMN] <coldef>`** — agrega una columna al final del esquema. Soporta `NOT NULL`, `DEFAULT`, `UNIQUE`. La keyword `COLUMN` es opcional.
+
+### 🧱 Cambios estructurales
+- `decode_row` tolera EOF mientras quedan columnas por decodificar: rellena con el `DEFAULT` de la columna o `NULL`. Permite `ADD COLUMN` sin reescribir filas existentes; el rewrite ocurre naturalmente en el próximo `UPDATE` de cada fila.
+- `Catalog::remove_table` borra la entrada del catálogo via `Tree::delete`.
+- `parse_column_def` factorizado y compartido entre `CREATE TABLE` y `ALTER TABLE ADD COLUMN`.
+- `parse_if_exists` factorizado para `DROP DATABASE` / `DROP TABLE`.
+
+### 🛡️ Restricciones de `ALTER ... ADD COLUMN`
+- `PRIMARY KEY` rechazado (la PK ya existe; esta versión no admite swap ni multi-PK).
+- `NOT NULL` requiere `DEFAULT` no nulo (sin él, las filas previas violarían la constraint inmediatamente).
+- `UNIQUE` con `DEFAULT` no nulo en tabla con > 1 fila se rechaza (produciría duplicados en el backfill).
+- `UNIQUE` sin DEFAULT en tabla poblada está OK: filas previas decodifican como `NULL`, y SQL UNIQUE permite múltiples NULLs.
+- Nombre de columna duplicado rechazado.
+- Validación completa del `coldef` (compatibilidad de tipo del DEFAULT, etc.) reusada del path de `CREATE TABLE`.
+
+### 🧪 Validación
+- 21/21 tests de integración (4 nuevos: `drop_table_removes_catalog_entry`, `alter_add_column_decodes_old_rows_with_default_or_null`, `alter_add_column_constraint_guards`, `alter_add_column_unique_then_enforces`).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+---
+
 ## 2026-05-07 — Sexta intervención: constraints declarativas (Camino A · paso 2)
 
 > **On-disk format jump: VERSION 4 → 5.** `Column` ahora persiste `NOT NULL` y `DEFAULT`; `IndexMeta` persiste `unique`. Las DBs creadas con la entrega anterior son rechazadas explícitamente al abrir — re-crear con el binario v5.

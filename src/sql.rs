@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable(CreateTableStmt),
+    DropTable(DropTableStmt),
+    AlterTableAddColumn(AlterAddColumnStmt),
     Insert(InsertStmt),
     Select(SelectStmt),
     Update(UpdateStmt),
@@ -26,6 +28,18 @@ pub enum Statement {
     CreateDatabase(CreateDatabaseStmt),
     DropDatabase(DropDatabaseStmt),
     ShowDatabases,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterAddColumnStmt {
+    pub table: String,
+    pub column: ColumnDef,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +149,8 @@ impl<'a> Engine<'a> {
     pub fn exec(&mut self, statement: Statement) -> DbResult<ResultSet> {
         match statement {
             Statement::CreateTable(stmt) => self.exec_create(stmt),
+            Statement::DropTable(stmt) => self.exec_drop_table(stmt),
+            Statement::AlterTableAddColumn(stmt) => self.exec_alter_add_column(stmt),
             Statement::Insert(stmt) => self.exec_insert(stmt),
             Statement::Select(stmt) => self.exec_select(stmt),
             Statement::Update(stmt) => self.exec_update(stmt),
@@ -218,6 +234,166 @@ impl<'a> Engine<'a> {
                     col_name.to_ascii_lowercase()
                 ),
                 column: col_name.clone(),
+                root_page: idx_root,
+                unique: true,
+            });
+        }
+
+        let mut catalog = Catalog::open(self.pager);
+        catalog.put_table(&meta)?;
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("OK".to_string()),
+        })
+    }
+
+    fn exec_drop_table(&mut self, stmt: DropTableStmt) -> DbResult<ResultSet> {
+        let mut catalog = Catalog::open(self.pager);
+        let removed = catalog.remove_table(&stmt.name)?;
+        if !removed && !stmt.if_exists {
+            return Err(DbError::new(format!("tabla no existe: {}", stmt.name)));
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("OK".to_string()),
+        })
+    }
+
+    fn exec_alter_add_column(&mut self, stmt: AlterAddColumnStmt) -> DbResult<ResultSet> {
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
+
+        // Translate the parser-level ColumnDef into a catalog Column,
+        // mirroring the logic in exec_create — but with two extra
+        // restrictions specific to ALTER on a populated table:
+        //
+        //   1. PRIMARY KEY can never be added by ALTER (single PK already
+        //      exists; this version doesn't support multi-PK or PK swap).
+        //   2. NOT NULL without DEFAULT would leave existing rows
+        //      violating the constraint immediately. Reject up front.
+        //   3. UNIQUE with a non-NULL DEFAULT applied to more than one
+        //      existing row would create a guaranteed duplicate. Reject.
+        if stmt.column.primary_key {
+            return Err(DbError::new(
+                "ALTER TABLE ADD COLUMN no admite PRIMARY KEY (la PK ya existe)",
+            ));
+        }
+
+        let column_type = ColumnType::from_sql(&stmt.column.type_name)?;
+        let default = match stmt.column.default.as_ref().map(value_to_default) {
+            Some(Ok(d)) => Some(d),
+            Some(Err(err)) => return Err(err),
+            None => None,
+        };
+
+        if stmt.column.not_null
+            && !matches!(&default, Some(d) if !matches!(d, DefaultLiteral::Null))
+        {
+            return Err(DbError::new(format!(
+                "ALTER TABLE ADD COLUMN '{}' NOT NULL requiere un DEFAULT no nulo \
+                 (existirían filas previas en NULL)",
+                stmt.column.name
+            )));
+        }
+
+        // Forbid duplicate column name (case-insensitive, like the rest
+        // of the engine).
+        if meta.column(&stmt.column.name).is_some() {
+            return Err(DbError::new(format!(
+                "columna '{}' ya existe en la tabla '{}'",
+                stmt.column.name, meta.name
+            )));
+        }
+
+        let new_col = Column {
+            name: stmt.column.name.clone(),
+            column_type,
+            not_null: stmt.column.not_null,
+            default: default.clone(),
+        };
+        // Run the standard validation against a *prospective* meta so the
+        // same DEFAULT/type compatibility rules used by CREATE TABLE
+        // apply here too.
+        let mut prospective = meta.clone();
+        prospective.columns.push(new_col.clone());
+        validate_create_table(&prospective)?;
+
+        // Count existing rows once: needed for the UNIQUE/DEFAULT guard
+        // and to decide whether the inline-UNIQUE backfill has to do work.
+        let row_count = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(meta.root_page, 0, None)?.len()
+        };
+
+        if stmt.column.unique
+            && row_count > 1
+            && matches!(&default, Some(d) if !matches!(d, DefaultLiteral::Null))
+        {
+            return Err(DbError::new(format!(
+                "ALTER TABLE ADD COLUMN '{}' UNIQUE con DEFAULT no nulo \
+                 produciría duplicados en {} filas existentes",
+                stmt.column.name, row_count
+            )));
+        }
+
+        meta.columns.push(new_col);
+
+        // If the new column is UNIQUE, materialize an index right away
+        // and backfill it. Existing rows decode via the EOF-tolerant
+        // path in decode_row → they yield the column's DEFAULT (or NULL).
+        // The backfill helper already aborts on duplicates, which gives
+        // us defense in depth on top of the row_count guard above.
+        if stmt.column.unique {
+            let idx_name = format!(
+                "uq_{}_{}",
+                meta.name.to_ascii_lowercase(),
+                stmt.column.name.to_ascii_lowercase()
+            );
+            if meta.index_by_name(&idx_name).is_some() {
+                return Err(DbError::new(format!(
+                    "no se pudo crear índice UNIQUE auto-nombrado '{}': ya existe",
+                    idx_name
+                )));
+            }
+            let idx_root = self.pager.new_page()?;
+            let mut leaf = vec![0; self.pager.page_size()];
+            init_leaf_page(&mut leaf);
+            self.pager.write_page(idx_root, &leaf, true)?;
+
+            let column = meta.columns.last().unwrap().clone();
+            let table_root = meta.root_page;
+            let rows = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.scan_rows(table_root, 0, None)?
+            };
+            let mut seen_unique: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            for kv in rows {
+                let decoded = decode_row(&meta, &kv.value)?;
+                let value = decoded
+                    .get(&normalize_ident(&column.name))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = encode_column_value(&column, &value)?;
+                if value_bytes != [0u8] && !seen_unique.insert(value_bytes.clone()) {
+                    return Err(DbError::new(format!(
+                        "ALTER ADD COLUMN UNIQUE rechazado: backfill de '{}' \
+                         encontró duplicados",
+                        column.name
+                    )));
+                }
+                index_upsert_pk(self.pager, idx_root, &value_bytes, kv.key)?;
+            }
+            meta.indexes.push(IndexMeta {
+                name: idx_name,
+                column: stmt.column.name.clone(),
                 root_page: idx_root,
                 unique: true,
             });
@@ -839,8 +1015,19 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
     let mut out = HashMap::new();
 
     for column in &meta.columns {
+        // EOF before this column means the row was written under an older
+        // schema (before ALTER TABLE ADD COLUMN added the trailing
+        // column). Fall back to the column's DEFAULT, or NULL when it has
+        // none. The on-disk row stays untouched until the next UPDATE
+        // rewrites it with the full column count.
         if offset >= data.len() {
-            return Err(DbError::new("fila corrupta"));
+            let key = normalize_ident(&column.name);
+            let value = match &column.default {
+                Some(default) => default_to_value(default),
+                None => Value::Null,
+            };
+            out.insert(key, value);
+            continue;
         }
         let present = data[offset];
         offset += 1;
@@ -1252,11 +1439,14 @@ impl Parser {
         if self.match_keyword("DROP") {
             return self.parse_drop();
         }
+        if self.match_keyword("ALTER") {
+            return self.parse_alter();
+        }
         if self.match_keyword("SHOW") {
             return self.parse_show();
         }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/SHOW)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW)",
         ))
     }
 
@@ -1316,21 +1506,86 @@ impl Parser {
 
     fn parse_drop(&mut self) -> DbResult<Statement> {
         if self.match_keyword("DATABASE") {
-            let if_exists = if self.match_keyword("IF") {
-                self.expect_keyword("EXISTS")?;
-                true
-            } else {
-                false
-            };
+            let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             return Ok(Statement::DropDatabase(DropDatabaseStmt {
                 name,
                 if_exists,
             }));
         }
+        if self.match_keyword("TABLE") {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropTable(DropTableStmt { name, if_exists }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
+    }
+
+    fn parse_if_exists(&mut self) -> DbResult<bool> {
+        if self.match_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn parse_alter(&mut self) -> DbResult<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_ident()?;
+        self.expect_keyword("ADD")?;
+        // The COLUMN keyword is optional, matching most other dialects.
+        let _ = self.match_keyword("COLUMN");
+        let column = self.parse_column_def()?;
+        Ok(Statement::AlterTableAddColumn(AlterAddColumnStmt {
+            table,
+            column,
+        }))
+    }
+
+    /// Shared between `CREATE TABLE` and `ALTER TABLE ADD COLUMN`. Reads
+    /// `name type column_constraint*` and returns the parser-level
+    /// `ColumnDef`. The constraint loop is intentionally permissive about
+    /// order — semantic validation (e.g. "DEFAULT NULL incompatible con
+    /// NOT NULL") happens later in `validate_create_table`.
+    fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
+        let name = self.expect_ident()?;
+        let type_name = self.expect_ident()?;
+        let mut primary_key = false;
+        let mut not_null = false;
+        let mut unique = false;
+        let mut default: Option<Value> = None;
+        loop {
+            if self.match_keyword("PRIMARY") {
+                self.expect_keyword("KEY")?;
+                primary_key = true;
+            } else if self.match_keyword("NOT") {
+                self.expect_keyword("NULL")?;
+                not_null = true;
+            } else if self.match_keyword("UNIQUE") {
+                unique = true;
+            } else if self.match_keyword("DEFAULT") {
+                if default.is_some() {
+                    return Err(DbError::new(format!(
+                        "DEFAULT duplicado en columna '{}'",
+                        name
+                    )));
+                }
+                default = Some(self.expect_value()?);
+            } else {
+                break;
+            }
+        }
+        Ok(ColumnDef {
+            name,
+            type_name,
+            primary_key,
+            not_null,
+            unique,
+            default,
+        })
     }
 
     fn parse_create_database(&mut self) -> DbResult<Statement> {
@@ -1370,43 +1625,11 @@ impl Parser {
         let mut columns = Vec::new();
         let mut primary_key = String::new();
         loop {
-            let column_name = self.expect_ident()?;
-            let type_name = self.expect_ident()?;
-            let mut is_pk = false;
-            let mut not_null = false;
-            let mut unique = false;
-            let mut default: Option<Value> = None;
-            // Column constraints can appear in any order after the type.
-            loop {
-                if self.match_keyword("PRIMARY") {
-                    self.expect_keyword("KEY")?;
-                    is_pk = true;
-                    primary_key = column_name.clone();
-                } else if self.match_keyword("NOT") {
-                    self.expect_keyword("NULL")?;
-                    not_null = true;
-                } else if self.match_keyword("UNIQUE") {
-                    unique = true;
-                } else if self.match_keyword("DEFAULT") {
-                    if default.is_some() {
-                        return Err(DbError::new(format!(
-                            "DEFAULT duplicado en columna '{}'",
-                            column_name
-                        )));
-                    }
-                    default = Some(self.expect_value()?);
-                } else {
-                    break;
-                }
+            let column = self.parse_column_def()?;
+            if column.primary_key {
+                primary_key = column.name.clone();
             }
-            columns.push(ColumnDef {
-                name: column_name,
-                type_name,
-                primary_key: is_pk,
-                not_null,
-                unique,
-                default,
-            });
+            columns.push(column);
             if self.match_symbol(")") {
                 break;
             }

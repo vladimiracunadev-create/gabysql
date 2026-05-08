@@ -149,6 +149,7 @@ Modo `UNIQUE`:
 - `UPDATE` no permite mutar la PK
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error explícito
 - columnas no presentes en `INSERT` toman su `DEFAULT` si lo tienen; si no, quedan en `NULL`
+- filas previas a un `ALTER TABLE ADD COLUMN` se decodifican con el `DEFAULT` de la columna nueva (o `NULL` si no tiene); se materializan en disco en el próximo `UPDATE`
 - `NOT NULL`: rechazo en `INSERT` (columna ausente sin DEFAULT, o `NULL` literal) y en `UPDATE` (asignación a `NULL`)
 - `DEFAULT NULL` y `NOT NULL` en la misma columna se rechazan en `CREATE TABLE`
 - el literal de `DEFAULT` debe coincidir con el tipo de la columna (validado en `CREATE TABLE`)
@@ -162,6 +163,8 @@ Modo `UNIQUE`:
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
 - `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>`
+- `DROP TABLE [IF EXISTS] <name>` (catalog-only; páginas backing no liberadas)
+- `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ...`
 - `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)

@@ -356,6 +356,21 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
+    /// Remove the catalog entry for the named table. Returns whether an
+    /// entry was actually removed. The pages backing the table's data and
+    /// secondary indexes are intentionally NOT freed — the page allocator
+    /// has no free-list yet, so reclaim is left to a future `vacuum`. This
+    /// matches the existing `DROP INDEX` policy.
+    pub fn remove_table(&mut self, name: &str) -> DbResult<bool> {
+        let header = self.pager.header();
+        if header.catalog_root_page == 0 {
+            return Ok(false);
+        }
+        let key = hash_name(name);
+        let mut tree = Tree::new(self.pager);
+        tree.delete(header.catalog_root_page, key)
+    }
+
     pub fn scan_rows(
         &mut self,
         root_page: u32,

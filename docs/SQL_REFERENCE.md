@@ -14,13 +14,15 @@
 | [`DROP DATABASE`](#drop-database) | DDL · server multi-DB | 🟢 |
 | [`SHOW DATABASES`](#show-databases) | DDL · server multi-DB | 🟢 |
 | [`CREATE TABLE`](#create-table) | DDL | 🟢 |
+| [`DROP TABLE`](#drop-table) | DDL | 🟢 |
+| [`ALTER TABLE ADD COLUMN`](#alter-table-add-column) | DDL | 🟢 |
 | [`CREATE INDEX`](#create-index) | DDL | 🟢 |
 | [`DROP INDEX`](#drop-index) | DDL | 🟢 |
 | [`INSERT`](#insert) | DML | 🟢 |
 | [`SELECT`](#select) | DML | 🟢 |
 | [`UPDATE`](#update) | DML | 🟢 |
 | [`DELETE`](#delete) | DML | 🟢 |
-| `ALTER TABLE`, `JOIN`, `ORDER BY`, `GROUP BY`, subqueries | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `ORDER BY`, `GROUP BY`, subqueries | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -305,6 +307,86 @@ DROP INDEX idx_users_name;
 | `índice no existe: X` | no hay un índice con ese nombre en ninguna tabla |
 
 > `DROP INDEX` no libera las páginas del B+Tree del índice. La reclamación queda para una futura herramienta `vacuum` (ver [STATUS.md](STATUS.md)).
+
+---
+
+## DROP TABLE
+
+> Borra la entrada de la tabla en el catálogo. Las páginas backing (data + índices secundarios de esa tabla) **no** se liberan; el espacio se reclama con un futuro `vacuum`.
+
+### 🛤️ Railroad
+
+```mermaid
+flowchart LR
+    S([▶]) --> D[DROP] --> T[TABLE]
+    T --> IFE{IF EXISTS?}
+    IFE -- "no" --> N[/table_name/]
+    IFE -- "sí" --> IF[IF] --> EX[EXISTS] --> N
+    N --> SEMI[";"] --> E([■])
+```
+
+### 📜 EBNF
+
+```
+drop_table ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier
+```
+
+### ✅ Ejemplos
+
+```sql
+DROP TABLE users;
+DROP TABLE IF EXISTS scratch;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `tabla no existe: X` | no hay tabla con ese nombre y no se usó `IF EXISTS` |
+
+---
+
+## ALTER TABLE ADD COLUMN
+
+> Agrega una columna **al final** del esquema. Las filas previas se decodifican con su `DEFAULT` (o `NULL`) sin reescritura — el rewrite ocurre naturalmente cuando un `UPDATE` toca esa fila.
+
+### 🛤️ Railroad
+
+```mermaid
+flowchart LR
+    S([▶]) --> A[ALTER] --> T[TABLE] --> N[/table_name/]
+    N --> ADD[ADD] --> COL{COLUMN?} --> CD[ColumnDef]
+    CD --> SEMI[";"] --> E([■])
+```
+
+### 📜 EBNF
+
+```
+alter_table_add ::= "ALTER" "TABLE" identifier "ADD" "COLUMN"? column_def
+column_def       ::= identifier type column_constraint*
+```
+
+### ✅ Ejemplos
+
+```sql
+ALTER TABLE users ADD COLUMN nick TEXT;
+ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE users ADD COLUMN email TEXT UNIQUE;
+ALTER TABLE users ADD score FLOAT DEFAULT 0;     -- COLUMN es opcional
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `tabla no existe: X` | la tabla a alterar no está en el catálogo |
+| `columna 'X' ya existe en la tabla 'Y'` | nombre repetido |
+| `ALTER TABLE ADD COLUMN no admite PRIMARY KEY (la PK ya existe)` | esta versión no permite swap ni multi-PK |
+| `ALTER TABLE ADD COLUMN 'X' NOT NULL requiere un DEFAULT no nulo (...)` | sin DEFAULT, las filas previas violarían la constraint |
+| `ALTER TABLE ADD COLUMN 'X' UNIQUE con DEFAULT no nulo produciría duplicados en N filas existentes` | el backfill insertaría el mismo valor en todas las filas |
+| `columna 'X': DEFAULT incompatible con tipo TEXT` | mismo validador de tipos que `CREATE TABLE` |
+
+> Restricciones: solo `ADD`. No hay `DROP COLUMN`, `RENAME COLUMN`, `RENAME TABLE` ni `ALTER ... TYPE` en esta versión — están en el roadmap del [Camino A](COMMERCIAL_ROADMAP.md).
 
 ---
 

@@ -626,6 +626,160 @@ fn create_unique_index_backfill_aborts_on_duplicates() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+#[test]
+fn drop_table_removes_catalog_entry() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("drop-table");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
+
+    // Plain DROP succeeds.
+    run_sql(&db, "DROP TABLE u;")?;
+    let err = run_sql(&db, "SELECT id FROM u;").unwrap_err();
+    assert!(err.to_string().contains("tabla no existe"), "got: {}", err);
+
+    // Re-creating with the same name works (catalog slot is free).
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, email TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,email) VALUES (1,'a@x');")?;
+    let res = run_sql(&db, "SELECT email FROM u WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("a@x".to_string()));
+
+    // DROP TABLE on missing → error without IF EXISTS.
+    let err = run_sql(&db, "DROP TABLE missing;").unwrap_err();
+    assert!(err.to_string().contains("tabla no existe"), "got: {}", err);
+
+    // DROP TABLE IF EXISTS on missing → silent OK.
+    run_sql(&db, "DROP TABLE IF EXISTS missing;")?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn alter_add_column_decodes_old_rows_with_default_or_null() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("alter-add");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (2,'Beto');")?;
+
+    // Plain ADD COLUMN: old rows decode with NULL.
+    run_sql(&db, "ALTER TABLE u ADD COLUMN nick TEXT;")?;
+    let res = run_sql(&db, "SELECT id,name,nick FROM u WHERE id = 1;")?;
+    assert_eq!(
+        res[0].rows[0],
+        vec![
+            Value::Integer(1),
+            Value::String("Ana".to_string()),
+            Value::Null,
+        ]
+    );
+
+    // ADD COLUMN with DEFAULT: old rows decode with the default.
+    run_sql(
+        &db,
+        "ALTER TABLE u ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';",
+    )?;
+    let res = run_sql(&db, "SELECT status FROM u WHERE id = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("pending".to_string()));
+
+    // New INSERT can target the new columns explicitly.
+    run_sql(
+        &db,
+        "INSERT INTO u (id,name,nick,status) VALUES (3,'Caro','c','done');",
+    )?;
+    let res = run_sql(&db, "SELECT nick,status FROM u WHERE id = 3;")?;
+    assert_eq!(
+        res[0].rows[0],
+        vec![
+            Value::String("c".to_string()),
+            Value::String("done".to_string())
+        ]
+    );
+
+    // UPDATE old row to materialize the new column on disk; subsequent
+    // SELECT still works.
+    run_sql(&db, "UPDATE u SET nick = 'A' WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT nick FROM u WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("A".to_string()));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn alter_add_column_constraint_guards() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("alter-guards");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (2,'Beto');")?;
+
+    // NOT NULL without DEFAULT on populated table → reject.
+    let err = run_sql(&db, "ALTER TABLE u ADD COLUMN status TEXT NOT NULL;").unwrap_err();
+    assert!(err.to_string().contains("NOT NULL"), "got: {}", err);
+
+    // PRIMARY KEY in ADD COLUMN → reject.
+    let err = run_sql(&db, "ALTER TABLE u ADD COLUMN extra INT PRIMARY KEY;").unwrap_err();
+    assert!(err.to_string().contains("PRIMARY KEY"), "got: {}", err);
+
+    // Duplicate column name → reject.
+    let err = run_sql(&db, "ALTER TABLE u ADD COLUMN name TEXT;").unwrap_err();
+    assert!(err.to_string().contains("ya existe"), "got: {}", err);
+
+    // UNIQUE with non-NULL DEFAULT on populated table → reject (would
+    // immediately produce duplicates).
+    let err = run_sql(&db, "ALTER TABLE u ADD COLUMN tag TEXT UNIQUE DEFAULT 'x';").unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn alter_add_column_unique_then_enforces() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("alter-unique");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (2,'Beto');")?;
+
+    // Plain UNIQUE on populated table works (existing rows have NULL,
+    // multi-NULL allowed under UNIQUE).
+    run_sql(&db, "ALTER TABLE u ADD COLUMN email TEXT UNIQUE;")?;
+
+    // Subsequent INSERTs are policed by the new index.
+    run_sql(
+        &db,
+        "INSERT INTO u (id,name,email) VALUES (3,'Caro','c@x');",
+    )?;
+    let err = run_sql(
+        &db,
+        "INSERT INTO u (id,name,email) VALUES (4,'Dany','c@x');",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
