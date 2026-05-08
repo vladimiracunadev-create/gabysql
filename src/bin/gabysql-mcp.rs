@@ -411,12 +411,8 @@ fn http_request(
     let (host, port) = parse_authority(server_url)?;
     let addr = format!("{host}:{port}");
     let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
     let body_bytes = body.unwrap_or("").as_bytes();
     let mut req = String::new();
@@ -621,24 +617,44 @@ fn schema_object(properties: Vec<(&str, &str, &str)>, required: &[&str]) -> Json
 fn handle_tools_list(cfg: &Config) -> Json {
     let empty_schema = schema_object(vec![], &[]);
     let db_only = schema_object(
-        vec![("db", "string", "Nombre del archivo .db (opcional en single-db mode)")],
+        vec![(
+            "db",
+            "string",
+            "Nombre del archivo .db (opcional en single-db mode)",
+        )],
         &[],
     );
     let db_required = schema_object(
-        vec![("db", "string", "Nombre del archivo .db (opcional en single-db mode)")],
+        vec![(
+            "db",
+            "string",
+            "Nombre del archivo .db (opcional en single-db mode)",
+        )],
         &[],
     );
     let query_schema = schema_object(
         vec![
-            ("db", "string", "Nombre del archivo .db (opcional en single-db mode)"),
+            (
+                "db",
+                "string",
+                "Nombre del archivo .db (opcional en single-db mode)",
+            ),
             ("sql", "string", "Sentencia SELECT/SHOW/DESCRIBE a ejecutar"),
         ],
         &["sql"],
     );
     let exec_schema = schema_object(
         vec![
-            ("db", "string", "Nombre del archivo .db (opcional en single-db mode)"),
-            ("sql", "string", "Sentencia DDL/DML (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP)"),
+            (
+                "db",
+                "string",
+                "Nombre del archivo .db (opcional en single-db mode)",
+            ),
+            (
+                "sql",
+                "string",
+                "Sentencia DDL/DML (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP)",
+            ),
         ],
         &["sql"],
     );
@@ -672,10 +688,67 @@ fn handle_tools_list(cfg: &Config) -> Json {
         "Ejecuta INTEGRITY CHECK sobre una DB y devuelve el reporte.",
         db_required,
     ));
+    tools.push(tool_def(
+        "gabysql_vector_search",
+        "Búsqueda vectorial top-k sobre una columna TEXT que contiene un array JSON de floats. \
+         Hace SELECT completo + cálculo de distancia en el gateway (no toca el motor). Métricas: \
+         cosine (default), euclidean, dot. Adecuada hasta decenas de miles de filas; ver ADR-0011.",
+        vector_search_schema(),
+    ));
 
     let mut out = Json::obj();
     out.push(("tools".into(), Json::Arr(tools)));
     Json::Obj(out)
+}
+
+fn vector_search_schema() -> Json {
+    let mut props = Json::obj();
+    let mut add = |name: &str, ty: &str, desc: &str| {
+        let mut p = Json::obj();
+        p.push(("type".into(), Json::Str(ty.into())));
+        p.push(("description".into(), Json::Str(desc.into())));
+        props.push((name.into(), Json::Obj(p)));
+    };
+    add("db", "string", "Nombre del archivo .db (opcional en single-db mode)");
+    add("table", "string", "Tabla a escanear");
+    add(
+        "pk_column",
+        "string",
+        "Columna PK a devolver para identificar la fila (default 'id')",
+    );
+    add(
+        "vector_column",
+        "string",
+        "Columna TEXT que contiene el vector como array JSON de floats",
+    );
+    // query es array<number>; describimos type genérico para máxima compat con clientes MCP
+    let mut q = Json::obj();
+    q.push(("type".into(), Json::Str("array".into())));
+    q.push((
+        "description".into(),
+        Json::Str("Vector de consulta como array de floats".into()),
+    ));
+    let mut items = Json::obj();
+    items.push(("type".into(), Json::Str("number".into())));
+    q.push(("items".into(), Json::Obj(items)));
+    props.push(("query".into(), Json::Obj(q)));
+    add("top_k", "integer", "Cuántos resultados devolver (default 10)");
+    add(
+        "metric",
+        "string",
+        "Distancia: 'cosine' (default), 'euclidean', 'dot'",
+    );
+
+    let req = vec![
+        Json::Str("table".into()),
+        Json::Str("vector_column".into()),
+        Json::Str("query".into()),
+    ];
+    let mut s = Json::obj();
+    s.push(("type".into(), Json::Str("object".into())));
+    s.push(("properties".into(), Json::Obj(props)));
+    s.push(("required".into(), Json::Arr(req)));
+    Json::Obj(s)
 }
 
 fn handle_tools_call(params: &Json, cfg: &Config) -> Result<Json, String> {
@@ -684,9 +757,18 @@ fn handle_tools_call(params: &Json, cfg: &Config) -> Result<Json, String> {
         .and_then(|v| v.as_str())
         .ok_or("falta tools/call.params.name")?
         .to_string();
-    let args = params.get("arguments").cloned().unwrap_or(Json::Obj(Json::obj()));
-    let db = args.get("db").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let sql_arg = args.get("sql").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Json::Obj(Json::obj()));
+    let db = args
+        .get("db")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let sql_arg = args
+        .get("sql")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let body = match name.as_str() {
         "gabysql_list_databases" => {
@@ -703,6 +785,7 @@ fn handle_tools_call(params: &Json, cfg: &Config) -> Result<Json, String> {
             exec_via_server(cfg, db.as_deref(), &sql_arg.unwrap_or_default())?
         }
         "gabysql_integrity_check" => exec_via_server(cfg, db.as_deref(), "INTEGRITY CHECK")?,
+        "gabysql_vector_search" => vector_search(cfg, db.as_deref(), &args)?,
         other => return Err(format!("tool desconocida: {other}")),
     };
 
@@ -780,7 +863,10 @@ fn handle_resources_list() -> Json {
     catalog.push(("mimeType".into(), Json::Str("application/json".into())));
 
     let mut schema = Json::obj();
-    schema.push(("uriTemplate".into(), Json::Str("gabysql://schema/{db}".into())));
+    schema.push((
+        "uriTemplate".into(),
+        Json::Str("gabysql://schema/{db}".into()),
+    ));
     schema.push(("name".into(), Json::Str("Schema por DB".into())));
     schema.push((
         "description".into(),
@@ -790,7 +876,10 @@ fn handle_resources_list() -> Json {
 
     let mut out = Json::obj();
     out.push(("resources".into(), Json::Arr(vec![Json::Obj(catalog)])));
-    out.push(("resourceTemplates".into(), Json::Arr(vec![Json::Obj(schema)])));
+    out.push((
+        "resourceTemplates".into(),
+        Json::Arr(vec![Json::Obj(schema)]),
+    ));
     Json::Obj(out)
 }
 
@@ -819,6 +908,266 @@ fn handle_resources_read(params: &Json, cfg: &Config) -> Result<Json, String> {
     let mut out = Json::obj();
     out.push(("contents".into(), Json::Arr(vec![Json::Obj(item)])));
     Ok(Json::Obj(out))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Vector search del lado del gateway (ADR-0011)
+//
+// Tesis: meter búsqueda vectorial sin tocar el motor. El vector vive en una
+// columna TEXT como `[0.1,0.2,...]`. El gateway hace SELECT completo y
+// computa distancias en Rust. Es O(n·d) por query — adecuado hasta decenas
+// de miles de filas. Para escala mayor se promueve a `VECTOR(n)` nativo
+// con index ANN (otra ADR, otro bump de formato, otro día).
+// ────────────────────────────────────────────────────────────────────────────
+
+fn vector_search(cfg: &Config, db: Option<&str>, args: &Json) -> Result<String, String> {
+    let table = args
+        .get("table")
+        .and_then(|v| v.as_str())
+        .ok_or("falta argumento 'table'")?
+        .to_string();
+    let vector_column = args
+        .get("vector_column")
+        .and_then(|v| v.as_str())
+        .ok_or("falta argumento 'vector_column'")?
+        .to_string();
+    let pk_column = args
+        .get("pk_column")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "id".to_string());
+    let query_arr = args.get("query").ok_or("falta argumento 'query'")?;
+    let query = parse_vector_json(query_arr)?;
+    if query.is_empty() {
+        return Err("'query' no puede estar vacío".into());
+    }
+    let top_k = args
+        .get("top_k")
+        .and_then(|v| if let Json::Num(n) = v { Some(*n as usize) } else { None })
+        .unwrap_or(10);
+    if top_k == 0 {
+        return Err("'top_k' debe ser >= 1".into());
+    }
+    let metric_raw = args
+        .get("metric")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cosine")
+        .to_ascii_lowercase();
+    let metric = parse_metric(&metric_raw)?;
+
+    // Identificadores tienen que ser seguros — los interpolamos al SQL.
+    safe_ident(&table).map_err(|e| format!("table: {e}"))?;
+    safe_ident(&vector_column).map_err(|e| format!("vector_column: {e}"))?;
+    safe_ident(&pk_column).map_err(|e| format!("pk_column: {e}"))?;
+
+    let sql = format!("SELECT {pk_column}, {vector_column} FROM {table}");
+    let raw = exec_via_server(cfg, db, &sql)?;
+    let parsed = json_parse(&raw).map_err(|e| format!("respuesta del server no es JSON: {e}"))?;
+    if parsed.get("ok").and_then(|v| if let Json::Bool(b) = v { Some(*b) } else { None })
+        != Some(true)
+    {
+        return Err(format!("server reportó error: {raw}"));
+    }
+    let result_set = parsed
+        .get("results")
+        .and_then(|v| if let Json::Arr(a) = v { a.first() } else { None })
+        .ok_or("respuesta sin results[0]")?;
+    let rows = result_set
+        .get("rows")
+        .and_then(|v| if let Json::Arr(a) = v { Some(a) } else { None })
+        .ok_or("results[0].rows ausente")?;
+
+    // Heap de tamaño top_k: distancia, pk_json, vector_json (para devolver verbatim)
+    let mut top: Vec<VectorMatch> = Vec::with_capacity(top_k + 1);
+    let mut skipped = 0usize;
+    for row in rows {
+        let row_arr = match row {
+            Json::Arr(a) if a.len() >= 2 => a,
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let pk = &row_arr[0];
+        let vec_text = match &row_arr[1] {
+            Json::Str(s) => s,
+            Json::Null => {
+                skipped += 1;
+                continue;
+            }
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let vec_json = match json_parse(vec_text) {
+            Ok(j) => j,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let v = match parse_vector_json(&vec_json) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if v.len() != query.len() {
+            skipped += 1;
+            continue;
+        }
+        let d = match distance(metric, &query, &v) {
+            Some(d) => d,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        push_top_k(&mut top, top_k, VectorMatch { distance: d, pk: pk.clone(), vector: vec_json });
+    }
+    // Orden ascendente: distancia menor = más parecido (cosine y euclidean).
+    // Para "dot" invertimos el signo de la distancia para que también ordene
+    // ascendente (mayor producto interno → distancia "más negativa").
+    top.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut matches = Vec::with_capacity(top.len());
+    for m in &top {
+        let mut item = Json::obj();
+        item.push(("pk".into(), m.pk.clone()));
+        item.push(("distance".into(), Json::Num(m.distance)));
+        item.push(("vector".into(), m.vector.clone()));
+        matches.push(Json::Obj(item));
+    }
+    let mut out = Json::obj();
+    out.push(("ok".into(), Json::Bool(true)));
+    out.push(("metric".into(), Json::Str(metric.as_name().into())));
+    out.push(("scanned".into(), Json::Num(rows.len() as f64)));
+    out.push(("skipped".into(), Json::Num(skipped as f64)));
+    out.push(("matches".into(), Json::Arr(matches)));
+    Ok(json_to_string(&Json::Obj(out)))
+}
+
+#[derive(Clone)]
+struct VectorMatch {
+    distance: f64,
+    pk: Json,
+    vector: Json,
+}
+
+fn push_top_k(top: &mut Vec<VectorMatch>, k: usize, item: VectorMatch) {
+    top.push(item);
+    if top.len() > k {
+        // Encuentra el peor (mayor distancia) y descártalo.
+        let mut worst_idx = 0;
+        let mut worst = top[0].distance;
+        for (i, m) in top.iter().enumerate().skip(1) {
+            if m.distance > worst {
+                worst = m.distance;
+                worst_idx = i;
+            }
+        }
+        top.swap_remove(worst_idx);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Metric {
+    Cosine,
+    Euclidean,
+    Dot,
+}
+
+impl Metric {
+    fn as_name(self) -> &'static str {
+        match self {
+            Metric::Cosine => "cosine",
+            Metric::Euclidean => "euclidean",
+            Metric::Dot => "dot",
+        }
+    }
+}
+
+fn parse_metric(raw: &str) -> Result<Metric, String> {
+    match raw {
+        "cosine" => Ok(Metric::Cosine),
+        "euclidean" | "l2" => Ok(Metric::Euclidean),
+        "dot" | "ip" => Ok(Metric::Dot),
+        other => Err(format!("metric desconocida: {other} (usa cosine|euclidean|dot)")),
+    }
+}
+
+fn distance(metric: Metric, a: &[f64], b: &[f64]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    match metric {
+        Metric::Euclidean => {
+            let mut sum = 0.0;
+            for i in 0..a.len() {
+                let d = a[i] - b[i];
+                sum += d * d;
+            }
+            Some(sum.sqrt())
+        }
+        Metric::Dot => {
+            let mut dot = 0.0;
+            for i in 0..a.len() {
+                dot += a[i] * b[i];
+            }
+            // Negamos para que sort ascendente devuelva mayor dot primero.
+            Some(-dot)
+        }
+        Metric::Cosine => {
+            let mut dot = 0.0;
+            let mut na = 0.0;
+            let mut nb = 0.0;
+            for i in 0..a.len() {
+                dot += a[i] * b[i];
+                na += a[i] * a[i];
+                nb += b[i] * b[i];
+            }
+            if na == 0.0 || nb == 0.0 {
+                return None;
+            }
+            let cos_sim = dot / (na.sqrt() * nb.sqrt());
+            // Distancia coseno = 1 - similitud. Rango [0, 2].
+            Some(1.0 - cos_sim)
+        }
+    }
+}
+
+fn parse_vector_json(v: &Json) -> Result<Vec<f64>, String> {
+    let arr = if let Json::Arr(a) = v {
+        a
+    } else {
+        return Err("se esperaba array de números".into());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        match item {
+            Json::Num(n) => out.push(*n),
+            _ => return Err("array contiene un valor no numérico".into()),
+        }
+    }
+    Ok(out)
+}
+
+fn safe_ident(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("identificador vacío".into());
+    }
+    let first = s.chars().next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(format!("'{s}' no empieza con letra o '_'"));
+    }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("'{s}' contiene carácter inválido '{c}'"));
+        }
+    }
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -872,11 +1221,7 @@ mod tests {
             read_only: false,
             show_help: false,
         };
-        let reply = dispatch(
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            &cfg,
-        )
-        .unwrap();
+        let reply = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &cfg).unwrap();
         assert!(reply.contains("gabysql_execute"));
         assert!(reply.contains("gabysql_query"));
         assert!(reply.contains("gabysql_integrity_check"));
@@ -890,11 +1235,7 @@ mod tests {
             read_only: true,
             show_help: false,
         };
-        let reply = dispatch(
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
-            &cfg,
-        )
-        .unwrap();
+        let reply = dispatch(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, &cfg).unwrap();
         assert!(!reply.contains("gabysql_execute"));
         assert!(reply.contains("gabysql_query"));
     }
@@ -972,5 +1313,125 @@ mod tests {
             parse_authority("http://example.com").unwrap(),
             ("example.com".into(), 80u16)
         );
+    }
+
+    #[test]
+    fn cosine_identical_vectors_distance_zero() {
+        let a = vec![1.0, 2.0, 3.0];
+        let d = distance(Metric::Cosine, &a, &a).unwrap();
+        assert!(d.abs() < 1e-9, "cosine de un vector consigo mismo debe ser ~0, fue {d}");
+    }
+
+    #[test]
+    fn cosine_orthogonal_vectors_distance_one() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let d = distance(Metric::Cosine, &a, &b).unwrap();
+        assert!((d - 1.0).abs() < 1e-9, "cosine de vectores ortogonales = 1, fue {d}");
+    }
+
+    #[test]
+    fn euclidean_known_distance() {
+        let a = vec![0.0, 0.0];
+        let b = vec![3.0, 4.0];
+        let d = distance(Metric::Euclidean, &a, &b).unwrap();
+        assert!((d - 5.0).abs() < 1e-9, "euclidean (0,0)→(3,4) = 5, fue {d}");
+    }
+
+    #[test]
+    fn dot_returns_negative_so_sort_picks_largest() {
+        // dot(a,a)=14, dot(a,b)=0 → con negación, -14 < 0 → a sale primero
+        let q = vec![1.0, 2.0, 3.0];
+        let a = vec![1.0, 2.0, 3.0]; // dot 14
+        let b = vec![3.0, -2.0, 1.0 / 3.0]; // dot ≈ 0
+        let da = distance(Metric::Dot, &q, &a).unwrap();
+        let db = distance(Metric::Dot, &q, &b).unwrap();
+        assert!(da < db, "dot mayor → distancia menor (sort ascendente)");
+    }
+
+    #[test]
+    fn distance_returns_none_on_dimension_mismatch() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0, 2.0, 3.0];
+        assert!(distance(Metric::Cosine, &a, &b).is_none());
+    }
+
+    #[test]
+    fn cosine_zero_vector_returns_none() {
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 1.0];
+        assert!(distance(Metric::Cosine, &a, &b).is_none());
+    }
+
+    #[test]
+    fn push_top_k_keeps_smallest_distances() {
+        let mk = |d: f64, id: i64| VectorMatch {
+            distance: d,
+            pk: Json::Num(id as f64),
+            vector: Json::Arr(vec![]),
+        };
+        let mut top = Vec::new();
+        for (d, id) in [(0.5, 1), (0.1, 2), (0.9, 3), (0.3, 4), (0.7, 5)] {
+            push_top_k(&mut top, 3, mk(d, id));
+        }
+        assert_eq!(top.len(), 3);
+        let mut dists: Vec<f64> = top.iter().map(|m| m.distance).collect();
+        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(dists, vec![0.1, 0.3, 0.5]);
+    }
+
+    #[test]
+    fn safe_ident_accepts_valid_identifiers() {
+        assert!(safe_ident("users").is_ok());
+        assert!(safe_ident("user_id").is_ok());
+        assert!(safe_ident("_private").is_ok());
+        assert!(safe_ident("Col1").is_ok());
+    }
+
+    #[test]
+    fn safe_ident_rejects_injection_attempts() {
+        assert!(safe_ident("users; DROP TABLE x").is_err());
+        assert!(safe_ident("users--").is_err());
+        assert!(safe_ident("a b").is_err());
+        assert!(safe_ident("1col").is_err());
+        assert!(safe_ident("").is_err());
+    }
+
+    #[test]
+    fn parse_metric_accepts_aliases() {
+        assert_eq!(parse_metric("cosine").unwrap(), Metric::Cosine);
+        assert_eq!(parse_metric("euclidean").unwrap(), Metric::Euclidean);
+        assert_eq!(parse_metric("l2").unwrap(), Metric::Euclidean);
+        assert_eq!(parse_metric("dot").unwrap(), Metric::Dot);
+        assert_eq!(parse_metric("ip").unwrap(), Metric::Dot);
+        assert!(parse_metric("manhattan").is_err());
+    }
+
+    #[test]
+    fn tools_list_includes_vector_search() {
+        let cfg = Config {
+            server_url: DEFAULT_SERVER.into(),
+            token: None,
+            read_only: false,
+            show_help: false,
+        };
+        let reply = dispatch(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#,
+            &cfg,
+        )
+        .unwrap();
+        assert!(reply.contains("gabysql_vector_search"));
+        assert!(reply.contains("ADR-0011"));
+    }
+
+    #[test]
+    fn parse_vector_json_validates_types() {
+        let arr = json_parse("[1.0, 2.5, -3.0]").unwrap();
+        let v = parse_vector_json(&arr).unwrap();
+        assert_eq!(v, vec![1.0, 2.5, -3.0]);
+        let bad = json_parse(r#"[1.0, "string"]"#).unwrap();
+        assert!(parse_vector_json(&bad).is_err());
+        let not_arr = json_parse("42").unwrap();
+        assert!(parse_vector_json(&not_arr).is_err());
     }
 }

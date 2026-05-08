@@ -4,6 +4,50 @@
 
 ---
 
+## 2026-05-07 — Decimoséptima intervención: búsqueda vectorial del lado del gateway (Fase 5 — AI-native, parte 2)
+
+> **Sin bump de formato. Sin cambios al motor.** Esta intervención añade búsqueda vectorial top-k a `gabysql-mcp`. Los vectores se guardan como `TEXT` (`'[0.1,0.2,...]'`); el cómputo ocurre en el binario del gateway. Justificación completa: [ADR-0011](docs/adr/0011-vector-search-gateway-side.md).
+
+### ✨ Cambio
+- Nueva tool MCP **`gabysql_vector_search`** en [src/bin/gabysql-mcp.rs](src/bin/gabysql-mcp.rs):
+  - Args: `db?`, `table`, `pk_column?` (default `id`), `vector_column`, `query: number[]`, `top_k?` (default 10), `metric?` (default `cosine`).
+  - Métricas: `cosine`, `euclidean`/`l2`, `dot`/`ip`.
+  - Hace `SELECT <pk>, <vec_col> FROM <table>` vía el HTTP existente, parsea cada vector, computa la distancia y devuelve top-k por heap selection.
+  - Identificadores validados con `safe_ident` (regex implícito `[A-Za-z_][A-Za-z0-9_]*`) antes de interpolar al SQL — bloquea inyección.
+  - Filas con vector mal formado o de dimensión distinta a la query van al campo `skipped` de la respuesta (no se silencian).
+- 9 tests unitarios nuevos: cosine identity/orthogonal, euclidean Pitágoras, dot con sort ascendente, dimension mismatch, vector cero, top-k heap, validador de identificadores (acepta válidos / rechaza inyección), aliases de métrica, schema visible en `tools/list`.
+
+### 🎯 Por qué este cambio
+La búsqueda vectorial es lo que la mayoría de agentes LLM espera de una "DB para los nuevos tiempos". El camino correcto a largo plazo es un tipo `VECTOR(n)` nativo con índice ANN — pero eso requiere bump de formato, cambios profundos en `sql.rs`/`storage.rs`/`bptree.rs`, y meses de trabajo. **Hacerlo "para validar el use case" es prematuro.**
+
+Esta entrega resuelve el 80% del valor (top-k usable hoy desde cualquier cliente MCP) con el 5% del riesgo (cero líneas tocadas en el motor). El ADR-0011 documenta las **condiciones de salida explícitas** para promover a `VECTOR(n)` nativo cuando la señal aparezca: dataset > 100K vectores, demanda de operadores SQL, o necesidad de índice ANN.
+
+### 🛡️ Cómo se respeta el motor
+- **No se toca `Cargo.toml`/`Cargo.lock`.** Sin nuevas deps. ADR-0001 intacto.
+- **No se toca `src/lib.rs` ni ningún archivo del motor.** Solo crece `src/bin/gabysql-mcp.rs`.
+- **No se cambia el formato en disco.** Los vectores son `TEXT`; `INSERT INTO docs (id, content, embedding) VALUES (1, 'texto', '[0.1,0.2,...]')` es SQL estándar que el motor procesa sin saber que es un vector.
+- **Storage existente sigue válido.** DBs viejas no requieren migración.
+
+### 📐 ADR
+- [ADR-0011 — Búsqueda vectorial del lado del gateway, no en el motor](docs/adr/0011-vector-search-gateway-side.md)
+
+### 🧪 Ejemplo de uso desde un agente MCP
+```json
+{ "method": "tools/call", "params": {
+    "name": "gabysql_vector_search",
+    "arguments": {
+      "db": "rag.db",
+      "table": "docs",
+      "vector_column": "embedding",
+      "query": [0.12, -0.04, 0.88, /* ... */],
+      "top_k": 5,
+      "metric": "cosine"
+    }
+} }
+```
+
+---
+
 ## 2026-05-07 — Decimosexta intervención: gateway MCP — `gabysql-mcp` (apertura Fase 5 AI-native)
 
 > **Sin bump de formato. Sin cambios al motor.** Esta intervención añade un binario nuevo (`gabysql-mcp`) que es cliente del `gabysql-server` HTTP/JSON existente. No abre el `.db`, no instancia un `Pager`, no toca `storage.rs` / `bptree.rs` / `catalog.rs` / `sql.rs`. El motor queda intacto. Justificación completa: [ADR-0010](docs/adr/0010-mcp-gateway.md).

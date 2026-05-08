@@ -81,7 +81,10 @@
   - resources: `gabysql://catalog`, `gabysql://schema/{db}`
   - **cero deps externas** (decisión final superó el objetivo del ADR — JSON parser, JSON-RPC y cliente HTTP/1.1 implementados a mano en el binario; ADR-0001 intacto)
   - reusa authz (bearer token), `write_lock` y rate-limit del server tal cual
-- **Búsqueda semántica** (tipo `VECTOR(n)` + índice plano sobre páginas existentes) — exploratoria, depende de Fase 5.1
+- ~~**Búsqueda semántica** (top-k vectorial sobre columnas TEXT con array JSON)~~ ✅ entregada via gateway (ADR-0011)
+  - tool `gabysql_vector_search` con métricas cosine/euclidean/dot, top-k configurable
+  - **cero bump de formato** — los vectores son `TEXT`, el cómputo ocurre en `gabysql-mcp` en Rust
+  - condiciones de salida hacia un `VECTOR(n)` nativo documentadas en el ADR (>100K vectores, demanda de operadores SQL, índice ANN)
 - **Audit log enriquecido** (cada escritura registra el agente y el "por qué" semántico además del SQL) — exploratoria, depende de Fase 5.1
 
 ---
