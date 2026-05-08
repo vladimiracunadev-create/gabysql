@@ -72,6 +72,18 @@
 - endurecimiento adicional del admin web
 - authz más serio en modo server
 
+### Fase 5 — AI-native (apertura)
+
+> **Tesis**: el consumidor que crece más rápido en el ecosistema es el agente LLM. Hoy cualquier integración con `gabysql` desde un agente requiere pegamento manual (cliente HTTP + token + schema metido en el prompt). Esta fase elimina ese pegamento sin tocar el motor. Justificación y diseño detallados en [ADR-0010](docs/adr/0010-mcp-gateway.md).
+
+- **Gateway MCP** (`gabysql-mcp`) como **binario adaptador separado** sobre el HTTP/JSON existente — pendiente, próximo bloque
+  - tools: `gabysql_list_databases`, `gabysql_describe_database`, `gabysql_query`, `gabysql_execute`, `gabysql_integrity_check`
+  - resources: `gabysql://schema/<db>`, `gabysql://catalog`
+  - dependencias del SDK MCP aisladas en el target binario, **cero impacto** en `lib`/`storage`/`bptree`/`catalog`/`sql`
+  - reusa authz (bearer token), `write_lock` y rate-limit del server tal cual
+- **Búsqueda semántica** (tipo `VECTOR(n)` + índice plano sobre páginas existentes) — exploratoria, depende de Fase 5.1
+- **Audit log enriquecido** (cada escritura registra el agente y el "por qué" semántico además del SQL) — exploratoria, depende de Fase 5.1
+
 ---
 
 ## 🚫 Lo que no conviene hacer todavía
