@@ -1,8 +1,8 @@
 # ADR-0010: Gateway MCP como adaptador externo sobre el HTTP/JSON existente
 
-**Estado**: 🟡 Propuesta
-**Fecha**: 2026-05-07
-**Contexto que la motiva**: apertura de Fase 5 (AI-native) en [ROADMAP.md](../../ROADMAP.md). Sin commit todavía; este ADR precede a la implementación para fijar el contrato antes de escribir código.
+**Estado**: ✅ Aceptada
+**Fecha**: 2026-05-07 (propuesta) → 2026-05-07 (aceptada con la implementación del bloque siguiente)
+**Contexto que la motiva**: apertura de Fase 5 (AI-native) en [ROADMAP.md](../../ROADMAP.md). Implementación entregada en `src/bin/gabysql-mcp.rs`.
 
 ## 🧭 Contexto
 
@@ -106,6 +106,8 @@ Diagrama:
 
 - Spec MCP: <https://modelcontextprotocol.io/specification>
 - Repo del estándar: <https://github.com/modelcontextprotocol/specification>
-- ADRs encadenadas: [ADR-0001](0001-rust-zero-deps-core.md) (cero deps en core, este ADR la respeta vía aislamiento por binario), [ADR-0007](0007-commercial-path-a.md) (camino A — el modo agente refuerza el nicho embebido, no lo abandona).
-- Implementación pendiente: `src/bin/gabysql-mcp.rs` + sección `[features.mcp]` en `Cargo.toml`. Bloque siguiente del roadmap.
+- ADRs encadenadas: [ADR-0001](0001-rust-zero-deps-core.md) (cero deps en core, este ADR la respeta porque la implementación final fue **también** zero-deps — JSON parser + cliente HTTP/1.1 + JSON-RPC todo a mano en el binario), [ADR-0007](0007-commercial-path-a.md) (camino A — el modo agente refuerza el nicho embebido, no lo abandona).
+- Implementación: [src/bin/gabysql-mcp.rs](../../src/bin/gabysql-mcp.rs) — binario auto-detectado por Cargo, sin tocar `Cargo.toml` (cero deps externas, sin feature flag necesario).
+- Tests: módulo `#[cfg(test)] mod tests` en el mismo archivo (parser JSON, dispatch de `initialize`/`tools/list`/`resources/list`/`ping`, modo `--read-only`, notifications).
+- CHANGELOG: entry "Decimosexta intervención: gateway MCP — `gabysql-mcp`" (2026-05-07).
 - Prior art: el patrón "MCP server como wrapper de un servicio existente" es el dominante hoy (filesystem, GitHub, Slack, Postgres mcp servers todos siguen este shape).

@@ -15,7 +15,7 @@ Las ADRs se numeran secuencialmente. Una decisión revertida no se borra: se mar
 | 0007 | [Camino A (embebido nicho) antes que B/C](0007-commercial-path-a.md) | ✅ Aceptada | Estrategia de producto |
 | 0008 | [`LeafCursor` (Iterator pattern) para SELECT lazy](0008-leaf-cursor-iterator.md) | ✅ Aceptada | Optimización de recursos en lectura |
 | 0009 | [`PageCache` con capacidad fija + LRU sobre páginas clean](0009-page-cache-lru-bounded.md) | ✅ Aceptada | Memoria del Pager acotada |
-| 0010 | [Gateway MCP como adaptador externo sobre el HTTP/JSON existente](0010-mcp-gateway.md) | 🟡 Propuesta | Modo agente / AI-native sin tocar el core |
+| 0010 | [Gateway MCP como adaptador externo sobre el HTTP/JSON existente](0010-mcp-gateway.md) | ✅ Aceptada | Modo agente / AI-native sin tocar el core |
 
 ---
 

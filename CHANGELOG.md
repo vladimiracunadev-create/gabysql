@@ -4,6 +4,53 @@
 
 ---
 
+## 2026-05-07 — Decimosexta intervención: gateway MCP — `gabysql-mcp` (apertura Fase 5 AI-native)
+
+> **Sin bump de formato. Sin cambios al motor.** Esta intervención añade un binario nuevo (`gabysql-mcp`) que es cliente del `gabysql-server` HTTP/JSON existente. No abre el `.db`, no instancia un `Pager`, no toca `storage.rs` / `bptree.rs` / `catalog.rs` / `sql.rs`. El motor queda intacto. Justificación completa: [ADR-0010](docs/adr/0010-mcp-gateway.md).
+
+### ✨ Cambio
+
+- Nuevo binario `src/bin/gabysql-mcp.rs` (~700 líneas, **cero dependencias externas**) que habla el protocolo **MCP (Model Context Protocol)** sobre stdio (JSON-RPC 2.0 delimitado por `\n`).
+- Cinco tools expuestas a cualquier cliente MCP-compatible (Claude Desktop, Claude Code, Cursor, etc.):
+  - `gabysql_list_databases` → wrap de `GET /dbs`
+  - `gabysql_describe_database` → wrap de `GET /tables[?db=…]`
+  - `gabysql_query` → wrap de `POST /exec` para `SELECT`/`SHOW`/`DESCRIBE`
+  - `gabysql_execute` → wrap de `POST /exec` para `INSERT`/`UPDATE`/`DELETE`/DDL (omitida si se lanza con `--read-only`)
+  - `gabysql_integrity_check` → wrap de `POST /exec` con `INTEGRITY CHECK`
+- Dos resources MCP:
+  - `gabysql://catalog` → lista de bases disponibles
+  - `gabysql://schema/{db}` → schema completo de una DB
+- Flags: `--server URL` (default `http://127.0.0.1:7878`, también `GABYSQL_SERVER`), `--token T` (también `GABYSQL_TOKEN`), `--read-only`.
+- Tests unitarios en el mismo archivo cubren: parser JSON (round-trip + escapes), `initialize`, `tools/list` con y sin `--read-only`, `resources/list`, `ping`, método desconocido, notifications sin id, parsing de URL del server.
+
+### 🎯 Por qué este cambio
+
+El consumidor que más rápido crece en el ecosistema es el agente LLM. Hoy una IA que quiera usar `gabysql` necesita: cliente HTTP a mano + token + el schema de la DB metido en el prompt + reintentos sobre errores SQL sin trazabilidad. Ese pegamento se reescribe en cada integración.
+
+MCP es el estándar emergente que define cómo un servidor expone *tools* y *resources* a clientes-agentes. Si `gabysql` lo habla de fábrica, cualquier agente lo enchufa directo:
+
+```bash
+gabysql-server -dir ./dbs -token MI_TOKEN
+gabysql-mcp --server http://127.0.0.1:7878 --token MI_TOKEN
+# Claude Desktop / Claude Code / Cursor lanzan gabysql-mcp como subprocess
+# y descubren las 5 tools + 2 resources sin código de pegamento.
+```
+
+### 🛡️ Cómo se respeta el motor
+
+- **No se toca `Cargo.toml`.** El binario se auto-descubre desde `src/bin/`. `Cargo.lock` no añade un solo paquete.
+- **No se cambia `[lib]`.** Sigue compilando con cero deps externas. [ADR-0001](docs/adr/0001-rust-zero-deps-core.md) intacto.
+- **No se abre el `.db`.** El gateway hace doble salto stdio→HTTP→Pager, así heredas todo lo que ya está endurecido en `server.rs`: `write_lock` global, tope de conexiones, bearer token, CORS preflight, validación de SQL antes de pegar al Pager.
+- **No se cambia el formato en disco.** Sin bump de VERSION, sin nuevo tipo de página, sin cambio en el WAL.
+
+### ✅ Tests
+- Módulo `#[cfg(test)] mod tests` en `src/bin/gabysql-mcp.rs`: 9 tests cubren parser JSON, dispatch JSON-RPC y semántica de `--read-only`. CI multi-OS los ejecuta vía `cargo test`.
+
+### 📐 ADR
+- [ADR-0010 — Gateway MCP como adaptador externo sobre el HTTP/JSON existente](docs/adr/0010-mcp-gateway.md): promovida de 🟡 Propuesta a ✅ Aceptada con la implementación.
+
+---
+
 ## 2026-05-08 — Decimoquinta intervención: `PageCache` LRU acotado — cierra fuga de memoria del server
 
 > **Sin bump de formato.** El cambio es interno al Pager. La API pública del Pager se mantiene compatible salvo dos métodos nuevos (`set_cache_capacity`, `cache_len`, `cache_capacity`).
