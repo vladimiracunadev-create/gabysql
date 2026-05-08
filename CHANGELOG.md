@@ -4,6 +4,29 @@
 
 ---
 
+## 2026-05-07 — Duodécima intervención: `ORDER BY` (Fase 2 paso 1)
+
+> **Sin bump de formato.** Todo el ordering ocurre en memoria sobre el resultado del scan/range/index path.
+
+### ✨ Funcionalidad SQL
+- **`SELECT ... ORDER BY <col> [ASC|DESC]`**. ASC es el default cuando se omite la dirección. Va entre `WHERE` y `LIMIT/OFFSET`.
+- Funciona sobre **cualquier columna** del schema (no requiere índice). Reusa el scan/range/index path existente y ordena el resultado en memoria.
+- **NULLs sortean primero** bajo ASC (consistente con SQLite). En DESC quedan al final por reverse.
+- Comparación tipada: INT/INT, FLOAT/FLOAT, mixto INT↔FLOAT (promueve a f64), BOOL (false<true), TEXT/DATE/DATETIME/JSON por byte order.
+
+### 🧱 Cambios estructurales
+- `SelectStmt.order_by: Option<OrderClause>` con `OrderClause { column, direction: OrderDir }`.
+- Cuando `order_by` está set, el executor difiere `LIMIT/OFFSET` hasta después del sort para no truncar prematuramente.
+- Nuevo helper `compare_values(Option<&Value>, Option<&Value>) -> Ordering` con NULL-first semantics.
+- Validación pre-I/O: `ORDER BY` sobre columna inexistente devuelve error explícito.
+- Reserved words extendidas: `order`, `by`, `asc`, `desc`.
+
+### 🧪 Validación
+- 34/34 tests de integración (4 nuevos: `order_by_int_asc_desc`, `order_by_text_with_limit_offset_window`, `order_by_nulls_sort_first_under_asc`, `order_by_unknown_column_rejected`).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+---
+
 ## 2026-05-07 — Undécima intervención: gabymodeler v2 (PowerDesigner-style) + CORS
 
 > **Sin bump de formato.** El motor no cambia; el modeler reescrito y el server gana headers CORS para que el modeler pueda hablarle directo.

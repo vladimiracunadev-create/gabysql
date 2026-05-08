@@ -129,8 +129,21 @@ pub struct SelectStmt {
     pub table: String,
     pub columns: Vec<String>,
     pub where_clause: Option<WhereClause>,
+    pub order_by: Option<OrderClause>,
     pub limit: Option<usize>,
     pub offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderClause {
+    pub column: String,
+    pub direction: OrderDir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDir {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -750,12 +763,38 @@ impl<'a> Engine<'a> {
             }
         };
 
+        // ORDER BY validation up front (before any I/O).
+        if let Some(ord) = &stmt.order_by {
+            if meta.column(&ord.column).is_none() {
+                return Err(DbError::new(format!(
+                    "ORDER BY: columna '{}' no existe en '{}'",
+                    ord.column, meta.name
+                )));
+            }
+        }
+
+        // When ORDER BY is set we must materialize *every* matching row
+        // before applying offset/limit — otherwise we'd window over an
+        // arbitrary B+Tree-key order and miss the requested ordering.
+        // Without ORDER BY we keep the existing fast path that lets
+        // scan_rows apply the window directly.
+        let defer_window = stmt.order_by.is_some();
         let mut catalog = Catalog::open(self.pager);
         let rows_bytes = match plan {
-            Plan::FullScan => catalog.scan_rows(meta.root_page, stmt.offset, stmt.limit)?,
+            Plan::FullScan => {
+                if defer_window {
+                    catalog.scan_rows(meta.root_page, 0, None)?
+                } else {
+                    catalog.scan_rows(meta.root_page, stmt.offset, stmt.limit)?
+                }
+            }
             Plan::Range { from, to } => {
                 let rows = catalog.range_rows(meta.root_page, from, to)?;
-                window_rows(rows, stmt.offset, stmt.limit)
+                if defer_window {
+                    rows
+                } else {
+                    window_rows(rows, stmt.offset, stmt.limit)
+                }
             }
             Plan::ByPks(pks) => {
                 let mut rows = Vec::with_capacity(pks.len());
@@ -768,15 +807,38 @@ impl<'a> Engine<'a> {
                     }
                 }
                 rows.sort_by_key(|kv| kv.key);
-                window_rows(rows, stmt.offset, stmt.limit)
+                if defer_window {
+                    rows
+                } else {
+                    window_rows(rows, stmt.offset, stmt.limit)
+                }
             }
         };
 
-        let mut rows = Vec::with_capacity(rows_bytes.len());
+        let mut rows: Vec<(HashMap<String, Value>, Vec<Value>)> =
+            Vec::with_capacity(rows_bytes.len());
         for kv in rows_bytes {
             let decoded = decode_row(&meta, &kv.value)?;
-            rows.push(project_row(&selected_columns, &decoded)?);
+            let projected = project_row(&selected_columns, &decoded)?;
+            rows.push((decoded, projected));
         }
+
+        if let Some(ord) = &stmt.order_by {
+            let key = normalize_ident(&ord.column);
+            rows.sort_by(|a, b| compare_values(a.0.get(&key), b.0.get(&key)));
+            if matches!(ord.direction, OrderDir::Desc) {
+                rows.reverse();
+            }
+            // Window is applied after the sort.
+            let total = rows.len();
+            let start = stmt.offset.min(total);
+            let end = match stmt.limit {
+                Some(l) => (start + l).min(total),
+                None => total,
+            };
+            rows = rows.into_iter().skip(start).take(end - start).collect();
+        }
+        let rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, r)| r).collect();
 
         Ok(ResultSet {
             columns: output_columns,
@@ -1807,6 +1869,34 @@ pub(crate) fn check_unique_conflict(
     Ok(())
 }
 
+/// Total ordering used by `ORDER BY`. NULLs sort first under ASC
+/// (matching SQLite, opposite of PostgreSQL's NULLS LAST default — we
+/// pick the simpler "low end" semantics so DESC mirrors as NULLs last
+/// without a separate `NULLS LAST` clause). Mixed types shouldn't
+/// happen in practice (a column has one declared type) but we still
+/// return Equal rather than panicking when they do.
+fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let av = a.unwrap_or(&Value::Null);
+    let bv = b.unwrap_or(&Value::Null);
+    match (av, bv) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Integer(x), Value::Float(y)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::Integer(y)) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+        }
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
 fn normalize_ident(value: &str) -> String {
     value
         .rsplit('.')
@@ -2236,6 +2326,25 @@ impl Parser {
             }
         }
 
+        // Optional ORDER BY <ident> [ASC|DESC]. Has to come after WHERE
+        // and before LIMIT/OFFSET — that's the standard SQL order and
+        // also what most callers expect.
+        let mut order_by = None;
+        if self.match_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            let column = self.expect_ident()?;
+            // ASC is the default. We still consume the literal ASC
+            // token if present so it doesn't leak into the LIMIT/OFFSET
+            // parser below.
+            let direction = if self.match_keyword("DESC") {
+                OrderDir::Desc
+            } else {
+                let _ = self.match_keyword("ASC");
+                OrderDir::Asc
+            };
+            order_by = Some(OrderClause { column, direction });
+        }
+
         let mut limit = None;
         let mut offset = 0usize;
         let mut seen_limit = false;
@@ -2272,6 +2381,7 @@ impl Parser {
             table,
             columns,
             where_clause,
+            order_by,
             limit,
             offset,
         }))

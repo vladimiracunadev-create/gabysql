@@ -44,6 +44,7 @@
 - ~~`WHERE` por columnas no PK (cuando hay índice)~~ ✅ entregado
 - ~~índices `UNIQUE` declarativos~~ ✅ entregado (VERSION 5)
 - ~~`FOREIGN KEY` declarativas + enforced~~ ✅ entregado (VERSION 6)
+- ~~`ORDER BY <col> [ASC|DESC]`~~ ✅ entregado
 - índices compuestos
 - range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)
 - `ORDER BY`

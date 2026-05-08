@@ -506,6 +506,7 @@ flowchart LR
 ```
 select       ::= "SELECT" select_cols "FROM" identifier
                   ("WHERE" where_clause)?
+                  ("ORDER" "BY" identifier ("ASC" | "DESC")?)?
                   ("LIMIT" integer)?
                   ("OFFSET" integer)?
 select_cols  ::= "*" | identifier ("," identifier)*
@@ -513,7 +514,7 @@ where_clause ::= identifier "=" value
                | identifier "BETWEEN" integer "AND" integer
 ```
 
-> `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` solo funciona sobre la PK (range scan secundario es parte del [Camino A](COMMERCIAL_ROADMAP.md)).
+> `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` solo funciona sobre la PK (range scan secundario es parte del [Camino A](COMMERCIAL_ROADMAP.md)). `ORDER BY` funciona sobre cualquier columna del schema (no requiere índice); el sort es en memoria post-scan, así que para tablas grandes con `LIMIT` chico conviene tener un `WHERE` que reduzca el conjunto antes del sort.
 
 ### ✅ Ejemplos
 
@@ -529,6 +530,11 @@ SELECT id, name FROM users WHERE id BETWEEN 1 AND 100;
 -- Por columna indexada (requiere CREATE INDEX previo)
 SELECT * FROM users WHERE name = 'Ana';
 SELECT id FROM orders WHERE status = 'pending' LIMIT 50;
+
+-- ORDER BY (cualquier columna; ASC default; NULLs primero)
+SELECT id, name FROM users ORDER BY name ASC;
+SELECT id, name FROM users ORDER BY score DESC LIMIT 10;
+SELECT id FROM orders WHERE status = 'pending' ORDER BY total DESC LIMIT 5 OFFSET 10;
 ```
 
 ### ❌ Errores típicos
@@ -536,6 +542,7 @@ SELECT id FROM orders WHERE status = 'pending' LIMIT 50;
 | Mensaje | Causa |
 | :--- | :--- |
 | `tabla no existe: X` | la tabla no está creada en la DB |
+| `ORDER BY: columna 'X' no existe en 'Y'` | la columna del ORDER BY no está en el schema de la tabla |
 | `WHERE solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | filtro sobre columna no-PK sin índice — créalo o usa la PK |
 | `WHERE soporta solo '=' o BETWEEN` | operador no implementado (`<`, `>`, `LIKE`, etc.) |
 | `PRIMARY KEY 'X' es INT; valor incompatible en WHERE` | pasaste un string a una PK INT |

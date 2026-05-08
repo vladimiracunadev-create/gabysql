@@ -1168,6 +1168,149 @@ fn integrity_check_reports_corrupted_page() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn order_by_int_asc_desc() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("order-int");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, score INT);")?;
+    run_sql(&db, "INSERT INTO u (id,score) VALUES (1,30);")?;
+    run_sql(&db, "INSERT INTO u (id,score) VALUES (2,10);")?;
+    run_sql(&db, "INSERT INTO u (id,score) VALUES (3,20);")?;
+
+    let asc = run_sql(&db, "SELECT id FROM u ORDER BY score ASC;")?;
+    let asc_pks: Vec<i64> = asc[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(asc_pks, vec![2, 3, 1]);
+
+    let desc = run_sql(&db, "SELECT id FROM u ORDER BY score DESC;")?;
+    let desc_pks: Vec<i64> = desc[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(desc_pks, vec![1, 3, 2]);
+
+    // Default direction is ASC.
+    let dflt = run_sql(&db, "SELECT id FROM u ORDER BY score;")?;
+    let dflt_pks: Vec<i64> = dflt[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(dflt_pks, vec![2, 3, 1]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn order_by_text_with_limit_offset_window() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("order-text");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Carla');")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (2,'Ana');")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (3,'Beto');")?;
+
+    // Sort by name ASC, take the middle row only.
+    let res = run_sql(
+        &db,
+        "SELECT id,name FROM u ORDER BY name ASC LIMIT 1 OFFSET 1;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][1], Value::String("Beto".to_string()));
+
+    // Sort DESC, take all.
+    let desc = run_sql(&db, "SELECT name FROM u ORDER BY name DESC;")?;
+    let names: Vec<String> = desc[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Carla".to_string(), "Beto".to_string(), "Ana".to_string()]
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn order_by_nulls_sort_first_under_asc() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("order-null");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Beto');")?;
+    run_sql(&db, "INSERT INTO u (id) VALUES (2);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (3,'Ana');")?;
+
+    let asc = run_sql(&db, "SELECT id FROM u ORDER BY name ASC;")?;
+    let asc_pks: Vec<i64> = asc[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    // NULL first, then 'Ana', then 'Beto'
+    assert_eq!(asc_pks, vec![2, 3, 1]);
+
+    let desc = run_sql(&db, "SELECT id FROM u ORDER BY name DESC;")?;
+    let desc_pks: Vec<i64> = desc[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    // 'Beto', 'Ana', NULL last (because we just reverse the ASC order)
+    assert_eq!(desc_pks, vec![1, 3, 2]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn order_by_unknown_column_rejected() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("order-bad");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    let err = run_sql(&db, "SELECT id FROM u ORDER BY nope ASC;").unwrap_err();
+    assert!(err.to_string().contains("ORDER BY"), "got: {}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
