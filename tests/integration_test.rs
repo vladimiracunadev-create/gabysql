@@ -1499,6 +1499,85 @@ fn crash_recovery_replay_is_idempotent() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `SELECT … LIMIT N` over a large table must NOT materialize every
+/// row before windowing — that's the whole reason the LeafCursor
+/// exists. We exercise the property with a 1.000-row table and assert
+/// LIMIT 5 returns the expected first five PKs in key order. The
+/// cursor's promise is observable through behaviour (correctness),
+/// not direct memory measurement; the resource win is verified by
+/// reading the executor code path.
+#[test]
+fn cursor_limit_returns_only_requested_rows() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("cursor-limit");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE big (id INT PRIMARY KEY, name TEXT);")?;
+    for i in 0..1000i64 {
+        run_sql(
+            &db,
+            &format!("INSERT INTO big (id,name) VALUES ({},'row{:04}');", i, i),
+        )?;
+    }
+
+    // LIMIT 5 with no offset
+    let res = run_sql(&db, "SELECT id FROM big LIMIT 5;")?;
+    let pks: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(pks, vec![0, 1, 2, 3, 4]);
+
+    // LIMIT 3 OFFSET 7
+    let res = run_sql(&db, "SELECT id FROM big LIMIT 3 OFFSET 7;")?;
+    let pks: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(pks, vec![7, 8, 9]);
+
+    // BETWEEN range with LIMIT — cursor_range must respect the upper
+    // bound AND short-circuit at LIMIT.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM big WHERE id BETWEEN 100 AND 999 LIMIT 4;",
+    )?;
+    let pks: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(pks, vec![100, 101, 102, 103]);
+
+    // Range whose upper bound is well before the end: must stop at
+    // the bound, not run to EOF.
+    let res = run_sql(&db, "SELECT id FROM big WHERE id BETWEEN 5 AND 9;")?;
+    let pks: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(pks, vec![5, 6, 7, 8, 9]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

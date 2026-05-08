@@ -140,6 +140,49 @@ impl<'a> Tree<'a> {
         self.scan(root, 0, None)
     }
 
+    /// Lazy cursor over every entry in the tree, in key order.
+    ///
+    /// The cursor borrows the Pager mutably for its lifetime — while
+    /// it is alive no other operation can write through the Pager.
+    /// SELECT (read-only) is the natural fit; patterns that read
+    /// rows AND mutate the same B+Tree (CREATE INDEX backfill,
+    /// INTEGRITY CHECK) keep using the materializing helpers
+    /// (`scan / range / all`).
+    ///
+    /// `LeafCursor` implements `Iterator`, so consumers compose with
+    /// the standard `skip(offset).take(limit)` to express
+    /// LIMIT/OFFSET windowing without ever loading the rows past the
+    /// window — that's the whole point of the cursor.
+    pub fn cursor_full(mut self, root: u32) -> DbResult<LeafCursor<'a>> {
+        if root == 0 {
+            let Tree { pager } = self;
+            return Ok(LeafCursor::empty(pager));
+        }
+        let leaf = self.leftmost_leaf(root)?;
+        let Tree { pager } = self;
+        LeafCursor::open(pager, leaf, None, None)
+    }
+
+    /// Lazy cursor over entries with key in `[from, to]` (both bounds
+    /// inclusive — same semantics as `WHERE pk BETWEEN from AND to`).
+    pub fn cursor_range(
+        mut self,
+        root: u32,
+        mut from: i64,
+        mut to: i64,
+    ) -> DbResult<LeafCursor<'a>> {
+        if from > to {
+            std::mem::swap(&mut from, &mut to);
+        }
+        if root == 0 {
+            let Tree { pager } = self;
+            return Ok(LeafCursor::empty(pager));
+        }
+        let leaf = self.find_leaf(root, from)?;
+        let Tree { pager } = self;
+        LeafCursor::open(pager, leaf, Some(from), Some(to))
+    }
+
     fn put(&mut self, root: u32, key: i64, value: Vec<u8>, allow_replace: bool) -> DbResult<u32> {
         if root == 0 {
             return Err(DbError::new("root page is 0"));
@@ -293,6 +336,137 @@ impl<'a> Tree<'a> {
                     current = internal.first_child;
                 }
                 other => return Err(DbError::new(format!("unknown page type: {}", other))),
+            }
+        }
+    }
+}
+
+/// Lazy iterator over the entries of a B+Tree, anchored at one root.
+///
+/// **Why this exists.** The materializing helpers (`Tree::scan/range/all`)
+/// load every matching entry into a `Vec<KeyValue>` before returning.
+/// That works for small tables, but a `SELECT … LIMIT 10` against a
+/// million-row table pays for the full million in RAM and CPU just to
+/// throw 999.990 away. `LeafCursor` walks leaves on demand: each call
+/// to `next()` advances within the current leaf, and only loads the
+/// next leaf via the chain pointer when the current one is exhausted.
+/// Combine with `Iterator::skip(offset).take(limit)` to express
+/// LIMIT/OFFSET windowing that is genuinely O(limit + offset) in I/O,
+/// not O(table_size).
+///
+/// **Borrow semantics.** The cursor holds the Pager mutably for its
+/// lifetime, so while a cursor is live no other write through the same
+/// Pager can run. SELECT (read-only) is the natural fit. Code paths
+/// that read rows AND mutate the same B+Tree (CREATE INDEX backfill,
+/// INTEGRITY CHECK) keep using the materializing helpers — they need
+/// to drop the read borrow before the write borrow can start.
+pub struct LeafCursor<'a> {
+    pager: &'a mut Pager,
+    /// Page number of the next leaf to load when the current buffer
+    /// is drained. `0` means there is no next leaf (we hit the right
+    /// edge of the tree).
+    next_leaf: u32,
+    /// Entries decoded from the current leaf. Drained left-to-right.
+    buf: Vec<KeyValue>,
+    /// Position within `buf` of the next entry to yield.
+    pos: usize,
+    /// Lower bound for `cursor_range` — used to skip the prefix of
+    /// the starting leaf whose keys fall below `from`. `None` means
+    /// no lower bound (full scan).
+    lower: Option<i64>,
+    /// Upper bound for `cursor_range`, inclusive. The cursor stops
+    /// as soon as it encounters a key strictly greater than this.
+    upper: Option<i64>,
+    /// Sticky flag set on EOF or after a load error so subsequent
+    /// `next()` calls return `None` cleanly.
+    done: bool,
+}
+
+impl<'a> LeafCursor<'a> {
+    fn empty(pager: &'a mut Pager) -> Self {
+        Self {
+            pager,
+            next_leaf: 0,
+            buf: Vec::new(),
+            pos: 0,
+            lower: None,
+            upper: None,
+            done: true,
+        }
+    }
+
+    fn open(
+        pager: &'a mut Pager,
+        leaf: u32,
+        lower: Option<i64>,
+        upper: Option<i64>,
+    ) -> DbResult<Self> {
+        let mut me = Self {
+            pager,
+            next_leaf: leaf,
+            buf: Vec::new(),
+            pos: 0,
+            lower,
+            upper,
+            done: leaf == 0,
+        };
+        if !me.done {
+            me.load_current()?;
+            // Skip the prefix of the starting leaf that falls below
+            // the lower bound — only relevant for cursor_range.
+            if let Some(low) = me.lower {
+                while me.pos < me.buf.len() && me.buf[me.pos].key < low {
+                    me.pos += 1;
+                }
+            }
+        }
+        Ok(me)
+    }
+
+    fn load_current(&mut self) -> DbResult<()> {
+        if self.next_leaf == 0 {
+            self.done = true;
+            return Ok(());
+        }
+        let page = self.pager.page_data(self.next_leaf)?;
+        let leaf = decode_leaf(&page)?;
+        self.buf = leaf.kvs;
+        self.pos = 0;
+        self.next_leaf = leaf.next;
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for LeafCursor<'a> {
+    type Item = DbResult<KeyValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if self.pos < self.buf.len() {
+                let kv = self.buf[self.pos].clone();
+                self.pos += 1;
+                if let Some(up) = self.upper {
+                    if kv.key > up {
+                        // We've crossed the right bound; latch done so
+                        // any further `next()` is a clean None.
+                        self.done = true;
+                        return None;
+                    }
+                }
+                return Some(Ok(kv));
+            }
+            if self.next_leaf == 0 {
+                self.done = true;
+                return None;
+            }
+            if let Err(err) = self.load_current() {
+                // Surface the load error once and latch done; the
+                // cursor doesn't try to recover from CRC failures.
+                self.done = true;
+                return Some(Err(err));
             }
         }
     }

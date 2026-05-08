@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-05-08 — Decimocuarta intervención: `LeafCursor` (Iterator pattern) — Fase 2 paso 2
+
+> **Sin bump de formato.** El cambio es estructural: cómo se leen los rows del B+Tree.
+
+### ✨ Cambio
+- Nuevo `bptree::LeafCursor<'a>` que implementa `Iterator<Item = DbResult<KeyValue>>` y carga páginas leaf **on-demand** vía la chain `next` del B+Tree.
+- Constructores en `Tree`: `cursor_full(root)` (full scan en orden de PK) y `cursor_range(root, from, to)` (range scan inclusive en ambos extremos).
+- Wrappers en `Catalog`: `scan_cursor(root)` y `range_cursor(root, from, to)` para el caller del SQL layer.
+- `exec_select` reescrito: cuando NO hay `ORDER BY`, los planes `FullScan` y `Range` consumen el cursor con `.skip(offset).take(limit)` en vez de materializar todo el B+Tree. Cuando hay `ORDER BY`, sigue materializando (necesita ordenar antes de window).
+
+### 🎯 Impacto medible en recursos
+- `SELECT … LIMIT N` sobre tabla de N filas pasa de O(filas_totales) memoria + IO a **O(N + offset)** memoria + IO. Verificable: el test `cursor_limit_returns_only_requested_rows` sobre 1.000 filas valida que `LIMIT 5` devuelve solo 5 PKs en orden, sin intermediarios.
+- `SELECT … WHERE pk BETWEEN a AND b LIMIT N` corta el walk apenas la PK supera `b`, sin tocar páginas ulteriores.
+- `Plan::ByPks` (path de índice secundario) sigue materializando — está acotado por la cardinalidad del lookup, no por el tamaño de la tabla.
+
+### 🛡️ Borrow semantics (intencionales)
+El cursor toma `&mut Pager` por su lifetime. Mientras está vivo, ninguna otra escritura puede pasar por el mismo Pager. Eso es lo correcto para SELECT (read-only) y por eso solo lo usa `exec_select`. Los call sites que necesitan leer Y mutar el mismo B+Tree (`CREATE INDEX` backfill, `INTEGRITY CHECK`, `delete_with_cascade`) siguen usando los helpers materializadores (`scan / range / all`); ahí la materialización es correcta porque la lectura tiene que terminar antes que la escritura empiece.
+
+### 🧪 Validación
+- 38/38 tests de integración (1 nuevo: `cursor_limit_returns_only_requested_rows` ejercita LIMIT/OFFSET y BETWEEN sobre 1.000 filas).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.
+
+---
+
 ## 2026-05-07 — Decimotercera intervención: crash tests dirigidos (Fase 1 reabierta y cerrada del todo)
 
 > **Sin bump de formato.** Solo nuevos tests de integración que ejercitan el path WAL→file con escenarios de crash sintéticos.

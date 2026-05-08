@@ -1,4 +1,4 @@
-use crate::bptree::{init_leaf_page, Tree};
+use crate::bptree::{init_leaf_page, LeafCursor, Tree};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::HashSet;
@@ -469,6 +469,20 @@ impl<'a> Catalog<'a> {
     ) -> DbResult<Vec<crate::bptree::KeyValue>> {
         let mut tree = Tree::new(self.pager);
         tree.range(root_page, from, to)
+    }
+
+    /// Lazy cursor over every row in a table's B+Tree. Combine with
+    /// `Iterator::skip(offset).take(limit)` for cheap LIMIT/OFFSET on
+    /// large tables — only the rows actually consumed are loaded.
+    /// Caller drops the cursor before opening another Catalog through
+    /// the same Pager (the cursor borrows the Pager mutably).
+    pub fn scan_cursor(self, root_page: u32) -> DbResult<LeafCursor<'a>> {
+        Tree::new(self.pager).cursor_full(root_page)
+    }
+
+    /// Lazy cursor over rows with PK in `[from, to]` (both inclusive).
+    pub fn range_cursor(self, root_page: u32, from: i64, to: i64) -> DbResult<LeafCursor<'a>> {
+        Tree::new(self.pager).cursor_range(root_page, from, to)
     }
 
     pub fn get_row(&mut self, root_page: u32, key: i64) -> DbResult<Option<Vec<u8>>> {

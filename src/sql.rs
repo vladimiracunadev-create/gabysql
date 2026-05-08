@@ -1,4 +1,4 @@
-use crate::bptree::{init_leaf_page, Tree};
+use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
     ForeignKeyMeta, IndexMeta, OnDelete, TableMeta,
@@ -776,40 +776,67 @@ impl<'a> Engine<'a> {
         // When ORDER BY is set we must materialize *every* matching row
         // before applying offset/limit — otherwise we'd window over an
         // arbitrary B+Tree-key order and miss the requested ordering.
-        // Without ORDER BY we keep the existing fast path that lets
-        // scan_rows apply the window directly.
+        // Without ORDER BY we walk the leaves lazily through a
+        // `LeafCursor` and let `Iterator::skip().take()` short-circuit
+        // the scan as soon as `LIMIT` is satisfied. That turns
+        // `SELECT … LIMIT 10` over a million-row table from a full
+        // materialization into an O(offset + limit) leaf walk.
         let defer_window = stmt.order_by.is_some();
-        let mut catalog = Catalog::open(self.pager);
-        let rows_bytes = match plan {
-            Plan::FullScan => {
-                if defer_window {
-                    catalog.scan_rows(meta.root_page, 0, None)?
-                } else {
-                    catalog.scan_rows(meta.root_page, stmt.offset, stmt.limit)?
-                }
-            }
-            Plan::Range { from, to } => {
-                let rows = catalog.range_rows(meta.root_page, from, to)?;
-                if defer_window {
-                    rows
-                } else {
-                    window_rows(rows, stmt.offset, stmt.limit)
-                }
-            }
-            Plan::ByPks(pks) => {
-                let mut rows = Vec::with_capacity(pks.len());
-                for pk in pks {
-                    if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
-                        rows.push(crate::bptree::KeyValue {
-                            key: pk,
-                            value: bytes,
-                        });
+        let rows_bytes: Vec<KeyValue> = if defer_window {
+            let mut catalog = Catalog::open(self.pager);
+            match plan {
+                Plan::FullScan => catalog.scan_rows(meta.root_page, 0, None)?,
+                Plan::Range { from, to } => catalog.range_rows(meta.root_page, from, to)?,
+                Plan::ByPks(pks) => {
+                    let mut rows = Vec::with_capacity(pks.len());
+                    for pk in pks {
+                        if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
+                            rows.push(KeyValue {
+                                key: pk,
+                                value: bytes,
+                            });
+                        }
                     }
-                }
-                rows.sort_by_key(|kv| kv.key);
-                if defer_window {
+                    rows.sort_by_key(|kv| kv.key);
                     rows
-                } else {
+                }
+            }
+        } else {
+            // `take(usize::MAX)` is the closed-form for "no limit"; the
+            // standard library short-circuits when the inner iterator
+            // returns None, so it never actually reaches usize::MAX.
+            let take = stmt.limit.unwrap_or(usize::MAX);
+            match plan {
+                Plan::FullScan => {
+                    let catalog = Catalog::open(self.pager);
+                    catalog
+                        .scan_cursor(meta.root_page)?
+                        .skip(stmt.offset)
+                        .take(take)
+                        .collect::<DbResult<Vec<_>>>()?
+                }
+                Plan::Range { from, to } => {
+                    let catalog = Catalog::open(self.pager);
+                    catalog
+                        .range_cursor(meta.root_page, from, to)?
+                        .skip(stmt.offset)
+                        .take(take)
+                        .collect::<DbResult<Vec<_>>>()?
+                }
+                Plan::ByPks(pks) => {
+                    // Bounded by the index lookup that produced `pks`,
+                    // so materialization here is O(|pks|), not O(table).
+                    let mut catalog = Catalog::open(self.pager);
+                    let mut rows = Vec::with_capacity(pks.len());
+                    for pk in pks {
+                        if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
+                            rows.push(KeyValue {
+                                key: pk,
+                                value: bytes,
+                            });
+                        }
+                    }
+                    rows.sort_by_key(|kv| kv.key);
                     window_rows(rows, stmt.offset, stmt.limit)
                 }
             }
