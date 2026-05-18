@@ -4,7 +4,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-6-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-39%2F39-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-40%2F40-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -26,10 +26,10 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Constraints declarativas (NOT NULL/UNIQUE/DEFAULT) | 🟢 | Inline en `CREATE TABLE`; `CREATE UNIQUE INDEX`; pre-check sin efectos colaterales. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
 | `FOREIGN KEY` declarativas + enforced | 🟢 | Single-column, target = PK del parent, `ON DELETE RESTRICT/CASCADE`, self-ref OK, cycle protection en cascade. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
 | Índices secundarios (equality) | 🟢 | Una columna, backfill, mantenimiento INSERT/UPDATE/DELETE. | [src/index.rs](../src/index.rs) |
-| Índices compuestos | 🔴 | En el [Camino A](COMMERCIAL_ROADMAP.md). | — |
+| Índices compuestos | 🔴 | Agrupado con range scan en índice 2º bajo el mismo bump VERSION 6 → 7. | — |
 | `WHERE col_indexada = val` (no PK) | 🟢 | Plan dispatch: PK vs índice vs error. | [src/sql.rs](../src/sql.rs) |
 | `WHERE BETWEEN` (rango por PK) | 🟢 | Solo en SELECT. | [src/sql.rs](../src/sql.rs) |
-| Range scan por índice secundario | 🔴 | En [Camino A](COMMERCIAL_ROADMAP.md). | — |
+| Range scan por índice secundario | 🔴 | El índice 2º actual es hash-based (FNV-1a-64) → range no es viable nativamente. Se entrega junto con índices compuestos en el bump VERSION 6 → 7 (índice 2º reestructurado a B+Tree ordenado). | — |
 | `ORDER BY` | 🟢 | Cualquier columna, `ASC`/`DESC`, NULLs first. Sort en memoria post-scan. | [src/sql.rs](../src/sql.rs) |
 | GROUP BY / JOIN | 🔴 | En [Camino A/B/C](COMMERCIAL_ROADMAP.md) según madurez. | — |
 | Subqueries / CTE / window functions | 🔴 | Camino C. | — |
@@ -41,6 +41,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Transacciones | 🟡 | Implícita por `exec`; sin savepoints, sin isolation levels explícitos. | [src/storage.rs](../src/storage.rs) |
 | MVCC | 🔴 | Camino C. | — |
 | Concurrencia | 🟡 | Mutex global de proceso para escrituras. | [src/server.rs](../src/server.rs) |
+| Lock cross-process sobre `.db` | 🟢 | `File::try_lock()` advisory exclusivo en `Pager::create/open`; falla rápido con error claro si otro proceso tiene la DB. Ver [ADR-0013](adr/0013-process-level-file-lock.md). | [src/storage.rs](../src/storage.rs) |
 | `gabysql-server` HTTP/JSON | 🟢 | Token, multi-DB, `/health`, `/dbs`, `/tables`, `/schema`, `/rows`, `/exec`. | [src/server.rs](../src/server.rs) |
 | Cap de conexiones simultáneas | 🟢 | Default 64, configurable con `-max-connections`. | [src/server.rs](../src/server.rs) |
 | TLS nativo en server | 🔴 | Reverse proxy en Camino A; nativo en Camino B. | — |

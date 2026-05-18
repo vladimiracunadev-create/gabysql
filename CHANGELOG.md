@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-05-18 — Decimonovena intervención: lock exclusivo cross-process sobre el `.db` (Fase 2 — concurrencia)
+
+> **Sin bump de formato. Sin deps añadidas.** Cierra el gap de corrupción silenciosa cuando dos procesos abren la misma DB. Justificación completa: [ADR-0013](docs/adr/0013-process-level-file-lock.md).
+
+### ✨ Cambio
+- Nuevo helper privado `acquire_db_lock(&File, &Path)` en [src/storage.rs](src/storage.rs) que llama `File::try_lock()` (advisory exclusivo, **estable desde Rust 1.89.0**).
+- Aplicado en `Pager::create` / `Pager::create_force` / `Pager::open`: el lock se adquiere tras abrir el handle y antes de cualquier escritura o replay del WAL.
+- `Pager::close` libera el lock explícitamente con `file.unlock()` (drop del `File` también lo libera como red de seguridad).
+- Si otro proceso (o incluso otro `Pager` en el mismo proceso) ya tiene la DB tomada, la segunda apertura **falla rápido** con:
+  ```
+  database is locked by another process: <path>.
+  Close the other gabysql process or wait for it to release the lock.
+  ```
+  No hay espera bloqueante, no hay cuelgue.
+- Test nuevo `cross_process_lock_rejects_second_open` que valida: primer `Pager::create` toma el lock → `Pager::open` segundo falla con mensaje claro → `close` del primero libera → `Pager::open` tercero funciona.
+
+### 🎯 Por qué este cambio
+La WAL+CRC de `gabysql` asume **un único escritor por archivo**. Sin lock cross-process, dos `gabysql` apuntando al mismo `.db` (server + CLI accidental, server reiniciado con proceso huérfano vivo, etc.) escribían páginas en paralelo y corrompían el archivo. El motor detectaba la corrupción **después** vía CRC, pero el daño ya estaba hecho.
+
+Ahora la corrupción por doble apertura es **imposible**: el segundo proceso no llega a tocar el archivo.
+
+### 🛡️ Restricciones respetadas
+- **Cero deps** (ADR-0001 intacto). Uso exclusivo de `std::fs::File::try_lock` / `unlock`.
+- **Cero bump de formato** (VERSION = 6 sigue válido).
+- **Cross-platform**: Windows (`LockFileEx` bajo el capó), Linux (`flock(2)` advisory), macOS (`flock(2)`). Los tres validados en CI.
+- **No-bloqueante**: `try_lock` falla inmediatamente; el caller decide qué hacer.
+
+### 📐 ADR
+- [ADR-0013 — Lock exclusivo a nivel de proceso sobre el archivo `.db`](docs/adr/0013-process-level-file-lock.md).
+
+### 📝 Notas de roadmap
+- Re-evaluado el ítem **"checkpoint/compaction del WAL"** de Fase 2: el WAL actual es per-transaction y se trunca/borra en cada commit (no acumula a través de commits), así que el concepto clásico de checkpoint no aplica sin un cambio previo a WAL persistente. Diferido hasta que aparezca demanda concreta.
+- Re-evaluado el ítem **"range scan por índice secundario"**: el índice 2º actual es hash-based (FNV-1a-64, ADR-0005) y no admite range nativo. Agrupado con índices compuestos bajo un futuro bump VERSION 6 → 7 que reestructurará el índice a B+Tree ordenado.
+
+---
+
 ## 2026-05-08 — Decimoctava intervención: audit log enriquecido en el gateway (Fase 5 — AI-native, cierre del trío)
 
 > **Sin bump de formato. Sin cambios al motor.** Tercera y última pieza del trío AI-native sobre el gateway. Justificación completa: [ADR-0012](docs/adr/0012-audit-log-enriquecido.md).

@@ -47,11 +47,10 @@
 - ~~`ORDER BY <col> [ASC|DESC]`~~ ✅ entregado
 - ~~`LeafCursor` lazy para `SELECT … LIMIT N` (O(N+offset) en vez de O(table))~~ ✅ entregado (ADR-0008)
 - ~~`PageCache` LRU acotado (memoria del server bounded)~~ ✅ entregado (ADR-0009)
-- índices compuestos
-- range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)
-- `ORDER BY`
-- checkpoint/compaction del WAL
-- locking simple entre procesos
+- índices compuestos *(requiere bump VERSION 6 → 7)*
+- range scan por índice secundario (`WHERE indexed_col BETWEEN ...`) *(agrupado con índices compuestos: el índice 2º actual es hash-based FNV-1a-64, no admite range nativo; se reestructura a B+Tree ordenado en el mismo bump VERSION 7)*
+- checkpoint/compaction del WAL *(re-evaluado: el WAL actual es per-transaction y se trunca/borra en cada commit, así que "checkpoint" en el sentido clásico requiere primero un cambio a WAL persistente. Diferido hasta que aparezca demanda real.)*
+- ~~locking simple entre procesos~~ ✅ entregado (ADR-0013, `File::try_lock` advisory exclusivo en `Pager::create/open`)
 - backup / restore verificado
 - logs estructurados y primeras métricas del server
 

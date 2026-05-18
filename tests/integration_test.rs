@@ -1620,6 +1620,40 @@ fn cursor_limit_returns_only_requested_rows() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn cross_process_lock_rejects_second_open() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("xproc-lock");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    // First Pager creates and holds the exclusive lock on the .db.
+    let mut first = Pager::create(&db)?;
+
+    // While `first` is alive, a second open on the same path must
+    // fail with a clear "database is locked" error — never a silent
+    // success that would let two writers race over the same file.
+    let second = Pager::open(&db);
+    assert!(second.is_err(), "second open should be rejected");
+    let err = second.err().unwrap().to_string();
+    assert!(
+        err.contains("locked"),
+        "error should mention the lock, got: {}",
+        err
+    );
+
+    // Releasing the first lock makes the same path openable again,
+    // proving the lock is held on the handle (not the path) and is
+    // released on close.
+    first.close()?;
+    drop(first);
+
+    let mut third = Pager::open(&db)?;
+    third.close()?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

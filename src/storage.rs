@@ -1,8 +1,34 @@
 use crate::{DbError, DbResult};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// Acquire an exclusive advisory lock on the open `.db` file so no other
+/// process (and no other `Pager` instance in the same process) can open
+/// the same DB concurrently. Without this, two processes could write
+/// dirty pages simultaneously and corrupt the file — the WAL design
+/// assumes a single writer.
+///
+/// The lock is held for the lifetime of the `File` handle owned by the
+/// `Pager` and released on `Pager::close` (or on `File` drop). We use
+/// `try_lock` (non-blocking) so callers fail fast with a clear error
+/// instead of hanging on a busy DB.
+fn acquire_db_lock(file: &File, path: &Path) -> DbResult<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(DbError::new(format!(
+            "database is locked by another process: {}. \
+             Close the other gabysql process or wait for it to release the lock.",
+            path.display()
+        ))),
+        Err(TryLockError::Error(err)) => Err(DbError::new(format!(
+            "failed to acquire DB lock on {}: {}",
+            path.display(),
+            err
+        ))),
+    }
+}
 
 pub const PAGE_SIZE_DEFAULT: usize = 4096;
 
@@ -281,6 +307,7 @@ impl Pager {
             .write(true)
             .truncate(true)
             .open(&path)?;
+        acquire_db_lock(&file, &path)?;
 
         let header = Header::new();
         let mut page0 = vec![0; PAGE_SIZE_DEFAULT];
@@ -302,6 +329,7 @@ impl Pager {
     pub fn open(path: impl AsRef<Path>) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        acquire_db_lock(&file, &path)?;
         let mut page0 = vec![0; PAGE_SIZE_DEFAULT];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut page0)?;
@@ -343,6 +371,11 @@ impl Pager {
             self.rollback()?;
         }
         self.file.sync_all()?;
+        // Release the advisory lock explicitly. Drop also releases it,
+        // but doing it here makes the handoff to another process
+        // immediate and deterministic on platforms where Drop ordering
+        // is non-obvious.
+        let _ = self.file.unlock();
         Ok(())
     }
 

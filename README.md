@@ -35,7 +35,7 @@
 > **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT … [WHERE …] [ORDER BY <col> [ASC|DESC]] [LIMIT n] [OFFSET n]`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página, crash tests dirigidos  
 > **Formato en disco**: `VERSION = 6` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
-> **Portabilidad**: Windows, Linux y macOS por CI · 37/37 tests de integración verdes  
+> **Portabilidad**: Windows, Linux y macOS por CI · 40/40 tests de integración verdes  
 > **Runtime opcional**: Docker + `docker compose`
 
 ## 🎯 Qué resuelve hoy este repositorio
@@ -73,6 +73,7 @@
 - Catálogo persistente de tablas con hashing FNV-1a-64 (estable entre versiones de Rust).
 - Índice por PK como **B+Tree real** con nodos internos: lookup descendente en O(log N).
 - `Pager::create` rehúsa sobrescribir un archivo existente (use `gabysql init --force` para reset intencional).
+- **Lock exclusivo cross-process** sobre el `.db` vía `File::try_lock()` (advisory en Linux/macOS, mandatory en Windows). Dos `gabysql` apuntando al mismo archivo: el segundo falla rápido con mensaje claro, sin corrupción posible. Ver [ADR-0013](docs/adr/0013-process-level-file-lock.md).
 - **`PageCache` LRU acotado** (default 1024 páginas ≈ 4 MB por DB; `Pager::set_cache_capacity` runtime). Memoria del server bounded incluso con docenas de DBs activas. Las páginas dirty nunca se evictan — correctness > strict cap. Ver [ADR-0009](docs/adr/0009-page-cache-lru-bounded.md).
 - **`LeafCursor` lazy** para `SELECT … LIMIT N`: O(N + offset) páginas leídas, no O(filas_totales). Ver [ADR-0008](docs/adr/0008-leaf-cursor-iterator.md).
 
@@ -230,7 +231,7 @@ El repositorio ya fue validado con:
 - Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).
 - La PK debe ser una sola columna `INT`. `ALTER TABLE ADD COLUMN` no admite agregar PK.
 - `JSON` no es indexable (sin semántica de igualdad canónica).
-- No hay MVCC ni locking fuerte entre procesos.
+- No hay MVCC. Existe lock advisory cross-process sobre el `.db` (ADR-0013), pero sin MVCC un solo escritor a la vez por archivo.
 - El servidor cap por defecto a 64 conexiones simultáneas (`-max-connections N` para ajustar).
 
 ## 🧠 Dirección técnica
