@@ -6,9 +6,28 @@
 
 ---
 
-## 🔥 Prioridad alta — prerequisitos para que el motor sirva al proyecto comparativo
+## 🧭 Sobre el contexto operativo (leer antes de las prioridades)
 
-> El proyecto comparativo (separado, que va a usar `gabysql` al lado de SQLite/DuckDB/etc.) requiere que el motor sea más robusto que hoy. Estas tareas son **prerequisito** para que la comparación no sea vergonzosa.
+Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversación, recordármelas.
+
+1. **`gabysql` es uno de varios proyectos en desarrollo paralelo del autor.** No es la única cosa que compite por tiempo. Las prioridades de este documento aplican **cuando se trabaja en `gabysql`**, no son un mandato calendárico. No hay "deberías estar haciendo X esta semana"; hay "cuando agarres el proyecto, lo siguiente es X".
+
+2. **Las prioridades acá son recomendaciones técnicas, no estratégicas absolutas.** Vienen del análisis del estado del motor + del plan declarado de usarlo en un proyecto comparativo. Pero:
+   - El mercado/tecnología/uso de DBs cambia de formas que nadie predice. Un proyecto puede tomar tracción por un tweet, por un caso de uso no anticipado, por estar listo cuando algo más se rompe.
+   - Una recomendación técnica correcta no implica que ignorar la recomendación sea error. El criterio del autor sobre cuándo arrancar el proyecto comparativo, cuándo hacer público qué, y qué priorizar de la vida en general es de él, no de la lista.
+
+3. **El orden de la lista puede invalidarse rápido**. Disparadores que justifican reordenar sin culpa:
+   - Aparece interés externo concreto (alguien probó algo, pidió algo).
+   - El proyecto comparativo se acerca o se aleja en el calendario.
+   - Una decisión técnica de otro proyecto del repositorio toca cosas que `gabysql` también necesita.
+   - Sale algo nuevo en el ecosistema (Rust stdlib, MCP spec, modelos LLM accesibles localmente) que cambia el costo de una de las fases.
+   - Aparece pereza/aburrimiento con una tarea — válido, se salta o se reordena.
+
+---
+
+## 🔥 Prioridad alta — recomendaciones técnicas para el proyecto comparativo
+
+> Vienen del análisis honesto del estado actual + del plan de usar `gabysql` al lado de SQLite/DuckDB/etc. Son las cosas que, **si las hacés cuando trabajes en este proyecto**, mueven más el dial. Si en el ínterin cambia el contexto (ver §🧭) y otra cosa pasa al frente, se reordenan sin drama.
 
 ### 1. Construir `gabybench` mínimo
 
@@ -95,9 +114,11 @@ Mantener en AGENDA_INVESTIGACION.md como north star. No mover acá hasta que las
 
 ## 🏛️ Notas de proceso
 
-- **Cómo se agrega una tarea**: si surge algo durante una intervención que no se puede cerrar en el mismo bloque, va acá antes de cerrar el commit. La idea es que este documento sea el único lugar donde "lo que falta" vive — no en TODOs comentados en el código, no en mensajes de WhatsApp, no en la cabeza.
+- **Cómo se agrega una tarea**: si surge algo durante una intervención que no se puede cerrar en el mismo bloque, va acá antes de cerrar el commit. La idea es que este documento sea el único lugar donde "lo que falta" vive — no en TODOs comentados en el código, no en mensajes sueltos, no en la cabeza.
 - **Cómo se cierra una tarea**: cuando la entrega vive en `main`, se mueve a CHANGELOG.md con la entrada formal de la intervención y se borra de acá.
-- **Cómo se reordenan prioridades**: cualquier momento. La prioridad alta de hoy puede ser media mañana si el contexto cambia (ej: si el proyecto comparativo se pospone, gabybench baja de prioridad real aunque siga siendo lo más útil técnicamente).
+- **Cómo se reordenan prioridades**: cualquier momento, sin justificar. La prioridad alta de hoy puede ser media mañana si el contexto cambia. Los disparadores típicos están en §🧭.
+- **Cómo se vetan recomendaciones**: si una tarea acá deja de tener sentido (ej: "ya no voy a hacer el proyecto comparativo, gabybench pierde el motivo principal"), se mueve a una sección "💤 archivadas" con una línea de por qué. No se borra silencioso — el por-qué del veto es información útil después.
+- **Cuándo el asistente debe callarse**: cuando el aporte de seguir empujando una recomendación es marginal respecto al ruido. Si una conversación entra en loop sobre la misma prioridad, se anota acá como "punto de fricción no resuelto" y se pasa a otra cosa.
 
 ---
 
