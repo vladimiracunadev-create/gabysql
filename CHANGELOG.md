@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-05-18 — Vigesimosegunda intervención: prefetch one-leaf-ahead en `LeafCursor` (Fase 2 — performance directional)
+
+> **Sin bump de formato. Sin deps añadidas. Mejora direccional sin medición cuantitativa todavía.** Justificación completa: [ADR-0016](docs/adr/0016-leafcursor-prefetch.md).
+
+### ✨ Cambio
+- 4 líneas nuevas en [src/bptree.rs](src/bptree.rs::LeafCursor::load_current): después de cargar la hoja actual, si hay siguiente, se hace `page_data` sobre ella para llevarla al `PageCache` (ADR-0009). Best-effort: errores de prefetch se descartan; el error real va a surgir en la próxima iteración real del cursor.
+- Nuevo helper `Pager::cache_contains(page_no) -> bool` ([src/storage.rs](src/storage.rs)) para tests + futura tooling operacional.
+
+### 🎯 Por qué este cambio
+El `LeafCursor` (ADR-0008) ya hace lo correcto algorítmicamente, pero presenta al kernel y al `PageCache` un patrón de I/O **stop-and-go**: lee hoja N, deja que el caller procese 100 filas (pausa larga), entonces lee hoja N+1. Esto:
+1. **Confunde el readahead del kernel**, que necesita lecturas back-to-back para detectar streaming.
+2. **Garantiza un cache miss en cada leaf transition** — la primera lectura post-transición siempre paga el costo de syscall + CRC verify.
+
+Prefetcheando la próxima hoja al final de la carga de la actual, el syscall ocurre antes y para cuando el caller la pide, ya está en cache.
+
+### 🛡️ Honestidad sobre la mejora
+- **No hay número absoluto todavía.** `gabybench` (la suite reproducible especificada en `docs/GABYBENCH_SPEC.md`) no existe aún. Cuando exista, esto se mide.
+- **Sobrelectura potencial de 1 hoja en queries cortas** (`LIMIT N` que cabe en la primera hoja).
+- El ADR vende esto como **directional**, no como "scan 2x más rápido".
+
+### 📐 ADR
+- [ADR-0016 — Prefetch one-leaf-ahead en `LeafCursor`](docs/adr/0016-leafcursor-prefetch.md).
+
+---
+
 ## 2026-05-18 — Vigesimoprimera intervención: backup/restore/verify con validación end-to-end (Fase 2 — operación)
 
 > **Sin bump de formato. Sin deps añadidas.** Cierra el gap operacional "no hay forma confiable de respaldar". Justificación completa: [ADR-0015](docs/adr/0015-verified-backup-restore.md).

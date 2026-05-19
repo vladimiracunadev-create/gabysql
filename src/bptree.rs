@@ -433,6 +433,17 @@ impl<'a> LeafCursor<'a> {
         self.buf = leaf.kvs;
         self.pos = 0;
         self.next_leaf = leaf.next;
+
+        // Prefetch one leaf ahead. Synchronous read into the PageCache
+        // (ADR-0009) so the next `load_current` becomes a cache hit and
+        // skips a disk syscall. We also surface the streaming pattern
+        // to the kernel's readahead heuristic earlier — most modern
+        // filesystems will then keep the pipeline warm. Best-effort:
+        // a CRC failure here is swallowed because the real read happens
+        // on the next iteration and will surface the same error then.
+        if self.next_leaf != 0 {
+            let _ = self.pager.page_data(self.next_leaf);
+        }
         Ok(())
     }
 }

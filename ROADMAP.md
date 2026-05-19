@@ -37,7 +37,7 @@
 - ~~comando `INTEGRITY CHECK` que recorra y valide CRCs y la estructura del B+Tree~~ ✅ entregado
 - ~~política más clara de compatibilidad del formato en disco (changelog explícito por bump de VERSION)~~ ✅ entregado (1 bloque = 1 push a `main`, CHANGELOG entry por intervención)
 - ~~crash tests dirigidos (kill -9 entre WAL y file flush)~~ ✅ entregado (3 escenarios sintéticos en `tests/integration_test.rs`)
-- mejoras de full scan para tablas medianas — pendiente
+- ~~mejoras de full scan para tablas medianas~~ ✅ entregado (ADR-0016, prefetch one-leaf-ahead en `LeafCursor`; medición cuantitativa pendiente hasta `gabybench`)
 
 ### Fase 2 — Storage y consulta
 - ~~índices secundarios (una columna, equality)~~ ✅ entregado

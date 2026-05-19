@@ -507,6 +507,13 @@ impl Pager {
         self.cache.len()
     }
 
+    /// Whether a specific page is currently resident in the cache.
+    /// Used by tests that need to observe prefetch / read-ahead
+    /// behavior (ADR-0016) and by future operational tooling.
+    pub fn cache_contains(&self, page_no: u32) -> bool {
+        self.cache.contains_key(page_no)
+    }
+
     /// Maximum number of cached pages. Hit by `cache_len()` and
     /// then eviction starts (clean-page LRU first).
     pub fn cache_capacity(&self) -> usize {
