@@ -92,19 +92,33 @@ pub fn decode_bucket(data: &[u8]) -> DbResult<Vec<(Vec<u8>, i64)>> {
         return Ok(Vec::new());
     }
     if data.len() < 2 {
-        return Err(DbError::new("bucket de índice corrupto"));
+        return Err(DbError::new(format!(
+            "bucket de índice (Hash) corrupto: necesito 2 bytes para el count, hay {}",
+            data.len()
+        )));
     }
     let count = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
     let mut pos = 2usize;
     let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         if pos + 2 > data.len() {
-            return Err(DbError::new("bucket de índice corrupto (vlen)"));
+            return Err(DbError::new(format!(
+                "bucket de índice (Hash) corrupto: faltan 2 bytes para el vlen \
+                 de la entrada {} de {} en offset {}",
+                i, count, pos
+            )));
         }
         let vlen = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
         if pos + vlen + 8 > data.len() {
-            return Err(DbError::new("bucket de índice corrupto (value+pk)"));
+            return Err(DbError::new(format!(
+                "bucket de índice (Hash) corrupto: entrada {} declara vlen={} \
+                 + pk(8) bytes en offset {}, solo quedan {}",
+                i,
+                vlen,
+                pos,
+                data.len() - pos
+            )));
         }
         let value = data[pos..pos + vlen].to_vec();
         pos += vlen;
@@ -117,15 +131,23 @@ pub fn decode_bucket(data: &[u8]) -> DbResult<Vec<(Vec<u8>, i64)>> {
 
 pub fn encode_bucket(entries: &[(Vec<u8>, i64)]) -> DbResult<Vec<u8>> {
     if entries.len() > u16::MAX as usize {
-        return Err(DbError::new(
-            "bucket de índice excede u16::MAX entradas (colisión patológica)",
-        ));
+        return Err(DbError::new(format!(
+            "bucket de índice (Hash) excede u16::MAX entradas: tiene {} (límite {}). \
+             Esto indica una colisión patológica de FNV-1a-64; reporte el caso.",
+            entries.len(),
+            u16::MAX
+        )));
     }
     let mut out = Vec::new();
     out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     for (value, pk) in entries {
         if value.len() > u16::MAX as usize {
-            return Err(DbError::new("valor indexado excede u16::MAX bytes"));
+            return Err(DbError::new(format!(
+                "valor indexado excede u16::MAX bytes: tiene {} bytes (límite {}, pk={})",
+                value.len(),
+                u16::MAX,
+                pk
+            )));
         }
         out.extend_from_slice(&(value.len() as u16).to_le_bytes());
         out.extend_from_slice(value);
@@ -198,9 +220,12 @@ pub fn ordered_int_key_from_value_bytes(value_bytes: &[u8]) -> DbResult<Option<i
         return Ok(None);
     }
     if value_bytes.len() != 9 || value_bytes[0] != 1 {
-        return Err(DbError::new(
-            "value_bytes inválidos para columna INT ordenada",
-        ));
+        return Err(DbError::new(format!(
+            "value_bytes inválidos para índice OrderedInt: tiene {} bytes, esperaba 9 \
+             (tag 0x01 + i64 LE); tag={:#04x}",
+            value_bytes.len(),
+            value_bytes.first().copied().unwrap_or(0)
+        )));
     }
     Ok(Some(i64::from_le_bytes(
         value_bytes[1..9].try_into().unwrap(),
@@ -213,15 +238,20 @@ pub fn decode_ordered_bucket(data: &[u8]) -> DbResult<Vec<i64>> {
         return Ok(Vec::new());
     }
     if data.len() < 2 {
-        return Err(DbError::new("bucket ordenado corrupto (header)"));
+        return Err(DbError::new(format!(
+            "bucket de índice (OrderedInt) corrupto: necesito 2 bytes para el count, hay {}",
+            data.len()
+        )));
     }
     let count = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
     let expected = 2 + count * 8;
     if data.len() != expected {
         return Err(DbError::new(format!(
-            "bucket ordenado corrupto (len={}, expected={})",
-            data.len(),
-            expected
+            "bucket de índice (OrderedInt) corrupto: count={} implica {} bytes, \
+             el bucket tiene {}",
+            count,
+            expected,
+            data.len()
         )));
     }
     let mut out = Vec::with_capacity(count);
@@ -237,9 +267,12 @@ pub fn decode_ordered_bucket(data: &[u8]) -> DbResult<Vec<i64>> {
 /// but check anyway so a bug never silently corrupts the page.
 pub fn encode_ordered_bucket(pks: &[i64]) -> DbResult<Vec<u8>> {
     if pks.len() > u16::MAX as usize {
-        return Err(DbError::new(
-            "bucket ordenado excede u16::MAX entradas para una misma clave",
-        ));
+        return Err(DbError::new(format!(
+            "bucket de índice (OrderedInt) excede u16::MAX entradas: {} PKs \
+             para una misma clave (límite {})",
+            pks.len(),
+            u16::MAX
+        )));
     }
     let mut out = Vec::with_capacity(2 + pks.len() * 8);
     out.extend_from_slice(&(pks.len() as u16).to_le_bytes());

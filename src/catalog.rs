@@ -61,7 +61,10 @@ impl ColumnType {
             5 => Ok(Self::Date),
             6 => Ok(Self::DateTime),
             7 => Ok(Self::Json),
-            _ => Err(DbError::new("tipo de columna inválido")),
+            other => Err(DbError::new(format!(
+                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON)",
+                other
+            ))),
         }
     }
 
@@ -107,7 +110,12 @@ impl DefaultLiteral {
 
     fn decode(data: &[u8], offset: &mut usize) -> DbResult<Self> {
         if *offset >= data.len() {
-            return Err(DbError::new("default corrupto (kind)"));
+            return Err(DbError::new(format!(
+                "DEFAULT corrupto: buffer agotado en offset {} (len={}), \
+                 falta el byte de kind",
+                *offset,
+                data.len()
+            )));
         }
         let kind = data[*offset];
         *offset += 1;
@@ -115,7 +123,12 @@ impl DefaultLiteral {
             0 => Self::Null,
             1 => {
                 if *offset + 8 > data.len() {
-                    return Err(DbError::new("default corrupto (int)"));
+                    return Err(DbError::new(format!(
+                        "DEFAULT INT corrupto: necesito 8 bytes en offset {}, \
+                         solo quedan {} bytes",
+                        *offset,
+                        data.len() - *offset
+                    )));
                 }
                 let n = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
                 *offset += 8;
@@ -123,7 +136,12 @@ impl DefaultLiteral {
             }
             2 => {
                 if *offset + 8 > data.len() {
-                    return Err(DbError::new("default corrupto (float)"));
+                    return Err(DbError::new(format!(
+                        "DEFAULT FLOAT corrupto: necesito 8 bytes en offset {}, \
+                         solo quedan {} bytes",
+                        *offset,
+                        data.len() - *offset
+                    )));
                 }
                 let n = f64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
                 *offset += 8;
@@ -131,14 +149,25 @@ impl DefaultLiteral {
             }
             3 => {
                 if *offset >= data.len() {
-                    return Err(DbError::new("default corrupto (bool)"));
+                    return Err(DbError::new(format!(
+                        "DEFAULT BOOL corrupto: necesito 1 byte en offset {} (len={})",
+                        *offset,
+                        data.len()
+                    )));
                 }
                 let b = data[*offset] != 0;
                 *offset += 1;
                 Self::Bool(b)
             }
             4 => Self::String(take_string(data, offset)?),
-            _ => return Err(DbError::new("default corrupto (kind desconocido)")),
+            other => {
+                return Err(DbError::new(format!(
+                    "DEFAULT corrupto: kind={} desconocido en offset {} \
+                     (esperaba 0=Null, 1=Int, 2=Float, 3=Bool, 4=String)",
+                    other,
+                    *offset - 1
+                )))
+            }
         })
     }
 }
@@ -174,7 +203,10 @@ impl OnDelete {
         match code {
             0 => Ok(Self::Restrict),
             1 => Ok(Self::Cascade),
-            _ => Err(DbError::new("FK on_delete inválido")),
+            other => Err(DbError::new(format!(
+                "FOREIGN KEY on_delete code desconocido en disco: {} (esperaba 0=RESTRICT o 1=CASCADE)",
+                other
+            ))),
         }
     }
 
@@ -247,7 +279,10 @@ impl IndexKind {
         match code {
             0 => Ok(IndexKind::Hash),
             1 => Ok(IndexKind::OrderedInt),
-            other => Err(DbError::new(format!("unknown index kind code: {}", other))),
+            other => Err(DbError::new(format!(
+                "IndexKind code desconocido en disco: {} (esperaba 0=Hash o 1=OrderedInt)",
+                other
+            ))),
         }
     }
 
@@ -359,17 +394,26 @@ impl TableMeta {
         let name = take_string(data, &mut offset)?;
         let primary_key = take_string(data, &mut offset)?;
         if offset + 6 > data.len() {
-            return Err(DbError::new("meta de tabla corrupta"));
+            return Err(DbError::new(format!(
+                "TableMeta corrupta para tabla '{}': necesito 6 bytes en offset {} \
+                 (root_page+col_count), solo quedan {}",
+                name,
+                offset,
+                data.len() - offset
+            )));
         }
         let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         offset += 4;
         let count = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
         let mut columns = Vec::with_capacity(count);
-        for _ in 0..count {
-            let name = take_string(data, &mut offset)?;
+        for i in 0..count {
+            let col_name = take_string(data, &mut offset)?;
             if offset + 2 > data.len() {
-                return Err(DbError::new("meta de tabla corrupta (column header)"));
+                return Err(DbError::new(format!(
+                    "TableMeta '{}' corrupta: faltan bytes para el header de la columna {} ('{}') en offset {}",
+                    name, i, col_name, offset
+                )));
             }
             let column_type = ColumnType::from_code(data[offset])?;
             offset += 1;
@@ -385,7 +429,10 @@ impl TableMeta {
                 let target_table = take_string(data, &mut offset)?;
                 let target_column = take_string(data, &mut offset)?;
                 if offset >= data.len() {
-                    return Err(DbError::new("meta de FK corrupta (on_delete)"));
+                    return Err(DbError::new(format!(
+                        "FOREIGN KEY corrupta en '{}.{}': faltan bytes para on_delete en offset {}",
+                        name, col_name, offset
+                    )));
                 }
                 let on_delete = OnDelete::from_code(data[offset])?;
                 offset += 1;
@@ -398,7 +445,7 @@ impl TableMeta {
                 None
             };
             columns.push(Column {
-                name,
+                name: col_name,
                 column_type,
                 not_null,
                 default,
@@ -406,16 +453,25 @@ impl TableMeta {
             });
         }
         if offset + 2 > data.len() {
-            return Err(DbError::new("meta de tabla corrupta (index count)"));
+            return Err(DbError::new(format!(
+                "TableMeta '{}' corrupta: faltan 2 bytes para idx_count en offset {} (len={})",
+                name,
+                offset,
+                data.len()
+            )));
         }
         let idx_count = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
         let mut indexes = Vec::with_capacity(idx_count);
-        for _ in 0..idx_count {
-            let name = take_string(data, &mut offset)?;
+        for i in 0..idx_count {
+            let idx_name = take_string(data, &mut offset)?;
             let column = take_string(data, &mut offset)?;
             if offset + 6 > data.len() {
-                return Err(DbError::new("meta de índice corrupta"));
+                return Err(DbError::new(format!(
+                    "IndexMeta corrupta en tabla '{}' (índice {} '{}'): faltan 6 bytes \
+                     (root_page+unique+kind) en offset {}",
+                    name, i, idx_name, offset
+                )));
             }
             let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
@@ -424,7 +480,7 @@ impl TableMeta {
             let kind = IndexKind::from_code(data[offset])?;
             offset += 1;
             indexes.push(IndexMeta {
-                name,
+                name: idx_name,
                 column,
                 root_page,
                 unique,
@@ -474,7 +530,13 @@ impl<'a> Catalog<'a> {
             if meta.name.eq_ignore_ascii_case(name) {
                 return Ok(Some(meta));
             }
-            return Err(DbError::new("colisión de hash en catálogo"));
+            return Err(DbError::new(format!(
+                "colisión de hash FNV-1a-64 en el catálogo: \
+                 se buscó '{}' pero el bucket contiene '{}'. Reporte este caso \
+                 como bug: los nombres tienen el mismo hash y el motor no \
+                 implementa todavía resolución por igualdad de nombre.",
+                name, meta.name
+            )));
         }
         Ok(None)
     }
@@ -581,7 +643,10 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
         ));
     }
     if meta.columns.is_empty() {
-        return Err(DbError::new("se requieren columnas"));
+        return Err(DbError::new(format!(
+            "CREATE TABLE '{}' rechazado: debe declarar al menos una columna",
+            meta.name
+        )));
     }
 
     let mut seen = HashSet::new();
@@ -590,7 +655,10 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
         validate_identifier(&column.name, "columna")?;
         let normalized = column.name.to_ascii_lowercase();
         if !seen.insert(normalized) {
-            return Err(DbError::new("nombre de columna duplicado"));
+            return Err(DbError::new(format!(
+                "CREATE TABLE '{}' rechazado: nombre de columna duplicado '{}'",
+                meta.name, column.name
+            )));
         }
         if column.name.eq_ignore_ascii_case(&meta.primary_key) {
             if column.column_type != ColumnType::Int {
@@ -782,7 +850,11 @@ fn hash_name(name: &str) -> i64 {
 fn push_string(out: &mut Vec<u8>, value: &str) -> DbResult<()> {
     let bytes = value.as_bytes();
     if bytes.len() > u16::MAX as usize {
-        return Err(DbError::new("string demasiado largo"));
+        return Err(DbError::new(format!(
+            "string demasiado largo para serializar: {} bytes, máximo soportado es {} (u16::MAX)",
+            bytes.len(),
+            u16::MAX
+        )));
     }
     out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
     out.extend_from_slice(bytes);
@@ -791,12 +863,23 @@ fn push_string(out: &mut Vec<u8>, value: &str) -> DbResult<()> {
 
 fn take_string(data: &[u8], offset: &mut usize) -> DbResult<String> {
     if *offset + 2 > data.len() {
-        return Err(DbError::new("string corrupto"));
+        return Err(DbError::new(format!(
+            "string serializado corrupto: necesito 2 bytes para el header de longitud \
+             en offset {}, solo quedan {} bytes",
+            *offset,
+            data.len().saturating_sub(*offset)
+        )));
     }
     let len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize;
     *offset += 2;
     if *offset + len > data.len() {
-        return Err(DbError::new("string corrupto"));
+        return Err(DbError::new(format!(
+            "string serializado corrupto en offset {}: header declara {} bytes \
+             pero solo quedan {} bytes en el buffer",
+            *offset - 2,
+            len,
+            data.len() - *offset
+        )));
     }
     let value = String::from_utf8(data[*offset..*offset + len].to_vec())?;
     *offset += len;

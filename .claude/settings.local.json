@@ -43,7 +43,10 @@
       "Bash(git commit -m 'docs: full sweep — DATABASE statements, gabymodeler, SQL surface *)",
       "PowerShell(cargo --version)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(grep -E '\"[a-záéíóúñ ]{1,30}\"')",
+      "Bash(grep -n 'DbError::new\\(\"[a-záéíóúñA-Z][^\"]\\\\{1,40\\\\}\"\\)' src/sql.rs)"
     ]
   }
 }

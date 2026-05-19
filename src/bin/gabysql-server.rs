@@ -26,14 +26,21 @@ fn real_main() -> DbResult<()> {
             "-addr" => addr = args.next().unwrap_or_else(|| ":8080".to_string()),
             "-token" => token = args.next(),
             "-max-connections" => {
-                let raw = args
-                    .next()
-                    .ok_or_else(|| gabysql::DbError::new("-max-connections requires a value"))?;
+                let raw = args.next().ok_or_else(|| {
+                    gabysql::DbError::new(
+                        "-max-connections requiere un valor (ej: -max-connections 32)",
+                    )
+                })?;
                 max_connections = raw.parse::<usize>().map_err(|err| {
-                    gabysql::DbError::new(format!("invalid -max-connections: {}", err))
+                    gabysql::DbError::new(format!(
+                        "-max-connections inválido: no es un entero ({}); recibí '{}'",
+                        err, raw
+                    ))
                 })?;
                 if max_connections == 0 {
-                    return Err(gabysql::DbError::new("-max-connections must be > 0"));
+                    return Err(gabysql::DbError::new(
+                        "-max-connections debe ser > 0; recibí 0",
+                    ));
                 }
             }
             "-log-json" => log_json = true,

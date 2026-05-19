@@ -185,7 +185,9 @@ impl<'a> Tree<'a> {
 
     fn put(&mut self, root: u32, key: i64, value: Vec<u8>, allow_replace: bool) -> DbResult<u32> {
         if root == 0 {
-            return Err(DbError::new("root page is 0"));
+            return Err(DbError::new(
+                "página raíz del B+Tree es 0: el catálogo no registró un root válido para esta tabla/índice",
+            ));
         }
         if let Some((split_key, right_no)) = self.put_recursive(root, key, value, allow_replace)? {
             self.split_root(root, split_key, right_no)?;
@@ -207,7 +209,10 @@ impl<'a> Tree<'a> {
                 match leaf.kvs.binary_search_by_key(&key, |kv| kv.key) {
                     Ok(idx) => {
                         if !allow_replace {
-                            return Err(DbError::new(format!("duplicate primary key: {}", key)));
+                            return Err(DbError::new(format!(
+                                "PRIMARY KEY duplicada: la clave {} ya existe en la tabla",
+                                key
+                            )));
                         }
                         leaf.kvs[idx].value = value;
                     }
@@ -220,7 +225,11 @@ impl<'a> Tree<'a> {
                 }
                 let split = leaf.kvs.len() / 2;
                 if split == 0 {
-                    return Err(DbError::new("leaf overflow on single entry"));
+                    return Err(DbError::new(format!(
+                        "hoja B+Tree (página {}) no admite una sola entrada (key={}): \
+                         el valor excede el espacio útil de la página",
+                        page_no, key
+                    )));
                 }
                 let right_kvs = leaf.kvs.split_off(split);
                 let right_first_key = right_kvs[0].key;
@@ -268,7 +277,11 @@ impl<'a> Tree<'a> {
 
                 let mid = internal.entries.len() / 2;
                 if mid == 0 {
-                    return Err(DbError::new("internal overflow on single entry"));
+                    return Err(DbError::new(format!(
+                        "nodo interno del B+Tree (página {}) no admite una sola entrada (split_key={}): \
+                         el separador excede el espacio útil de la página",
+                        page_no, split_key
+                    )));
                 }
                 let right_entries = internal.entries.split_off(mid);
                 let (promote_key, promote_child) = right_entries[0];
@@ -285,7 +298,10 @@ impl<'a> Tree<'a> {
                 self.pager.write_page(page_no, &left_buf, true)?;
                 Ok(Some((promote_key, right_no)))
             }
-            other => Err(DbError::new(format!("unknown page type: {}", other))),
+            other => Err(DbError::new(format!(
+                "tipo de página desconocido: {:#04x} (esperaba LEAF={:#04x} o INTERNAL={:#04x})",
+                other, PAGE_TYPE_LEAF, PAGE_TYPE_INTERNAL
+            ))),
         }
     }
 
@@ -306,7 +322,9 @@ impl<'a> Tree<'a> {
 
     fn find_leaf(&mut self, root: u32, key: i64) -> DbResult<u32> {
         if root == 0 {
-            return Err(DbError::new("root page is 0"));
+            return Err(DbError::new(
+                "página raíz del B+Tree es 0: el catálogo no registró un root válido para esta tabla/índice",
+            ));
         }
         let mut current = root;
         loop {
@@ -317,7 +335,12 @@ impl<'a> Tree<'a> {
                     let internal = decode_internal(&page)?;
                     current = pick_child(&internal, key);
                 }
-                other => return Err(DbError::new(format!("unknown page type: {}", other))),
+                other => {
+                    return Err(DbError::new(format!(
+                        "tipo de página desconocido: {:#04x} (esperaba LEAF={:#04x} o INTERNAL={:#04x})",
+                        other, PAGE_TYPE_LEAF, PAGE_TYPE_INTERNAL
+                    )))
+                }
             }
         }
     }
@@ -335,7 +358,12 @@ impl<'a> Tree<'a> {
                     let internal = decode_internal(&page)?;
                     current = internal.first_child;
                 }
-                other => return Err(DbError::new(format!("unknown page type: {}", other))),
+                other => {
+                    return Err(DbError::new(format!(
+                        "tipo de página desconocido: {:#04x} (esperaba LEAF={:#04x} o INTERNAL={:#04x})",
+                        other, PAGE_TYPE_LEAF, PAGE_TYPE_INTERNAL
+                    )))
+                }
             }
         }
     }
@@ -492,7 +520,9 @@ pub fn init_leaf_page(page: &mut [u8]) {
 
 fn page_type(page: &[u8]) -> DbResult<u8> {
     if page.is_empty() {
-        return Err(DbError::new("page too small"));
+        return Err(DbError::new(
+            "página vacía: no se puede leer el byte de page_type",
+        ));
     }
     Ok(page[0])
 }
@@ -531,25 +561,46 @@ fn internal_fits(page_size: usize, entries: &[(i64, u32)]) -> bool {
 
 fn decode_leaf(page: &[u8]) -> DbResult<LeafNode> {
     if page.len() < LEAF_HEADER_SIZE {
-        return Err(DbError::new("page too small"));
+        return Err(DbError::new(format!(
+            "página de hoja corrupta: tiene {} bytes, se requieren al menos {} para el header",
+            page.len(),
+            LEAF_HEADER_SIZE
+        )));
     }
     if page[0] != PAGE_TYPE_LEAF {
-        return Err(DbError::new("not a leaf page"));
+        return Err(DbError::new(format!(
+            "página corrupta: page_type={:#04x} (esperaba LEAF={:#04x})",
+            page[0], PAGE_TYPE_LEAF
+        )));
     }
     let next = u32::from_le_bytes(page[1..5].try_into().unwrap());
     let count = u16::from_le_bytes(page[5..7].try_into().unwrap()) as usize;
     let mut pos = LEAF_HEADER_SIZE;
     let mut kvs = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         if pos + 10 > page.len() {
-            return Err(DbError::new("leaf decode overflow"));
+            return Err(DbError::new(format!(
+                "hoja corrupta: overflow decodificando entrada {} de {} en offset {} \
+                 (page_len={})",
+                i,
+                count,
+                pos,
+                page.len()
+            )));
         }
         let key = i64::from_le_bytes(page[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let len = u16::from_le_bytes(page[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
         if pos + len > page.len() {
-            return Err(DbError::new("leaf decode value overflow"));
+            return Err(DbError::new(format!(
+                "hoja corrupta: valor de la entrada {} (key={}) declara len={} \
+                 pero solo quedan {} bytes en la página",
+                i,
+                key,
+                len,
+                page.len() - pos
+            )));
         }
         kvs.push(KeyValue {
             key,
@@ -562,7 +613,12 @@ fn decode_leaf(page: &[u8]) -> DbResult<LeafNode> {
 
 fn encode_leaf(page_size: usize, leaf: &LeafNode) -> DbResult<Vec<u8>> {
     if !leaf_fits(page_size, &leaf.kvs) {
-        return Err(DbError::new("leaf too large"));
+        return Err(DbError::new(format!(
+            "hoja B+Tree no entra en una página: tiene {} entradas, page_size={}; \
+             el caller debió splittear antes de llamar a encode_leaf()",
+            leaf.kvs.len(),
+            page_size
+        )));
     }
     let mut page = vec![0; page_size];
     page[0] = PAGE_TYPE_LEAF;
@@ -582,18 +638,32 @@ fn encode_leaf(page_size: usize, leaf: &LeafNode) -> DbResult<Vec<u8>> {
 
 fn decode_internal(page: &[u8]) -> DbResult<InternalNode> {
     if page.len() < INTERNAL_HEADER_SIZE {
-        return Err(DbError::new("internal page too small"));
+        return Err(DbError::new(format!(
+            "página interna corrupta: tiene {} bytes, se requieren al menos {} para el header",
+            page.len(),
+            INTERNAL_HEADER_SIZE
+        )));
     }
     if page[0] != PAGE_TYPE_INTERNAL {
-        return Err(DbError::new("not an internal page"));
+        return Err(DbError::new(format!(
+            "página corrupta: page_type={:#04x} (esperaba INTERNAL={:#04x})",
+            page[0], PAGE_TYPE_INTERNAL
+        )));
     }
     let count = u16::from_le_bytes(page[5..7].try_into().unwrap()) as usize;
     let first_child = u32::from_le_bytes(page[7..11].try_into().unwrap());
     let mut pos = INTERNAL_HEADER_SIZE;
     let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         if pos + INTERNAL_ENTRY_SIZE > page.len() {
-            return Err(DbError::new("internal decode overflow"));
+            return Err(DbError::new(format!(
+                "página interna corrupta: overflow decodificando entrada {} de {} \
+                 en offset {} (page_len={})",
+                i,
+                count,
+                pos,
+                page.len()
+            )));
         }
         let key = i64::from_le_bytes(page[pos..pos + 8].try_into().unwrap());
         pos += 8;
@@ -609,11 +679,20 @@ fn decode_internal(page: &[u8]) -> DbResult<InternalNode> {
 
 fn encode_internal(page_size: usize, internal: &InternalNode) -> DbResult<Vec<u8>> {
     if !internal_fits(page_size, &internal.entries) {
-        return Err(DbError::new("internal too large"));
+        return Err(DbError::new(format!(
+            "nodo interno del B+Tree no entra en una página: tiene {} entradas, page_size={}; \
+             el caller debió splittear antes de llamar a encode_internal()",
+            internal.entries.len(),
+            page_size
+        )));
     }
     let max_entries = (usable_page_size(page_size) - INTERNAL_HEADER_SIZE) / INTERNAL_ENTRY_SIZE;
     if max_entries < INTERNAL_MAX_ENTRIES_FLOOR {
-        return Err(DbError::new("page size too small for internal node"));
+        return Err(DbError::new(format!(
+            "page_size demasiado chico para nodos internos: caben {} entradas, \
+             el motor requiere al menos {} (page_size={})",
+            max_entries, INTERNAL_MAX_ENTRIES_FLOOR, page_size
+        )));
     }
     let mut page = vec![0; page_size];
     page[0] = PAGE_TYPE_INTERNAL;

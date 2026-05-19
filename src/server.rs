@@ -377,10 +377,11 @@ fn dbs_json(config: &ServerConfig) -> DbResult<String> {
         ));
     }
 
-    let dir = config
-        .dir
-        .as_ref()
-        .ok_or_else(|| DbError::new("servidor sin directorio configurado"))?;
+    let dir = config.dir.as_ref().ok_or_else(|| {
+        DbError::new(
+            "el servidor está en modo single-DB (-db); esta operación requiere -dir <carpeta>",
+        )
+    })?;
     let dbs = list_dbs(dir)?;
     Ok(format!(
         "{{\"ok\":true,\"mode\":\"multi-db\",\"dbs\":{}}}",
@@ -396,10 +397,11 @@ fn create_db(
     if config.single_db.is_some() {
         return Ok(Response::text(405, "use GET"));
     }
-    let dir = config
-        .dir
-        .as_ref()
-        .ok_or_else(|| DbError::new("servidor sin directorio configurado"))?;
+    let dir = config.dir.as_ref().ok_or_else(|| {
+        DbError::new(
+            "el servidor está en modo single-DB (-db); esta operación requiere -dir <carpeta>",
+        )
+    })?;
     let body = String::from_utf8_lossy(&request.body);
     let mut name = if body.trim_start().starts_with('{') {
         extract_json_string(&body, "db").unwrap_or_default()
@@ -409,9 +411,9 @@ fn create_db(
     name = normalize_db_name(&name)?;
     let path = dir.join(&name);
 
-    let _guard = write_lock
-        .lock()
-        .map_err(|_| DbError::new("mutex poisoned"))?;
+    let _guard = write_lock.lock().map_err(|_| {
+        DbError::new("mutex envenenado: otro thread paniqueó mientras tenía el write_lock")
+    })?;
     if path.exists() {
         return Ok(Response::json(
             409,
@@ -448,7 +450,9 @@ fn schema(request: Request, config: &ServerConfig) -> DbResult<Response> {
         .get("table")
         .cloned()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| DbError::new("falta table"))?;
+        .ok_or_else(|| {
+            DbError::new("falta el parámetro 'table' en la query string (ej: ?table=users)")
+        })?;
     let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
     let mut catalog = Catalog::open(&mut pager);
     let table_meta = match catalog.get_table(&table)? {
@@ -473,7 +477,9 @@ fn rows(request: Request, config: &ServerConfig) -> DbResult<Response> {
         .get("table")
         .cloned()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| DbError::new("falta table"))?;
+        .ok_or_else(|| {
+            DbError::new("falta el parámetro 'table' en la query string (ej: ?table=users)")
+        })?;
 
     let mut limit = request
         .query
@@ -555,9 +561,9 @@ fn exec_sql(
         ));
     }
     let requested_db = extract_json_string(&body, "db");
-    let _guard = write_lock
-        .lock()
-        .map_err(|_| DbError::new("mutex poisoned"))?;
+    let _guard = write_lock.lock().map_err(|_| {
+        DbError::new("mutex envenenado: otro thread paniqueó mientras tenía el write_lock")
+    })?;
 
     // Pre-parse to detect DB-level statements that don't operate on a
     // single .db file but on the directory. They are dispatched here
@@ -640,10 +646,11 @@ fn exec_db_level(stmts: Vec<Statement>, config: &ServerConfig) -> DbResult<Respo
                 .to_string(),
         ));
     }
-    let dir = config
-        .dir
-        .as_ref()
-        .ok_or_else(|| DbError::new("servidor sin directorio configurado"))?;
+    let dir = config.dir.as_ref().ok_or_else(|| {
+        DbError::new(
+            "el servidor está en modo single-DB (-db); esta operación requiere -dir <carpeta>",
+        )
+    })?;
 
     let mut results = Vec::new();
     for stmt in stmts {
@@ -739,11 +746,18 @@ fn open_pager_from_request(
         return Ok((Pager::open(single_db)?, name));
     }
 
-    let dir = config
-        .dir
-        .as_ref()
-        .ok_or_else(|| DbError::new("falta db (modo -dir)"))?;
-    let requested = requested_db.ok_or_else(|| DbError::new("falta db (modo -dir)"))?;
+    let dir = config.dir.as_ref().ok_or_else(|| {
+        DbError::new(
+            "el servidor está en modo single-DB (-db); las rutas multi-DB (?db=...) \
+             requieren arrancar con -dir <carpeta>",
+        )
+    })?;
+    let requested = requested_db.ok_or_else(|| {
+        DbError::new(
+            "falta el parámetro 'db' en la query string (ej: ?db=demo.db); \
+             requerido en modo -dir",
+        )
+    })?;
     let name = normalize_db_name(requested)?;
     Ok((Pager::open(dir.join(&name))?, name))
 }
@@ -751,10 +765,16 @@ fn open_pager_from_request(
 fn normalize_db_name(value: &str) -> DbResult<String> {
     let mut name = value.trim().to_string();
     if name.is_empty() {
-        return Err(DbError::new("db vacío"));
+        return Err(DbError::new(
+            "parámetro 'db' vacío: indique el nombre del archivo .db dentro del directorio configurado",
+        ));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(DbError::new("db inválida"));
+        return Err(DbError::new(format!(
+            "nombre de db inválido '{}': no se admiten separadores de path \
+             ('/' o '\\\\'); la DB debe estar directamente en el directorio configurado con -dir",
+            name
+        )));
     }
     if !name.to_ascii_lowercase().ends_with(".db") {
         name.push_str(".db");
@@ -965,7 +985,10 @@ fn read_request(stream: &mut TcpStream) -> DbResult<Request> {
     loop {
         let read = stream.read(&mut chunk)?;
         if read == 0 {
-            return Err(DbError::new("conexión cerrada"));
+            return Err(DbError::new(
+                "conexión cerrada por el peer antes de recibir el header HTTP completo \
+                 (esperaba terminar con CRLFCRLF)",
+            ));
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(position) = find_bytes(&buffer, b"\r\n\r\n") {
@@ -973,23 +996,27 @@ fn read_request(stream: &mut TcpStream) -> DbResult<Request> {
             break;
         }
         if buffer.len() > 1024 * 1024 {
-            return Err(DbError::new("request header demasiado grande"));
+            return Err(DbError::new(format!(
+                "header de request demasiado grande: {} bytes acumulados sin encontrar CRLFCRLF \
+                 (límite duro: 1 MiB)",
+                buffer.len()
+            )));
         }
     }
 
     let header_text = String::from_utf8(buffer[..header_end].to_vec())?;
     let mut lines = header_text.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| DbError::new("request line vacía"))?;
+    let request_line = lines.next().ok_or_else(|| {
+        DbError::new("request line HTTP vacía: el header no contiene 'METHOD path HTTP/x.y'")
+    })?;
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
-        .ok_or_else(|| DbError::new("método faltante"))?
+        .ok_or_else(|| DbError::new(format!("request line HTTP sin método: '{}'", request_line)))?
         .to_string();
     let target = parts
         .next()
-        .ok_or_else(|| DbError::new("path faltante"))?
+        .ok_or_else(|| DbError::new(format!("request line HTTP sin path: '{}'", request_line)))?
         .to_string();
 
     let mut headers = HashMap::new();
@@ -1098,10 +1125,17 @@ fn percent_decode(value: &str) -> DbResult<String> {
             }
             b'%' => {
                 if index + 2 >= bytes.len() {
-                    return Err(DbError::new("escape URL inválido"));
+                    return Err(DbError::new(format!(
+                        "escape URL inválido en offset {}: '%' truncado, faltan dígitos hexadecimales",
+                        index
+                    )));
                 }
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
-                    .map_err(|_| DbError::new("escape URL inválido"))?;
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| {
+                    DbError::new(format!(
+                        "escape URL inválido en offset {}: dígitos hexadecimales no son UTF-8",
+                        index
+                    ))
+                })?;
                 let value = u8::from_str_radix(hex, 16)?;
                 out.push(value);
                 index += 3;

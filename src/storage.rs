@@ -18,12 +18,12 @@ fn acquire_db_lock(file: &File, path: &Path) -> DbResult<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => Err(DbError::new(format!(
-            "database is locked by another process: {}. \
-             Close the other gabysql process or wait for it to release the lock.",
+            "base de datos bloqueada por otro proceso: {}. \
+             Cierre el otro proceso gabysql o espere a que libere el lock.",
             path.display()
         ))),
         Err(TryLockError::Error(err)) => Err(DbError::new(format!(
-            "failed to acquire DB lock on {}: {}",
+            "no se pudo adquirir el lock exclusivo sobre {}: {}",
             path.display(),
             err
         ))),
@@ -98,7 +98,11 @@ impl Header {
 
     pub fn encode_into(&self, dst: &mut [u8]) -> DbResult<()> {
         if dst.len() < PAGE_SIZE_DEFAULT {
-            return Err(DbError::new("header page demasiado pequeña"));
+            return Err(DbError::new(format!(
+                "buffer del header demasiado chico: tiene {} bytes, se requieren al menos {}",
+                dst.len(),
+                PAGE_SIZE_DEFAULT
+            )));
         }
         dst.fill(0);
         dst[0..8].copy_from_slice(MAGIC);
@@ -111,16 +115,21 @@ impl Header {
 
     pub fn decode(src: &[u8]) -> DbResult<Self> {
         if src.len() < 24 {
-            return Err(DbError::new("header demasiado pequeño"));
+            return Err(DbError::new(format!(
+                "header demasiado chico: tiene {} bytes, requieren al menos 24 para el header gabysql",
+                src.len()
+            )));
         }
         if &src[0..8] != MAGIC {
-            return Err(DbError::new("bad magic (not gabysql db)"));
+            return Err(DbError::new(
+                "magic bytes inválidos: el archivo no es una base de datos gabysql (esperaba 'GABYSQL1')",
+            ));
         }
         let version = u32::from_le_bytes(src[8..12].try_into().unwrap());
         if version != VERSION {
             return Err(DbError::new(format!(
-                "unsupported gabysql file format: version={} (expected {}). \
-                 Re-create the database with the current binary.",
+                "formato de archivo gabysql no soportado: version={} (esperaba {}). \
+                 Re-cree la base de datos con el binario actual.",
                 version, VERSION
             )));
         }
@@ -130,7 +139,7 @@ impl Header {
         // another binary header change.
         if page_size as usize != PAGE_SIZE_DEFAULT {
             return Err(DbError::new(format!(
-                "unsupported page_size={}; this build requires {}",
+                "page_size no soportado: archivo declara {}, este build requiere {}",
                 page_size, PAGE_SIZE_DEFAULT
             )));
         }
@@ -302,8 +311,8 @@ impl Pager {
         }
         if !force && path.exists() {
             return Err(DbError::new(format!(
-                "refusing to overwrite existing database: {}. \
-                 Delete it first or use create_force().",
+                "se rehúsa sobrescribir base de datos existente: {}. \
+                 Bórrela primero o use create_force() (CLI: 'gabysql init --force').",
                 path.display()
             )));
         }
@@ -339,8 +348,13 @@ impl Pager {
         let mut page0 = vec![0; PAGE_SIZE_DEFAULT];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut page0)?;
-        verify_page_checksum(&page0)
-            .map_err(|err| DbError::new(format!("header page corrupt: {}", err)))?;
+        verify_page_checksum(&page0).map_err(|err| {
+            DbError::new(format!(
+                "página del header corrupta al abrir {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
         let mut header = Header::decode(&page0)?;
 
         let wal_path = wal_path_for(&path);
@@ -357,7 +371,11 @@ impl Pager {
             file.seek(SeekFrom::Start(0))?;
             file.read_exact(&mut refreshed)?;
             verify_page_checksum(&refreshed).map_err(|err| {
-                DbError::new(format!("header page corrupt after WAL replay: {}", err))
+                DbError::new(format!(
+                    "página del header corrupta después del replay del WAL en {}: {}",
+                    path.display(),
+                    err
+                ))
             })?;
             header = Header::decode(&refreshed)?;
         }
@@ -395,7 +413,10 @@ impl Pager {
 
     pub fn begin(&mut self) -> DbResult<()> {
         if self.in_tx {
-            return Err(DbError::new("tx already started"));
+            return Err(DbError::new(
+                "transacción ya iniciada: este Pager ya tiene una transacción abierta; \
+                 llame a commit() o rollback() antes de begin()",
+            ));
         }
         self.wal = Some(Wal::create(wal_path_for(&self.path))?);
         self.in_tx = true;
@@ -404,7 +425,9 @@ impl Pager {
 
     pub fn commit(&mut self) -> DbResult<()> {
         if !self.in_tx {
-            return Err(DbError::new("no active tx"));
+            return Err(DbError::new(
+                "no hay transacción activa: commit() requiere un begin() previo",
+            ));
         }
 
         // Materialize dirty pages and finalize their checksum trailer
@@ -421,10 +444,11 @@ impl Pager {
             finalize_page_checksum(data);
         }
 
-        let wal = self
-            .wal
-            .as_mut()
-            .ok_or_else(|| DbError::new("wal no inicializado"))?;
+        let wal = self.wal.as_mut().ok_or_else(|| {
+            DbError::new(
+                "estado inconsistente: in_tx=true pero el WAL no fue inicializado en begin()",
+            )
+        })?;
 
         for (no, data) in &dirty_pages {
             wal.write_page(*no, data)?;
@@ -450,7 +474,9 @@ impl Pager {
 
     pub fn rollback(&mut self) -> DbResult<()> {
         if !self.in_tx {
-            return Err(DbError::new("no active tx"));
+            return Err(DbError::new(
+                "no hay transacción activa: rollback() requiere un begin() previo",
+            ));
         }
         self.cache.clear();
         self.wal = None;
@@ -470,20 +496,35 @@ impl Pager {
         Ok(self
             .cache
             .get(no)
-            .ok_or_else(|| DbError::new("page cache inconsistente"))?
+            .ok_or_else(|| {
+                DbError::new(format!(
+                    "estado inconsistente del page cache: la página {} se reportó \
+                     como cargada pero no está en el HashMap",
+                    no
+                ))
+            })?
             .data
             .clone())
     }
 
     pub fn write_page(&mut self, no: u32, data: &[u8], dirty: bool) -> DbResult<()> {
         if data.len() != self.page_size() {
-            return Err(DbError::new("tamaño de página inválido"));
+            return Err(DbError::new(format!(
+                "tamaño de página inválido al escribir página {}: \
+                 recibí {} bytes, el archivo usa páginas de {} bytes",
+                no,
+                data.len(),
+                self.page_size()
+            )));
         }
         self.ensure_page_loaded(no)?;
-        let page = self
-            .cache
-            .get_mut(no)
-            .ok_or_else(|| DbError::new("page cache inconsistente"))?;
+        let page = self.cache.get_mut(no).ok_or_else(|| {
+            DbError::new(format!(
+                "estado inconsistente del page cache: la página {} se reportó \
+                 como cargada pero no está en el HashMap",
+                no
+            ))
+        })?;
         page.data.copy_from_slice(data);
         page.dirty = dirty;
         Ok(())
@@ -491,10 +532,13 @@ impl Pager {
 
     pub fn mark_dirty(&mut self, no: u32) -> DbResult<()> {
         self.ensure_page_loaded(no)?;
-        let page = self
-            .cache
-            .get_mut(no)
-            .ok_or_else(|| DbError::new("page cache inconsistente"))?;
+        let page = self.cache.get_mut(no).ok_or_else(|| {
+            DbError::new(format!(
+                "estado inconsistente del page cache: la página {} se reportó \
+                 como cargada pero no está en el HashMap",
+                no
+            ))
+        })?;
         page.dirty = true;
         Ok(())
     }
@@ -528,7 +572,9 @@ impl Pager {
 
     pub fn new_page(&mut self) -> DbResult<u32> {
         if !self.in_tx {
-            return Err(DbError::new("NewPage requires tx"));
+            return Err(DbError::new(
+                "new_page() requiere una transacción activa: llame a begin() primero",
+            ));
         }
         let no = self.header.page_count;
         self.header.page_count += 1;
@@ -545,7 +591,9 @@ impl Pager {
 
     pub fn set_catalog_root_page(&mut self, page_no: u32) -> DbResult<()> {
         if !self.in_tx {
-            return Err(DbError::new("SetCatalogRootPage requires tx"));
+            return Err(DbError::new(
+                "set_catalog_root_page() requiere una transacción activa: llame a begin() primero",
+            ));
         }
         self.header.catalog_root_page = page_no;
         self.refresh_header_page()?;
@@ -575,7 +623,10 @@ impl Pager {
 
     fn ensure_page_loaded(&mut self, no: u32) -> DbResult<()> {
         if no >= self.header.page_count {
-            return Err(DbError::new(format!("page out of range: {}", no)));
+            return Err(DbError::new(format!(
+                "página fuera de rango: pedida {}, el archivo tiene {} páginas",
+                no, self.header.page_count
+            )));
         }
         if self.cache.contains_key(no) {
             return Ok(());
@@ -584,7 +635,7 @@ impl Pager {
         self.file.seek(SeekFrom::Start(self.page_offset(no)))?;
         self.file.read_exact(&mut data)?;
         verify_page_checksum(&data)
-            .map_err(|err| DbError::new(format!("page {} corrupt: {}", no, err)))?;
+            .map_err(|err| DbError::new(format!("página {} corrupta: {}", no, err)))?;
         self.cache.insert(no, CachedPage { data, dirty: false });
         Ok(())
     }
@@ -637,7 +688,10 @@ impl Wal {
 
     fn write_page(&mut self, page_no: u32, data: &[u8]) -> DbResult<()> {
         if data.is_empty() {
-            return Err(DbError::new("empty page data"));
+            return Err(DbError::new(format!(
+                "Wal::write_page: payload vacío al escribir página {} (esperaba {} bytes)",
+                page_no, PAGE_SIZE_DEFAULT
+            )));
         }
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&[WAL_REC_PAGE])?;
@@ -676,7 +730,12 @@ impl Wal {
                     self.file.seek(SeekFrom::Current(len as i64))?;
                 }
                 WAL_REC_COMMIT => self.has_commit = true,
-                _ => return Err(DbError::new("unknown wal record")),
+                other => {
+                    return Err(DbError::new(format!(
+                        "WAL corrupto: record type desconocido {:#04x} (esperaba PAGE={:#04x} o COMMIT={:#04x})",
+                        other, WAL_REC_PAGE, WAL_REC_COMMIT
+                    )))
+                }
             }
         }
     }
@@ -700,7 +759,10 @@ impl Wal {
                     let page_no = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
                     let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
                     if len != page_size {
-                        return Err(DbError::new("wal con tamaño de página inconsistente"));
+                        return Err(DbError::new(format!(
+                            "WAL inconsistente: record para página {} declara len={}, el .db usa page_size={}",
+                            page_no, len, page_size
+                        )));
                     }
                     let mut data = vec![0; len];
                     self.file.read_exact(&mut data)?;
@@ -709,7 +771,7 @@ impl Wal {
                     // refused instead of silently corrupting the DB file.
                     verify_page_checksum(&data).map_err(|err| {
                         DbError::new(format!(
-                            "WAL record for page {} fails checksum: {}",
+                            "WAL record para página {} con CRC32 inválido: {}",
                             page_no, err
                         ))
                     })?;
@@ -717,7 +779,12 @@ impl Wal {
                     db.write_all(&data)?;
                 }
                 WAL_REC_COMMIT => {}
-                _ => return Err(DbError::new("unknown wal record")),
+                other => {
+                    return Err(DbError::new(format!(
+                        "WAL corrupto: record type desconocido {:#04x} (esperaba PAGE={:#04x} o COMMIT={:#04x})",
+                        other, WAL_REC_PAGE, WAL_REC_COMMIT
+                    )))
+                }
             }
         }
     }
@@ -734,7 +801,7 @@ pub fn finalize_page_checksum(page: &mut [u8]) {
     let n = page.len();
     assert!(
         n >= PAGE_CHECKSUM_BYTES,
-        "page smaller than checksum trailer"
+        "página más chica que el trailer del checksum"
     );
     let crc = crc32_ieee(&page[..n - PAGE_CHECKSUM_BYTES]);
     page[n - PAGE_CHECKSUM_BYTES..].copy_from_slice(&crc.to_le_bytes());

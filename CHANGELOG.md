@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-05-18 — Vigesimoquinta intervención: guía canónica de manejo de errores + sweep al español + enriquecimiento
+
+> **Sin bump de formato. Sin deps añadidas. Levanta la barra de calidad de los mensajes de error a nivel producto.** Cierra el síntoma "los errores en pantalla son pobres y no aclaran nada".
+
+### ✨ Cambio
+- Nuevo documento canónico [`docs/ERROR_HANDLING.md`](docs/ERROR_HANDLING.md) — guía normativa para los ~210 sitios donde se construyen errores en el motor:
+  - Filosofía: cada mensaje responde *qué pasó*, *por qué*, y (cuando aplica) *cómo se resuelve*.
+  - Reglas de estilo: idioma español, minúscula, sin punto final, incluir el nombre concreto del objeto, incluir el dato del fallo, sugerir el remedio.
+  - 8 categorías canónicas (validación, NotFound, Conflict, Constraint, Limitación, Integridad, Estado interno, I/O) cada una con patrón recomendado.
+  - Mapeo sistemático a HTTP (400/401/404/405/409/500/503).
+  - Anti-patrones explícitos (mensajes de una palabra, `unwrap` que miente, `From` que enmascara, idiomas mezclados, secretos en mensajes).
+  - Checklist de PR para revisar cualquier nuevo `DbError::new(...)`.
+
+- **Traducción al español de todos los mensajes en inglés** heredados de iteraciones previas:
+  - `storage.rs`: `tx already started` → `transacción ya iniciada`; `no active tx` → `no hay transacción activa: commit() requiere un begin() previo`; `bad magic` → `magic bytes inválidos: el archivo no es una base de datos gabysql`; `unsupported gabysql file format` → `formato de archivo gabysql no soportado`; `refusing to overwrite` → `se rehúsa sobrescribir base de datos existente`; `database is locked by another process` → `base de datos bloqueada por otro proceso`; etc.
+  - `bptree.rs`: `root page is 0`, `leaf overflow`, `page too small`, `not a leaf page`, `leaf decode overflow`, `internal too large`, `unknown page type`, etc. — todos en español con contexto.
+  - `server.rs`: mensajes de `read_request` (`request line vacía`, `método faltante`, `escape URL inválido`), validación de `-max-connections`, mensajes de auth/multi-DB.
+  - `index.rs`: `bucket de índice corrupto` con offset, count, len y descripción precisa.
+
+- **Enriquecimiento de mensajes pobres**. Los ~20 mensajes que eran 1-3 palabras y no orientaban al operador ahora incluyen contexto:
+  - `default corrupto (kind)` → `DEFAULT corrupto: buffer agotado en offset {N} (len={M}), falta el byte de kind`.
+  - `string corrupto` → `string serializado corrupto en offset {N}: header declara {L} bytes pero solo quedan {R} bytes en el buffer`.
+  - `fila corrupta (INT)` → `fila corrupta en tabla '{T}': campo '{C}' (INT) necesita 8 bytes en offset {N}, solo quedan {R}`.
+  - `db vacío` → `parámetro 'db' vacío: indique el nombre del archivo .db dentro del directorio configurado`.
+  - `meta de tabla corrupta` → `TableMeta '{T}' corrupta: faltan bytes para el header de la columna {i} ('{C}') en offset {N}`.
+  - `colisión de hash en catálogo` → mensaje completo que dice qué nombres colisionaron y que se debe reportar como bug.
+  - `cantidad columnas != valores` → `INSERT INTO '{T}': cantidad de columnas ({c}) no coincide con cantidad de valores ({v})`.
+
+- **3 tests de integración actualizados** que asertaban sobre los strings originales (`duplicate primary key`, `refusing to overwrite`, `locked`) — ahora aceptan tanto el texto en español como, por compatibilidad transicional, el inglés equivalente cuando es razonable.
+
+### 🎯 Por qué este cambio
+Auditoría con el usuario: "los errores en pantalla son pobres en indicaciones y no aclaran nada". La auditoría confirmó:
+- Existía una convención **observada** pero **no escrita** sobre los mensajes.
+- Muchos eran de 1-3 palabras (`db vacío`, `string corrupto`, `fila corrupta (INT)`) — imposibles de buscar en troubleshooting y sin información accionable.
+- Había mezcla de español e inglés sin razón.
+- Sin documento normativo, un PR podía agregar `"Column Not Found."` y nada lo paraba.
+
+Ahora hay tres cosas concretas:
+1. **Documento normativo** (`docs/ERROR_HANDLING.md`) que define qué es un mensaje aceptable.
+2. **Estado actual auditado** — ~210 sitios revisados, todos cumplen las reglas.
+3. **Checklist de PR** para que nuevos errores se midan contra la guía.
+
+### 🛡️ Restricciones respetadas
+- **Cero deps añadidas.** ADR-0001 intacto.
+- **Cero bump de formato.** VERSION 7 sigue válido.
+- **Cero rotura de API.** Los `Display::fmt` siguen devolviendo el texto puro; los clientes que no leen el texto no se ven afectados.
+
+### 📐 Documentos
+- [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md) — guía canónica completa (las 8 categorías, checklist de PR, anti-patrones).
+
+---
+
 ## 2026-05-18 — Vigesimocuarta intervención: ADR-0018 (Propuesta) — WAL-mode opt-in (sólo diseño)
 
 > **Sin código. Sin bump de formato.** Cierre honesto del ítem "checkpoint del WAL" de Fase 2: el diseño queda capturado con scope, alternativas y condiciones de salida explícitas, pero la implementación se difiere hasta que aparezca medición de `gabybench` o demanda real. Justificación completa: [ADR-0018](docs/adr/0018-wal-mode-opt-in.md).

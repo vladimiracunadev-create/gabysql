@@ -644,7 +644,12 @@ impl<'a> Engine<'a> {
 
     fn exec_insert(&mut self, stmt: InsertStmt) -> DbResult<ResultSet> {
         if stmt.columns.len() != stmt.values.len() {
-            return Err(DbError::new("cantidad columnas != valores"));
+            return Err(DbError::new(format!(
+                "INSERT INTO '{}': cantidad de columnas ({}) no coincide con cantidad de valores ({})",
+                stmt.table,
+                stmt.columns.len(),
+                stmt.values.len()
+            )));
         }
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -658,7 +663,10 @@ impl<'a> Engine<'a> {
         for (column_name, value) in stmt.columns.into_iter().zip(stmt.values) {
             let normalized = normalize_ident(&column_name);
             if !seen.insert(normalized.clone()) {
-                return Err(DbError::new("columna duplicada en INSERT"));
+                return Err(DbError::new(format!(
+                    "INSERT INTO '{}': columna '{}' aparece más de una vez en la lista",
+                    stmt.table, column_name
+                )));
             }
             if meta.column(&normalized).is_none() {
                 return Err(DbError::new(format!("columna no existe: {}", column_name)));
@@ -939,10 +947,16 @@ impl<'a> Engine<'a> {
                 ));
             }
             if meta.column(&normalized).is_none() {
-                return Err(DbError::new(format!("columna no existe: {}", column_name)));
+                return Err(DbError::new(format!(
+                    "UPDATE sobre '{}': columna '{}' no existe en la tabla",
+                    meta.name, column_name
+                )));
             }
             if overrides.insert(normalized, value).is_some() {
-                return Err(DbError::new("columna duplicada en SET"));
+                return Err(DbError::new(format!(
+                    "UPDATE sobre '{}': columna '{}' aparece más de una vez en SET",
+                    meta.name, column_name
+                )));
             }
         }
 
@@ -1004,7 +1018,11 @@ impl<'a> Engine<'a> {
 
         let (pk, row_bytes) = encode_row(&meta, &current)?;
         if pk != stmt.where_pk {
-            return Err(DbError::new("PK derivada del row no coincide con WHERE"));
+            return Err(DbError::new(format!(
+                "inconsistencia interna en UPDATE sobre '{}': la PK reconstruida del row \
+                 es {} pero el WHERE pidió pk={}",
+                meta.name, pk, stmt.where_pk
+            )));
         }
         {
             let mut catalog = Catalog::open(self.pager);
@@ -1283,7 +1301,10 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
         match (&column.column_type, value) {
             (ColumnType::Int, Value::Null) => {
                 if column.name.eq_ignore_ascii_case(&meta.primary_key) {
-                    return Err(DbError::new("PRIMARY KEY no puede ser NULL"));
+                    return Err(DbError::new(format!(
+                        "PRIMARY KEY '{}' no puede ser NULL en INSERT/UPDATE de tabla '{}'",
+                        column.name, meta.name
+                    )));
                 }
                 out.push(0);
             }
@@ -1340,7 +1361,12 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
     }
 
     Ok((
-        pk.ok_or_else(|| DbError::new("PRIMARY KEY requerida"))?,
+        pk.ok_or_else(|| {
+            DbError::new(format!(
+                "INSERT/UPDATE de tabla '{}' sin valor para la PRIMARY KEY '{}'",
+                meta.name, meta.primary_key
+            ))
+        })?,
         out,
     ))
 }
@@ -1375,7 +1401,14 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
         let value = match column.column_type {
             ColumnType::Int => {
                 if offset + 8 > data.len() {
-                    return Err(DbError::new("fila corrupta (INT)"));
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' (INT) necesita 8 bytes \
+                         en offset {}, solo quedan {}",
+                        meta.name,
+                        column.name,
+                        offset,
+                        data.len() - offset
+                    )));
                 }
                 let number = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                 offset += 8;
@@ -1383,7 +1416,14 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
             }
             ColumnType::Float => {
                 if offset + 8 > data.len() {
-                    return Err(DbError::new("fila corrupta (FLOAT)"));
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' (FLOAT) necesita 8 bytes \
+                         en offset {}, solo quedan {}",
+                        meta.name,
+                        column.name,
+                        offset,
+                        data.len() - offset
+                    )));
                 }
                 let number = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                 offset += 8;
@@ -1391,7 +1431,14 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
             }
             ColumnType::Bool => {
                 if offset >= data.len() {
-                    return Err(DbError::new("fila corrupta (BOOL)"));
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' (BOOL) necesita 1 byte \
+                         en offset {} (data_len={})",
+                        meta.name,
+                        column.name,
+                        offset,
+                        data.len()
+                    )));
                 }
                 let flag = data[offset] != 0;
                 offset += 1;
@@ -1399,12 +1446,29 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
             }
             ColumnType::Text | ColumnType::Date | ColumnType::DateTime | ColumnType::Json => {
                 if offset + 2 > data.len() {
-                    return Err(DbError::new("fila corrupta (TEXT len)"));
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' ({}) necesita 2 bytes \
+                         para len en offset {}, solo quedan {}",
+                        meta.name,
+                        column.name,
+                        column.column_type.as_sql(),
+                        offset,
+                        data.len() - offset
+                    )));
                 }
                 let len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
                 if offset + len > data.len() {
-                    return Err(DbError::new("fila corrupta (TEXT bytes)"));
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' ({}) declara len={} \
+                         en offset {}, solo quedan {} bytes",
+                        meta.name,
+                        column.name,
+                        column.column_type.as_sql(),
+                        len,
+                        offset,
+                        data.len() - offset
+                    )));
                 }
                 let text = String::from_utf8(data[offset..offset + len].to_vec())?;
                 offset += len;
@@ -2180,7 +2244,10 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                 index += 1;
             }
             if index > chars.len() {
-                return Err(DbError::new("string sin cierre"));
+                return Err(DbError::new(format!(
+                    "literal string sin cerrar: comillas simples no balanceadas (texto inicial: '{}')",
+                    value.chars().take(40).collect::<String>()
+                )));
             }
             tokens.push(Token {
                 kind: TokenKind::String,
@@ -2516,7 +2583,11 @@ impl Parser {
                 let to = self.expect_integer()?;
                 where_clause = Some(WhereClause::Between { column, from, to });
             } else {
-                return Err(DbError::new("WHERE soporta solo '=' o BETWEEN"));
+                return Err(DbError::new(format!(
+                    "WHERE soporta solo '=' o BETWEEN como operadores; \
+                     no se reconoció el operador después de la columna '{}'",
+                    column
+                )));
             }
         }
 
@@ -2546,11 +2617,13 @@ impl Parser {
         loop {
             if self.match_keyword("LIMIT") {
                 if seen_limit {
-                    return Err(DbError::new("LIMIT repetido"));
+                    return Err(DbError::new(
+                        "LIMIT aparece más de una vez en la query: solo se admite uno por SELECT",
+                    ));
                 }
                 let raw = self.expect_integer()?;
                 if raw < 0 {
-                    return Err(DbError::new("LIMIT debe ser >= 0"));
+                    return Err(DbError::new(format!("LIMIT debe ser >= 0; recibí {}", raw)));
                 }
                 limit = Some(raw as usize);
                 seen_limit = true;
@@ -2558,11 +2631,16 @@ impl Parser {
             }
             if self.match_keyword("OFFSET") {
                 if seen_offset {
-                    return Err(DbError::new("OFFSET repetido"));
+                    return Err(DbError::new(
+                        "OFFSET aparece más de una vez en la query: solo se admite uno por SELECT",
+                    ));
                 }
                 let raw = self.expect_integer()?;
                 if raw < 0 {
-                    return Err(DbError::new("OFFSET debe ser >= 0"));
+                    return Err(DbError::new(format!(
+                        "OFFSET debe ser >= 0; recibí {}",
+                        raw
+                    )));
                 }
                 offset = raw as usize;
                 seen_offset = true;

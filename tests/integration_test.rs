@@ -96,7 +96,12 @@ fn duplicate_primary_key_is_rejected() -> Result<(), Box<dyn Error>> {
     run_sql(&db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")?;
     run_sql(&db, "INSERT INTO users (id,name) VALUES (1,'Ana');")?;
     let err = run_sql(&db, "INSERT INTO users (id,name) VALUES (1,'Otra');").unwrap_err();
-    assert!(err.to_string().contains("duplicate primary key"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("PRIMARY KEY duplicada") || msg.contains("ya existe"),
+        "mensaje de PK duplicada no incluye la palabra clave esperada: {}",
+        msg
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())
@@ -333,10 +338,11 @@ fn create_refuses_to_overwrite_existing_db() -> Result<(), Box<dyn Error>> {
         Err(e) => e,
         Ok(_) => panic!("expected Pager::create to refuse overwrite"),
     };
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("refusing to overwrite"),
+        msg.contains("se rehúsa sobrescribir") || msg.contains("refusing to overwrite"),
         "got: {}",
-        err
+        msg
     );
 
     // create_force succeeds and the new DB is empty (no 'keep' table).
@@ -1857,8 +1863,8 @@ fn cross_process_lock_rejects_second_open() -> Result<(), Box<dyn Error>> {
     assert!(second.is_err(), "second open should be rejected");
     let err = second.err().unwrap().to_string();
     assert!(
-        err.contains("locked"),
-        "error should mention the lock, got: {}",
+        err.contains("bloqueada") || err.contains("lock"),
+        "el mensaje del lock debería mencionar 'bloqueada' o 'lock', recibí: {}",
         err
     );
 
