@@ -47,8 +47,8 @@
 - ~~`ORDER BY <col> [ASC|DESC]`~~ ✅ entregado
 - ~~`LeafCursor` lazy para `SELECT … LIMIT N` (O(N+offset) en vez de O(table))~~ ✅ entregado (ADR-0008)
 - ~~`PageCache` LRU acotado (memoria del server bounded)~~ ✅ entregado (ADR-0009)
-- índices compuestos *(requiere bump VERSION 6 → 7)*
-- range scan por índice secundario (`WHERE indexed_col BETWEEN ...`) *(agrupado con índices compuestos: el índice 2º actual es hash-based FNV-1a-64, no admite range nativo; se reestructura a B+Tree ordenado en el mismo bump VERSION 7)*
+- índices compuestos — pendiente *(no se cumplió en VERSION 7; requiere un B+Tree byte-keyed o encoder multi-columna; diferido a un futuro bloque)*
+- ~~range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)~~ ✅ entregado para columnas **INT** (ADR-0017, VERSION 7). TEXT/FLOAT/BOOL/DATE/DATETIME indexados siguen siendo equality-only — diferido.
 - checkpoint/compaction del WAL *(re-evaluado: el WAL actual es per-transaction y se trunca/borra en cada commit, así que "checkpoint" en el sentido clásico requiere primero un cambio a WAL persistente. Diferido hasta que aparezca demanda real.)*
 - ~~locking simple entre procesos~~ ✅ entregado (ADR-0013, `File::try_lock` advisory exclusivo en `Pager::create/open`)
 - ~~backup / restore verificado~~ ✅ entregado (ADR-0015, `gabysql backup/restore/verify` con CRC end-to-end)

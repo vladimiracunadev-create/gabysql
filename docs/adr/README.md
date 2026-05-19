@@ -22,6 +22,7 @@ Las ADRs se numeran secuencialmente. Una decisión revertida no se borra: se mar
 | 0014 | [Logs JSON estructurados + endpoint `/metrics`](0014-logs-json-metrics.md) | ✅ Aceptada | Observabilidad del server sin deps externas |
 | 0015 | [Backup / restore / verify con validación end-to-end](0015-verified-backup-restore.md) | ✅ Aceptada | Operación honesta de respaldo sin deps |
 | 0016 | [Prefetch one-leaf-ahead en `LeafCursor`](0016-leafcursor-prefetch.md) | ✅ Aceptada | Cursor que warm-a la PageCache antes de la próxima leaf transition |
+| 0017 | [Índice secundario INT-ordenado para range scan (VERSION 7)](0017-int-ordered-index-version-7.md) | ✅ Aceptada | `WHERE col_idx BETWEEN a AND b` sobre columnas INT |
 
 ---
 

@@ -34,8 +34,8 @@
 > **Estado**: 🟢 Fase 1 (Robustez funcional) cerrada · Fase 2 arrancada  
 > **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT … [WHERE …] [ORDER BY <col> [ASC|DESC]] [LIMIT n] [OFFSET n]`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página, crash tests dirigidos  
-> **Formato en disco**: `VERSION = 6` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
-> **Portabilidad**: Windows, Linux y macOS por CI · 43/43 tests de integración verdes · `/metrics` + `-log-json` para observabilidad básica · `gabysql backup/restore/verify` con CRC end-to-end  
+> **Formato en disco**: `VERSION = 7` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag + `IndexKind` Hash/OrderedInt, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
+> **Portabilidad**: Windows, Linux y macOS por CI · 45/45 tests de integración verdes · `/metrics` + `-log-json` para observabilidad básica · `gabysql backup/restore/verify` con CRC end-to-end · `WHERE col_int_idx BETWEEN a AND b` con índice ordenado  
 > **Runtime opcional**: Docker + `docker compose`
 
 ## 🎯 Qué resuelve hoy este repositorio
@@ -90,6 +90,7 @@
 - `SELECT ... WHERE <pk> = valor`
 - `SELECT ... WHERE <pk> BETWEEN a AND b`
 - `SELECT ... WHERE <col_indexada> = valor` *(usa índice secundario)*
+- `SELECT ... WHERE <col_int_indexada> BETWEEN a AND b` *(usa índice INT-ordenado, ADR-0017)*
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (valida NOT NULL/UNIQUE/FK; mantiene índices)
 - `DELETE FROM <tabla> WHERE <pk> = N` (cascade/restrict según FKs entrantes; mantiene índices)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)

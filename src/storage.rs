@@ -58,7 +58,13 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        column + ON DELETE action). Single-column FKs only; target must
 //        be the parent table's PRIMARY KEY. V5 files are rejected on
 //        open — no automatic upgrade.
-pub const VERSION: u32 = 6;
+//   7 -> IndexMeta carries an `IndexKind` byte (Hash | OrderedInt).
+//        OrderedInt indexes (created automatically over INT-typed
+//        columns) use the value as the B+Tree key, enabling
+//        `WHERE col_idx BETWEEN a AND b` range scans. Legacy hash
+//        indexes over TEXT/FLOAT/BOOL/DATE/DATETIME stay equality-only.
+//        V6 files are rejected on open — no automatic upgrade.
+pub const VERSION: u32 = 7;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

@@ -4,6 +4,43 @@
 
 ---
 
+## 2026-05-18 — Vigesimotercera intervención: índice INT-ordenado + range scan (Fase 2 — VERSION 7)
+
+> **Bump de formato VERSION 6 → 7.** Cierra el ítem "range scan por índice secundario" del roadmap, restringido honestamente a columnas INT. Justificación completa: [ADR-0017](docs/adr/0017-int-ordered-index-version-7.md).
+
+### ✨ Cambio
+- **VERSION on-disk pasa de 6 a 7.** Archivos V6 se rechazan limpiamente al abrir (mensaje "Re-create the database with the current binary"). Igual patrón que cada bump anterior.
+- **Nuevo `IndexKind`** en `IndexMeta` ([src/catalog.rs](src/catalog.rs)):
+  - `Hash` (ADR-0005): el layout legacy. Usado para TEXT/FLOAT/BOOL/DATE/DATETIME. **Equality only**.
+  - `OrderedInt` (nuevo): para columnas INT. El B+Tree se indexa por el valor directamente; los buckets son solo `[count:u16] + count × pk:i64`. Soporta range scan.
+  - `IndexKind::for_column(column_type)` decide automáticamente al crear el índice. Cero cambios al SQL externo.
+- **Nuevo path `WHERE col_idx BETWEEN a AND b`** sobre columnas INT indexadas: ejecutor llama a `lookup_pks_via_index_range` que usa `Tree::cursor_range(idx.root_page, from, to)` y devuelve los PKs en O(log N + k).
+- **BETWEEN sobre columna TEXT/FLOAT/etc. indexada falla loud** con mensaje claro:
+  *"el índice secundario es hash-based (equality only). Solo columnas INT-indexadas admiten BETWEEN."*
+- **NULL no se almacena en índices OrderedInt**. SQL `BETWEEN` ignora NULL por definición y UNIQUE permite múltiples NULLs; ambas semánticas caen naturalmente al no indexar la representación NULL.
+- Helpers nuevos en [src/index.rs](src/index.rs): `ordered_int_key_from_value_bytes`, `encode_ordered_bucket`/`decode_ordered_bucket`, `ordered_bucket_insert`/`_remove`/`_unique_conflict`.
+- Integrity check ([src/sql.rs](src/sql.rs)) y FK cascade lookup branchean por `idx.kind` para decodificar el bucket correcto.
+- **2 tests nuevos**: range BETWEEN sobre INT indexado (incluyendo verify que NULL queda fuera) y rechazo BETWEEN sobre TEXT indexado.
+
+### 🎯 Por qué este cambio (y por qué INT solamente)
+ADR-0005 había fijado el índice como **hash-based** (FNV-1a-64) para tolerar colisiones de hash con un bucket por clave. Equality funciona; range no compone — hashes de valores cercanos son arbitrariamente distintos. El ítem del roadmap "range scan por índice secundario" había sido marcado como **no viable bajo VERSION 6** explícitamente en intervenciones previas.
+
+La salida natural es usar el valor como clave del B+Tree donde el orden i64 ya es el orden semántico — **solo INT** cumple sin tocar el motor. TEXT requeriría un B+Tree byte-keyed (~800+ LOC, riesgo de regresión); FLOAT necesita encoding flip-sign no-trivial. Ambos quedan diferidos a un bloque futuro cuando aparezca demanda real.
+
+### 🛡️ Restricciones respetadas
+- **Cero deps** (ADR-0001).
+- **Memoria acotada** (ADR-0009 — el bucket ordenado es estrictamente más chico que el bucket Hash equivalente).
+- **Convivencia limpia**: índices Hash siguen funcionando para los tipos no-INT (ADR-0005 sigue vigente).
+- **Sin cambios al cursor**: `Tree::cursor_range` (ADR-0008) ya servía perfectamente.
+
+### 📐 ADR
+- [ADR-0017 — Índice secundario INT-ordenado para range scan (VERSION 7)](docs/adr/0017-int-ordered-index-version-7.md).
+
+### 📝 Notas
+- **Índices compuestos no entran en este bloque.** El roadmap inicial los agrupaba con range scan bajo el mismo bump, pero compuestos requieren claves multi-columna que con el approach value-as-i64 es forzado. Quedan diferidos a un futuro VERSION 8 (o se entregan dentro de VERSION 7 si la demanda aparece sin necesidad de cambio de formato).
+
+---
+
 ## 2026-05-18 — Vigesimosegunda intervención: prefetch one-leaf-ahead en `LeafCursor` (Fase 2 — performance directional)
 
 > **Sin bump de formato. Sin deps añadidas. Mejora direccional sin medición cuantitativa todavía.** Justificación completa: [ADR-0016](docs/adr/0016-leafcursor-prefetch.md).

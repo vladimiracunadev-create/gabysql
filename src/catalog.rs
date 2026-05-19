@@ -3,7 +3,7 @@ use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Int,
     Text,
@@ -219,12 +219,60 @@ impl Column {
     }
 }
 
+/// Physical kind of a secondary index, written to disk on VERSION 7+.
+///
+/// - `Hash`: the legacy bucket-by-FNV1a layout (ADR-0005). Supports
+///   equality lookup only. Used for TEXT / FLOAT / BOOL / DATE /
+///   DATETIME columns where producing an order-preserving i64 key is
+///   not trivial without a byte-keyed B+Tree.
+/// - `OrderedInt`: the indexed value (an `INT`) is used **directly as
+///   the B+Tree key**, so `cursor_range(from, to)` walks index entries
+///   in true value order. Enables `WHERE col_idx BETWEEN a AND b` for
+///   INT-typed indexed columns (ADR-0017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    Hash,
+    OrderedInt,
+}
+
+impl IndexKind {
+    pub fn code(&self) -> u8 {
+        match self {
+            IndexKind::Hash => 0,
+            IndexKind::OrderedInt => 1,
+        }
+    }
+
+    pub fn from_code(code: u8) -> DbResult<Self> {
+        match code {
+            0 => Ok(IndexKind::Hash),
+            1 => Ok(IndexKind::OrderedInt),
+            other => Err(DbError::new(format!("unknown index kind code: {}", other))),
+        }
+    }
+
+    /// Pick the right index kind for a column. INT columns get the new
+    /// ordered layout (range-scan capable); every other type stays on
+    /// the legacy hash-bucket layout (equality only) — extending range
+    /// to TEXT/FLOAT would need a byte-keyed B+Tree which is out of
+    /// scope for this bump.
+    pub fn for_column(column_type: ColumnType) -> Self {
+        match column_type {
+            ColumnType::Int => IndexKind::OrderedInt,
+            _ => IndexKind::Hash,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexMeta {
     pub name: String,
     pub column: String,
     pub root_page: u32,
     pub unique: bool,
+    /// V7+: distinguishes legacy hash-bucket indexes from new
+    /// INT-ordered indexes that support range scan. See [`IndexKind`].
+    pub kind: IndexKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -255,7 +303,7 @@ impl TableMeta {
             .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
-    /// VERSION = 6 on-disk layout for a TableMeta record:
+    /// VERSION = 7 on-disk layout for a TableMeta record:
     ///
     ///     [name][primary_key][root_page:u32]
     ///     [col_count:u16] · col_count × {
@@ -264,7 +312,7 @@ impl TableMeta {
     ///         flags & 0x04 ? [target_table][target_column][on_delete:u8] : ∅
     ///     }
     ///     [idx_count:u16] · idx_count × {
-    ///         [name][column][root_page:u32][unique:u8]
+    ///         [name][column][root_page:u32][unique:u8][kind:u8]
     ///     }
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
@@ -301,6 +349,7 @@ impl TableMeta {
             push_string(&mut out, &idx.column)?;
             out.extend_from_slice(&idx.root_page.to_le_bytes());
             out.push(u8::from(idx.unique));
+            out.push(idx.kind.code());
         }
         Ok(out)
     }
@@ -365,18 +414,21 @@ impl TableMeta {
         for _ in 0..idx_count {
             let name = take_string(data, &mut offset)?;
             let column = take_string(data, &mut offset)?;
-            if offset + 5 > data.len() {
+            if offset + 6 > data.len() {
                 return Err(DbError::new("meta de índice corrupta"));
             }
             let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
             let unique = data[offset] != 0;
             offset += 1;
+            let kind = IndexKind::from_code(data[offset])?;
+            offset += 1;
             indexes.push(IndexMeta {
                 name,
                 column,
                 root_page,
                 unique,
+                kind,
             });
         }
         Ok(Self {

@@ -1,17 +1,29 @@
 //! Secondary index machinery.
 //!
-//! A secondary index is a B+Tree whose key is a 64-bit FNV-1a hash of the
-//! indexed column value, and whose value is a *bucket* listing every
-//! `(serialized_value, primary_key)` pair that hashes to that key. Storing
-//! the serialized value alongside the PK lets the engine distinguish hash
-//! collisions from real matches at lookup time, and it lets duplicate
-//! values share a bucket without losing any of them.
+//! Two physical layouts coexist, distinguished by [`IndexKind`] in
+//! `IndexMeta`:
 //!
-//! Bucket layout on disk:
-//!     [count:u16] + count × ([vlen:u16][value_bytes][pk:i64])
+//! - **Hash buckets** (`IndexKind::Hash`, ADR-0005): the B+Tree key is a
+//!   64-bit FNV-1a hash of the indexed column value, and the value is a
+//!   *bucket* listing every `(serialized_value, primary_key)` pair that
+//!   hashes to that key. Storing the serialized value alongside the PK
+//!   lets the engine distinguish hash collisions from real matches at
+//!   lookup time, and it lets duplicate values share a bucket without
+//!   losing any of them. Used for TEXT / FLOAT / BOOL / DATE / DATETIME
+//!   columns and supports equality lookup only.
+//!   Bucket layout:
+//!   `[count:u16] + count × ([vlen:u16][value_bytes][pk:i64])`
 //!
-//! Today only equality lookups (`WHERE col = N`) hit the index; range and
-//! ordered scans over secondary indexes are out of scope for this hito.
+//! - **INT-ordered** (`IndexKind::OrderedInt`, ADR-0017, VERSION 7+): the
+//!   B+Tree key **is** the indexed `INT` value itself, so
+//!   `Tree::cursor_range(from, to)` walks index entries in true value
+//!   order and we can satisfy `WHERE col_idx BETWEEN a AND b`. The bucket
+//!   payload only needs the PKs because the value is recoverable from the
+//!   key. NULL is **not** indexed here (SQL `BETWEEN` ignores NULLs and
+//!   UNIQUE allows multiple NULLs, so skipping them keeps both semantics
+//!   intact).
+//!   Bucket layout:
+//!   `[count:u16] + count × [pk:i64]`
 
 use crate::catalog::{Column, ColumnType, TableMeta};
 use crate::sql::Value;
@@ -174,6 +186,92 @@ pub fn bucket_unique_conflict(
         .iter()
         .find(|(v, pk)| v.as_slice() == value && Some(*pk) != exclude_pk)
         .map(|(_, pk)| *pk)
+}
+
+// ---------- OrderedInt bucket helpers (VERSION 7) ----------
+
+/// Decode the i64 key that an INT column's `value_bytes` (as produced by
+/// [`encode_column_value`]) represents. Returns `None` for the NULL
+/// marker since NULL is not stored in OrderedInt indexes.
+pub fn ordered_int_key_from_value_bytes(value_bytes: &[u8]) -> DbResult<Option<i64>> {
+    if value_bytes == [0u8] {
+        return Ok(None);
+    }
+    if value_bytes.len() != 9 || value_bytes[0] != 1 {
+        return Err(DbError::new(
+            "value_bytes inválidos para columna INT ordenada",
+        ));
+    }
+    Ok(Some(i64::from_le_bytes(
+        value_bytes[1..9].try_into().unwrap(),
+    )))
+}
+
+/// Decode an OrderedInt bucket: `[count:u16] + count × pk:i64`.
+pub fn decode_ordered_bucket(data: &[u8]) -> DbResult<Vec<i64>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data.len() < 2 {
+        return Err(DbError::new("bucket ordenado corrupto (header)"));
+    }
+    let count = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
+    let expected = 2 + count * 8;
+    if data.len() != expected {
+        return Err(DbError::new(format!(
+            "bucket ordenado corrupto (len={}, expected={})",
+            data.len(),
+            expected
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 2 + i * 8;
+        out.push(i64::from_le_bytes(data[off..off + 8].try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+/// Encode an OrderedInt bucket. Errors out past `u16::MAX` entries on a
+/// single key — a pathological case we don't expect under normal usage
+/// but check anyway so a bug never silently corrupts the page.
+pub fn encode_ordered_bucket(pks: &[i64]) -> DbResult<Vec<u8>> {
+    if pks.len() > u16::MAX as usize {
+        return Err(DbError::new(
+            "bucket ordenado excede u16::MAX entradas para una misma clave",
+        ));
+    }
+    let mut out = Vec::with_capacity(2 + pks.len() * 8);
+    out.extend_from_slice(&(pks.len() as u16).to_le_bytes());
+    for pk in pks {
+        out.extend_from_slice(&pk.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Idempotent insert into an ordered bucket. Keeps the PK list sorted so
+/// equality lookups + `WHERE pk = …` short-circuits remain deterministic.
+pub fn ordered_bucket_insert(pks: &mut Vec<i64>, pk: i64) {
+    if let Err(pos) = pks.binary_search(&pk) {
+        pks.insert(pos, pk);
+    }
+}
+
+/// Remove `pk` from an ordered bucket. Returns whether the bucket changed.
+pub fn ordered_bucket_remove(pks: &mut Vec<i64>, pk: i64) -> bool {
+    match pks.binary_search(&pk) {
+        Ok(pos) => {
+            pks.remove(pos);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// UNIQUE conflict for an OrderedInt bucket: any PK other than
+/// `exclude_pk` in the bucket means the value is already taken.
+pub fn ordered_bucket_unique_conflict(pks: &[i64], exclude_pk: Option<i64>) -> Option<i64> {
+    pks.iter().copied().find(|pk| Some(*pk) != exclude_pk)
 }
 
 /// Validate that the column type can be used as an index key in this

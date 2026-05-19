@@ -1621,6 +1621,118 @@ fn cursor_limit_returns_only_requested_rows() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn where_between_on_int_indexed_column_uses_ordered_index() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("idx-int-between");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    // Note: PK is `id`, but we'll BETWEEN over `score` which is a
+    // non-PK INT column that gets an OrderedInt index.
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT, score INT NOT NULL);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_u_score ON u (score);")?;
+    for (id, score) in [(1, 10), (2, 25), (3, 50), (4, 75), (5, 90), (6, 100)] {
+        run_sql(
+            &db,
+            &format!(
+                "INSERT INTO u (id,name,score) VALUES ({},'r{}',{});",
+                id, id, score
+            ),
+        )?;
+    }
+    // Insert a NULL-score row to confirm OrderedInt indexes skip NULLs
+    // (and so BETWEEN ignores them, matching SQL semantics).
+    run_sql(&db, "CREATE TABLE u2 (id INT PRIMARY KEY, score INT);")?;
+    run_sql(&db, "CREATE INDEX idx_u2_score ON u2 (score);")?;
+    run_sql(&db, "INSERT INTO u2 (id,score) VALUES (1,42);")?;
+    run_sql(&db, "INSERT INTO u2 (id,score) VALUES (2,NULL);")?;
+    run_sql(&db, "INSERT INTO u2 (id,score) VALUES (3,55);")?;
+
+    // BETWEEN over the indexed INT column.
+    let res = run_sql(&db, "SELECT id,score FROM u WHERE score BETWEEN 20 AND 80;")?;
+    let pairs: Vec<(i64, i64)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::Integer(id), Value::Integer(s)) => (*id, *s),
+            _ => (-1, -1),
+        })
+        .collect();
+    let mut sorted = pairs.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec![(2, 25), (3, 50), (4, 75)], "got: {:?}", pairs);
+
+    // BETWEEN that misses everything.
+    let res = run_sql(&db, "SELECT id FROM u WHERE score BETWEEN 200 AND 300;")?;
+    assert_eq!(res[0].rows.len(), 0);
+
+    // NULL-score row must NOT show up in BETWEEN (matches ANSI SQL).
+    let res = run_sql(&db, "SELECT id FROM u2 WHERE score BETWEEN 0 AND 1000;")?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .filter_map(|r| match r[0] {
+            Value::Integer(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    let mut sorted_ids = ids.clone();
+    sorted_ids.sort();
+    assert_eq!(
+        sorted_ids,
+        vec![1, 3],
+        "NULL row leaked into BETWEEN: {:?}",
+        ids
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_between_on_text_indexed_column_is_rejected() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("idx-text-between-reject");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT NOT NULL);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_u_name ON u (name);")?;
+    run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
+
+    // The parser only accepts integer literals in BETWEEN today, so
+    // text literals fail there first. The defense-in-depth path that
+    // matters is the engine gate: even when ints sneak through against
+    // a TEXT-indexed column, the engine refuses because the index is
+    // hash-based (equality only).
+    let parser_err = run_sql(&db, "SELECT id FROM u WHERE name BETWEEN 'A' AND 'Z';");
+    assert!(parser_err.is_err(), "TEXT literals in BETWEEN should fail");
+
+    let engine_err = run_sql(&db, "SELECT id FROM u WHERE name BETWEEN 1 AND 10;");
+    assert!(
+        engine_err.is_err(),
+        "BETWEEN on hash-indexed column should be rejected by the engine"
+    );
+    let msg = engine_err.err().unwrap().to_string();
+    assert!(
+        msg.contains("hash") || msg.contains("equality") || msg.contains("INT"),
+        "error should explain why TEXT BETWEEN is rejected, got: {}",
+        msg
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn backup_roundtrip_verifies_end_to_end() -> Result<(), Box<dyn Error>> {
     let src = temp_db_path("backup-src");
     let dst = temp_db_path("backup-dst");

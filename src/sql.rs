@@ -1,11 +1,13 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
-    ForeignKeyMeta, IndexMeta, OnDelete, TableMeta,
+    ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, TableMeta,
 };
 use crate::index::{
     bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
-    encode_bucket, encode_column_value, hash_value, validate_indexable,
+    decode_ordered_bucket, encode_bucket, encode_column_value, encode_ordered_bucket, hash_value,
+    ordered_bucket_insert, ordered_bucket_remove, ordered_bucket_unique_conflict,
+    ordered_int_key_from_value_bytes, validate_indexable,
 };
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
@@ -262,6 +264,10 @@ impl<'a> Engine<'a> {
             let mut leaf = vec![0; self.pager.page_size()];
             init_leaf_page(&mut leaf);
             self.pager.write_page(idx_root, &leaf, true)?;
+            let col_type = meta
+                .column(col_name)
+                .map(|c| c.column_type)
+                .ok_or_else(|| DbError::new("columna UNIQUE inline no presente en meta"))?;
             meta.indexes.push(IndexMeta {
                 name: format!(
                     "uq_{}_{}",
@@ -271,6 +277,7 @@ impl<'a> Engine<'a> {
                 column: col_name.clone(),
                 root_page: idx_root,
                 unique: true,
+                kind: IndexKind::for_column(col_type),
             });
         }
 
@@ -354,7 +361,9 @@ impl<'a> Engine<'a> {
             rows_scanned += kvs.len();
 
             // 3. Walk every bucket of every secondary index and verify
-            //    each (value_bytes, pk) pair points at a real row.
+            //    each (value_bytes, pk) or pk entry points at a real row.
+            //    Hash and OrderedInt buckets have different layouts; the
+            //    integrity sweep must decode according to `idx.kind`.
             for idx in &table.indexes {
                 indexes_scanned += 1;
                 let bucket_kvs = {
@@ -362,8 +371,14 @@ impl<'a> Engine<'a> {
                     tree.all(idx.root_page)?
                 };
                 for kv in bucket_kvs {
-                    let bucket = decode_bucket(&kv.value)?;
-                    for (_, pk) in bucket {
+                    let pks: Vec<i64> = match idx.kind {
+                        IndexKind::Hash => decode_bucket(&kv.value)?
+                            .into_iter()
+                            .map(|(_, pk)| pk)
+                            .collect(),
+                        IndexKind::OrderedInt => decode_ordered_bucket(&kv.value)?,
+                    };
+                    for pk in pks {
                         if !live_pks.contains(&pk) {
                             issues.push((
                                 "orphan_index_entry".into(),
@@ -600,13 +615,20 @@ impl<'a> Engine<'a> {
                         column.name
                     )));
                 }
-                index_upsert_pk(self.pager, idx_root, &value_bytes, kv.key)?;
+                index_upsert_pk(
+                    self.pager,
+                    idx_root,
+                    IndexKind::for_column(column_type),
+                    &value_bytes,
+                    kv.key,
+                )?;
             }
             meta.indexes.push(IndexMeta {
                 name: idx_name,
                 column: stmt.column.name.clone(),
                 root_page: idx_root,
                 unique: true,
+                kind: IndexKind::for_column(column_type),
             });
         }
 
@@ -697,7 +719,7 @@ impl<'a> Engine<'a> {
                 .cloned()
                 .unwrap_or(Value::Null);
             let value_bytes = encode_column_value(column, &value)?;
-            index_upsert_pk(self.pager, idx.root_page, &value_bytes, pk)?;
+            index_upsert_pk(self.pager, idx.root_page, idx.kind, &value_bytes, pk)?;
         }
 
         Ok(ResultSet {
@@ -758,8 +780,33 @@ impl<'a> Engine<'a> {
                 }
             }
             Some(WhereClause::Between { column, from, to }) => {
-                ensure_pk_filter(&meta, &column)?;
-                Plan::Range { from, to }
+                let normalized = normalize_ident(&column);
+                if normalized == normalize_ident(&meta.primary_key) {
+                    Plan::Range { from, to }
+                } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                    // BETWEEN over an indexed column only works when the
+                    // index is INT-ordered (ADR-0017). Hash indexes are
+                    // equality-only by construction.
+                    match idx.kind {
+                        IndexKind::OrderedInt => {
+                            let pks = lookup_pks_via_index_range(self.pager, &idx, from, to)?;
+                            Plan::ByPks(pks)
+                        }
+                        IndexKind::Hash => {
+                            return Err(DbError::new(format!(
+                                "WHERE BETWEEN sobre '{}': el índice secundario es hash-based \
+                                 (equality only). Solo columnas INT-indexadas admiten BETWEEN.",
+                                column
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(DbError::new(format!(
+                        "WHERE BETWEEN solo soporta PK ({}) o columnas INT con índice; \
+                         '{}' no califica",
+                        meta.primary_key, column
+                    )));
+                }
             }
         };
 
@@ -985,8 +1032,8 @@ impl<'a> Engine<'a> {
             }
             let old_bytes = encode_column_value(column, &old_value)?;
             let new_bytes = encode_column_value(column, &new_value)?;
-            index_remove_pk(self.pager, idx.root_page, &old_bytes, pk)?;
-            index_upsert_pk(self.pager, idx.root_page, &new_bytes, pk)?;
+            index_remove_pk(self.pager, idx.root_page, idx.kind, &old_bytes, pk)?;
+            index_upsert_pk(self.pager, idx.root_page, idx.kind, &new_bytes, pk)?;
         }
 
         Ok(ResultSet {
@@ -1081,7 +1128,13 @@ impl<'a> Engine<'a> {
                     column.name
                 )));
             }
-            index_upsert_pk(self.pager, idx_root, &value_bytes, kv.key)?;
+            index_upsert_pk(
+                self.pager,
+                idx_root,
+                IndexKind::for_column(column.column_type),
+                &value_bytes,
+                kv.key,
+            )?;
         }
 
         // 6. Publish the index in the catalog.
@@ -1090,6 +1143,7 @@ impl<'a> Engine<'a> {
             column: stmt.column,
             root_page: idx_root,
             unique: stmt.unique,
+            kind: IndexKind::for_column(column.column_type),
         });
         let mut catalog = Catalog::open(self.pager);
         catalog.put_table(&meta)?;
@@ -1423,7 +1477,8 @@ fn window_rows<T: Clone>(rows: Vec<T>, offset: usize, limit: Option<usize>) -> V
 
 /// Translate `WHERE col = value` into the list of PKs that match, by
 /// going through the secondary index `idx`. Returns an empty Vec when no
-/// row matches.
+/// row matches. Branches on `idx.kind`: hash buckets for legacy indexes,
+/// direct value-keyed lookup for OrderedInt indexes (ADR-0017).
 fn lookup_pks_via_index(
     pager: &mut Pager,
     meta: &TableMeta,
@@ -1437,64 +1492,148 @@ fn lookup_pks_via_index(
         ))
     })?;
     let value_bytes = encode_column_value(column, value)?;
-    let key = hash_value(&value_bytes);
+
     let mut tree = Tree::new(pager);
-    let bucket_bytes = match tree.get(idx.root_page, key)? {
-        Some(b) => b,
-        None => return Ok(Vec::new()),
-    };
-    let bucket = decode_bucket(&bucket_bytes)?;
-    Ok(bucket_lookup(&bucket, &value_bytes))
+    match idx.kind {
+        IndexKind::Hash => {
+            let key = hash_value(&value_bytes);
+            let bucket_bytes = match tree.get(idx.root_page, key)? {
+                Some(b) => b,
+                None => return Ok(Vec::new()),
+            };
+            let bucket = decode_bucket(&bucket_bytes)?;
+            Ok(bucket_lookup(&bucket, &value_bytes))
+        }
+        IndexKind::OrderedInt => {
+            // NULL never lives in an OrderedInt index, so a NULL lookup
+            // is always empty (matches SQL semantics for `WHERE col = NULL`).
+            let Some(key) = ordered_int_key_from_value_bytes(&value_bytes)? else {
+                return Ok(Vec::new());
+            };
+            let bucket_bytes = match tree.get(idx.root_page, key)? {
+                Some(b) => b,
+                None => return Ok(Vec::new()),
+            };
+            decode_ordered_bucket(&bucket_bytes)
+        }
+    }
 }
 
-/// Add `(value_bytes, pk)` to the bucket at `hash(value_bytes)` in the
-/// secondary-index B+Tree rooted at `idx_root`. Idempotent — re-inserting
-/// the same `(value, pk)` is a no-op.
+/// Walk an OrderedInt index from key `from` to key `to` (inclusive)
+/// and return every PK in the range, sorted by indexed value first
+/// and PK second (stable order inside duplicates). The caller is
+/// responsible for guarding that `idx.kind == OrderedInt`.
+fn lookup_pks_via_index_range(
+    pager: &mut Pager,
+    idx: &IndexMeta,
+    from: i64,
+    to: i64,
+) -> DbResult<Vec<i64>> {
+    debug_assert!(matches!(idx.kind, IndexKind::OrderedInt));
+    let mut pks = Vec::new();
+    let tree = Tree::new(pager);
+    let cursor = tree.cursor_range(idx.root_page, from, to)?;
+    for entry in cursor {
+        let kv = entry?;
+        let bucket = decode_ordered_bucket(&kv.value)?;
+        pks.extend(bucket);
+    }
+    Ok(pks)
+}
+
+/// Add `(value_bytes, pk)` to the secondary index B+Tree rooted at
+/// `idx_root`. Idempotent — re-inserting the same `(value, pk)` is a
+/// no-op. Branches on `kind`.
 pub(crate) fn index_upsert_pk(
     pager: &mut Pager,
     idx_root: u32,
+    kind: IndexKind,
     value_bytes: &[u8],
     pk: i64,
 ) -> DbResult<()> {
-    let key = hash_value(value_bytes);
     let mut tree = Tree::new(pager);
-    let mut bucket = match tree.get(idx_root, key)? {
-        Some(bytes) => decode_bucket(&bytes)?,
-        None => Vec::new(),
-    };
-    bucket_insert(&mut bucket, value_bytes.to_vec(), pk);
-    let payload = encode_bucket(&bucket)?;
-    tree.upsert(idx_root, key, payload)?;
+    match kind {
+        IndexKind::Hash => {
+            let key = hash_value(value_bytes);
+            let mut bucket = match tree.get(idx_root, key)? {
+                Some(bytes) => decode_bucket(&bytes)?,
+                None => Vec::new(),
+            };
+            bucket_insert(&mut bucket, value_bytes.to_vec(), pk);
+            let payload = encode_bucket(&bucket)?;
+            tree.upsert(idx_root, key, payload)?;
+        }
+        IndexKind::OrderedInt => {
+            // NULLs are intentionally not stored in OrderedInt indexes
+            // (see module docs). UNIQUE with multiple NULLs and BETWEEN
+            // ignoring NULL both fall out of this naturally.
+            let Some(key) = ordered_int_key_from_value_bytes(value_bytes)? else {
+                return Ok(());
+            };
+            let mut bucket = match tree.get(idx_root, key)? {
+                Some(bytes) => decode_ordered_bucket(&bytes)?,
+                None => Vec::new(),
+            };
+            ordered_bucket_insert(&mut bucket, pk);
+            let payload = encode_ordered_bucket(&bucket)?;
+            tree.upsert(idx_root, key, payload)?;
+        }
+    }
     Ok(())
 }
 
-/// Remove `(value_bytes, pk)` from the bucket at `hash(value_bytes)`. If
-/// the bucket becomes empty after the removal we delete the leaf entry
-/// outright; otherwise we re-write the smaller bucket. Returns whether
-/// an entry was actually removed.
+/// Remove `(value_bytes, pk)` from the index. If the bucket becomes
+/// empty after the removal we delete the leaf entry outright; otherwise
+/// we re-write the smaller bucket. Returns whether an entry was
+/// actually removed.
 pub(crate) fn index_remove_pk(
     pager: &mut Pager,
     idx_root: u32,
+    kind: IndexKind,
     value_bytes: &[u8],
     pk: i64,
 ) -> DbResult<bool> {
-    let key = hash_value(value_bytes);
     let mut tree = Tree::new(pager);
-    let Some(bytes) = tree.get(idx_root, key)? else {
-        return Ok(false);
-    };
-    let mut bucket = decode_bucket(&bytes)?;
-    let removed = bucket_remove(&mut bucket, value_bytes, pk);
-    if !removed {
-        return Ok(false);
+    match kind {
+        IndexKind::Hash => {
+            let key = hash_value(value_bytes);
+            let Some(bytes) = tree.get(idx_root, key)? else {
+                return Ok(false);
+            };
+            let mut bucket = decode_bucket(&bytes)?;
+            let removed = bucket_remove(&mut bucket, value_bytes, pk);
+            if !removed {
+                return Ok(false);
+            }
+            if bucket.is_empty() {
+                tree.delete(idx_root, key)?;
+            } else {
+                let payload = encode_bucket(&bucket)?;
+                tree.upsert(idx_root, key, payload)?;
+            }
+            Ok(true)
+        }
+        IndexKind::OrderedInt => {
+            let Some(key) = ordered_int_key_from_value_bytes(value_bytes)? else {
+                return Ok(false);
+            };
+            let Some(bytes) = tree.get(idx_root, key)? else {
+                return Ok(false);
+            };
+            let mut bucket = decode_ordered_bucket(&bytes)?;
+            let removed = ordered_bucket_remove(&mut bucket, pk);
+            if !removed {
+                return Ok(false);
+            }
+            if bucket.is_empty() {
+                tree.delete(idx_root, key)?;
+            } else {
+                let payload = encode_ordered_bucket(&bucket)?;
+                tree.upsert(idx_root, key, payload)?;
+            }
+            Ok(true)
+        }
     }
-    if bucket.is_empty() {
-        tree.delete(idx_root, key)?;
-    } else {
-        let payload = encode_bucket(&bucket)?;
-        tree.upsert(idx_root, key, payload)?;
-    }
-    Ok(true)
 }
 
 /// Convert a parser-time `Value` literal into a catalog `DefaultLiteral`.
@@ -1587,11 +1726,7 @@ fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
             let pk = meta.column(&meta.primary_key).ok_or_else(|| {
                 DbError::new("FK self-ref: tabla sin PK definida (estado inconsistente)")
             })?;
-            (
-                meta.primary_key.clone(),
-                pk.column_type.clone(),
-                meta.name.clone(),
-            )
+            (meta.primary_key.clone(), pk.column_type, meta.name.clone())
         } else {
             let target = {
                 let mut catalog = Catalog::open(pager);
@@ -1610,7 +1745,7 @@ fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
             })?;
             (
                 target.primary_key.clone(),
-                pk.column_type.clone(),
+                pk.column_type,
                 target.name.clone(),
             )
         };
@@ -1744,14 +1879,28 @@ fn find_child_pks_with_fk_value(
     let value_bytes = encode_column_value(column, &value)?;
 
     if let Some(idx) = child_table.index_for_column(fk_column) {
-        let key = hash_value(&value_bytes);
         let mut tree = Tree::new(pager);
-        let bucket_bytes = match tree.get(idx.root_page, key)? {
-            Some(b) => b,
-            None => return Ok(Vec::new()),
-        };
-        let bucket = decode_bucket(&bucket_bytes)?;
-        return Ok(bucket_lookup(&bucket, &value_bytes));
+        match idx.kind {
+            IndexKind::Hash => {
+                let key = hash_value(&value_bytes);
+                let bucket_bytes = match tree.get(idx.root_page, key)? {
+                    Some(b) => b,
+                    None => return Ok(Vec::new()),
+                };
+                let bucket = decode_bucket(&bucket_bytes)?;
+                return Ok(bucket_lookup(&bucket, &value_bytes));
+            }
+            IndexKind::OrderedInt => {
+                let Some(key) = ordered_int_key_from_value_bytes(&value_bytes)? else {
+                    return Ok(Vec::new());
+                };
+                let bucket_bytes = match tree.get(idx.root_page, key)? {
+                    Some(b) => b,
+                    None => return Ok(Vec::new()),
+                };
+                return decode_ordered_bucket(&bucket_bytes);
+            }
+        }
     }
 
     let mut catalog = Catalog::open(pager);
@@ -1864,7 +2013,7 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
                 .cloned()
                 .unwrap_or(Value::Null);
             let value_bytes = encode_column_value(column, &value)?;
-            index_remove_pk(pager, idx.root_page, &value_bytes, parent_pk)?;
+            index_remove_pk(pager, idx.root_page, idx.kind, &value_bytes, parent_pk)?;
         }
         let mut catalog = Catalog::open(pager);
         catalog.delete_row(parent_meta.root_page, parent_pk)?;
@@ -1881,13 +2030,31 @@ pub(crate) fn check_unique_conflict(
     value_bytes: &[u8],
     exclude_pk: Option<i64>,
 ) -> DbResult<()> {
-    let key = hash_value(value_bytes);
     let mut tree = Tree::new(pager);
-    let bucket = match tree.get(idx.root_page, key)? {
-        Some(bytes) => decode_bucket(&bytes)?,
-        None => return Ok(()),
+    let conflict_pk: Option<i64> = match idx.kind {
+        IndexKind::Hash => {
+            let key = hash_value(value_bytes);
+            let bucket = match tree.get(idx.root_page, key)? {
+                Some(bytes) => decode_bucket(&bytes)?,
+                None => return Ok(()),
+            };
+            bucket_unique_conflict(&bucket, value_bytes, exclude_pk)
+        }
+        IndexKind::OrderedInt => {
+            // NULLs are not tracked in OrderedInt indexes, so a NULL
+            // pre-check is always a free pass (SQL allows many NULLs
+            // even under UNIQUE).
+            let Some(key) = ordered_int_key_from_value_bytes(value_bytes)? else {
+                return Ok(());
+            };
+            let bucket = match tree.get(idx.root_page, key)? {
+                Some(bytes) => decode_ordered_bucket(&bytes)?,
+                None => return Ok(()),
+            };
+            ordered_bucket_unique_conflict(&bucket, exclude_pk)
+        }
     };
-    if let Some(other_pk) = bucket_unique_conflict(&bucket, value_bytes, exclude_pk) {
+    if let Some(other_pk) = conflict_pk {
         return Err(DbError::new(format!(
             "violación de UNIQUE en índice '{}' (PK existente: {})",
             idx.name, other_pk
