@@ -60,7 +60,8 @@ graph LR
 ### `src/storage.rs`
 Responsable de:
 - crear (sin sobrescribir) y abrir archivos `.db`; expone `create_force` para reset explícito
-- mantener el header del formato `VERSION=6` (rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md))
+- adquirir un **lock exclusivo cross-process** sobre el `.db` con `File::try_lock()` en cada `create/open`: dos procesos `gabysql` apuntando al mismo archivo → el segundo falla rápido con `database is locked by another process` (ver [ADR-0013](adr/0013-process-level-file-lock.md))
+- mantener el header del formato `VERSION=7` (rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md))
 - gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
 - finalizar el checksum antes de cada flush y verificarlo al leer
 - escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`
@@ -76,15 +77,15 @@ Responsable de:
 - inserción/upsert/delete por PK con splits en cascada
 - mantener `root_page` estable cuando el root necesita splittear (técnica copy-up: el contenido del root se copia a una página nueva y el slot de root se reescribe como nuevo `INTERNAL`)
 - recorrer rangos y full scans descendiendo al leftmost-leaf y siguiendo el chain `next`
-- **`LeafCursor<'a>` lazy** que implementa `Iterator<Item = DbResult<KeyValue>>`: carga páginas leaf on-demand vía la chain `next` y short-circuita con `Iterator::take(n)`. Habilita `SELECT … LIMIT N` en O(N + offset) páginas leídas, no O(filas_totales). Ver [ADR-0008](adr/0008-leaf-cursor-iterator.md).
+- **`LeafCursor<'a>` lazy** que implementa `Iterator<Item = DbResult<KeyValue>>`: carga páginas leaf on-demand vía la chain `next` y short-circuita con `Iterator::take(n)`. Habilita `SELECT … LIMIT N` en O(N + offset) páginas leídas, no O(filas_totales). Ver [ADR-0008](adr/0008-leaf-cursor-iterator.md). Desde [ADR-0016](adr/0016-leafcursor-prefetch.md), `load_current` además warm-ea la siguiente hoja en `PageCache`.
 
 ### `src/catalog.rs`
 Responsable de:
 - registrar tablas usando hashing **FNV-1a-64** (estable entre versiones de Rust)
 - leer schema y resolver páginas raíz de cada tabla
 - validar `CREATE TABLE` (PK obligatoria, escalar `INT`; identificadores `[A-Za-z_][A-Za-z0-9_]*`, ≤ 64 chars, no reservados)
-- persistir `Column { name, type, not_null, default?, references? }` con flags por bit (`0x01` NOT NULL, `0x02` HAS_DEFAULT, `0x04` HAS_FK) — VERSION 6
-- persistir la lista de `IndexMeta { name, column, root_page, unique }` en `TableMeta`
+- persistir `Column { name, type, not_null, default?, references? }` con flags por bit (`0x01` NOT NULL, `0x02` HAS_DEFAULT, `0x04` HAS_FK) — VERSION 7
+- persistir la lista de `IndexMeta { name, column, root_page, unique, kind }` en `TableMeta` (`kind: IndexKind = Hash | OrderedInt`, ADR-0017)
 - persistir `ForeignKeyMeta { table, column, on_delete: RESTRICT|CASCADE }` por columna
 - validar FK targets al DDL (target table existe o es self-ref, target column es la PK del target, tipos coinciden)
 - exponer `insert_row`, `upsert_row`, `delete_row`, `get_row`, `scan_rows`, `range_rows`, `remove_table`
@@ -113,7 +114,8 @@ Responsable de:
 
 ### `src/server.rs`
 Responsable de:
-- exponer endpoints HTTP/JSON
+- exponer endpoints HTTP/JSON (incluido `GET /metrics` con `requests_total`, `requests_by_status`, `errors_total`, latencias p50/p95 y uptime; ver [ADR-0014](adr/0014-logs-json-metrics.md))
+- emitir logs estructurados a stdout cuando se arranca con `-log-json` (una línea JSON por request: `{ts_unix, method, path, status, latency_ms}`)
 - resolver single DB o multi DB
 - aplicar autenticación por token
 - limitar conexiones simultáneas (default 64, configurable con `-max-connections`); las que exceden el techo reciben `503`
@@ -163,10 +165,15 @@ Las mejoras naturales siguientes son:
 - ~~crash tests dirigidos (kill -9 entre WAL y file flush)~~ ✅ entregado
 - ~~`LeafCursor` lazy iterator (SELECT LIMIT en O(N+offset))~~ ✅ entregado (ADR-0008)
 - ~~`PageCache` LRU acotado (memoria del server bounded)~~ ✅ entregado (ADR-0009)
+- ~~lock exclusivo cross-process del `.db`~~ ✅ entregado (ADR-0013)
+- ~~logs JSON + endpoint `/metrics`~~ ✅ entregado (ADR-0014)
+- ~~`backup`/`restore`/`verify` CLI con CRC end-to-end~~ ✅ entregado (ADR-0015)
+- ~~prefetch en `LeafCursor` (warm-up de la próxima hoja)~~ ✅ entregado (ADR-0016)
+- ~~índice INT-ordenado + range scan por índice (VERSION 7)~~ ✅ entregado (ADR-0017)
 - `Transaction` (Unit of Work) con cache de `TableMeta` — pendiente, ROI marginal hoy
+- WAL persistente estilo SQLite-WAL — diseño documentado, sin código (ver [ADR-0018](adr/0018-wal-mode-opt-in.md)); condiciones de salida: bottleneck medido en gabybench, workload write-heavy real, o necesidad de MVCC
 - índices compuestos
-- range scan por índice secundario
+- range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`
 - planner cost-based real (hoy: deterministic dispatch + plan enum cerrado)
 - `JOIN` y `GROUP BY`
-- mejor locking entre procesos
 - política formal de migración entre versiones del formato en disco

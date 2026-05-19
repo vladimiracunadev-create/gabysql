@@ -15,6 +15,7 @@ Este documento es el ancla central. Las políticas (cómo reportar, qué está i
 | Replay de WAL truncado | Verificación CRC sobre el payload de cada record antes de aplicar al `.db`; abort explícito | [`src/storage.rs:Wal::replay_to`](../src/storage.rs) | [RUNBOOK.md §Recovery tras caída](../RUNBOOK.md) |
 | Apertura de DB con formato incompatible | `Header::decode` rechaza con mensaje explícito y bumpea `VERSION` cada vez que cambia el formato | [`src/storage.rs:Header::decode`](../src/storage.rs) | [CHANGELOG.md](../CHANGELOG.md), [COMPATIBILITY.md §Formato en disco](../COMPATIBILITY.md) |
 | Pérdida silenciosa por `gabysql init` sobre archivo existente | `Pager::create` rehúsa overwrite; se requiere `create_force` (CLI: `--force`) | [`src/storage.rs:Pager::create_internal`](../src/storage.rs) | [USER_MANUAL.md §1. CLI](../USER_MANUAL.md), [TROUBLESHOOTING.md §refusing to overwrite](../TROUBLESHOOTING.md) |
+| Apertura concurrente del mismo `.db` por dos procesos (corrupción por escrituras intercaladas) | Lock exclusivo cross-process vía `File::try_lock()` en `Pager::create/open` — advisory en Linux/macOS, mandatory en Windows. El segundo proceso falla fast con `database is locked by another process`. | [`src/storage.rs:Pager::open` / `Pager::create_internal`](../src/storage.rs) | [ADR-0013](adr/0013-process-level-file-lock.md), [TROUBLESHOOTING.md §database is locked](../TROUBLESHOOTING.md) |
 | Hash del catálogo dependiente de la versión de Rust (DBs ilegibles tras toolchain upgrade) | FNV-1a-64 fijado en código, independiente de `std` | [`src/catalog.rs:hash_name`](../src/catalog.rs), [`src/index.rs:hash_value`](../src/index.rs) | [docs/TECHNICAL_SPECS.md §Catálogo](TECHNICAL_SPECS.md) |
 
 > Los CRC32 detectan **corrupción accidental**, no manipulación adversarial: un atacante con acceso de escritura al disco puede recomputar el CRC. Esto está explícitamente fuera de scope del modelo de amenaza.
@@ -141,7 +142,7 @@ Para no inflar la postura de seguridad más allá de lo entregado:
 
 - **TLS nativo**: el server publica HTTP plano. Producción → reverse proxy con TLS.
 - **Cifrado en reposo**: el `.db` no está cifrado; el OS / disco completo es responsable.
-- **MVCC / aislamiento avanzado**: una sola transacción global por proceso.
+- **MVCC / aislamiento avanzado**: una sola transacción global por proceso. El file lock cross-process del ADR-0013 previene apertura concurrente del mismo `.db` por dos procesos, pero no es un sustituto de MVCC.
 - **Authz fina**: solo token compartido; no hay usuarios/roles, no hay auditoría granular.
 - **Rate limiting por IP/cliente**: el cap de conexiones es DoS-mitigation mínimo, no un WAF.
 - **Manipulación adversarial del `.db`**: los CRC32 detectan errores accidentales, no tampering.

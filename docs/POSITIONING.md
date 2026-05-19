@@ -177,8 +177,8 @@ gabysql exec demo.db "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);"
 
 # Inspeccionar los primeros bytes del header.
 xxd -l 32 demo.db
-# 00000000: 4741 4259 5351 4c31 0400 0000 0010 0000  GABYSQL1........
-#                                ^^^^^^^^^ versión = 4
+# 00000000: 4741 4259 5351 4c31 0700 0000 0010 0000  GABYSQL1........
+#                                ^^^^^^^^^ versión = 7
 #                                          ^^^^ page_size = 4096
 ```
 

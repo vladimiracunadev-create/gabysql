@@ -78,7 +78,7 @@ flowchart LR
 
 ## CREATE DATABASE
 
-> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 6`. En modo single-DB (`-db`) responde `405`.
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 7`. En modo single-DB (`-db`) responde `405`.
 
 ### 🛤️ Railroad
 
@@ -514,7 +514,7 @@ where_clause ::= identifier "=" value
                | identifier "BETWEEN" integer "AND" integer
 ```
 
-> `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` solo funciona sobre la PK (range scan secundario es parte del [Camino A](COMMERCIAL_ROADMAP.md)). `ORDER BY` funciona sobre cualquier columna del schema (no requiere índice); el sort es en memoria post-scan, así que para tablas grandes con `LIMIT` chico conviene tener un `WHERE` que reduzca el conjunto antes del sort.
+> `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` funciona sobre la PK y sobre cualquier columna `INT` con índice secundario (índice `OrderedInt`, default automático al crear índice sobre `INT`; ver [ADR-0017](adr/0017-int-ordered-index-version-7.md)). Para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados, `BETWEEN` queda en el [Camino A](COMMERCIAL_ROADMAP.md). `ORDER BY` funciona sobre cualquier columna del schema (no requiere índice); el sort es en memoria post-scan, así que para tablas grandes con `LIMIT` chico conviene tener un `WHERE` que reduzca el conjunto antes del sort.
 
 ### ✅ Ejemplos
 
@@ -530,6 +530,10 @@ SELECT id, name FROM users WHERE id BETWEEN 1 AND 100;
 -- Por columna indexada (requiere CREATE INDEX previo)
 SELECT * FROM users WHERE name = 'Ana';
 SELECT id FROM orders WHERE status = 'pending' LIMIT 50;
+
+-- BETWEEN sobre columna INT indexada (índice OrderedInt, ADR-0017)
+-- CREATE INDEX idx_users_score ON users (score);  -- score INT
+SELECT id, name FROM users WHERE score BETWEEN 80 AND 100 LIMIT 25;
 
 -- ORDER BY (cualquier columna; ASC default; NULLs primero)
 SELECT id, name FROM users ORDER BY name ASC;

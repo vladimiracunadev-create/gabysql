@@ -9,13 +9,13 @@
 | Campo | Valor |
 |---|---|
 | Magic | `GABYSQL1` |
-| Versión de formato | `4` |
+| Versión de formato | `7` |
 | Tamaño de página | `4096` bytes (fijo en esta versión) |
 | Trailer de checksum por página | `4` bytes (CRC32-IEEE) |
 | Hashing del catálogo y de claves de índice | FNV-1a-64 (estable entre versiones de Rust) |
 | Tipos de página B+Tree | `LEAF` (1), `INTERNAL` (2) |
 
-> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action). Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action); `6` → `7` agregó el campo `kind: IndexKind` (`Hash` | `OrderedInt`) a `IndexMeta` para habilitar índices ordenados sobre columnas `INT` con range scan O(log N + k) — ver [ADR-0017](adr/0017-int-ordered-index-version-7.md). Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
 
 ---
 
@@ -24,7 +24,7 @@
 | Offset | Significado |
 |---|---|
 | `0..7` | magic |
-| `8..11` | versión `u32` little-endian (debe ser `4`) |
+| `8..11` | versión `u32` little-endian (debe ser `7`) |
 | `12..13` | page size `u16` little-endian (debe ser `4096`) |
 | `16..19` | page count `u32` little-endian |
 | `20..23` | `catalog_root_page` `u32` little-endian |
@@ -106,6 +106,8 @@ Implicancia para el server: memoria total acotada por `cache_capacity × #DBs_ab
 
 Garantía de complejidad para `SELECT … LIMIT N` sin ORDER BY: **O(N + offset)** páginas leídas, no O(filas_totales). Ver [ADR-0008](adr/0008-leaf-cursor-iterator.md).
 
+Desde [ADR-0016](adr/0016-leafcursor-prefetch.md), `LeafCursor::load_current` hace `page_data` también sobre la siguiente hoja del chain — warm-ea la `PageCache` antes de que el caller la pida, sin allocations adicionales (la página queda en el cache LRU). Helper `Pager::cache_contains(page_no) -> bool` expuesto para introspección/tests.
+
 ---
 
 ## 🗂️ Catálogo
@@ -115,9 +117,9 @@ Cada `TableMeta` contiene:
 - nombre de PK
 - columnas con `{ name, type, not_null, default?, references? }`
 - página raíz de la tabla (root de su B+Tree)
-- lista de `IndexMeta { name, column, root_page, unique }` (vacía si la tabla no tiene índices secundarios)
+- lista de `IndexMeta { name, column, root_page, unique, kind }` (vacía si la tabla no tiene índices secundarios). `kind: IndexKind` es `Hash` (default; el bucket vive en un B+Tree hash-keyed) u `OrderedInt` (clave física = valor `INT`; habilita `BETWEEN` por índice).
 
-Layout binario v6 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`.
+Layout binario v7 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`.
 - Default: `[kind:u8] + payload` (kinds: 0 Null, 1 Int, 2 Float, 3 Bool, 4 String).
 - FK: `[target_table:string][target_column:string][on_delete:u8]` con `0 = RESTRICT`, `1 = CASCADE`.
 
@@ -127,7 +129,14 @@ El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowerca
 
 ## 🔍 Índices secundarios
 
-Un índice secundario es un B+Tree paralelo cuya **clave** es el FNV-1a-64 del valor de la columna y cuyo **valor** es un *bucket* (lista) de `(value_bytes, pk)`:
+Desde VERSION 7, cada `IndexMeta` lleva un campo `kind: IndexKind`:
+
+- **`Hash`** (default; usado para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` y para `INT` salvo override) — equality only.
+- **`OrderedInt`** (solo aplica a columnas `INT`) — el B+Tree del índice usa el valor `INT` directamente como clave física, lo que habilita `WHERE col_int_idx BETWEEN a AND b` en O(log N + k). `NULL` no se almacena (consistente con la semántica SQL de `BETWEEN`/`UNIQUE`).
+
+### Buckets (kind = Hash)
+
+Un índice hash es un B+Tree paralelo cuya **clave** es el FNV-1a-64 del valor de la columna y cuyo **valor** es un *bucket* (lista) de `(value_bytes, pk)`:
 
 | Campo | Encoding |
 | :--- | :--- |
@@ -144,9 +153,9 @@ Operaciones:
 
 Restricciones de la versión actual:
 - Una columna por índice (no compuestos).
-- Solo equality (`=`); sin range scan ni `BETWEEN` por índice secundario.
 - `JSON` no es indexable.
 - El nombre del índice es único en toda la base de datos.
+- Equality (`=`) sobre cualquier columna indexada. **`BETWEEN` solo sobre columnas `INT` con índice `OrderedInt`** (default automático al crear índice sobre una columna `INT`); `BETWEEN` sobre `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados devuelve error claro.
 
 Modo `UNIQUE`:
 - `CREATE UNIQUE INDEX` o constraint inline `column UNIQUE` setean `IndexMeta.unique = true`.
@@ -156,7 +165,7 @@ Modo `UNIQUE`:
 
 ---
 
-## 🔗 FOREIGN KEY (VERSION 6+)
+## 🔗 FOREIGN KEY (VERSION 7+)
 
 Cada columna puede declarar como mucho una FK single-column. Se persiste en `Column.references = Some(ForeignKeyMeta { table, column, on_delete })`.
 
@@ -217,6 +226,7 @@ Enforcement en runtime:
 - `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)
 - `WHERE <col_indexada> = <valor>` (solo en `SELECT`)
 - `WHERE <pk> BETWEEN ... AND ...` (solo en `SELECT`)
+- `WHERE <col_int_indexada> BETWEEN ... AND ...` (solo en `SELECT`; requiere índice `OrderedInt`, default para INT)
 - `LIMIT` / `OFFSET`
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N`
 - `DELETE FROM <tabla> WHERE <pk> = N`
@@ -231,7 +241,7 @@ Enforcement en runtime:
 - `GROUP BY`
 - `LIKE`
 - `WHERE` por columnas no PK ni indexadas
-- `WHERE` sobre columna indexada con operador distinto a `=` (no `BETWEEN`, no `<`/`>`)
+- `WHERE` sobre columna no-INT indexada con operador distinto a `=` (no `BETWEEN`, no `<`/`>`)
 - Índices compuestos (multi-columna)
 - `UPDATE` / `DELETE` por columnas no PK ni por rango
 
@@ -250,8 +260,7 @@ Enforcement en runtime:
 ## ⚠️ Limitaciones técnicas actuales
 
 - no hay MVCC
-- no hay índices secundarios
-- no hay locking fuerte entre procesos
+- el locking cross-process es advisory (`File::try_lock`); previene apertura concurrente pero no es un sustituto de MVCC ni de un protocolo de replicación — ver [ADR-0013](adr/0013-process-level-file-lock.md)
 - no hay migraciones de formato en disco entre versiones mayores
 - el cálculo de `total` en `/rows` requiere scan completo
 

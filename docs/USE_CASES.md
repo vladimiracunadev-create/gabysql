@@ -204,33 +204,36 @@ SELECT * FROM users WHERE email = 'cambiado@example.com'; -- 1 fila
 DROP INDEX idx_users_email;
 ```
 
-Limitaciones actuales del índice secundario (todas en el [Camino A](COMMERCIAL_ROADMAP.md) backlog):
-- una sola columna por índice
-- solo equality (`=`), no `BETWEEN` ni `<`/`>`
-- no hay `UNIQUE` declarativo
+Limitaciones actuales del índice secundario:
+- una sola columna por índice (compuestos en el [Camino A](COMMERCIAL_ROADMAP.md) backlog).
+- equality (`=`) sobre cualquier tipo indexable; `BETWEEN` solo sobre columnas `INT` con índice `OrderedInt` (default automático, ADR-0017). Rango sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` queda en backlog.
+- `UNIQUE` declarativo: ✅ soportado (inline `column UNIQUE` o `CREATE UNIQUE INDEX`).
 
 ---
 
 ## 6. Backup / restore manual
 
-**Escenario**: snapshot reproducible antes de un experimento o release.
+**Escenario**: snapshot reproducible antes de un experimento o release. Desde [ADR-0015](adr/0015-verified-backup-restore.md), el CLI expone subcomandos dedicados que validan CRC32 página por página en lectura y re-abren el destino para confirmar legibilidad — reemplazan al `cp` informal.
 
 ```bash
-# 1) Detener cualquier escritor (CLI, server) — evita backup inconsistente
+# 1) Detener cualquier escritor (CLI, server) — el lock cross-process (ADR-0013)
+#    ya bloquea backups en caliente; aprovechá el corte para hacer un replay limpio.
 sudo systemctl stop gabysql-server   # o kill del proceso CLI
 
-# 2) Verificar que no hay WAL pendiente. Si existe, primero abre la DB
-#    para que el replay corra y luego volvemos a verificar.
-ls -la mydb.db mydb.db.wal 2>/dev/null
-gabysql info mydb.db   # provoca el replay si había WAL committed
+# 2) Si quedó WAL pendiente, forzar replay
+gabysql info mydb.db
 
-# 3) Backup atómico (cp es suficiente sin WAL)
-cp mydb.db backup-$(date +%Y%m%d-%H%M).db
-sha256sum mydb.db backup-*.db   # debe coincidir
+# 3) Snapshot verificado
+gabysql backup mydb.db backup-$(date +%Y%m%d-%H%M).db
+# CRC validado página por página al leer + re-abre el destino al final
+# Si algo falla, aborta antes de dejar un destino corrupto silencioso
 
-# 4) Verificar que el backup abre limpio
-gabysql info backup-*.db        # imprime header; si CRC falla, sale aquí
-gabysql exec backup-*.db "SELECT COUNT(*) FROM users;"
+# 4) (Opcional) Sweep CRC standalone, sin escribir nada
+gabysql verify backup-*.db
+gabysql exec   backup-*.db "SELECT COUNT(*) FROM users;"
+
+# 5) Restore (idéntico motor; comando explicita la dirección)
+gabysql restore --force backup-*.db mydb.db
 ```
 
 > Backup online (sin parar el server) es parte del [Camino A](COMMERCIAL_ROADMAP.md).
@@ -509,7 +512,7 @@ curl -s "http://localhost:8080/schema?db=prod.db&table=orders" \
 TMP=$(mktemp -d)
 cd "$TMP"
 
-# Crear DB nueva (formato actual VERSION 6)
+# Crear DB nueva (formato actual VERSION 7)
 ./target/release/gabysql init smoke.db
 ./target/release/gabysql info smoke.db
 # pageSize=4096  pageCount=1  catalogRoot=0

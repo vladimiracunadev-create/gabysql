@@ -37,10 +37,10 @@ cargo run --release --bin gabysql -- init demo.db
 
 ---
 
-## 🔢 `unsupported gabysql file format: version=N (expected 6)`
+## 🔢 `unsupported gabysql file format: version=N (expected 7)`
 
 ### Causa
-Intentas abrir un archivo con una versión de formato anterior. La versión actual es `6`. Las versiones `1` a `5` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
+Intentas abrir un archivo con una versión de formato anterior. La versión actual es `7`. Las versiones `1` a `6` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`, `7` agregó `IndexKind` para índices INT-ordenados). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
 
 ### Solución
 - Re-crear la base con el binario actual: `gabysql init <file.db>`.
@@ -158,6 +158,22 @@ Separar en dos llamadas:
 
 ---
 
+## 🔒 `database is locked by another process`
+
+### Causa
+Otro proceso `gabysql` ya tiene la `.db` abierta. Desde [ADR-0013](docs/adr/0013-process-level-file-lock.md), `Pager::create/open` adquiere un lock exclusivo cross-process vía `File::try_lock()` (advisory en Linux/macOS, mandatory en Windows). El segundo proceso que intenta abrir el mismo archivo falla rápido en vez de corromperlo.
+
+### Solución
+- Identifica el proceso que tiene el archivo abierto (`gabysql-server`, otra CLI, un script colgado) y deténlo.
+- Si quedó un proceso zombi en Linux/macOS y el lock no se liberó tras kill, reintenta tras unos segundos (el OS limpia el `flock` al cerrar el FD).
+- En Windows, si un binario crasheó dejando el handle abierto, suele bastar con esperar a que el Resource Manager libere el handle; un reboot es el último recurso.
+
+### Lo que esto NO significa
+- No hay corrupción. El lock es preventivo: bloquea **antes** de tocar el archivo.
+- No reemplaza MVCC ni un protocolo de replicación. Sigue siendo un solo escritor a la vez por archivo.
+
+---
+
 ## 🚫 `refusing to overwrite existing database`
 
 ### Causa
@@ -209,7 +225,7 @@ El servidor alcanzó el techo de conexiones simultáneas (default `64`).
 La consulta usa operadores no implementados (`LIKE`, `>`, `<`, etc.).
 
 ### Solución
-Restringe `WHERE` a la PK con `=` o `BETWEEN`. Recordá que `UPDATE` y `DELETE` solo aceptan `=`, no `BETWEEN`.
+Restringe `WHERE` a la PK con `=` o `BETWEEN`, o a una columna con índice secundario (equality sobre cualquier tipo; `BETWEEN` solo si la columna es `INT` y por tanto tiene índice `OrderedInt`). `UPDATE` y `DELETE` solo aceptan `=`, no `BETWEEN`.
 
 ---
 

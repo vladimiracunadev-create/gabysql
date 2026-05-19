@@ -226,7 +226,7 @@ El repositorio ya fue validado con:
 ## ⚠️ Limitaciones deliberadas
 
 - `UPDATE` y `DELETE` solo aceptan filtro `WHERE <pk> = N` (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
-- Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); índices compuestos y range scan por índice secundario quedan para Fase 2.
+- Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` (índice `OrderedInt`, ADR-0017). Índices compuestos y range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados quedan para Fase 2.
 - `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
 - `ORDER BY` ya está soportado; **`JOIN` y `GROUP BY` no** (Fase 2/3).
 - Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).

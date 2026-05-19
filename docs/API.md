@@ -40,6 +40,7 @@ Sin token válido, el server responde `401`.
 | Método | Ruta | Qué hace |
 |---|---|---|
 | `GET` | `/health` | health check del server |
+| `GET` | `/metrics` | métricas operacionales (JSON: contadores + latencias p50/p95) |
 | `GET` | `/dbs` | lista bases disponibles |
 | `POST` | `/dbs` | crea una DB en modo `-dir` |
 | `GET` | `/tables` | lista tablas de una DB |
@@ -61,6 +62,42 @@ Ejemplo de respuesta:
   "timeUnix": 1773970519
 }
 ```
+
+---
+
+## `GET /metrics`
+
+Devuelve un snapshot de las métricas operacionales acumuladas desde el arranque del server. Pensado para scraping periódico (cron + curl, Vector, Telegraf) o un dashboard mínimo sin desplegar Prometheus. Ver [ADR-0014](adr/0014-logs-json-metrics.md).
+
+Ejemplo de respuesta:
+```json
+{
+  "ok": true,
+  "started_unix": 1773970519,
+  "uptime_s": 4827,
+  "requests_total": 1284,
+  "requests_by_status": {
+    "200": 1199,
+    "400": 42,
+    "401": 11,
+    "404": 18,
+    "500": 14
+  },
+  "errors_total": 85,
+  "latency_ms": {
+    "p50": 2,
+    "p95": 38,
+    "samples": 1024,
+    "count": 1284
+  }
+}
+```
+
+Notas:
+- `errors_total` cuenta status `>= 500` (errores del server, no del cliente).
+- `latency_ms.samples` es el tamaño del ring buffer en memoria (cap fijo `LATENCY_SAMPLE_RING = 1024`); `count` es el total observado desde el arranque. `p50`/`p95` se calculan sobre el sample.
+- Si el server arranca con `-log-json`, cada request termina emitiendo una línea JSON a stdout (`{ts_unix, method, path, status, latency_ms}`).
+- No requiere autenticación distinta a la del server (si arrancaste con `-token`, el header se exige también acá).
 
 ---
 

@@ -22,13 +22,18 @@ El binario principal sirve para inicializar bases, inspeccionar metadatos, ejecu
 
 ### Comandos
 ```text
-gabysql init [--force] <file.db>
-gabysql info <file.db>
-gabysql exec <file.db> "<SQL...>"
-gabysql repl <file.db>
+gabysql init    [--force] <file.db>
+gabysql info               <file.db>
+gabysql exec               <file.db> "<SQL...>"
+gabysql repl               <file.db>
+gabysql backup  [--force] <src.db> <dst.db>
+gabysql restore [--force] <src.db> <dst.db>
+gabysql verify             <file.db>
 ```
 
 > `init` rehúsa sobrescribir un archivo existente. Pasa `--force` para reemplazarlo intencionalmente.
+> `backup` lee `src.db` validando CRC32 página por página, escribe `dst.db` y lo re-abre al final para confirmar que es legible. `restore` es la operación inversa (mismo motor; el comando explicita la dirección de la operación). `verify` solo recorre el archivo y valida CRCs. Si alguna página falla, los tres abortan con error claro **antes** de tocar el destino. Ver [ADR-0015](docs/adr/0015-verified-backup-restore.md).
+> Si otro proceso `gabysql` tiene el archivo abierto, las operaciones que requieren lock (incluido `init`/`exec`/`repl`) fallan con `database is locked by another process` — ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md) y [ADR-0013](docs/adr/0013-process-level-file-lock.md).
 
 ### Ejemplos
 ```powershell
@@ -63,7 +68,7 @@ CREATE TABLE orders (
 );
 ```
 
-Constraints disponibles por columna (gabysql `VERSION 6+`):
+Constraints disponibles por columna (gabysql `VERSION 7+`):
 - `PRIMARY KEY` — una sola, debe ser `INT`, implícitamente `NOT NULL`.
 - `NOT NULL` — rechaza `NULL` literal y omisión sin DEFAULT.
 - `UNIQUE` — auto-genera índice unique `uq_<tabla>_<col>`. Múltiples NULL permitidos.
@@ -121,7 +126,8 @@ DROP   INDEX        idx_users_name;
 
 Reglas:
 - una sola columna por índice (no compuestos).
-- soportan equality (`=`), no rangos ni `BETWEEN`.
+- soportan equality (`=`) sobre cualquier tipo indexable.
+- **`BETWEEN` solo sobre columnas `INT` indexadas** (índice `OrderedInt`, default automático al crear índice sobre `INT`; ADR-0017). `BETWEEN` sobre `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados devuelve error claro.
 - se mantienen automáticamente al `INSERT`, `UPDATE` (cuando cambia la columna indexada) y `DELETE`.
 - **no admiten** columnas `JSON`.
 - el nombre del índice debe ser único en toda la base de datos.
@@ -153,7 +159,7 @@ Sweep de solo lectura: valida CRCs de cada página, decodifica cada fila, verifi
 - `PRIMARY KEY` no puede ser `NULL` y es implícitamente `NOT NULL`.
 - PK duplicada se rechaza al `INSERT`.
 - `WHERE col = val` funciona sobre la PK siempre, y sobre cualquier otra columna **solo si tiene un índice secundario**.
-- `WHERE col BETWEEN a AND b` solo funciona sobre la PK (range scan secundario es Fase 2).
+- `WHERE col BETWEEN a AND b` funciona sobre la PK y sobre cualquier columna `INT` con índice secundario (índice `OrderedInt`, ADR-0017). Para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` queda en backlog.
 - `UPDATE` y `DELETE` solo aceptan `WHERE pk = N`, no por columna no-PK.
 - `UPDATE` no permite cambiar la PK; intentarlo devuelve error explícito.
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error (no son no-ops silenciosos).
@@ -200,6 +206,18 @@ El servidor por defecto limita a `64` conexiones activas. Las conexiones por enc
 cargo run --release --bin gabysql-server -- -dir ./dbs -max-connections 32
 ```
 
+### Logs JSON estructurados (`-log-json`)
+```powershell
+cargo run --release --bin gabysql-server -- -db demo.db -log-json
+```
+Con `-log-json`, cada request finalizado emite una sola línea JSON a stdout: `{ts_unix, method, path, status, latency_ms}`. Pensado para ingestión por Loki, Vector, journald, etc. Sin el flag, el binario solo escribe el banner de arranque a stderr (default silencioso por request). Ver [ADR-0014](docs/adr/0014-logs-json-metrics.md).
+
+### Endpoint `/metrics`
+```powershell
+Invoke-WebRequest -UseBasicParsing http://localhost:8080/metrics
+```
+Devuelve un JSON con `started_unix`, `uptime_s`, `requests_total`, `requests_by_status` (mapa `status_code → count`), `errors_total` y `latency_ms` (`p50`, `p95`, `samples`, `count`). Útil para scraping periódico o un dashboard mínimo sin desplegar Prometheus. Ver [docs/API.md §GET /metrics](docs/API.md#get-metrics).
+
 > [!TIP]
 > Para detalles de endpoints, payloads y errores, ve a [docs/API.md](docs/API.md).
 
@@ -207,7 +225,7 @@ cargo run --release --bin gabysql-server -- -dir ./dbs -max-connections 32
 
 ## 5. 📐 `gabymodeler v2` — modelador web (PowerDesigner-style)
 
-`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 6`.
+`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 7`.
 
 ### Levantarlo
 ```bash
@@ -224,7 +242,7 @@ php -S localhost:8000 -t web
 - **Constraints inline por columna**: `PK`, `NOT NULL` (NN), `UNIQUE` (UN), `DEFAULT <literal>`, `FOREIGN KEY` (FK con `ON DELETE RESTRICT|CASCADE`).
 - **Check Model continuo** con 14 reglas (PK ausente, identificador inválido o reservado, NOT NULL+DEFAULT NULL, FK rota, type mismatch, etc.). Cada hallazgo es clickeable y selecciona la entidad/columna.
 - **SQL Preview en vivo** (panel inferior) + modal `Ver SQL` con copiar/descargar. El DDL emitido respeta orden topológico (parents antes que children) e incluye todas las constraints inline.
-- **↘ Importar de gabysql**: dado URL del server + DB, hace `GET /tables?db=<db>` y reconstruye entidades, columnas, constraints y FKs. CORS habilitado en el server desde VERSION 6.
+- **↘ Importar de gabysql**: dado URL del server + DB, hace `GET /tables?db=<db>` y reconstruye entidades, columnas, constraints y FKs. CORS habilitado en el server desde VERSION 6+.
 - **Persistencia local** (`localStorage` con clave `gabymodeler.v2`; migración automática desde la v1 vieja).
 
 ### Manual completo con screenshots
@@ -270,5 +288,5 @@ Consulta [examples/README.md](examples/README.md) para ejemplos de clientes Pyth
 
 - Usa `gabysql` para operaciones locales y pruebas rápidas
 - Usa `gabysql-server` cuando necesites UI web o integración HTTP
-- Haz backup offline del `.db` antes de cambios manuales o pruebas destructivas
+- Para snapshots usá `gabysql backup <src.db> <dst.db>` en vez de `cp` — valida CRC end-to-end y re-abre el destino para confirmar legibilidad.
 - Si necesitas reproducibilidad entre equipos, usa Docker Compose

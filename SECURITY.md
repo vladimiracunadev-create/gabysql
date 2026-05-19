@@ -14,8 +14,8 @@
 
 | Línea | Estado | Formato en disco |
 |---|---|---|
-| `0.1.x` (último binario en `main`) | soportada | `VERSION = 6` |
-| `0.1.x` previos | sin soporte de seguridad | `VERSION = 1` a `5` (cada bump rechaza explícitamente las DBs anteriores; ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco)) |
+| `0.1.x` (último binario en `main`) | soportada | `VERSION = 7` |
+| `0.1.x` previos | sin soporte de seguridad | `VERSION = 1` a `6` (cada bump rechaza explícitamente las DBs anteriores; ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco)) |
 | implementación previa al rewrite en Rust | no soportada | n/a |
 
 > Cualquier reporte de vulnerabilidad debe estar reproducido contra el `HEAD` de `main` o el último release publicado. No se publicarán parches retroactivos para versiones anteriores del formato en disco.
@@ -31,7 +31,9 @@
 - el nombre de DB en modo `-dir` se normaliza y bloquea rutas arbitrarias
 - el motor hace rollback ante errores de ejecución SQL dentro de la transacción activa
 - `Pager::create` rehúsa sobrescribir un archivo existente (mitiga pérdida de datos por uso accidental de `init`)
+- `Pager::create/open` adquiere un **lock exclusivo cross-process** sobre el `.db` (advisory en Linux/macOS, mandatory en Windows): impide que dos procesos abran y escriban concurrentemente el mismo archivo. Ver [ADR-0013](docs/adr/0013-process-level-file-lock.md).
 - cada página persistida valida CRC32-IEEE al leerse y al replay del WAL (mitiga corrupción silenciosa, no es protección contra adversarios con acceso al disco)
+- el CLI ofrece `gabysql backup/restore/verify` que validan CRC página por página y re-abren el destino post-escritura — operación canónica para snapshots, en vez de `cp` (ver [ADR-0015](docs/adr/0015-verified-backup-restore.md))
 - el modelador web `gabymodeler` es **zero-coupling** (no llama a la API ni lee tokens; el usuario copia el SQL al portapapeles y lo pega en `phpgabyadmin`), evitando exposición de credenciales en el front
 
 ---

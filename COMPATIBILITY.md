@@ -48,7 +48,8 @@
 
 | `VERSION` del header | Estado | Notas |
 | :--- | :--- | :--- |
-| `6` | 🟢 Actual | Agrega `FOREIGN KEY` por columna (target table + column + ON DELETE RESTRICT/CASCADE). |
+| `7` | 🟢 Actual | Agrega `kind: IndexKind` (`Hash` \| `OrderedInt`) a `IndexMeta`: índices sobre columnas `INT` son ordenados y soportan `BETWEEN` por índice (ADR-0017). |
+| `6` | 🔴 Rechazado | Agregaba `FOREIGN KEY` por columna (target table + column + ON DELETE RESTRICT/CASCADE). Recrear DB con binario actual. |
 | `5` | 🔴 Rechazado | Agregaba `NOT NULL` + `DEFAULT` por columna y `unique` por índice. Recrear DB con binario actual. |
 | `4` | 🔴 Rechazado | Sin constraints declarativas. Recrear DB. |
 | `3` | 🔴 Rechazado | Sin índices secundarios. Recrear DB. |
@@ -95,4 +96,4 @@ No se prueba contra IE11 ni navegadores legacy.
 
 - El servidor no expone TLS nativo. Para producción se requiere un reverse proxy con TLS.
 - `cargo audit` y `cargo deny` corren en CI (workflow `security.yml`); el grafo de dependencias hoy es vacío, pero la barrera está activa para el día que se introduzcan crates.
-- Las DBs creadas con versiones anteriores del formato no son legibles — ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#-unsupported-gabysql-file-format-versionn-expected-6) (sección reescrita en cada bump).
+- Las DBs creadas con versiones anteriores del formato no son legibles — ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#-unsupported-gabysql-file-format-versionn-expected-7) (sección reescrita en cada bump).

@@ -121,7 +121,7 @@ Solo cambian las dimensiones que el camino A entrega:
 | Índices compuestos / UNIQUE | 🔴 | 🟢 |
 | ORDER BY (al menos por índice) | 🔴 | 🟢 |
 | Constraints declarativas (NOT NULL/DEFAULT/UNIQUE) | 🔴 | 🟢 |
-| `integrity_check` + backup/restore con verificación | 🔴 | 🟢 |
+| `integrity_check` + backup/restore con verificación | 🟢 | 🟢 |
 | Suite de benchmarks reproducible (`gabybench`) | 🔴 | 🟢 |
 | Drivers oficiales (Python + Node.js) | 🔴 | 🟢 |
 | Madurez | 🔴 | 🟡 (`0.5+`, ≥ 1 caso piloto) |
