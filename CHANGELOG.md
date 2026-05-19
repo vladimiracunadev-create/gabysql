@@ -4,6 +4,50 @@
 
 ---
 
+## 2026-05-18 — Vigesimoprimera intervención: backup/restore/verify con validación end-to-end (Fase 2 — operación)
+
+> **Sin bump de formato. Sin deps añadidas.** Cierra el gap operacional "no hay forma confiable de respaldar". Justificación completa: [ADR-0015](docs/adr/0015-verified-backup-restore.md).
+
+### ✨ Cambio
+- Nuevo módulo [src/backup.rs](src/backup.rs) con tres entradas públicas: `backup`, `restore`, `verify`. Todas validan **CRC32 página por página en lectura** y, post-escritura, **re-abren el destino y revalidan cada página**. Si una sola página falla el CRC en cualquiera de las dos fases, la operación aborta — nunca se publica un backup roto.
+- Nuevos subcomandos CLI:
+  - `gabysql backup [--force] <src.db> <dst.db>`
+  - `gabysql restore [--force] <src.db> <dst.db>` (alias semántico)
+  - `gabysql verify <file.db>`
+- Salida estructurada: `OK backup  src=...  dst=...  pages=N  bytes=M`.
+- 3 tests de integración nuevos: round-trip con verify, detección de corrupción en origen (byte flip rechaza el backup), verify sobre DB sana.
+
+### 🎯 Por qué este cambio
+La operación de respaldo era "`cp demo.db backups/demo.db.bak`" — sin validación, sin awareness del WAL, sin garantía de que el destino se pudiera *usar*. Una página corrupta en el origen se replicaba al backup sin warning hasta que alguien intentaba restaurar (semanas después, en una emergencia).
+
+Ahora el contrato es claro:
+- Si el comando termina con `OK`, el archivo destino se puede abrir con el mismo binario, todas sus páginas tienen CRC válido, y su header coincide con el origen.
+- Si algo falla, error explícito que apunta a la página corrupta o la causa raíz.
+
+### 🛡️ Restricciones respetadas
+- **Cero deps** (ADR-0001 intacto).
+- **Cero bump de formato.** VERSION = 6 sigue válido — el destino es un `.db` regular.
+- **Lock exclusivo** vía ADR-0013: la DB debe estar cerrada por otros procesos (server apagado). Endpoint server-side `/backup` que tome el `write_lock` queda para Fase 3.
+
+### 📐 ADR
+- [ADR-0015 — Backup / restore / verify con validación end-to-end](docs/adr/0015-verified-backup-restore.md).
+
+### 📝 Ejemplo
+```powershell
+# Cierre el server primero (el lock exclusivo bloquea backups online)
+gabysql backup demo.db backups/demo.db.bak
+# → OK backup  src=demo.db  dst=backups/demo.db.bak  pages=128  bytes=524288
+
+# Verificar un backup antiguo
+gabysql verify backups/demo.db.bak
+# → OK verify  path=backups/demo.db.bak  pages=128  bytes=524288
+
+# Restaurar
+gabysql restore --force backups/demo.db.bak demo.db
+```
+
+---
+
 ## 2026-05-18 — Vigésima intervención: logs JSON + endpoint `/metrics` en el server (Fase 2 — observabilidad)
 
 > **Sin bump de formato. Sin deps añadidas.** Primer paso de observabilidad operacional para `gabysql-server`. Justificación completa: [ADR-0014](docs/adr/0014-logs-json-metrics.md).

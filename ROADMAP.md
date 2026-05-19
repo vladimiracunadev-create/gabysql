@@ -51,7 +51,7 @@
 - range scan por índice secundario (`WHERE indexed_col BETWEEN ...`) *(agrupado con índices compuestos: el índice 2º actual es hash-based FNV-1a-64, no admite range nativo; se reestructura a B+Tree ordenado en el mismo bump VERSION 7)*
 - checkpoint/compaction del WAL *(re-evaluado: el WAL actual es per-transaction y se trunca/borra en cada commit, así que "checkpoint" en el sentido clásico requiere primero un cambio a WAL persistente. Diferido hasta que aparezca demanda real.)*
 - ~~locking simple entre procesos~~ ✅ entregado (ADR-0013, `File::try_lock` advisory exclusivo en `Pager::create/open`)
-- backup / restore verificado
+- ~~backup / restore verificado~~ ✅ entregado (ADR-0015, `gabysql backup/restore/verify` con CRC end-to-end)
 - ~~logs estructurados y primeras métricas del server~~ ✅ entregado (ADR-0014, endpoint `/metrics` + flag `-log-json`)
 
 ### Fase 3 — Planeación y rendimiento

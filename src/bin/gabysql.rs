@@ -67,12 +67,62 @@ fn run() -> DbResult<()> {
             }
             run_repl(PathBuf::from(&args[2]))?;
         }
+        "backup" => run_backup_cmd(&args[2..], false)?,
+        "restore" => run_backup_cmd(&args[2..], true)?,
+        "verify" => {
+            if args.len() != 3 {
+                usage();
+                std::process::exit(2);
+            }
+            let report = gabysql::backup::verify(Path::new(&args[2]))?;
+            println!(
+                "OK verify  path={}  pages={}  bytes={}",
+                report.path.display(),
+                report.pages,
+                report.bytes
+            );
+        }
         _ => {
             usage();
             std::process::exit(2);
         }
     }
 
+    Ok(())
+}
+
+/// Shared driver for `backup` and `restore` (both produce a verified
+/// copy of `src` at `dst`). Accepts an optional leading `--force` to
+/// allow overwriting an existing `dst`.
+fn run_backup_cmd(rest: &[String], is_restore: bool) -> DbResult<()> {
+    let mut force = false;
+    let mut positional: Vec<&str> = Vec::new();
+    for arg in rest {
+        if arg == "--force" {
+            force = true;
+        } else {
+            positional.push(arg);
+        }
+    }
+    if positional.len() != 2 {
+        usage();
+        std::process::exit(2);
+    }
+    let src = Path::new(positional[0]);
+    let dst = Path::new(positional[1]);
+    let report = if is_restore {
+        gabysql::backup::restore(src, dst, force)?
+    } else {
+        gabysql::backup::backup(src, dst, force)?
+    };
+    println!(
+        "OK {}  src={}  dst={}  pages={}  bytes={}",
+        if is_restore { "restore" } else { "backup" },
+        report.src.display(),
+        report.dst.display(),
+        report.pages,
+        report.bytes
+    );
     Ok(())
 }
 
@@ -246,6 +296,6 @@ fn value_to_string(value: &Value) -> String {
 
 fn usage() {
     println!(
-        "Uso:\n  gabysql init [--force] <file.db>\n  gabysql info <file.db>\n  gabysql exec <file.db> \"<SQL...>\"\n  gabysql repl <file.db>\n\n  init refuses to overwrite an existing file; pass --force to replace it.\n\nSQL soportado:\n  CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);\n  INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);\n  SELECT * FROM users;\n  SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;"
+        "Uso:\n  gabysql init [--force] <file.db>\n  gabysql info <file.db>\n  gabysql exec <file.db> \"<SQL...>\"\n  gabysql repl <file.db>\n  gabysql backup [--force] <src.db> <dst.db>\n  gabysql restore [--force] <src.db> <dst.db>\n  gabysql verify <file.db>\n\n  init refuses to overwrite an existing file; pass --force to replace it.\n  backup/restore verify every CRC32 page trailer on read and re-open the destination to confirm end-to-end integrity.\n  verify walks every page of a closed DB and reports the page count.\n\nSQL soportado:\n  CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);\n  INSERT INTO users (id,name,active) VALUES (1,'Ana',TRUE);\n  SELECT * FROM users;\n  SELECT id,name FROM users WHERE id BETWEEN 1 AND 10 LIMIT 5 OFFSET 0;"
     );
 }

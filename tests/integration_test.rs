@@ -1621,6 +1621,115 @@ fn cursor_limit_returns_only_requested_rows() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn backup_roundtrip_verifies_end_to_end() -> Result<(), Box<dyn Error>> {
+    let src = temp_db_path("backup-src");
+    let dst = temp_db_path("backup-dst");
+    let wal_src = wal_path(&src);
+    let wal_dst = wal_path(&dst);
+    cleanup(&[&src, &dst, &wal_src, &wal_dst]);
+
+    let mut pager = Pager::create(&src)?;
+    pager.close()?;
+    run_sql(
+        &src,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &src,
+        "INSERT INTO users (id,name) VALUES (1,'Ana'); INSERT INTO users (id,name) VALUES (2,'Beto'); INSERT INTO users (id,name) VALUES (3,'Cris');",
+    )?;
+
+    // Backup must produce a verified-good copy.
+    let report = gabysql::backup::backup(&src, &dst, false)?;
+    assert!(report.pages >= 2, "expected at least a header + data page");
+    assert_eq!(report.bytes as usize, report.pages as usize * 4096);
+
+    // Refuses to overwrite without --force.
+    let again = gabysql::backup::backup(&src, &dst, false);
+    assert!(again.is_err(), "second backup without --force should fail");
+
+    // With force, the second backup succeeds.
+    gabysql::backup::backup(&src, &dst, true)?;
+
+    // The destination must hold the same rows as the source.
+    let rows = run_sql(&dst, "SELECT id,name FROM users WHERE id = 2;")?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].rows.len(), 1);
+    assert_eq!(rows[0].rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0].rows[0][1], Value::String("Beto".to_string()));
+
+    cleanup(&[&src, &dst, &wal_src, &wal_dst]);
+    Ok(())
+}
+
+#[test]
+fn backup_detects_corrupted_source() -> Result<(), Box<dyn Error>> {
+    let src = temp_db_path("backup-corrupt-src");
+    let dst = temp_db_path("backup-corrupt-dst");
+    let wal_src = wal_path(&src);
+    let wal_dst = wal_path(&dst);
+    cleanup(&[&src, &dst, &wal_src, &wal_dst]);
+
+    let mut pager = Pager::create(&src)?;
+    pager.close()?;
+    run_sql(
+        &src,
+        "CREATE TABLE t (id INT PRIMARY KEY, payload TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &src,
+        "INSERT INTO t (id,payload) VALUES (1,'hello'); INSERT INTO t (id,payload) VALUES (2,'world');",
+    )?;
+
+    // Flip a byte in the middle of page 1 (after the header page) so
+    // its CRC32 trailer no longer matches. backup() must catch this
+    // and refuse to publish the corrupted copy.
+    {
+        let mut bytes = fs::read(&src)?;
+        assert!(bytes.len() >= 2 * 4096, "DB too small for the test setup");
+        bytes[4096 + 100] ^= 0xFF;
+        fs::write(&src, bytes)?;
+    }
+
+    let result = gabysql::backup::backup(&src, &dst, true);
+    assert!(
+        result.is_err(),
+        "backup should refuse a source with a corrupt page"
+    );
+    let msg = result.err().unwrap().to_string();
+    assert!(
+        msg.contains("corrupt") || msg.contains("checksum") || msg.contains("CRC"),
+        "error should mention corruption, got: {}",
+        msg
+    );
+
+    cleanup(&[&src, &dst, &wal_src, &wal_dst]);
+    Ok(())
+}
+
+#[test]
+fn verify_walks_every_page() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("verify");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,name) VALUES (1,'a'); INSERT INTO t (id,name) VALUES (2,'b');",
+    )?;
+
+    let report = gabysql::backup::verify(&db)?;
+    assert!(report.pages >= 2);
+    assert_eq!(report.bytes as usize, report.pages as usize * 4096);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn cross_process_lock_rejects_second_open() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("xproc-lock");
     let wal = wal_path(&db);

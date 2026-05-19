@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+pub mod backup;
 pub mod bptree;
 pub mod catalog;
 pub mod index;
