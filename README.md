@@ -20,6 +20,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 
 | 📄 | Documento | Para qué sirve |
 | :---: | :--- | :--- |
+| 📌 | [TAREAS_PENDIENTES](docs/TAREAS_PENDIENTES.md) | **lo próximo a hacer**, ordenado por prioridad real — primer doc al pedir "estado del proyecto" |
 | 🔬 | [AGENDA_INVESTIGACION](docs/AGENDA_INVESTIGACION.md) | **agenda real del proyecto**: tesis, ejes de investigación, fases de aprendizaje, anti-agenda |
 | 📋 | [STATUS](docs/STATUS.md) | madurez por subsistema (🟢/🟡/🔴 fila por fila) |
 | 🧪 | [USE_CASES](docs/USE_CASES.md) | 17 recetas concretas listas para copiar |
