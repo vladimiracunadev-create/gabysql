@@ -26,6 +26,7 @@
 //!   `[count:u16] + count × [pk:i64]`
 
 use crate::catalog::{Column, ColumnType, TableMeta};
+use crate::errors::{coded, codes};
 use crate::sql::Value;
 use crate::{DbError, DbResult};
 
@@ -311,12 +312,20 @@ pub fn ordered_bucket_unique_conflict(pks: &[i64], exclude_pk: Option<i64>) -> O
 /// version. (Today: any of the supported scalar types except JSON, which
 /// has no canonical equality semantics.)
 pub fn validate_indexable(meta: &TableMeta, column: &str) -> DbResult<()> {
-    let col = meta
-        .column(column)
-        .ok_or_else(|| DbError::new(format!("columna no existe: {}", column)))?;
+    let col = meta.column(column).ok_or_else(|| {
+        coded(
+            codes::COLUMN_NOT_FOUND,
+            format!("columna '{}' no existe en tabla '{}'", column, meta.name),
+        )
+    })?;
     if matches!(col.column_type, ColumnType::Json) {
-        return Err(DbError::new(
-            "no se admiten índices sobre columnas JSON en esta versión",
+        return Err(coded(
+            codes::INDEX_ON_JSON,
+            format!(
+                "no se admiten índices sobre columnas JSON en esta versión \
+                 (columna '{}' es JSON)",
+                column
+            ),
         ));
     }
     Ok(())

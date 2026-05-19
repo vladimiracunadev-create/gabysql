@@ -1,4 +1,5 @@
 use crate::catalog::{Catalog, DefaultLiteral, TableMeta};
+use crate::errors::{coded, codes};
 use crate::sql::{decode_row, parse, Engine, ResultSet, Statement, Value};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
@@ -180,8 +181,10 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
                     let body = format!(
                         "{{\"ok\":false,\"error\":{}}}",
                         json_string(&format!(
-                            "server busy: {} active connections (max {})",
-                            current, max_connections
+                            "[GBY-{:04}] server saturado: {} conexiones activas (max {})",
+                            codes::SERVER_BUSY,
+                            current,
+                            max_connections
                         ))
                     );
                     let _ = write_response(&mut stream, Response::json(503, body));
@@ -318,7 +321,7 @@ fn handle_request(
         if !auth_ok {
             return Ok(Response::json(
                 401,
-                "{\"ok\":false,\"error\":\"unauthorized\"}".to_string(),
+                "{\"ok\":false,\"error\":\"[GBY-5004] unauthorized\"}".to_string(),
             ));
         }
     }
@@ -451,7 +454,10 @@ fn schema(request: Request, config: &ServerConfig) -> DbResult<Response> {
         .cloned()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            DbError::new("falta el parámetro 'table' en la query string (ej: ?table=users)")
+            coded(
+                codes::MISSING_TABLE_PARAM,
+                "falta el parámetro 'table' en la query string (ej: ?table=users)",
+            )
         })?;
     let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
     let mut catalog = Catalog::open(&mut pager);
@@ -478,7 +484,10 @@ fn rows(request: Request, config: &ServerConfig) -> DbResult<Response> {
         .cloned()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            DbError::new("falta el parámetro 'table' en la query string (ej: ?table=users)")
+            coded(
+                codes::MISSING_TABLE_PARAM,
+                "falta el parámetro 'table' en la query string (ej: ?table=users)",
+            )
         })?;
 
     let mut limit = request
@@ -747,13 +756,15 @@ fn open_pager_from_request(
     }
 
     let dir = config.dir.as_ref().ok_or_else(|| {
-        DbError::new(
+        coded(
+            codes::SERVER_NOT_MULTI_DB,
             "el servidor está en modo single-DB (-db); las rutas multi-DB (?db=...) \
              requieren arrancar con -dir <carpeta>",
         )
     })?;
     let requested = requested_db.ok_or_else(|| {
-        DbError::new(
+        coded(
+            codes::MISSING_DB_PARAM,
             "falta el parámetro 'db' en la query string (ej: ?db=demo.db); \
              requerido en modo -dir",
         )
@@ -765,16 +776,20 @@ fn open_pager_from_request(
 fn normalize_db_name(value: &str) -> DbResult<String> {
     let mut name = value.trim().to_string();
     if name.is_empty() {
-        return Err(DbError::new(
+        return Err(coded(
+            codes::INVALID_DB_NAME,
             "parámetro 'db' vacío: indique el nombre del archivo .db dentro del directorio configurado",
         ));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(DbError::new(format!(
-            "nombre de db inválido '{}': no se admiten separadores de path \
-             ('/' o '\\\\'); la DB debe estar directamente en el directorio configurado con -dir",
-            name
-        )));
+        return Err(coded(
+            codes::INVALID_DB_NAME,
+            format!(
+                "nombre de db inválido '{}': no se admiten separadores de path \
+                 ('/' o '\\\\'); la DB debe estar directamente en el directorio configurado con -dir",
+                name
+            ),
+        ));
     }
     if !name.to_ascii_lowercase().ends_with(".db") {
         name.push_str(".db");

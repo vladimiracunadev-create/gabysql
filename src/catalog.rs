@@ -1,4 +1,5 @@
 use crate::bptree::{init_leaf_page, LeafCursor, Tree};
+use crate::errors::{coded, codes};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::HashSet;
@@ -655,10 +656,13 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
         validate_identifier(&column.name, "columna")?;
         let normalized = column.name.to_ascii_lowercase();
         if !seen.insert(normalized) {
-            return Err(DbError::new(format!(
-                "CREATE TABLE '{}' rechazado: nombre de columna duplicado '{}'",
-                meta.name, column.name
-            )));
+            return Err(coded(
+                codes::DUPLICATE_COLUMN_NAME,
+                format!(
+                    "CREATE TABLE '{}' rechazado: nombre de columna duplicado '{}'",
+                    meta.name, column.name
+                ),
+            ));
         }
         if column.name.eq_ignore_ascii_case(&meta.primary_key) {
             if column.column_type != ColumnType::Int {
@@ -774,36 +778,54 @@ pub const RESERVED_WORDS: &[&str] = &[
 pub fn validate_identifier(name: &str, kind: &str) -> DbResult<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(DbError::new(format!("nombre de {} vacío", kind)));
+        return Err(coded(
+            codes::INVALID_IDENTIFIER,
+            format!("nombre de {} vacío", kind),
+        ));
     }
     if trimmed.len() > MAX_IDENT_LEN {
-        return Err(DbError::new(format!(
-            "nombre de {} '{}' excede el máximo de {} caracteres",
-            kind, trimmed, MAX_IDENT_LEN
-        )));
+        return Err(coded(
+            codes::INVALID_IDENTIFIER,
+            format!(
+                "nombre de {} '{}' excede el máximo de {} caracteres (tiene {})",
+                kind,
+                trimmed,
+                MAX_IDENT_LEN,
+                trimmed.len()
+            ),
+        ));
     }
     let mut chars = trimmed.chars();
     let first = chars.next().expect("non-empty checked above");
     if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(DbError::new(format!(
-            "nombre de {} '{}' inválido: debe empezar con letra o '_'",
-            kind, trimmed
-        )));
+        return Err(coded(
+            codes::INVALID_IDENTIFIER,
+            format!(
+                "nombre de {} '{}' inválido: debe empezar con letra o '_'",
+                kind, trimmed
+            ),
+        ));
     }
     for ch in chars {
         if !(ch.is_ascii_alphanumeric() || ch == '_') {
-            return Err(DbError::new(format!(
-                "nombre de {} '{}' inválido: solo se admiten [A-Za-z0-9_]",
-                kind, trimmed
-            )));
+            return Err(coded(
+                codes::INVALID_IDENTIFIER,
+                format!(
+                    "nombre de {} '{}' inválido: solo se admiten [A-Za-z0-9_]",
+                    kind, trimmed
+                ),
+            ));
         }
     }
     let lower = trimmed.to_ascii_lowercase();
     if RESERVED_WORDS.iter().any(|w| *w == lower) {
-        return Err(DbError::new(format!(
-            "nombre de {} '{}' es palabra reservada",
-            kind, trimmed
-        )));
+        return Err(coded(
+            codes::INVALID_IDENTIFIER,
+            format!(
+                "nombre de {} '{}' es palabra reservada del motor",
+                kind, trimmed
+            ),
+        ));
     }
     Ok(())
 }

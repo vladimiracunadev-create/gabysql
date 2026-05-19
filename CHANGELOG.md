@@ -4,6 +4,52 @@
 
 ---
 
+## 2026-05-18 — Vigesimosexta intervención: códigos numéricos `[GBY-NNNN]` estilo MySQL `ER_*` + catálogo operacional
+
+> **Sin bump de formato. Sin deps añadidas.** Cierre del trabajo de manejo de errores: cada error user-facing ahora lleva un código estable y existe un catálogo operacional búscable. Análogo al sistema `ER_DUP_ENTRY=1062` de MySQL.
+
+### ✨ Cambio
+- Nuevo módulo [src/errors.rs](src/errors.rs):
+  - `pub mod codes` con ~30 constantes `pub const NAME: u32 = NNNN` agrupadas por rango:
+    - `1000–1999` storage / WAL / file lock
+    - `2000–2999` catalog / schema / identificadores
+    - `3000–3999` constraints (PK, NOT NULL, UNIQUE, FK)
+    - `4000–4999` superficie SQL (parser, planner, limitaciones)
+    - `5000–5999` server / HTTP / auth
+  - Helper `coded(code: u32, message: impl Into<String>) -> DbError` que produce mensajes con prefijo `[GBY-NNNN]`.
+  - 3 unit tests del módulo.
+- Sweep de ~30 sitios user-facing en `storage.rs`, `bptree.rs`, `sql.rs`, `catalog.rs`, `index.rs`, `server.rs`: cada error visible para CLI/HTTP/embedido ahora pasa por `coded(...)`.
+- Auth fallida (`401`) y server-busy (`503`) llevan códigos `[GBY-5004]` y `[GBY-5005]` respectivamente.
+- Nuevo documento normativo [docs/ERROR_CODES.md](docs/ERROR_CODES.md) — catálogo operacional con cada código: causa, remedio, ejemplo de mensaje real, integración desde CLI/HTTP/Rust/Python.
+- README, ERROR_HANDLING y CONTRIBUTING enlazan al catálogo.
+
+### 🎯 Por qué este cambio
+Pregunta del usuario: *"y tener un número referencial como MySQL tiene para el manejo de errores"*. Razón concreta: el texto de un mensaje puede evolucionar (mejor redacción, más contexto), pero un cliente que reacciona programáticamente al error necesita un contrato estable. El código numérico **es** ese contrato.
+
+Ahora:
+- Las herramientas pueden hacer `grep -oE 'GBY-[0-9]{4}'` para detectar la clase del error sin parsear texto humano.
+- El troubleshooting tiene un eje claro: cada código apunta a su entrada en [ERROR_CODES.md](docs/ERROR_CODES.md).
+- Los clientes embebidos pueden hacer `text.starts_with("[GBY-3001]")` para detectar PK duplicada sin depender de la redacción exacta.
+
+### 🛡️ Decisión: constantes Rust, no JSON externo
+Documentada en [src/errors.rs](src/errors.rs) y en la sección "Por qué constantes en Rust" del catálogo:
+- Zero-deps (ADR-0001) — sin filesystem I/O al startup.
+- Type-checked: el compilador detecta renames; con JSON sería un test runtime dedicado.
+- Misma flexibilidad práctica: cambiar un mensaje es edit + rebuild + redeploy en cualquier caso.
+- i18n futuro se resuelve con `feature` flags si llega, sin filesystem.
+
+### 🛡️ Restricciones respetadas
+- **Cero deps.** ADR-0001 intacto.
+- **Cero bump de formato.** VERSION 7 sigue válido.
+- **Cero rotura del contrato externo.** Los mensajes ahora prefijan con `[GBY-NNNN]`, pero los clientes que no parsean el texto (mayoría) no se ven afectados.
+- **45/45 integration + 30 lib + 4 server + 3 errors unit tests verdes.**
+
+### 📐 Documentos
+- [docs/ERROR_CODES.md](docs/ERROR_CODES.md) — catálogo completo de los ~30 códigos.
+- [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md) — guía de estilo (actualizada para reflejar el nuevo sistema de códigos).
+
+---
+
 ## 2026-05-18 — Vigesimoquinta intervención: guía canónica de manejo de errores + sweep al español + enriquecimiento
 
 > **Sin bump de formato. Sin deps añadidas. Levanta la barra de calidad de los mensajes de error a nivel producto.** Cierra el síntoma "los errores en pantalla son pobres y no aclaran nada".

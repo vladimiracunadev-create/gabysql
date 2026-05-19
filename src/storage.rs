@@ -1,3 +1,4 @@
+use crate::errors::{coded, codes};
 use crate::{DbError, DbResult};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -17,16 +18,22 @@ use std::path::{Path, PathBuf};
 fn acquire_db_lock(file: &File, path: &Path) -> DbResult<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => Err(DbError::new(format!(
-            "base de datos bloqueada por otro proceso: {}. \
-             Cierre el otro proceso gabysql o espere a que libere el lock.",
-            path.display()
-        ))),
-        Err(TryLockError::Error(err)) => Err(DbError::new(format!(
-            "no se pudo adquirir el lock exclusivo sobre {}: {}",
-            path.display(),
-            err
-        ))),
+        Err(TryLockError::WouldBlock) => Err(coded(
+            codes::DB_LOCKED_BY_PROCESS,
+            format!(
+                "base de datos bloqueada por otro proceso: {}. \
+                 Cierre el otro proceso gabysql o espere a que libere el lock.",
+                path.display()
+            ),
+        )),
+        Err(TryLockError::Error(err)) => Err(coded(
+            codes::DB_LOCKED_BY_PROCESS,
+            format!(
+                "no se pudo adquirir el lock exclusivo sobre {}: {}",
+                path.display(),
+                err
+            ),
+        )),
     }
 }
 
@@ -121,27 +128,34 @@ impl Header {
             )));
         }
         if &src[0..8] != MAGIC {
-            return Err(DbError::new(
+            return Err(coded(
+                codes::BAD_MAGIC_BYTES,
                 "magic bytes inválidos: el archivo no es una base de datos gabysql (esperaba 'GABYSQL1')",
             ));
         }
         let version = u32::from_le_bytes(src[8..12].try_into().unwrap());
         if version != VERSION {
-            return Err(DbError::new(format!(
-                "formato de archivo gabysql no soportado: version={} (esperaba {}). \
-                 Re-cree la base de datos con el binario actual.",
-                version, VERSION
-            )));
+            return Err(coded(
+                codes::UNSUPPORTED_FORMAT_VERSION,
+                format!(
+                    "formato de archivo gabysql no soportado: version={} (esperaba {}). \
+                     Re-cree la base de datos con el binario actual.",
+                    version, VERSION
+                ),
+            ));
         }
         let page_size = u16::from_le_bytes(src[12..14].try_into().unwrap());
         // Format v3 only supports the default page size. The field is kept on
         // disk so a future format revision can lift the constraint without
         // another binary header change.
         if page_size as usize != PAGE_SIZE_DEFAULT {
-            return Err(DbError::new(format!(
-                "page_size no soportado: archivo declara {}, este build requiere {}",
-                page_size, PAGE_SIZE_DEFAULT
-            )));
+            return Err(coded(
+                codes::UNSUPPORTED_PAGE_SIZE,
+                format!(
+                    "page_size no soportado: archivo declara {}, este build requiere {}",
+                    page_size, PAGE_SIZE_DEFAULT
+                ),
+            ));
         }
         Ok(Self {
             version,
@@ -310,11 +324,14 @@ impl Pager {
             }
         }
         if !force && path.exists() {
-            return Err(DbError::new(format!(
-                "se rehúsa sobrescribir base de datos existente: {}. \
-                 Bórrela primero o use create_force() (CLI: 'gabysql init --force').",
-                path.display()
-            )));
+            return Err(coded(
+                codes::REFUSE_OVERWRITE_DB,
+                format!(
+                    "se rehúsa sobrescribir base de datos existente: {}. \
+                     Bórrela primero o use create_force() (CLI: 'gabysql init --force').",
+                    path.display()
+                ),
+            ));
         }
         let mut file = OpenOptions::new()
             .create(true)
@@ -413,7 +430,8 @@ impl Pager {
 
     pub fn begin(&mut self) -> DbResult<()> {
         if self.in_tx {
-            return Err(DbError::new(
+            return Err(coded(
+                codes::TX_ALREADY_STARTED,
                 "transacción ya iniciada: este Pager ya tiene una transacción abierta; \
                  llame a commit() o rollback() antes de begin()",
             ));
@@ -425,7 +443,8 @@ impl Pager {
 
     pub fn commit(&mut self) -> DbResult<()> {
         if !self.in_tx {
-            return Err(DbError::new(
+            return Err(coded(
+                codes::NO_ACTIVE_TX,
                 "no hay transacción activa: commit() requiere un begin() previo",
             ));
         }
@@ -474,7 +493,8 @@ impl Pager {
 
     pub fn rollback(&mut self) -> DbResult<()> {
         if !self.in_tx {
-            return Err(DbError::new(
+            return Err(coded(
+                codes::NO_ACTIVE_TX,
                 "no hay transacción activa: rollback() requiere un begin() previo",
             ));
         }
@@ -634,8 +654,12 @@ impl Pager {
         let mut data = vec![0; self.page_size()];
         self.file.seek(SeekFrom::Start(self.page_offset(no)))?;
         self.file.read_exact(&mut data)?;
-        verify_page_checksum(&data)
-            .map_err(|err| DbError::new(format!("página {} corrupta: {}", no, err)))?;
+        verify_page_checksum(&data).map_err(|err| {
+            coded(
+                codes::PAGE_CRC_INVALID,
+                format!("página {} corrupta: {}", no, err),
+            )
+        })?;
         self.cache.insert(no, CachedPage { data, dirty: false });
         Ok(())
     }
@@ -770,10 +794,13 @@ impl Wal {
                     // trailer. Verify before applying so a torn write is
                     // refused instead of silently corrupting the DB file.
                     verify_page_checksum(&data).map_err(|err| {
-                        DbError::new(format!(
-                            "WAL record para página {} con CRC32 inválido: {}",
-                            page_no, err
-                        ))
+                        coded(
+                            codes::WAL_RECORD_CRC_INVALID,
+                            format!(
+                                "WAL record para página {} con CRC32 inválido: {}",
+                                page_no, err
+                            ),
+                        )
                     })?;
                     db.seek(SeekFrom::Start(page_no as u64 * page_size as u64))?;
                     db.write_all(&data)?;

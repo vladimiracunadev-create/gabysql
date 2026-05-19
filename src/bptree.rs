@@ -209,10 +209,13 @@ impl<'a> Tree<'a> {
                 match leaf.kvs.binary_search_by_key(&key, |kv| kv.key) {
                     Ok(idx) => {
                         if !allow_replace {
-                            return Err(DbError::new(format!(
-                                "PRIMARY KEY duplicada: la clave {} ya existe en la tabla",
-                                key
-                            )));
+                            return Err(crate::errors::coded(
+                                crate::errors::codes::DUPLICATE_PRIMARY_KEY,
+                                format!(
+                                    "PRIMARY KEY duplicada: la clave {} ya existe en la tabla",
+                                    key
+                                ),
+                            ));
                         }
                         leaf.kvs[idx].value = value;
                     }

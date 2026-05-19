@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 pub mod backup;
 pub mod bptree;
 pub mod catalog;
+pub mod errors;
 pub mod index;
 pub mod server;
 pub mod sql;

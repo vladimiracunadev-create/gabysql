@@ -10,7 +10,7 @@
 - Si cambias storage, parser o semántica SQL, agrega o ajusta pruebas
 - Si cambias comportamiento visible, actualiza también la documentación
 - Prefiere cambios pequeños, verificables y reversibles
-- **Cualquier `DbError::new(...)` que agregues debe respetar [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md)** — mensajes en español, con el nombre concreto del objeto y el dato del fallo. La guía tiene un checklist al final para autorrevisión.
+- **Cualquier error nuevo debe respetar [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md) y, si es user-facing, llevar un código `[GBY-NNNN]` del catálogo en [docs/ERROR_CODES.md](docs/ERROR_CODES.md)** (definido en [src/errors.rs](src/errors.rs)). Para errores user-facing usá `coded(codes::SYMBOL, "mensaje...")` en lugar de `DbError::new(...)` directo. La guía tiene un checklist al final para autorrevisión.
 
 ---
 

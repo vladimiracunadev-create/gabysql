@@ -3,6 +3,7 @@ use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
     ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, TableMeta,
 };
+use crate::errors::{coded, codes};
 use crate::index::{
     bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
     decode_ordered_bucket, encode_bucket, encode_column_value, encode_ordered_bucket, hash_value,
@@ -247,7 +248,13 @@ impl<'a> Engine<'a> {
         {
             let mut catalog = Catalog::open(self.pager);
             if catalog.get_table(&meta.name)?.is_some() {
-                return Err(DbError::new(format!("tabla {} ya existe", meta.name)));
+                return Err(coded(
+                    codes::TABLE_ALREADY_EXISTS,
+                    format!(
+                        "CREATE TABLE rechazado: ya existe una tabla llamada '{}'",
+                        meta.name
+                    ),
+                ));
             }
         }
 
@@ -644,18 +651,24 @@ impl<'a> Engine<'a> {
 
     fn exec_insert(&mut self, stmt: InsertStmt) -> DbResult<ResultSet> {
         if stmt.columns.len() != stmt.values.len() {
-            return Err(DbError::new(format!(
-                "INSERT INTO '{}': cantidad de columnas ({}) no coincide con cantidad de valores ({})",
-                stmt.table,
-                stmt.columns.len(),
-                stmt.values.len()
-            )));
+            return Err(coded(
+                codes::INSERT_COLS_VS_VALUES_MISMATCH,
+                format!(
+                    "INSERT INTO '{}': cantidad de columnas ({}) no coincide con cantidad de valores ({})",
+                    stmt.table,
+                    stmt.columns.len(),
+                    stmt.values.len()
+                ),
+            ));
         }
         let meta = {
             let mut catalog = Catalog::open(self.pager);
-            catalog
-                .get_table(&stmt.table)?
-                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+            catalog.get_table(&stmt.table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("tabla no existe: {}", stmt.table),
+                )
+            })?
         };
 
         let mut seen = HashSet::new();
@@ -663,13 +676,22 @@ impl<'a> Engine<'a> {
         for (column_name, value) in stmt.columns.into_iter().zip(stmt.values) {
             let normalized = normalize_ident(&column_name);
             if !seen.insert(normalized.clone()) {
-                return Err(DbError::new(format!(
-                    "INSERT INTO '{}': columna '{}' aparece más de una vez en la lista",
-                    stmt.table, column_name
-                )));
+                return Err(coded(
+                    codes::DUPLICATE_COLUMN_NAME,
+                    format!(
+                        "INSERT INTO '{}': columna '{}' aparece más de una vez en la lista",
+                        stmt.table, column_name
+                    ),
+                ));
             }
             if meta.column(&normalized).is_none() {
-                return Err(DbError::new(format!("columna no existe: {}", column_name)));
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "columna '{}' no existe en tabla '{}'",
+                        column_name, stmt.table
+                    ),
+                ));
             }
             values.insert(normalized, value);
         }
@@ -780,11 +802,14 @@ impl<'a> Engine<'a> {
                     let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
                     Plan::ByPks(pks)
                 } else {
-                    return Err(DbError::new(format!(
-                        "WHERE solo soporta PK ({}) o columnas con índice secundario; \
-                         '{}' no está indexada",
-                        meta.primary_key, column
-                    )));
+                    return Err(coded(
+                        codes::WHERE_OPERATOR_UNSUPPORTED,
+                        format!(
+                            "WHERE solo soporta PK ({}) o columnas con índice secundario; \
+                             '{}' no está indexada",
+                            meta.primary_key, column
+                        ),
+                    ));
                 }
             }
             Some(WhereClause::Between { column, from, to }) => {
@@ -801,19 +826,25 @@ impl<'a> Engine<'a> {
                             Plan::ByPks(pks)
                         }
                         IndexKind::Hash => {
-                            return Err(DbError::new(format!(
-                                "WHERE BETWEEN sobre '{}': el índice secundario es hash-based \
-                                 (equality only). Solo columnas INT-indexadas admiten BETWEEN.",
-                                column
-                            )));
+                            return Err(coded(
+                                codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
+                                format!(
+                                    "WHERE BETWEEN sobre '{}': el índice secundario es hash-based \
+                                     (equality only). Solo columnas INT-indexadas admiten BETWEEN.",
+                                    column
+                                ),
+                            ));
                         }
                     }
                 } else {
-                    return Err(DbError::new(format!(
-                        "WHERE BETWEEN solo soporta PK ({}) o columnas INT con índice; \
-                         '{}' no califica",
-                        meta.primary_key, column
-                    )));
+                    return Err(coded(
+                        codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
+                        format!(
+                            "WHERE BETWEEN solo soporta PK ({}) o columnas INT con índice; \
+                             '{}' no califica",
+                            meta.primary_key, column
+                        ),
+                    ));
                 }
             }
         };
@@ -942,21 +973,31 @@ impl<'a> Engine<'a> {
         for (column_name, value) in stmt.assignments {
             let normalized = normalize_ident(&column_name);
             if normalized == normalize_ident(&meta.primary_key) {
-                return Err(DbError::new(
-                    "no se permite cambiar la PRIMARY KEY en UPDATE (esta versión)",
+                return Err(coded(
+                    codes::UPDATE_PK_NOT_ALLOWED,
+                    format!(
+                        "UPDATE sobre '{}': no se permite cambiar la PRIMARY KEY '{}' (esta versión)",
+                        meta.name, meta.primary_key
+                    ),
                 ));
             }
             if meta.column(&normalized).is_none() {
-                return Err(DbError::new(format!(
-                    "UPDATE sobre '{}': columna '{}' no existe en la tabla",
-                    meta.name, column_name
-                )));
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "UPDATE sobre '{}': columna '{}' no existe en la tabla",
+                        meta.name, column_name
+                    ),
+                ));
             }
             if overrides.insert(normalized, value).is_some() {
-                return Err(DbError::new(format!(
-                    "UPDATE sobre '{}': columna '{}' aparece más de una vez en SET",
-                    meta.name, column_name
-                )));
+                return Err(coded(
+                    codes::DUPLICATE_COLUMN_NAME,
+                    format!(
+                        "UPDATE sobre '{}': columna '{}' aparece más de una vez en SET",
+                        meta.name, column_name
+                    ),
+                ));
             }
         }
 
@@ -964,7 +1005,15 @@ impl<'a> Engine<'a> {
             let mut catalog = Catalog::open(self.pager);
             catalog
                 .get_row(meta.root_page, stmt.where_pk)?
-                .ok_or_else(|| DbError::new(format!("fila no existe: PK={}", stmt.where_pk)))?
+                .ok_or_else(|| {
+                    coded(
+                        codes::ROW_NOT_FOUND_FOR_PK,
+                        format!(
+                            "UPDATE sobre '{}': fila no existe PK={}",
+                            meta.name, stmt.where_pk
+                        ),
+                    )
+                })?
         };
         let old_row = decode_row(&meta, &existing)?;
         let mut current = old_row.clone();
@@ -983,10 +1032,13 @@ impl<'a> Engine<'a> {
                 continue;
             }
             if matches!(current.get(&normalized), Some(Value::Null) | None) {
-                return Err(DbError::new(format!(
-                    "columna '{}' es NOT NULL; UPDATE no puede dejarla en NULL",
-                    column.name
-                )));
+                return Err(coded(
+                    codes::NOT_NULL_VIOLATED,
+                    format!(
+                        "UPDATE sobre '{}': columna '{}' es NOT NULL y no puede quedar en NULL",
+                        meta.name, column.name
+                    ),
+                ));
             }
         }
 
@@ -1081,16 +1133,23 @@ impl<'a> Engine<'a> {
         //    duplicate index *over the same column* (one secondary index
         //    per column is enough for this version's equality lookups).
         if meta.index_by_name(&stmt.name).is_some() {
-            return Err(DbError::new(format!(
-                "ya existe un índice llamado '{}' en la tabla '{}'",
-                stmt.name, meta.name
-            )));
+            return Err(coded(
+                codes::INDEX_ALREADY_EXISTS,
+                format!(
+                    "ya existe un índice llamado '{}' en la tabla '{}'",
+                    stmt.name, meta.name
+                ),
+            ));
         }
         if meta.index_for_column(&stmt.column).is_some() {
-            return Err(DbError::new(format!(
-                "la columna '{}' ya tiene un índice secundario",
-                stmt.column
-            )));
+            return Err(coded(
+                codes::INDEX_ALREADY_EXISTS,
+                format!(
+                    "la columna '{}' ya tiene un índice secundario en '{}' \
+                     (esta versión admite un solo índice por columna)",
+                    stmt.column, meta.name
+                ),
+            ));
         }
 
         // Reject duplicate index name across the whole catalog.
@@ -1101,10 +1160,13 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 if other.index_by_name(&stmt.name).is_some() {
-                    return Err(DbError::new(format!(
-                        "ya existe un índice llamado '{}' en la tabla '{}'",
-                        stmt.name, other.name
-                    )));
+                    return Err(coded(
+                        codes::INDEX_ALREADY_EXISTS,
+                        format!(
+                            "ya existe un índice llamado '{}' en la tabla '{}'",
+                            stmt.name, other.name
+                        ),
+                    ));
                 }
             }
         }
@@ -1217,10 +1279,13 @@ impl<'a> Engine<'a> {
             catalog.get_row(meta.root_page, stmt.where_pk)?.is_some()
         };
         if !exists {
-            return Err(DbError::new(format!(
-                "fila no existe: PK={}",
-                stmt.where_pk
-            )));
+            return Err(coded(
+                codes::ROW_NOT_FOUND_FOR_PK,
+                format!(
+                    "DELETE FROM '{}': fila no existe PK={}",
+                    meta.name, stmt.where_pk
+                ),
+            ));
         }
 
         // delete_with_cascade resolves the FK graph, applies RESTRICT
@@ -1301,10 +1366,13 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
         match (&column.column_type, value) {
             (ColumnType::Int, Value::Null) => {
                 if column.name.eq_ignore_ascii_case(&meta.primary_key) {
-                    return Err(DbError::new(format!(
-                        "PRIMARY KEY '{}' no puede ser NULL en INSERT/UPDATE de tabla '{}'",
-                        column.name, meta.name
-                    )));
+                    return Err(coded(
+                        codes::PRIMARY_KEY_NULL,
+                        format!(
+                            "PRIMARY KEY '{}' no puede ser NULL en INSERT/UPDATE de tabla '{}'",
+                            column.name, meta.name
+                        ),
+                    ));
                 }
                 out.push(0);
             }
@@ -1510,9 +1578,12 @@ fn resolve_selected_columns(
     let mut out = Vec::with_capacity(requested.len());
     for name in requested {
         let normalized = normalize_ident(name);
-        let column = meta
-            .column(&normalized)
-            .ok_or_else(|| DbError::new(format!("columna no existe: {}", name)))?;
+        let column = meta.column(&normalized).ok_or_else(|| {
+            coded(
+                codes::COLUMN_NOT_FOUND,
+                format!("columna '{}' no existe en tabla '{}'", name, meta.name),
+            )
+        })?;
         out.push((column.name.clone(), normalize_ident(&column.name)));
     }
     Ok(out)
@@ -1522,10 +1593,14 @@ fn ensure_pk_filter(meta: &TableMeta, column: &str) -> DbResult<()> {
     if meta.primary_key.eq_ignore_ascii_case(column) {
         return Ok(());
     }
-    Err(DbError::new(format!(
-        "WHERE solo soporta PK ({})",
-        meta.primary_key
-    )))
+    Err(coded(
+        codes::UPDATE_DELETE_REQUIRES_PK_FILTER,
+        format!(
+            "UPDATE/DELETE solo soportan WHERE sobre la PRIMARY KEY ({}); \
+             '{}' no es la PK de '{}'",
+            meta.primary_key, column, meta.name
+        ),
+    ))
 }
 
 fn window_rows<T: Clone>(rows: Vec<T>, offset: usize, limit: Option<usize>) -> Vec<T> {
@@ -1749,10 +1824,14 @@ fn enforce_not_null_on_insert(meta: &TableMeta, values: &HashMap<String, Value>)
         let normalized = normalize_ident(&column.name);
         let is_null = matches!(values.get(&normalized), None | Some(Value::Null));
         if is_null {
-            return Err(DbError::new(format!(
-                "columna '{}' es NOT NULL; INSERT no la cubre",
-                column.name
-            )));
+            return Err(coded(
+                codes::NOT_NULL_VIOLATED,
+                format!(
+                    "INSERT INTO '{}': columna '{}' es NOT NULL y no fue cubierta por VALUES \
+                     (ni tiene DEFAULT no nulo)",
+                    meta.name, column.name
+                ),
+            ));
         }
     }
     Ok(())
@@ -1795,10 +1874,13 @@ fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
             let target = {
                 let mut catalog = Catalog::open(pager);
                 catalog.get_table(&fk.table)?.ok_or_else(|| {
-                    DbError::new(format!(
-                        "FOREIGN KEY '{}.{}' referencia tabla inexistente '{}'",
-                        meta.name, column.name, fk.table
-                    ))
+                    coded(
+                        codes::TABLE_NOT_FOUND,
+                        format!(
+                            "FOREIGN KEY '{}.{}' referencia tabla inexistente '{}'",
+                            meta.name, column.name, fk.table
+                        ),
+                    )
                 })?
             };
             let pk = target.column(&target.primary_key).ok_or_else(|| {
@@ -1863,10 +1945,13 @@ fn check_fk_value(
         catalog.get_row(parent_meta.root_page, target_pk)?.is_some()
     };
     if !exists {
-        return Err(DbError::new(format!(
-            "violación de FK: '{}.{}' = {} no existe en '{}'",
-            meta.name, column_name, target_pk, fk.table
-        )));
+        return Err(coded(
+            codes::FK_PARENT_MISSING,
+            format!(
+                "violación de FOREIGN KEY: '{}.{}' = {} no existe en la tabla padre '{}'",
+                meta.name, column_name, target_pk, fk.table
+            ),
+        ));
     }
     Ok(())
 }
@@ -2032,14 +2117,17 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
                 }
                 match fk.on_delete {
                     OnDelete::Restrict => {
-                        return Err(DbError::new(format!(
-                            "violación de FK: '{}.{}' referencia '{}' \
-                             (ON DELETE RESTRICT, {} fila(s) afectadas)",
-                            child_table.name,
-                            child_col.name,
-                            parent_name,
-                            child_pks.len()
-                        )));
+                        return Err(coded(
+                            codes::FK_RESTRICT_BLOCKS_DELETE,
+                            format!(
+                                "DELETE FROM '{}' bloqueado: '{}.{}' referencia esta fila \
+                                 con ON DELETE RESTRICT ({} fila(s) hijas afectarían)",
+                                parent_name,
+                                child_table.name,
+                                child_col.name,
+                                child_pks.len()
+                            ),
+                        ));
                     }
                     OnDelete::Cascade => {
                         for cpk in child_pks {
@@ -2119,10 +2207,13 @@ pub(crate) fn check_unique_conflict(
         }
     };
     if let Some(other_pk) = conflict_pk {
-        return Err(DbError::new(format!(
-            "violación de UNIQUE en índice '{}' (PK existente: {})",
-            idx.name, other_pk
-        )));
+        return Err(coded(
+            codes::UNIQUE_VIOLATED,
+            format!(
+                "violación de UNIQUE en índice '{}' (PK existente: {})",
+                idx.name, other_pk
+            ),
+        ));
     }
     Ok(())
 }
@@ -2244,10 +2335,13 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                 index += 1;
             }
             if index > chars.len() {
-                return Err(DbError::new(format!(
-                    "literal string sin cerrar: comillas simples no balanceadas (texto inicial: '{}')",
-                    value.chars().take(40).collect::<String>()
-                )));
+                return Err(coded(
+                    codes::STRING_LITERAL_UNTERMINATED,
+                    format!(
+                        "literal string sin cerrar: comillas simples no balanceadas (texto inicial: '{}')",
+                        value.chars().take(40).collect::<String>()
+                    ),
+                ));
             }
             tokens.push(Token {
                 kind: TokenKind::String,
@@ -2583,11 +2677,14 @@ impl Parser {
                 let to = self.expect_integer()?;
                 where_clause = Some(WhereClause::Between { column, from, to });
             } else {
-                return Err(DbError::new(format!(
-                    "WHERE soporta solo '=' o BETWEEN como operadores; \
-                     no se reconoció el operador después de la columna '{}'",
-                    column
-                )));
+                return Err(coded(
+                    codes::WHERE_OPERATOR_UNSUPPORTED,
+                    format!(
+                        "WHERE soporta solo '=' o BETWEEN como operadores; \
+                         no se reconoció el operador después de la columna '{}'",
+                        column
+                    ),
+                ));
             }
         }
 
@@ -2617,13 +2714,17 @@ impl Parser {
         loop {
             if self.match_keyword("LIMIT") {
                 if seen_limit {
-                    return Err(DbError::new(
+                    return Err(coded(
+                        codes::LIMIT_DUPLICATED,
                         "LIMIT aparece más de una vez en la query: solo se admite uno por SELECT",
                     ));
                 }
                 let raw = self.expect_integer()?;
                 if raw < 0 {
-                    return Err(DbError::new(format!("LIMIT debe ser >= 0; recibí {}", raw)));
+                    return Err(coded(
+                        codes::LIMIT_NEGATIVE,
+                        format!("LIMIT debe ser >= 0; recibí {}", raw),
+                    ));
                 }
                 limit = Some(raw as usize);
                 seen_limit = true;
@@ -2631,16 +2732,17 @@ impl Parser {
             }
             if self.match_keyword("OFFSET") {
                 if seen_offset {
-                    return Err(DbError::new(
+                    return Err(coded(
+                        codes::OFFSET_DUPLICATED,
                         "OFFSET aparece más de una vez en la query: solo se admite uno por SELECT",
                     ));
                 }
                 let raw = self.expect_integer()?;
                 if raw < 0 {
-                    return Err(DbError::new(format!(
-                        "OFFSET debe ser >= 0; recibí {}",
-                        raw
-                    )));
+                    return Err(coded(
+                        codes::OFFSET_NEGATIVE,
+                        format!("OFFSET debe ser >= 0; recibí {}", raw),
+                    ));
                 }
                 offset = raw as usize;
                 seen_offset = true;

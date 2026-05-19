@@ -344,14 +344,16 @@ Tras el sweep aplicado junto con esta guía:
 - ✅ Los mensajes egregios de una palabra (`"db vacío"`, `"string corrupto"`, `"fila corrupta (INT)"`) recibieron contexto.
 - ✅ Los mensajes en inglés heredados (`"tx already started"`, `"page too small"`, `"database is locked by another process: …"`, etc.) están traducidos.
 - ✅ Tests de integración que asertaban sobre el texto original están actualizados.
-- 🟡 No hay `enum DbErrorKind` todavía. Cuando se introduzca, vendrá con un mapeo automático kind→HTTP que reemplazará al mapeo manual en cada handler.
-- 🟡 No hay códigos numéricos / SQLSTATE. Sería un bump no-trivial al contrato externo; si llega, viene con su propio ADR.
+- ✅ **Códigos numéricos `[GBY-NNNN]` estilo MySQL `ER_*`** en todos los errores user-facing. Definiciones en [src/errors.rs](../src/errors.rs); catálogo operacional en [ERROR_CODES.md](ERROR_CODES.md).
+- 🟡 No hay `enum DbErrorKind` todavía. Cuando se introduzca, vendrá con un mapeo automático kind→HTTP que reemplazará al mapeo manual en cada handler. El contrato vía prefijo string es estable y suficiente para casi todos los casos de uso.
 
 ---
 
 ## 11. Referencias
 
 - [src/lib.rs](../src/lib.rs) — definición de `DbError` y `DbResult`.
+- [src/errors.rs](../src/errors.rs) — códigos numerados estables.
+- [ERROR_CODES.md](ERROR_CODES.md) — catálogo operacional con cada código documentado.
 - [src/server.rs](../src/server.rs) — mapeo HTTP, helpers `Response::json/text`.
 - [src/bin/gabysql.rs](../src/bin/gabysql.rs) — política CLI.
 - [TROUBLESHOOTING.md](../TROUBLESHOOTING.md) — el operador entra acá con un mensaje exacto del motor.

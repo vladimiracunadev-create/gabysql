@@ -318,7 +318,12 @@ fn update_and_delete_by_pk_roundtrip() -> Result<(), Box<dyn Error>> {
 
     // DELETE non-PK column should error.
     let err = run_sql(&db, "DELETE FROM u WHERE name = 1;").unwrap_err();
-    assert!(err.to_string().contains("WHERE solo soporta PK"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("PRIMARY KEY") || msg.contains("PK"),
+        "el error de DELETE sin PK debe mencionar PRIMARY KEY: {}",
+        msg
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())
@@ -913,11 +918,19 @@ fn fk_insert_update_enforcement() -> Result<(), Box<dyn Error>> {
 
     // INSERT with non-existent parent → reject.
     let err = run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (12,99);").unwrap_err();
-    assert!(err.to_string().contains("FK"), "got: {}", err);
+    assert!(
+        err.to_string().contains("FK") || err.to_string().contains("FOREIGN KEY"),
+        "got: {}",
+        err
+    );
 
     // UPDATE FK to non-existent parent → reject.
     let err = run_sql(&db, "UPDATE child SET parent_id = 99 WHERE id = 10;").unwrap_err();
-    assert!(err.to_string().contains("FK"), "got: {}", err);
+    assert!(
+        err.to_string().contains("FK") || err.to_string().contains("FOREIGN KEY"),
+        "got: {}",
+        err
+    );
 
     // UPDATE FK to existing parent → OK.
     run_sql(&db, "UPDATE child SET parent_id = 2 WHERE id = 10;")?;
@@ -955,7 +968,11 @@ fn fk_self_reference_allows_pointing_at_self() -> Result<(), Box<dyn Error>> {
         "INSERT INTO employee (id,name,manager_id) VALUES (3,'Lost',99);",
     )
     .unwrap_err();
-    assert!(err.to_string().contains("FK"), "got: {}", err);
+    assert!(
+        err.to_string().contains("FK") || err.to_string().contains("FOREIGN KEY"),
+        "got: {}",
+        err
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())
