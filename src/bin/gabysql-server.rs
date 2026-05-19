@@ -16,6 +16,7 @@ fn real_main() -> DbResult<()> {
     let mut addr = ":8080".to_string();
     let mut token = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut log_json = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,6 +36,7 @@ fn real_main() -> DbResult<()> {
                     return Err(gabysql::DbError::new("-max-connections must be > 0"));
                 }
             }
+            "-log-json" => log_json = true,
             "-h" | "--help" => {
                 usage();
                 return Ok(());
@@ -50,12 +52,13 @@ fn real_main() -> DbResult<()> {
             dir,
             token,
             max_connections,
+            log_json,
         },
     )
 }
 
 fn usage() {
     println!(
-        "Uso:\n  gabysql-server -db demo.db -addr :8080\n  gabysql-server -dir ./dbs -addr :8080\n  gabysql-server -db demo.db -token secret\n  gabysql-server -dir ./dbs -max-connections 32"
+        "Uso:\n  gabysql-server -db demo.db -addr :8080\n  gabysql-server -dir ./dbs -addr :8080\n  gabysql-server -db demo.db -token secret\n  gabysql-server -dir ./dbs -max-connections 32\n  gabysql-server -db demo.db -log-json   (one JSON line per request on stdout)"
     );
 }

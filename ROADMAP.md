@@ -52,7 +52,7 @@
 - checkpoint/compaction del WAL *(re-evaluado: el WAL actual es per-transaction y se trunca/borra en cada commit, así que "checkpoint" en el sentido clásico requiere primero un cambio a WAL persistente. Diferido hasta que aparezca demanda real.)*
 - ~~locking simple entre procesos~~ ✅ entregado (ADR-0013, `File::try_lock` advisory exclusivo en `Pager::create/open`)
 - backup / restore verificado
-- logs estructurados y primeras métricas del server
+- ~~logs estructurados y primeras métricas del server~~ ✅ entregado (ADR-0014, endpoint `/metrics` + flag `-log-json`)
 
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats

@@ -4,6 +4,48 @@
 
 ---
 
+## 2026-05-18 — Vigésima intervención: logs JSON + endpoint `/metrics` en el server (Fase 2 — observabilidad)
+
+> **Sin bump de formato. Sin deps añadidas.** Primer paso de observabilidad operacional para `gabysql-server`. Justificación completa: [ADR-0014](docs/adr/0014-logs-json-metrics.md).
+
+### ✨ Cambio
+- Nuevo struct `Metrics` en [src/server.rs](src/server.rs): contadores por status HTTP, `errors_total` (status ≥ 500), y ring buffer acotado de 1024 latencias para p50/p95. Memoria O(1) bajo carga sostenida.
+- Nuevo endpoint **`GET /metrics`**:
+  ```json
+  {"ok":true,"started_unix":...,"uptime_s":3600,"requests_total":1234,
+   "requests_by_status":{"200":1180,"400":30,"500":24},
+   "errors_total":24,
+   "latency_ms":{"p50":5,"p95":87,"samples":1024,"count":1234}}
+  ```
+  Gated por `-token` igual que el resto de la API.
+- Nuevo flag **`-log-json`** en `gabysql-server`. Cuando se activa, cada request finalizado emite una línea JSON a stdout:
+  ```json
+  {"ts_unix":1747497612,"method":"POST","path":"/exec","status":200,"latency_ms":12}
+  ```
+  Por defecto **off** — la UX del binario silencioso de hoy no cambia. Útil con `tee`, `jq`, ingest a S3/ELK/Loki.
+- 4 tests unitarios nuevos: registro de status + latencia, percentiles sobre 1..=100, comportamiento con buffer vacío, ring buffer acotado bajo overflow.
+
+### 🎯 Por qué este cambio
+El binario en producción era opaco: sin logs por request, sin contadores agregados, sin forma de responder "¿cómo se está comportando bajo carga?". El RUNBOOK pedía observabilidad básica pero no había nada que pedirle al server más allá de `/health`.
+
+Ahora cualquier operador puede:
+- Curl `/metrics` y ver counts por status + p50/p95 inmediatamente.
+- Activar `-log-json` y pipear a `jq '. | select(.latency_ms > 100)'` para encontrar requests lentas.
+- Configurar una alerta sobre `errors_total` creciendo.
+
+Y todo sin agregar una sola dependencia.
+
+### 🛡️ Restricciones respetadas
+- **Cero deps** (ADR-0001 intacto). Sin `tracing`, sin `prometheus`, sin `metrics-rs`.
+- **Memoria acotada** (ADR-0009 mismo principio). Ring buffer de 1024 × 4 bytes = 4 KB por server.
+- **Opt-in** para logs. Defaults preservan la UX silenciosa.
+- **Sin bump de formato**. VERSION = 6 sigue válido.
+
+### 📐 ADR
+- [ADR-0014 — Logs JSON estructurados + endpoint `/metrics` en el server](docs/adr/0014-logs-json-metrics.md).
+
+---
+
 ## 2026-05-18 — Decimonovena intervención: lock exclusivo cross-process sobre el `.db` (Fase 2 — concurrencia)
 
 > **Sin bump de formato. Sin deps añadidas.** Cierra el gap de corrupción silenciosa cuando dos procesos abren la misma DB. Justificación completa: [ADR-0013](docs/adr/0013-process-level-file-lock.md).

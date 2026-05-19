@@ -10,9 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
+/// Bounded ring of recent latency samples used for the p50/p95 in
+/// `/metrics`. Keeping it fixed-size means the metrics endpoint runs in
+/// O(N log N) on a small slice (a few thousand entries at most) and the
+/// memory footprint of the server stays bounded under sustained load.
+const LATENCY_SAMPLE_RING: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -20,6 +26,9 @@ pub struct ServerConfig {
     pub dir: Option<PathBuf>,
     pub token: Option<String>,
     pub max_connections: usize,
+    /// Emit one JSON line per request to stdout. Opt-in so the default
+    /// stdout stays clean for humans / `tail -f` runbooks.
+    pub log_json: bool,
 }
 
 impl ServerConfig {
@@ -29,8 +38,114 @@ impl ServerConfig {
             dir,
             token,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            log_json: false,
         }
     }
+}
+
+/// In-memory metrics accumulated since the server started. Shared
+/// across handler threads via `Arc<Mutex<Metrics>>`.
+#[derive(Debug)]
+pub struct Metrics {
+    started_unix: u64,
+    requests_by_status: HashMap<u16, u64>,
+    errors_total: u64,
+    latency_samples: Vec<u32>,
+    latency_cursor: usize,
+    latency_count: u64,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            started_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            requests_by_status: HashMap::new(),
+            errors_total: 0,
+            latency_samples: Vec::with_capacity(LATENCY_SAMPLE_RING),
+            latency_cursor: 0,
+            latency_count: 0,
+        }
+    }
+
+    /// Record a finished request. Statuses ≥ 500 also bump
+    /// `errors_total` so runbook alerts can wire to a single number.
+    pub fn record(&mut self, status: u16, latency_ms: u32) {
+        *self.requests_by_status.entry(status).or_insert(0) += 1;
+        if status >= 500 {
+            self.errors_total += 1;
+        }
+        if self.latency_samples.len() < LATENCY_SAMPLE_RING {
+            self.latency_samples.push(latency_ms);
+        } else {
+            self.latency_samples[self.latency_cursor] = latency_ms;
+            self.latency_cursor = (self.latency_cursor + 1) % LATENCY_SAMPLE_RING;
+        }
+        self.latency_count += 1;
+    }
+
+    /// JSON snapshot for the `/metrics` endpoint.
+    pub fn snapshot_json(&self) -> String {
+        let uptime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(self.started_unix);
+        let requests_total: u64 = self.requests_by_status.values().sum();
+
+        let (p50, p95) = percentiles(&self.latency_samples);
+
+        let mut by_status: Vec<(u16, u64)> = self
+            .requests_by_status
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        by_status.sort_by_key(|(k, _)| *k);
+        let by_status_json = by_status
+            .iter()
+            .map(|(status, count)| format!("\"{}\":{}", status, count))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "{{\"ok\":true,\"started_unix\":{},\"uptime_s\":{},\"requests_total\":{},\
+             \"requests_by_status\":{{{}}},\"errors_total\":{},\
+             \"latency_ms\":{{\"p50\":{},\"p95\":{},\"samples\":{},\"count\":{}}}}}",
+            self.started_unix,
+            uptime,
+            requests_total,
+            by_status_json,
+            self.errors_total,
+            p50,
+            p95,
+            self.latency_samples.len(),
+            self.latency_count,
+        )
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute p50 and p95 over a latency sample buffer. Returns (0, 0)
+/// when the buffer is empty so the metrics endpoint stays well-formed
+/// even on a freshly started server.
+fn percentiles(samples: &[u32]) -> (u32, u32) {
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    let mut sorted: Vec<u32> = samples.to_vec();
+    sorted.sort_unstable();
+    let pick = |q: f64| -> u32 {
+        let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    };
+    (pick(0.50), pick(0.95))
 }
 
 pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
@@ -45,6 +160,7 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
     let listener = TcpListener::bind(&bind_addr)?;
     let write_lock = Arc::new(Mutex::new(()));
     let active = Arc::new(AtomicUsize::new(0));
+    let metrics = Arc::new(Mutex::new(Metrics::new()));
     let max_connections = if config.max_connections == 0 {
         DEFAULT_MAX_CONNECTIONS
     } else {
@@ -52,8 +168,8 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
     };
 
     eprintln!(
-        "gabysql-server escuchando en {} (single={:?} dir={:?} max_connections={})",
-        bind_addr, config.single_db, config.dir, max_connections
+        "gabysql-server escuchando en {} (single={:?} dir={:?} max_connections={} log_json={})",
+        bind_addr, config.single_db, config.dir, max_connections, config.log_json
     );
 
     for stream in listener.incoming() {
@@ -69,16 +185,29 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
                         ))
                     );
                     let _ = write_response(&mut stream, Response::json(503, body));
+                    if let Ok(mut m) = metrics.lock() {
+                        m.record(503, 0);
+                    }
+                    if config.log_json {
+                        log_request_json("?", "?", 503, 0);
+                    }
                     continue;
                 }
                 active.fetch_add(1, Ordering::AcqRel);
                 let config = config.clone();
                 let write_lock = Arc::clone(&write_lock);
                 let active = Arc::clone(&active);
+                let metrics_thread = Arc::clone(&metrics);
                 thread::spawn(move || {
-                    let response = match read_request(&mut stream)
-                        .and_then(|request| handle_request(request, &config, &write_lock))
-                    {
+                    let start = Instant::now();
+                    let parsed = read_request(&mut stream);
+                    let (method, path) = match &parsed {
+                        Ok(req) => (req.method.clone(), req.path.clone()),
+                        Err(_) => ("?".to_string(), "?".to_string()),
+                    };
+                    let response = match parsed.and_then(|request| {
+                        handle_request(request, &config, &write_lock, &metrics_thread)
+                    }) {
                         Ok(response) => response,
                         Err(err) => Response::json(
                             500,
@@ -88,7 +217,15 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
                             ),
                         ),
                     };
+                    let status = response.status;
                     let _ = write_response(&mut stream, response);
+                    let latency_ms = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+                    if let Ok(mut m) = metrics_thread.lock() {
+                        m.record(status, latency_ms);
+                    }
+                    if config.log_json {
+                        log_request_json(&method, &path, status, latency_ms);
+                    }
                     active.fetch_sub(1, Ordering::AcqRel);
                 });
             }
@@ -97,6 +234,25 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
     }
 
     Ok(())
+}
+
+/// Emit a single JSON line describing a finished request. Goes to
+/// stdout (not stderr) so the runbook can pipe it through `jq`/`tee`
+/// while the startup banner on stderr stays readable. Opt-in via
+/// `-log-json` so the default UX stays quiet.
+fn log_request_json(method: &str, path: &str, status: u16, latency_ms: u32) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    println!(
+        "{{\"ts_unix\":{},\"method\":{},\"path\":{},\"status\":{},\"latency_ms\":{}}}",
+        ts,
+        json_string(method),
+        json_string(path),
+        status,
+        latency_ms
+    );
 }
 
 #[derive(Debug)]
@@ -137,6 +293,7 @@ fn handle_request(
     request: Request,
     config: &ServerConfig,
     write_lock: &Arc<Mutex<()>>,
+    metrics: &Arc<Mutex<Metrics>>,
 ) -> DbResult<Response> {
     // CORS preflight: every browser-originated request that carries
     // Authorization (which gabymodeler does when a token is set) sends
@@ -168,6 +325,15 @@ fn handle_request(
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(Response::json(200, health_json(config))),
+        ("GET", "/metrics") => {
+            let body = metrics
+                .lock()
+                .map(|m| m.snapshot_json())
+                .unwrap_or_else(|_| {
+                    "{\"ok\":false,\"error\":\"metrics lock poisoned\"}".to_string()
+                });
+            Ok(Response::json(200, body))
+        }
         ("GET", "/dbs") => Ok(Response::json(200, dbs_json(config)?)),
         ("POST", "/dbs") => create_db(request, config, write_lock),
         ("GET", "/tables") => tables(request, config),
@@ -986,4 +1152,58 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_records_status_and_latency() {
+        let mut m = Metrics::new();
+        m.record(200, 5);
+        m.record(200, 15);
+        m.record(400, 7);
+        m.record(500, 50);
+
+        let snap = m.snapshot_json();
+        assert!(snap.contains("\"200\":2"), "snap: {}", snap);
+        assert!(snap.contains("\"400\":1"), "snap: {}", snap);
+        assert!(snap.contains("\"500\":1"), "snap: {}", snap);
+        assert!(snap.contains("\"errors_total\":1"), "snap: {}", snap);
+        assert!(snap.contains("\"requests_total\":4"), "snap: {}", snap);
+    }
+
+    #[test]
+    fn metrics_percentiles_basic() {
+        // 1..=100 → p50 ≈ 50, p95 ≈ 95
+        let samples: Vec<u32> = (1..=100).collect();
+        let (p50, p95) = percentiles(&samples);
+        assert!(
+            (49..=51).contains(&p50),
+            "p50 should be around 50, got {}",
+            p50
+        );
+        assert!(
+            (94..=96).contains(&p95),
+            "p95 should be around 95, got {}",
+            p95
+        );
+    }
+
+    #[test]
+    fn metrics_percentiles_empty_safe() {
+        assert_eq!(percentiles(&[]), (0, 0));
+    }
+
+    #[test]
+    fn metrics_latency_ring_bounded() {
+        let mut m = Metrics::new();
+        for i in 0..(LATENCY_SAMPLE_RING * 3) {
+            m.record(200, (i % 1000) as u32);
+        }
+        // Sample buffer caps at the ring size, but total count keeps growing.
+        assert_eq!(m.latency_samples.len(), LATENCY_SAMPLE_RING);
+        assert_eq!(m.latency_count as usize, LATENCY_SAMPLE_RING * 3);
+    }
 }
