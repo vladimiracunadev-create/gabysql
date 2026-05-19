@@ -12,7 +12,7 @@ Las ADRs se numeran secuencialmente. Una decisión revertida no se borra: se mar
 | 0004 | [B+Tree con `root_page` estable vía copy-up](0004-bptree-root-stable.md) | ✅ Aceptada | Estructura del índice |
 | 0005 | [Bucket layout para índices secundarios + hash collision tolerante](0005-secondary-index-bucket.md) | ✅ Aceptada | Índices secundarios |
 | 0006 | [`grype --only-fixed` en lugar de `--fail-on critical`](0006-grype-only-fixed.md) | ✅ Aceptada | Política de container scan |
-| 0007 | [Camino A (embebido nicho) antes que B/C](0007-commercial-path-a.md) | ✅ Aceptada | Estrategia de producto |
+| 0007 | [Camino A (embebido nicho) antes que B/C](0007-commercial-path-a.md) | 🗑️ Superseded por [AGENDA_INVESTIGACION.md](../AGENDA_INVESTIGACION.md) | El marco comercial fue retirado |
 | 0008 | [`LeafCursor` (Iterator pattern) para SELECT lazy](0008-leaf-cursor-iterator.md) | ✅ Aceptada | Optimización de recursos en lectura |
 | 0009 | [`PageCache` con capacidad fija + LRU sobre páginas clean](0009-page-cache-lru-bounded.md) | ✅ Aceptada | Memoria del Pager acotada |
 | 0010 | [Gateway MCP como adaptador externo sobre el HTTP/JSON existente](0010-mcp-gateway.md) | ✅ Aceptada | Modo agente / AI-native sin tocar el core |

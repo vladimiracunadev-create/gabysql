@@ -1,8 +1,11 @@
 # ADR-0007: Camino A (embebido nicho) antes que B/C
 
-**Estado**: ✅ Aceptada
-**Fecha**: 2026-05-04
+**Estado**: 🗑️ Superseded por [docs/AGENDA_INVESTIGACION.md](../AGENDA_INVESTIGACION.md)
+**Fecha original**: 2026-05-04
+**Fecha de superseded**: 2026-05-18
 **Contexto**: estrategia de producto. Decisión derivada del análisis de los PDFs estratégicos en [docs/tareas_pendientes/](../tareas_pendientes/).
+
+> **Por qué quedó superseded**: el marco completo (caminos A/B/C, decidir entre estrategias comerciales) presuponía que `gabysql` es un producto. La revisión de mayo 2026 concluyó que no lo es: es un proyecto de aprendizaje. Esta ADR queda como artefacto histórico — la decisión técnica que motivó (priorizar profundidad sobre amplitud SQL) sigue siendo razonable, pero por motivos distintos a los originales.
 
 ## 🧭 Contexto
 

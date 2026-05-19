@@ -1,5 +1,15 @@
 # 💼 Hoja de ruta comercial de `gabysql`
 
+> # 🏛️ DOCUMENTO HISTÓRICO — NO ES LA AGENDA OPERATIVA
+>
+> Este documento fue un **ejercicio mental** de pensar `gabysql` como producto comercial: tres caminos A/B/C, ICPs, comparativas, etc. La conclusión honesta tras escribirlo y operar el proyecto durante varios meses es que **el proyecto no es comercial y no apunta a serlo**.
+>
+> La agenda real del proyecto vive en **[AGENDA_INVESTIGACION.md](AGENDA_INVESTIGACION.md)**: un marco de aprendizaje + exploración sobre "cómo se vería una DB nativa de la era de los agentes LLM". No hay clientes, no hay validación externa, y eso está bien — el objetivo es entender bases de datos a fondo, no shipear un producto.
+>
+> Este texto queda en el repo como artefacto histórico: ayuda a entender qué partes valen la pena pulir técnicamente. **No tomes decisiones basadas en este documento.** Si la pregunta es "¿qué hago después?", la respuesta está en `AGENDA_INVESTIGACION.md`.
+
+---
+
 > **Tres caminos posibles para llevar `gabysql` desde "MVP funcional" a "producto comercial defendible". Documento estratégico — para decidir, no para ejecutar paso a paso (eso es el [PLAN_MAESTRO_GABYSQL.md](PLAN_MAESTRO_GABYSQL.md)).**
 
 ---

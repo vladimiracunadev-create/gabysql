@@ -1,8 +1,10 @@
 ﻿# 🗺️ ROADMAP
 
-> **Dirección técnica de `gabysql`: qué está estable hoy y qué falta para acercarlo a una v1 más seria.**
+> **Dirección técnica de `gabysql`: qué está estable hoy + qué bloques de cada Fase ya cerraron.**
+>
+> **🔬 Fuente operativa de qué viene después**: [docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md). Este `ROADMAP.md` documenta lo entregado y lo planificado de Fase 1 y Fase 2; las exploraciones futuras (schema semántico, plan-as-data, embedded variants, time-travel) viven en la agenda. El proyecto **dejó de ser comercial**; ver el reframe en `AGENDA_INVESTIGACION.md §1`.
 
-> **Base estratégica adicional**: ver [docs/tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md](docs/tareas_pendientes/ANALISIS_PROYECCIONES_GABYSQL.md) para la lectura ejecutiva de las proyecciones RDBMS, [docs/PLAN_MAESTRO_GABYSQL.md](docs/PLAN_MAESTRO_GABYSQL.md) para la hoja de ruta paso a paso, y [docs/GABYBENCH_SPEC.md](docs/GABYBENCH_SPEC.md) para la base canónica de benchmark y comparación con otros motores.
+> **Documentos históricos** (no son agenda operativa): [docs/COMMERCIAL_ROADMAP.md](docs/COMMERCIAL_ROADMAP.md), [docs/POSITIONING.md](docs/POSITIONING.md), [docs/COMPETITIVE_ANALYSIS.md](docs/COMPETITIVE_ANALYSIS.md), [ADR-0007](docs/adr/0007-commercial-path-a.md). Quedan en el repo para entender de dónde viene el proyecto.
 
 ---
 

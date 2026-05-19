@@ -1,5 +1,13 @@
 # 🥊 Análisis competitivo de `gabysql`
 
+> # 🏛️ DOCUMENTO HISTÓRICO — NO ES LA AGENDA OPERATIVA
+>
+> Comparativa contra SQLite/DuckDB/Postgres/MySQL hecha bajo el marco "esto es un producto comercial". El proyecto **no** es un producto y no compite con esos motores en sus ejes. Ver [AGENDA_INVESTIGACION.md](AGENDA_INVESTIGACION.md) para qué es realmente.
+>
+> Este texto sigue siendo **útil como mapa del mercado de DBs** (entender qué hace cada uno y por qué). Pero **no** es donde `gabysql` aspira a ganar.
+
+---
+
 > **Comparación honesta frente a otros motores de base de datos**: dónde `gabysql` ya gana, dónde pierde, y dónde puede ganar al final de cada camino comercial.
 >
 > **Regla del documento**: nada de hype. Si `gabysql` no gana en una dimensión hoy, se dice. Si gana solo en un nicho específico, se acota.

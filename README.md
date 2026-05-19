@@ -8,7 +8,9 @@
 ![Target](https://img.shields.io/badge/target-Windows%20%7C%20Linux%20%7C%20macOS-1f6feb)
 ![Storage](https://img.shields.io/badge/storage-single--file%20db%20%2B%20wal-8a5a2b)
 
-`gabysql` es una base de datos embebida escrita en Rust, pensada como un producto base serio: storage claro, formato en disco entendible, portabilidad real y una ruta de evolución honesta. No pretende todavía reemplazar a PostgreSQL, MySQL o SQLite en amplitud funcional; hoy prioriza estabilidad, durabilidad y claridad arquitectónica.
+`gabysql` es **un proyecto de aprendizaje + exploración sobre cómo se construye una base de datos**, escrito en Rust desde cero, usando la pregunta *"¿cómo se vería una DB nativa de la era de los agentes LLM?"* como hilo conductor. **No es un producto comercial y no apunta a serlo**: no hay usuarios, no hay clientes, no hay validación externa, y eso está bien. El objetivo es entender bases de datos a fondo y, en paralelo, explorar qué cambia cuando el consumidor principal no es un humano escribiendo SQL ni una app, sino un agente que razona sobre datos.
+
+El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica como **plataforma de exploración** (no como producto). El detalle de hacia dónde va el proyecto vive en **[docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md)**.
 
 ---
 
@@ -18,15 +20,14 @@
 
 | 📄 | Documento | Para qué sirve |
 | :---: | :--- | :--- |
-| 🎯 | [POSITIONING](docs/POSITIONING.md) | qué problema resuelve, ICP, ejemplos de uso reales |
-| 💼 | [COMMERCIAL_ROADMAP](docs/COMMERCIAL_ROADMAP.md) | los 3 caminos A/B/C para llegar a producto comercial |
-| 🥊 | [COMPETITIVE_ANALYSIS](docs/COMPETITIVE_ANALYSIS.md) | comparativa honesta vs SQLite/DuckDB/Postgres/MySQL/etc. |
+| 🔬 | [AGENDA_INVESTIGACION](docs/AGENDA_INVESTIGACION.md) | **agenda real del proyecto**: tesis, ejes de investigación, fases de aprendizaje, anti-agenda |
 | 📋 | [STATUS](docs/STATUS.md) | madurez por subsistema (🟢/🟡/🔴 fila por fila) |
 | 🧪 | [USE_CASES](docs/USE_CASES.md) | 17 recetas concretas listas para copiar |
 | 📐 | [SQL_REFERENCE](docs/SQL_REFERENCE.md) | gramática con railroad diagrams + EBNF + ejemplos |
 | 🛡️ | [SECURITY_LAYERS](docs/SECURITY_LAYERS.md) | mapa completo de las 6 capas de seguridad |
 | 🚨 | [ERROR_CODES](docs/ERROR_CODES.md) | catálogo numerado de errores `[GBY-NNNN]` (estilo MySQL `ER_*`) |
 | 📜 | [ADRs](docs/adr/) | decisiones arquitectónicas (contexto, alternativas, consecuencias) |
+| 🏛️ | Históricos: [POSITIONING](docs/POSITIONING.md) · [COMMERCIAL_ROADMAP](docs/COMMERCIAL_ROADMAP.md) · [COMPETITIVE_ANALYSIS](docs/COMPETITIVE_ANALYSIS.md) | artefactos del intento de pensar `gabysql` como producto. **No son agenda operativa**. |
 
 ---
 
@@ -59,8 +60,7 @@
 | Técnico / maintainer | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | capas del motor y flujo interno |
 | API / integración | [docs/API.md](docs/API.md) | endpoints, auth y payloads |
 | Seguridad | [SECURITY.md](SECURITY.md) + [docs/SECURITY_LAYERS.md](docs/SECURITY_LAYERS.md) | postura, capas y hardening |
-| **Producto / negocio** | [docs/POSITIONING.md](docs/POSITIONING.md) + [docs/COMMERCIAL_ROADMAP.md](docs/COMMERCIAL_ROADMAP.md) | qué problema resuelve y caminos comerciales A/B/C |
-| **Comparativa** | [docs/COMPETITIVE_ANALYSIS.md](docs/COMPETITIVE_ANALYSIS.md) | dónde gana / pierde vs SQLite/Postgres/DuckDB/etc. |
+| **Para qué existe el proyecto** | [docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md) | tesis, ejes de investigación, fases de aprendizaje |
 | **Estado actual** | [docs/STATUS.md](docs/STATUS.md) | madurez por subsistema (qué está 🟢/🟡/🔴) |
 | **Decisiones técnicas** | [docs/adr/](docs/adr/) | ADRs numeradas con contexto, alternativas y consecuencias |
 

@@ -4,6 +4,47 @@
 
 ---
 
+## 2026-05-18 — Vigesimoséptima intervención: reframe — `gabysql` es un proyecto de aprendizaje, no comercial
+
+> **Solo docs. Cero código.** Reescribe el marco operativo del proyecto.
+
+### ✨ Cambio
+- Nuevo documento **[docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md)** (~500 líneas, 10 secciones) que reemplaza como fuente operativa a `COMMERCIAL_ROADMAP.md`/`POSITIONING.md`/`COMPETITIVE_ANALYSIS.md`. Contiene:
+  - El reframe explícito: el proyecto **no es comercial y no apunta a serlo**.
+  - La tesis: "¿cómo se vería una DB nativa de la era de los agentes LLM?".
+  - 7 ejes de investigación con honestidad sobre qué entiendo / qué no / qué cuesta:
+    1. Schema semántico (no solo tipado)
+    2. Plan-as-data en cada respuesta
+    3. Embedded variants de columnas TEXT
+    4. Time-travel por default
+    5. Audit trail consultable como tabla
+    6. Schema migration como conversación
+    7. Probes de invariantes
+  - 6 Fases de aprendizaje (α–ζ) con **objetivo cognitivo** ("qué quiero entender"), no objetivo de producto.
+  - Anti-agenda explícita: lo que NO entra (JOIN/GROUP BY/replicación/optimizer cost-based/etc.).
+  - Ritmo realista (1 intervención/semana, no 9/día) y métricas de éxito honestas ("puedo explicar X" en vez de "MAUs").
+- **Marcados como históricos** (banner explícito al inicio):
+  - `docs/COMMERCIAL_ROADMAP.md`
+  - `docs/POSITIONING.md`
+  - `docs/COMPETITIVE_ANALYSIS.md`
+- **ADR-0007** (Camino A) marcada como `🗑️ Superseded por AGENDA_INVESTIGACION.md`. El índice de ADRs refleja el cambio.
+- **README.md** reescribe la introducción y la tabla de documentos clave: el proyecto se presenta como lo que es (laboratorio de aprendizaje sobre DBs + agentes), no como producto.
+- **ROADMAP.md** redirige a la nueva agenda como fuente operativa y mantiene su rol histórico (qué entregó cada Fase 1/2).
+
+### 🎯 Por qué este cambio
+Auditoría con el usuario del estado del proyecto:
+> *"además no se saca nada con pensar que alguien le interese, si creo todavia esta en pañales, lo realmente es mi objetivo, crea una base de datos que no sea como las demás, mientras evoluciona la IA, el producto puede evolucionar de forma natural con lo que es una base de datos y las nuevas tecnologias"*
+
+El marco anterior (caminos A/B/C, ICPs, comparativas comerciales) distorsionaba las decisiones técnicas: justificaba o vetaba features con argumentos comerciales que en realidad no aplicaban (no hay clientes ni hay intención de tenerlos). El reframe permite decir las cosas como son y elegir exploraciones por **valor de aprendizaje + diferenciación honesta**, no por encaje a un ICP imaginario.
+
+### 🛡️ Lo que NO cambia
+- Cero código tocado. Motor estable como estaba.
+- ADRs técnicos (0001–0006, 0008–0018) siguen vigentes. Son decisiones del motor, independientes del marco comercial.
+- `STATUS.md`, `USE_CASES.md`, `SQL_REFERENCE.md`, `ARCHITECTURE.md`, `TECHNICAL_SPECS.md`, `ERROR_HANDLING.md`, `ERROR_CODES.md` siguen vigentes — describen lo que el motor **es**, no qué se vende.
+- 45/45 integration + 27 lib + 7 unit tests verdes. CI sin alterar.
+
+---
+
 ## 2026-05-18 — Vigesimosexta intervención: códigos numéricos `[GBY-NNNN]` estilo MySQL `ER_*` + catálogo operacional
 
 > **Sin bump de formato. Sin deps añadidas.** Cierre del trabajo de manejo de errores: cada error user-facing ahora lleva un código estable y existe un catálogo operacional búscable. Análogo al sistema `ER_DUP_ENTRY=1062` de MySQL.

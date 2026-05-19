@@ -1,5 +1,15 @@
 # 🎯 Posicionamiento de `gabysql`
 
+> # 🏛️ DOCUMENTO HISTÓRICO — NO ES LA AGENDA OPERATIVA
+>
+> Este documento fue el intento de posicionar `gabysql` como producto comercial (ICPs, casos de uso, "a quién le sirve"). La conclusión tras operar el proyecto es que **`gabysql` no es un producto; es un proyecto de aprendizaje + exploración**. No tiene ICP porque no tiene clientes y no apunta a tenerlos.
+>
+> La declaración real de qué es el proyecto vive en **[AGENDA_INVESTIGACION.md](AGENDA_INVESTIGACION.md)**.
+>
+> Este texto queda como artefacto histórico para entender de dónde viene el proyecto. **No lo uses para tomar decisiones técnicas o de scope.**
+
+---
+
 > **Por qué existe este motor, qué problema resuelve y a quién le sirve.** Documento ancla: cuando dudes si una feature pertenece al producto, vuelve aquí.
 
 ---
