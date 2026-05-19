@@ -49,7 +49,7 @@
 - ~~`PageCache` LRU acotado (memoria del server bounded)~~ ✅ entregado (ADR-0009)
 - índices compuestos — pendiente *(no se cumplió en VERSION 7; requiere un B+Tree byte-keyed o encoder multi-columna; diferido a un futuro bloque)*
 - ~~range scan por índice secundario (`WHERE indexed_col BETWEEN ...`)~~ ✅ entregado para columnas **INT** (ADR-0017, VERSION 7). TEXT/FLOAT/BOOL/DATE/DATETIME indexados siguen siendo equality-only — diferido.
-- checkpoint/compaction del WAL *(re-evaluado: el WAL actual es per-transaction y se trunca/borra en cada commit, así que "checkpoint" en el sentido clásico requiere primero un cambio a WAL persistente. Diferido hasta que aparezca demanda real.)*
+- checkpoint/compaction del WAL — **diseño aceptado, implementación deferida** ([ADR-0018](docs/adr/0018-wal-mode-opt-in.md)). El WAL actual es per-transaction (cada commit ya checkpoint-ea); habilitar checkpoint requiere primero un WAL persistente opt-in. Condiciones de salida documentadas en el ADR.
 - ~~locking simple entre procesos~~ ✅ entregado (ADR-0013, `File::try_lock` advisory exclusivo en `Pager::create/open`)
 - ~~backup / restore verificado~~ ✅ entregado (ADR-0015, `gabysql backup/restore/verify` con CRC end-to-end)
 - ~~logs estructurados y primeras métricas del server~~ ✅ entregado (ADR-0014, endpoint `/metrics` + flag `-log-json`)

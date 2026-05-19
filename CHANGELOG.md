@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-05-18 — Vigesimocuarta intervención: ADR-0018 (Propuesta) — WAL-mode opt-in (sólo diseño)
+
+> **Sin código. Sin bump de formato.** Cierre honesto del ítem "checkpoint del WAL" de Fase 2: el diseño queda capturado con scope, alternativas y condiciones de salida explícitas, pero la implementación se difiere hasta que aparezca medición de `gabybench` o demanda real. Justificación completa: [ADR-0018](docs/adr/0018-wal-mode-opt-in.md).
+
+### ✨ Cambio
+- Nuevo [ADR-0018](docs/adr/0018-wal-mode-opt-in.md) en estado **Propuesta**. Describe:
+  - El modelo WAL-per-transaction actual y por qué "checkpoint" no aplica.
+  - El modelo propuesto: WAL persistente, `Pager::checkpoint()` explícito, `wal_index` in-memory, read-path WAL-aware.
+  - Alternativas evaluadas y descartadas (group commit, mmap, auto-checkpoint, etc.).
+  - **Condiciones de salida** (cuándo pasa a "Aceptada" + implementación): cuando `gabybench` muestre fsync(.db) como cuello de botella, o aparezca workload write-heavy con métricas concretas, o se necesite MVCC.
+- ROADMAP.md actualizado: el ítem pasa de "diferido sin condiciones" a "diseño aceptado, implementación deferida con condiciones de salida documentadas".
+
+### 🎯 Por qué este formato
+Implementar WAL-mode real es ~400-600 LOC en el hot path del Pager con riesgo de regresión alto y sin un workload medido que lo justifique. Hacerlo a ciegas para "marcar el bloque como entregado" contradice la honestidad del resto de Fase 2 (donde cada bloque mostró su scope real, no inflado).
+
+El diseño completo es valor por sí mismo: cualquier persona futura — humana o agente — que retome el ítem encuentra el análisis listo, las alternativas evaluadas, y el contrato de cuándo activarlo. Eso es lo que se entrega.
+
+### 📐 ADR
+- [ADR-0018 — WAL-mode opt-in con checkpoint explícito](docs/adr/0018-wal-mode-opt-in.md).
+
+---
+
 ## 2026-05-18 — Vigesimotercera intervención: índice INT-ordenado + range scan (Fase 2 — VERSION 7)
 
 > **Bump de formato VERSION 6 → 7.** Cierra el ítem "range scan por índice secundario" del roadmap, restringido honestamente a columnas INT. Justificación completa: [ADR-0017](docs/adr/0017-int-ordered-index-version-7.md).
