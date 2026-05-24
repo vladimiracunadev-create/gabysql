@@ -219,6 +219,17 @@ El servidor alcanzó el techo de conexiones simultáneas (default `64`).
 
 ---
 
+## 🔎 `subquery escalar en WHERE devolvió N filas; debe devolver a lo sumo 1` `[GBY-4014]`
+
+### Causa
+La consulta usa `WHERE col = (SELECT ...)` pero la subquery matcheó más de una fila. Una subquery escalar puede devolver a lo sumo 1 fila × 1 columna.
+
+### Solución
+- Restringir la subquery con un `WHERE` que la haga unívoca (típicamente filtrando por una columna `UNIQUE`).
+- O usar `IN (SELECT ...)` en lugar de `=` si querés conservar el conjunto.
+
+---
+
 ## 🔎 `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)`
 
 ### Causa

@@ -140,6 +140,8 @@ pub mod codes {
     pub const IN_PK_TYPE_MISMATCH: u32 = 4012;
     /// `WHERE col IN (SELECT ...)` cuando `col` no es PK ni tiene índice secundario.
     pub const IN_REQUIRES_PK_OR_INDEX: u32 = 4013;
+    /// Subquery escalar `= (SELECT ...)` que devuelve más de una fila.
+    pub const SCALAR_SUBQUERY_TOO_MANY_ROWS: u32 = 4014;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -24,7 +24,8 @@
 | [`UPDATE`](#update) | DML | 🟢 |
 | [`DELETE`](#delete) | DML | 🟢 |
 | `WHERE col IN (SELECT …)` (no-correlacionada, single-column) | DML | 🟢 |
-| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `GROUP BY`, subqueries escalares / `EXISTS` / correlacionadas / derived tables | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
+| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `GROUP BY`, subqueries `EXISTS` / correlacionadas / derived tables | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -498,7 +499,7 @@ flowchart LR
 flowchart LR
     A([WHERE clause]) --> COL[/column/]
     COL --> EQ{operador}
-    EQ -- "=" --> V1[value]
+    EQ -- "=" --> V1[value | "(" SELECT subquery ")"]
     EQ -- "BETWEEN" --> V2[int] --> AND[AND] --> V3[int]
     EQ -- "IN" --> LP["("] --> SUB[SELECT subquery] --> RP[")"]
 ```
@@ -512,7 +513,7 @@ select       ::= "SELECT" select_cols "FROM" identifier
                   ("LIMIT" integer)?
                   ("OFFSET" integer)?
 select_cols  ::= "*" | identifier ("," identifier)*
-where_clause ::= identifier "=" value
+where_clause ::= identifier "=" ( value | "(" select ")" )
                | identifier "BETWEEN" integer "AND" integer
                | identifier "IN" "(" select ")"
 ```
@@ -550,6 +551,12 @@ SELECT nombre FROM alumnos
 
 -- IN sobre PK directa (no requiere índice en el outer):
 SELECT id, label FROM t WHERE id IN (SELECT ref_id FROM picks);
+
+-- = (SELECT …) — subquery escalar (1 columna × ≤1 fila).
+-- Si la subquery devuelve 0 filas o NULL, el match es vacío (semántica ANSI).
+-- Si devuelve >1 fila, error [GBY-4014] — usar IN (...) en su lugar.
+SELECT nombre FROM alumnos
+ WHERE curso_id = (SELECT id FROM cursos WHERE nombre = 'matematica');
 ```
 
 ### ❌ Errores típicos
@@ -561,7 +568,9 @@ SELECT id, label FROM t WHERE id IN (SELECT ref_id FROM picks);
 | `WHERE solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | filtro sobre columna no-PK sin índice — créalo o usa la PK |
 | `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)` | operador no implementado (`<`, `>`, `LIKE`, `IN (lista, literal)`, etc.) |
 | `subquery en IN debe devolver exactamente 1 columna; devolvió N` | la subquery proyectó más de una columna — reescribila con una sola |
-| `WHERE IN solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | la columna del outer en `IN (...)` no es PK ni tiene `CREATE INDEX` |
+| `subquery escalar debe devolver exactamente 1 columna; devolvió N` | igual que el anterior pero en `= (SELECT ...)` |
+| `subquery escalar en WHERE devolvió N filas; debe devolver a lo sumo 1` | la subquery escalar matcheó más de una fila — agregar `WHERE`/`LIMIT 1` o usar `IN (SELECT ...)` |
+| `WHERE IN solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | la columna del outer en `IN (...)` o `= (SELECT ...)` no es PK ni tiene `CREATE INDEX` |
 | `PRIMARY KEY 'X' es INT; valor incompatible en WHERE` | pasaste un string a una PK INT |
 
 ---

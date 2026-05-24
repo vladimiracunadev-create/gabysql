@@ -35,7 +35,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 ## 🚦 Estado actual del producto
 
 > **Estado**: 🟢 Fase 1 (Robustez funcional) cerrada · Fase 2 arrancada  
-> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT … [WHERE col {= val | BETWEEN a AND b | IN (SELECT …)}] [ORDER BY <col> [ASC|DESC]] [LIMIT n] [OFFSET n]`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
+> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT … [WHERE col {= val | = (SELECT …) | BETWEEN a AND b | IN (SELECT …)}] [ORDER BY <col> [ASC|DESC]] [LIMIT n] [OFFSET n]`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página, crash tests dirigidos  
 > **Formato en disco**: `VERSION = 7` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag + `IndexKind` Hash/OrderedInt, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
 > **Portabilidad**: Windows, Linux y macOS por CI · 45/45 tests de integración verdes · `/metrics` + `-log-json` para observabilidad básica · `gabysql backup/restore/verify` con CRC end-to-end · `WHERE col_int_idx BETWEEN a AND b` con índice ordenado  
@@ -94,6 +94,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 - `SELECT ... WHERE <col_indexada> = valor` *(usa índice secundario)*
 - `SELECT ... WHERE <col_int_indexada> BETWEEN a AND b` *(usa índice INT-ordenado, ADR-0017)*
 - `SELECT ... WHERE <col> IN (SELECT <col> FROM ... [WHERE ...])` *(subquery no-correlacionada, single-column; outer column debe ser PK o tener índice)*
+- `SELECT ... WHERE <col> = (SELECT <col> FROM ... [WHERE ...])` *(subquery escalar no-correlacionada; 1 columna × ≤1 fila; 0 filas o NULL → match vacío)*
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (valida NOT NULL/UNIQUE/FK; mantiene índices)
 - `DELETE FROM <tabla> WHERE <pk> = N` (cascade/restrict según FKs entrantes; mantiene índices)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
@@ -232,7 +233,7 @@ El repositorio ya fue validado con:
 - Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` (índice `OrderedInt`, ADR-0017). Índices compuestos y range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados quedan para Fase 2.
 - `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
 - `ORDER BY` ya está soportado; **`JOIN` y `GROUP BY` no** (Fase 2/3).
-- Subqueries: solo `WHERE col IN (SELECT col FROM ...)` **no-correlacionada** y single-column. Subqueries escalares (`= (SELECT ...)`), `EXISTS`, correlacionadas y derived tables (`FROM (SELECT ...) t`) quedan para bloques siguientes.
+- Subqueries: `WHERE col IN (SELECT col FROM ...)` y `WHERE col = (SELECT col FROM ...)` **no-correlacionadas** y single-column. `EXISTS`, correlacionadas y derived tables (`FROM (SELECT ...) t`) quedan para bloques siguientes.
 - Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).
 - La PK debe ser una sola columna `INT`. `ALTER TABLE ADD COLUMN` no admite agregar PK.
 - `JSON` no es indexable (sin semántica de igualdad canónica).

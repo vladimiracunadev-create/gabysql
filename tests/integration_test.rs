@@ -2061,6 +2061,166 @@ fn where_in_subquery_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn where_eq_scalar_subquery_hit() -> Result<(), Box<dyn Error>> {
+    // Caso típico: traer el alumno cuyo curso_id = (subquery que devuelve 1 id).
+    let db = temp_db_path("eq_scalar_hit");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE cursos (id INT PRIMARY KEY, nombre TEXT NOT NULL UNIQUE);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE alumnos (id INT PRIMARY KEY, nombre TEXT NOT NULL, curso_id INT);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_alumnos_curso ON alumnos (curso_id);")?;
+
+    run_sql(
+        &db,
+        "INSERT INTO cursos (id,nombre) VALUES (1,'matematica');
+         INSERT INTO cursos (id,nombre) VALUES (2,'historia');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id) VALUES (10,'Ana',1);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (11,'Beto',2);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (12,'Carla',1);",
+    )?;
+
+    // Vía índice secundario (curso_id).
+    let res = run_sql(
+        &db,
+        "SELECT nombre FROM alumnos \
+         WHERE curso_id = (SELECT id FROM cursos WHERE nombre = 'matematica') \
+         ORDER BY nombre ASC;",
+    )?;
+    let names: Vec<&str> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.as_str(),
+            other => panic!("expected String, got {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Ana", "Carla"]);
+
+    // Vía PK directa.
+    let res = run_sql(
+        &db,
+        "SELECT nombre FROM cursos WHERE id = (SELECT curso_id FROM alumnos WHERE id = 11);",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::String("historia".to_string()));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_eq_scalar_subquery_empty_and_null() -> Result<(), Box<dyn Error>> {
+    // 0 filas o 1 fila NULL → match vacío (semántica ANSI: ningún valor iguala NULL).
+    let db = temp_db_path("eq_scalar_empty");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, label TEXT);")?;
+    run_sql(&db, "CREATE TABLE s (id INT PRIMARY KEY, val INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,label) VALUES (1,'a'); INSERT INTO t (id,label) VALUES (2,'b');",
+    )?;
+    run_sql(&db, "INSERT INTO s (id,val) VALUES (1,NULL);")?;
+
+    // 0 filas.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE id = (SELECT val FROM s WHERE id = 9999);",
+    )?;
+    assert!(res[0].rows.is_empty());
+
+    // 1 fila NULL.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE id = (SELECT val FROM s WHERE id = 1);",
+    )?;
+    assert!(res[0].rows.is_empty());
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_eq_scalar_subquery_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("eq_scalar_errors");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "CREATE TABLE s (id INT PRIMARY KEY, a INT, b INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,name) VALUES (1,'x'); INSERT INTO t (id,name) VALUES (2,'y');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO s (id,a,b) VALUES (1,10,20); INSERT INTO s (id,a,b) VALUES (2,30,40);",
+    )?;
+
+    // > 1 fila → SCALAR_SUBQUERY_TOO_MANY_ROWS.
+    let err = run_sql(&db, "SELECT id FROM t WHERE id = (SELECT a FROM s);")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("GBY-4014") && err.contains("a lo sumo 1"),
+        "mensaje inesperado: {}",
+        err
+    );
+
+    // > 1 columna → SUBQUERY_MUST_RETURN_ONE_COLUMN (4011).
+    let err = run_sql(
+        &db,
+        "SELECT id FROM t WHERE id = (SELECT a, b FROM s WHERE id = 1);",
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        err.contains("GBY-4011") && err.contains("exactamente 1 columna"),
+        "mensaje inesperado: {}",
+        err
+    );
+
+    // Columna outer no indexada → IN_REQUIRES_PK_OR_INDEX (4013).
+    let err = run_sql(
+        &db,
+        "SELECT id FROM t WHERE name = (SELECT a FROM s WHERE id = 1);",
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        err.contains("GBY-4013") && err.contains("no está indexada"),
+        "mensaje inesperado: {}",
+        err
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

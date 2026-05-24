@@ -103,7 +103,8 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4010` | `OFFSET_DUPLICATED` | `OFFSET n OFFSET m` — `OFFSET` aparece más de una vez. | Usar uno solo. |
 | `4011` | `SUBQUERY_MUST_RETURN_ONE_COLUMN` | `WHERE col IN (SELECT a, b ...)` — la subquery proyecta más (o menos) de una columna. | Reescribir la subquery para que devuelva una sola columna. |
 | `4012` | `IN_PK_TYPE_MISMATCH` | `WHERE pk_int IN (SELECT t FROM ...)` donde la subquery devuelve valores no-`INT`. | Ajustar la subquery para que devuelva `INT`, o filtrar por una columna no-PK. |
-| `4013` | `IN_REQUIRES_PK_OR_INDEX` | `WHERE col IN (SELECT ...)` cuando `col` no es PK ni tiene índice secundario. | Crear índice (`CREATE INDEX idx_t_col ON t (col);`) o filtrar por la PK. |
+| `4013` | `IN_REQUIRES_PK_OR_INDEX` | `WHERE col IN (SELECT ...)` (o `= (SELECT ...)`) cuando `col` no es PK ni tiene índice secundario. | Crear índice (`CREATE INDEX idx_t_col ON t (col);`) o filtrar por la PK. |
+| `4014` | `SCALAR_SUBQUERY_TOO_MANY_ROWS` | `WHERE col = (SELECT ...)` cuya subquery devolvió más de 1 fila. | Restringir la subquery con un `WHERE`/`LIMIT 1`, o usar `IN (SELECT ...)` en lugar de `=`. |
 
 ---
 

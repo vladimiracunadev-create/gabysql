@@ -164,6 +164,10 @@ pub enum WhereClause {
         column: String,
         subquery: Box<SelectStmt>,
     },
+    EqSubquery {
+        column: String,
+        subquery: Box<SelectStmt>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -921,6 +925,66 @@ impl<'a> Engine<'a> {
                                 meta.primary_key, column
                             ),
                         ));
+                    }
+                }
+            }
+            Some(WhereClause::EqSubquery { column, subquery }) => {
+                // Subquery escalar: la subquery debe devolver 1 columna y a
+                // lo sumo 1 fila. 0 filas o 1 fila NULL → set vacío (semántica
+                // ANSI: comparar contra NULL nunca matchea). 1 fila con valor
+                // se reusa por la rama Eq existente (PK directa o índice).
+                let inner = self.exec_select(*subquery)?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                if inner.rows.len() > 1 {
+                    return Err(coded(
+                        codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
+                        format!(
+                            "subquery escalar en WHERE devolvió {} filas; debe devolver a lo sumo 1",
+                            inner.rows.len()
+                        ),
+                    ));
+                }
+                let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
+                match scalar {
+                    None | Some(Value::Null) => Plan::ByPks(Vec::new()),
+                    Some(value) => {
+                        let normalized = normalize_ident(&column);
+                        if normalized == normalize_ident(&meta.primary_key) {
+                            let pk = match value {
+                                Value::Integer(n) => n,
+                                _ => {
+                                    return Err(coded(
+                                        codes::IN_PK_TYPE_MISMATCH,
+                                        format!(
+                                            "PRIMARY KEY '{}' es INT; valor incompatible \
+                                             devuelto por la subquery escalar",
+                                            meta.primary_key
+                                        ),
+                                    ))
+                                }
+                            };
+                            Plan::ByPks(vec![pk])
+                        } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                            let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
+                            Plan::ByPks(pks)
+                        } else {
+                            return Err(coded(
+                                codes::IN_REQUIRES_PK_OR_INDEX,
+                                format!(
+                                    "WHERE = (SELECT ...) solo soporta PK ({}) o columnas \
+                                     con índice secundario; '{}' no está indexada",
+                                    meta.primary_key, column
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -2747,8 +2811,23 @@ impl Parser {
         if self.match_keyword("WHERE") {
             let column = self.expect_ident()?;
             if self.match_symbol("=") {
-                let value = self.expect_value()?;
-                where_clause = Some(WhereClause::Eq { column, value });
+                // Dispatch escalar-subquery vs literal: tras `=`, un `(`
+                // solo puede iniciar un `(SELECT ...)` — no hay agrupación
+                // de expresiones en este SQL. Cualquier otra cosa cae al
+                // parser de literales habitual.
+                if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+                    self.expect_symbol("(")?;
+                    self.expect_keyword("SELECT")?;
+                    let subquery = self.parse_select_stmt()?;
+                    self.expect_symbol(")")?;
+                    where_clause = Some(WhereClause::EqSubquery {
+                        column,
+                        subquery: Box::new(subquery),
+                    });
+                } else {
+                    let value = self.expect_value()?;
+                    where_clause = Some(WhereClause::Eq { column, value });
+                }
             } else if self.match_keyword("BETWEEN") {
                 let from = self.expect_integer()?;
                 self.expect_keyword("AND")?;
