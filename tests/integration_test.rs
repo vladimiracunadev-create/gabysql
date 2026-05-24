@@ -2221,6 +2221,150 @@ fn where_eq_scalar_subquery_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn where_exists_uncorrelated() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("exists_uncorr");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "CREATE TABLE s (id INT PRIMARY KEY, v INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,name) VALUES (1,'a'); INSERT INTO t (id,name) VALUES (2,'b');",
+    )?;
+    run_sql(&db, "INSERT INTO s (id,v) VALUES (1,42);")?;
+
+    // EXISTS con subquery no vacía → toda t pasa.
+    let res = run_sql(&db, "SELECT id FROM t WHERE EXISTS (SELECT id FROM s);")?;
+    assert_eq!(res[0].rows.len(), 2);
+
+    // EXISTS con subquery vacía → 0 filas.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE EXISTS (SELECT id FROM s WHERE id = 9999);",
+    )?;
+    assert!(res[0].rows.is_empty());
+
+    // NOT EXISTS invierte ambos casos.
+    let res = run_sql(&db, "SELECT id FROM t WHERE NOT EXISTS (SELECT id FROM s);")?;
+    assert!(res[0].rows.is_empty());
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE NOT EXISTS (SELECT id FROM s WHERE id = 9999);",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_exists_correlated_via_outer_ref() -> Result<(), Box<dyn Error>> {
+    // Pattern: SELECT * FROM padre p WHERE EXISTS (SELECT 1 FROM hijo h WHERE h.parent_id = p.id);
+    let db = temp_db_path("exists_corr");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE padre (id INT PRIMARY KEY, nombre TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE hijo (id INT PRIMARY KEY, parent_id INT, label TEXT);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_hijo_parent ON hijo (parent_id);")?;
+
+    // padre 1,2,3 ; hijos solo para padre 1 y 3.
+    run_sql(
+        &db,
+        "INSERT INTO padre (id,nombre) VALUES (1,'Ana');
+         INSERT INTO padre (id,nombre) VALUES (2,'Beto');
+         INSERT INTO padre (id,nombre) VALUES (3,'Carla');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO hijo (id,parent_id,label) VALUES (10,1,'h1');
+         INSERT INTO hijo (id,parent_id,label) VALUES (11,3,'h2');
+         INSERT INTO hijo (id,parent_id,label) VALUES (12,3,'h3');",
+    )?;
+
+    // EXISTS correlacionado: padres que tienen al menos un hijo.
+    let res = run_sql(
+        &db,
+        "SELECT id, nombre FROM padre \
+         WHERE EXISTS (SELECT id FROM hijo WHERE parent_id = padre.id) \
+         ORDER BY id ASC;",
+    )?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!("expected Integer"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 3]);
+
+    // NOT EXISTS correlacionado: padres sin hijos.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM padre \
+         WHERE NOT EXISTS (SELECT id FROM hijo WHERE parent_id = padre.id) \
+         ORDER BY id ASC;",
+    )?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!("expected Integer"),
+        })
+        .collect();
+    assert_eq!(ids, vec![2]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_exists_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("exists_errors");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "INSERT INTO t (id,name) VALUES (1,'x');")?;
+
+    // EXISTS sin '(' → [GBY-4015]
+    let err = run_sql(&db, "SELECT id FROM t WHERE EXISTS 5;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4015"), "mensaje inesperado: {}", err);
+
+    // outer-column ref FUERA de subquery correlacionada → [GBY-4016]
+    let err = run_sql(&db, "SELECT id FROM t WHERE id = padre.id;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4016"), "mensaje inesperado: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

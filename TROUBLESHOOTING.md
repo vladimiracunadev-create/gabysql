@@ -219,6 +219,27 @@ El servidor alcanzó el techo de conexiones simultáneas (default `64`).
 
 ---
 
+## 🔎 `EXISTS requiere '(SELECT ...)' a continuación` `[GBY-4015]`
+
+### Causa
+Tras `EXISTS` (o `NOT EXISTS`) no había un `(` que abriera una subquery `SELECT`.
+
+### Solución
+Reescribir como `EXISTS (SELECT col FROM tabla [WHERE ...])`.
+
+---
+
+## 🔎 `outer column 'X.Y' fuera de alcance` `[GBY-4016]`
+
+### Causa
+Una referencia a una columna cualificada (`outer_table.col`) en el RHS de un `=` se usó **fuera** de una subquery correlacionada — el SQL outer solo admite literales o subqueries `(SELECT ...)` ahí, no referencias a otras tablas.
+
+### Solución
+- Si querés correlacionar: envolver el predicado en `EXISTS (SELECT ... FROM ... WHERE inner_col = outer_table.outer_col)`.
+- Si querés un valor: usar `= (SELECT ...)` (subquery escalar) en lugar de la referencia.
+
+---
+
 ## 🔎 `subquery escalar en WHERE devolvió N filas; debe devolver a lo sumo 1` `[GBY-4014]`
 
 ### Causa

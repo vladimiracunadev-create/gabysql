@@ -168,6 +168,22 @@ pub enum WhereClause {
         column: String,
         subquery: Box<SelectStmt>,
     },
+    /// `WHERE inner_col = outer_table.outer_col` (o sin prefijo), válido SOLO
+    /// dentro de subqueries correlacionadas. El engine lo resuelve mirando
+    /// el `outer_stack`; fuera de una subquery devuelve `[GBY-4016]`.
+    EqColumnRef {
+        column: String,
+        ref_table: Option<String>,
+        ref_column: String,
+    },
+    /// `WHERE [NOT] EXISTS (SELECT ...)`. La subquery puede contener
+    /// `EqColumnRef` (correlacionada) o no (no-correlacionada): el engine
+    /// detecta el caso vía `subquery_has_outer_refs` y aplica pre-ejecución
+    /// o post-filter per-row.
+    Exists {
+        subquery: Box<SelectStmt>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,11 +204,25 @@ pub struct ResultSet {
 
 pub struct Engine<'a> {
     pager: &'a mut Pager,
+    /// Stack de outer-rows activas para resolver `EqColumnRef` dentro de
+    /// subqueries correlacionadas. Cada entrada lleva el nombre de la tabla
+    /// outer y un mapa de columnas (normalizadas) a valores. Push antes de
+    /// ejecutar la subquery correlacionada, pop después — siempre balanceado.
+    outer_stack: Vec<OuterRow>,
+}
+
+#[derive(Debug, Clone)]
+struct OuterRow {
+    table: String,
+    values: HashMap<String, Value>,
 }
 
 impl<'a> Engine<'a> {
     pub fn new(pager: &'a mut Pager) -> Self {
-        Self { pager }
+        Self {
+            pager,
+            outer_stack: Vec::new(),
+        }
     }
 
     pub fn exec(&mut self, statement: Statement) -> DbResult<ResultSet> {
@@ -774,6 +804,52 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Look up `ref_table.ref_column` against the current `outer_stack`.
+    /// With an explicit `ref_table`, returns the value from the most-recent
+    /// frame whose table name matches (case-insensitive). Without one,
+    /// returns the value from the top frame. Returns `[GBY-4016]` when no
+    /// frame matches (e.g. EqColumnRef used outside a correlated subquery)
+    /// or when the frame doesn't carry the requested column.
+    fn resolve_outer_ref(&self, ref_table: Option<&str>, ref_column: &str) -> DbResult<Value> {
+        let key = normalize_ident(ref_column);
+        let frame = self
+            .outer_stack
+            .iter()
+            .rev()
+            .find(|frame| match ref_table {
+                Some(t) => frame.table.eq_ignore_ascii_case(t),
+                None => true,
+            })
+            .ok_or_else(|| {
+                coded(
+                    codes::OUTER_COLUMN_REF_INVALID,
+                    match ref_table {
+                        Some(t) => format!(
+                            "outer column '{}.{}' fuera de alcance: o la tabla outer '{}' \
+                             no está activa, o la referencia se usó fuera de una subquery \
+                             correlacionada",
+                            t, ref_column, t
+                        ),
+                        None => format!(
+                            "columna '{}' referenciada sin tabla y sin outer-scope activo; \
+                             dentro de un WHERE outer, los RHS deben ser literales — solo \
+                             las subqueries correlacionadas pueden referenciar columnas",
+                            ref_column
+                        ),
+                    },
+                )
+            })?;
+        frame.values.get(&key).cloned().ok_or_else(|| {
+            coded(
+                codes::OUTER_COLUMN_REF_INVALID,
+                format!(
+                    "outer column '{}' no existe en la tabla outer '{}'",
+                    ref_column, frame.table
+                ),
+            )
+        })
+    }
+
     fn exec_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -788,6 +864,20 @@ impl<'a> Engine<'a> {
             .map(|(name, _)| name.clone())
             .collect();
 
+        // Si el WHERE es un EXISTS correlacionado, no podemos pre-ejecutar la
+        // subquery: hay que evaluarla por cada fila del outer con la fila
+        // actual empujada en `outer_stack`. El resto del flujo (plan, scan,
+        // ORDER BY, LIMIT/OFFSET) se mantiene; el filtro se aplica entre la
+        // materialización de `rows_bytes` y la proyección.
+        let exists_postfilter: Option<(Box<SelectStmt>, bool)> = match &stmt.where_clause {
+            Some(WhereClause::Exists { subquery, negated })
+                if subquery_has_outer_refs(subquery) =>
+            {
+                Some((subquery.clone(), *negated))
+            }
+            _ => None,
+        };
+
         // First decide what list of PKs we need (or whether we need a full
         // scan), without holding the Catalog borrow. Then we open Catalog
         // again to actually read each row's bytes. This keeps the borrow
@@ -798,193 +888,254 @@ impl<'a> Engine<'a> {
             Range { from: i64, to: i64 },
         }
 
-        let plan = match stmt.where_clause.clone() {
-            None => Plan::FullScan,
-            Some(WhereClause::Eq { column, value }) => {
-                let normalized = normalize_ident(&column);
-                if normalized == normalize_ident(&meta.primary_key) {
-                    let pk = match value {
-                        Value::Integer(n) => n,
-                        _ => {
-                            return Err(DbError::new(format!(
-                                "PRIMARY KEY '{}' es INT; valor incompatible en WHERE",
-                                meta.primary_key
-                            )))
-                        }
-                    };
-                    Plan::ByPks(vec![pk])
-                } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
-                    let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
-                    Plan::ByPks(pks)
-                } else {
-                    return Err(coded(
-                        codes::WHERE_OPERATOR_UNSUPPORTED,
-                        format!(
-                            "WHERE solo soporta PK ({}) o columnas con índice secundario; \
-                             '{}' no está indexada",
-                            meta.primary_key, column
-                        ),
-                    ));
-                }
-            }
-            Some(WhereClause::Between { column, from, to }) => {
-                let normalized = normalize_ident(&column);
-                if normalized == normalize_ident(&meta.primary_key) {
-                    Plan::Range { from, to }
-                } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
-                    // BETWEEN over an indexed column only works when the
-                    // index is INT-ordered (ADR-0017). Hash indexes are
-                    // equality-only by construction.
-                    match idx.kind {
-                        IndexKind::OrderedInt => {
-                            let pks = lookup_pks_via_index_range(self.pager, &idx, from, to)?;
-                            Plan::ByPks(pks)
-                        }
-                        IndexKind::Hash => {
-                            return Err(coded(
-                                codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
-                                format!(
-                                    "WHERE BETWEEN sobre '{}': el índice secundario es hash-based \
-                                     (equality only). Solo columnas INT-indexadas admiten BETWEEN.",
-                                    column
-                                ),
-                            ));
-                        }
-                    }
-                } else {
-                    return Err(coded(
-                        codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
-                        format!(
-                            "WHERE BETWEEN solo soporta PK ({}) o columnas INT con índice; \
-                             '{}' no califica",
-                            meta.primary_key, column
-                        ),
-                    ));
-                }
-            }
-            Some(WhereClause::In { column, subquery }) => {
-                // Non-correlated IN: execute the subquery once, materialize
-                // its single-column result, then turn each value into a PK
-                // (direct or via secondary index lookup). The Plan stays
-                // `ByPks`, so the existing row-fetch path handles ORDER BY,
-                // LIMIT and OFFSET without changes.
-                let inner = self.exec_select(*subquery)?;
-                if inner.columns.len() != 1 {
-                    return Err(coded(
-                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
-                        format!(
-                            "subquery en IN debe devolver exactamente 1 columna; devolvió {}",
-                            inner.columns.len()
-                        ),
-                    ));
-                }
-                let values: Vec<Value> = inner
-                    .rows
-                    .into_iter()
-                    .filter_map(|mut row| row.pop())
-                    .filter(|v| !matches!(v, Value::Null))
-                    .collect();
-                if values.is_empty() {
-                    Plan::ByPks(Vec::new())
-                } else {
+        let plan = if exists_postfilter.is_some() {
+            // El filtrado real ocurre en el post-filter; el scan barre todo.
+            Plan::FullScan
+        } else {
+            match stmt.where_clause.clone() {
+                None => Plan::FullScan,
+                Some(WhereClause::Eq { column, value }) => {
                     let normalized = normalize_ident(&column);
                     if normalized == normalize_ident(&meta.primary_key) {
-                        let mut pks = Vec::with_capacity(values.len());
-                        for v in values {
-                            match v {
-                                Value::Integer(n) => pks.push(n),
-                                _ => {
-                                    return Err(coded(
-                                        codes::IN_PK_TYPE_MISMATCH,
-                                        format!(
-                                            "PRIMARY KEY '{}' es INT; valor incompatible en IN",
-                                            meta.primary_key
-                                        ),
-                                    ))
-                                }
+                        let pk = match value {
+                            Value::Integer(n) => n,
+                            _ => {
+                                return Err(DbError::new(format!(
+                                    "PRIMARY KEY '{}' es INT; valor incompatible en WHERE",
+                                    meta.primary_key
+                                )))
                             }
-                        }
-                        pks.sort_unstable();
-                        pks.dedup();
-                        Plan::ByPks(pks)
+                        };
+                        Plan::ByPks(vec![pk])
                     } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
-                        let mut pks: Vec<i64> = Vec::new();
-                        for v in values {
-                            let mut more = lookup_pks_via_index(self.pager, &meta, &idx, &v)?;
-                            pks.append(&mut more);
-                        }
-                        pks.sort_unstable();
-                        pks.dedup();
+                        let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
                         Plan::ByPks(pks)
                     } else {
                         return Err(coded(
-                            codes::IN_REQUIRES_PK_OR_INDEX,
+                            codes::WHERE_OPERATOR_UNSUPPORTED,
                             format!(
-                                "WHERE IN solo soporta PK ({}) o columnas con índice secundario; \
-                                 '{}' no está indexada",
+                                "WHERE solo soporta PK ({}) o columnas con índice secundario; \
+                             '{}' no está indexada",
                                 meta.primary_key, column
                             ),
                         ));
                     }
                 }
-            }
-            Some(WhereClause::EqSubquery { column, subquery }) => {
-                // Subquery escalar: la subquery debe devolver 1 columna y a
-                // lo sumo 1 fila. 0 filas o 1 fila NULL → set vacío (semántica
-                // ANSI: comparar contra NULL nunca matchea). 1 fila con valor
-                // se reusa por la rama Eq existente (PK directa o índice).
-                let inner = self.exec_select(*subquery)?;
-                if inner.columns.len() != 1 {
-                    return Err(coded(
-                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
-                        format!(
-                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
-                            inner.columns.len()
-                        ),
-                    ));
+                Some(WhereClause::Between { column, from, to }) => {
+                    let normalized = normalize_ident(&column);
+                    if normalized == normalize_ident(&meta.primary_key) {
+                        Plan::Range { from, to }
+                    } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                        // BETWEEN over an indexed column only works when the
+                        // index is INT-ordered (ADR-0017). Hash indexes are
+                        // equality-only by construction.
+                        match idx.kind {
+                            IndexKind::OrderedInt => {
+                                let pks = lookup_pks_via_index_range(self.pager, &idx, from, to)?;
+                                Plan::ByPks(pks)
+                            }
+                            IndexKind::Hash => {
+                                return Err(coded(
+                                    codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
+                                    format!(
+                                    "WHERE BETWEEN sobre '{}': el índice secundario es hash-based \
+                                     (equality only). Solo columnas INT-indexadas admiten BETWEEN.",
+                                    column
+                                ),
+                                ));
+                            }
+                        }
+                    } else {
+                        return Err(coded(
+                            codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
+                            format!(
+                                "WHERE BETWEEN solo soporta PK ({}) o columnas INT con índice; \
+                             '{}' no califica",
+                                meta.primary_key, column
+                            ),
+                        ));
+                    }
                 }
-                if inner.rows.len() > 1 {
-                    return Err(coded(
+                Some(WhereClause::In { column, subquery }) => {
+                    // Non-correlated IN: execute the subquery once, materialize
+                    // its single-column result, then turn each value into a PK
+                    // (direct or via secondary index lookup). The Plan stays
+                    // `ByPks`, so the existing row-fetch path handles ORDER BY,
+                    // LIMIT and OFFSET without changes.
+                    let inner = self.exec_select(*subquery)?;
+                    if inner.columns.len() != 1 {
+                        return Err(coded(
+                            codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                            format!(
+                                "subquery en IN debe devolver exactamente 1 columna; devolvió {}",
+                                inner.columns.len()
+                            ),
+                        ));
+                    }
+                    let values: Vec<Value> = inner
+                        .rows
+                        .into_iter()
+                        .filter_map(|mut row| row.pop())
+                        .filter(|v| !matches!(v, Value::Null))
+                        .collect();
+                    if values.is_empty() {
+                        Plan::ByPks(Vec::new())
+                    } else {
+                        let normalized = normalize_ident(&column);
+                        if normalized == normalize_ident(&meta.primary_key) {
+                            let mut pks = Vec::with_capacity(values.len());
+                            for v in values {
+                                match v {
+                                    Value::Integer(n) => pks.push(n),
+                                    _ => {
+                                        return Err(coded(
+                                            codes::IN_PK_TYPE_MISMATCH,
+                                            format!(
+                                                "PRIMARY KEY '{}' es INT; valor incompatible en IN",
+                                                meta.primary_key
+                                            ),
+                                        ))
+                                    }
+                                }
+                            }
+                            pks.sort_unstable();
+                            pks.dedup();
+                            Plan::ByPks(pks)
+                        } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                            let mut pks: Vec<i64> = Vec::new();
+                            for v in values {
+                                let mut more = lookup_pks_via_index(self.pager, &meta, &idx, &v)?;
+                                pks.append(&mut more);
+                            }
+                            pks.sort_unstable();
+                            pks.dedup();
+                            Plan::ByPks(pks)
+                        } else {
+                            return Err(coded(
+                                codes::IN_REQUIRES_PK_OR_INDEX,
+                                format!(
+                                "WHERE IN solo soporta PK ({}) o columnas con índice secundario; \
+                                 '{}' no está indexada",
+                                meta.primary_key, column
+                            ),
+                            ));
+                        }
+                    }
+                }
+                Some(WhereClause::EqSubquery { column, subquery }) => {
+                    // Subquery escalar: la subquery debe devolver 1 columna y a
+                    // lo sumo 1 fila. 0 filas o 1 fila NULL → set vacío (semántica
+                    // ANSI: comparar contra NULL nunca matchea). 1 fila con valor
+                    // se reusa por la rama Eq existente (PK directa o índice).
+                    let inner = self.exec_select(*subquery)?;
+                    if inner.columns.len() != 1 {
+                        return Err(coded(
+                            codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                            format!(
+                                "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                                inner.columns.len()
+                            ),
+                        ));
+                    }
+                    if inner.rows.len() > 1 {
+                        return Err(coded(
                         codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
                         format!(
                             "subquery escalar en WHERE devolvió {} filas; debe devolver a lo sumo 1",
                             inner.rows.len()
                         ),
                     ));
-                }
-                let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
-                match scalar {
-                    None | Some(Value::Null) => Plan::ByPks(Vec::new()),
-                    Some(value) => {
-                        let normalized = normalize_ident(&column);
-                        if normalized == normalize_ident(&meta.primary_key) {
-                            let pk = match value {
-                                Value::Integer(n) => n,
-                                _ => {
-                                    return Err(coded(
-                                        codes::IN_PK_TYPE_MISMATCH,
-                                        format!(
-                                            "PRIMARY KEY '{}' es INT; valor incompatible \
+                    }
+                    let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
+                    match scalar {
+                        None | Some(Value::Null) => Plan::ByPks(Vec::new()),
+                        Some(value) => {
+                            let normalized = normalize_ident(&column);
+                            if normalized == normalize_ident(&meta.primary_key) {
+                                let pk = match value {
+                                    Value::Integer(n) => n,
+                                    _ => {
+                                        return Err(coded(
+                                            codes::IN_PK_TYPE_MISMATCH,
+                                            format!(
+                                                "PRIMARY KEY '{}' es INT; valor incompatible \
                                              devuelto por la subquery escalar",
-                                            meta.primary_key
-                                        ),
-                                    ))
-                                }
-                            };
-                            Plan::ByPks(vec![pk])
-                        } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
-                            let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
-                            Plan::ByPks(pks)
-                        } else {
-                            return Err(coded(
-                                codes::IN_REQUIRES_PK_OR_INDEX,
-                                format!(
-                                    "WHERE = (SELECT ...) solo soporta PK ({}) o columnas \
+                                                meta.primary_key
+                                            ),
+                                        ))
+                                    }
+                                };
+                                Plan::ByPks(vec![pk])
+                            } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                                let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
+                                Plan::ByPks(pks)
+                            } else {
+                                return Err(coded(
+                                    codes::IN_REQUIRES_PK_OR_INDEX,
+                                    format!(
+                                        "WHERE = (SELECT ...) solo soporta PK ({}) o columnas \
                                      con índice secundario; '{}' no está indexada",
-                                    meta.primary_key, column
-                                ),
-                            ));
+                                        meta.primary_key, column
+                                    ),
+                                ));
+                            }
                         }
+                    }
+                }
+                Some(WhereClause::EqColumnRef {
+                    column,
+                    ref_table,
+                    ref_column,
+                }) => {
+                    // `WHERE inner_col = outer_table.col` resuelto contra el
+                    // outer_stack. Si el stack está vacío (uso fuera de una
+                    // subquery correlacionada) o la columna outer no existe,
+                    // resolve_outer_ref devuelve `[GBY-4016]`. Cuando hay valor
+                    // se reusa el dispatch PK/índice del Eq.
+                    let value = self.resolve_outer_ref(ref_table.as_deref(), &ref_column)?;
+                    let normalized = normalize_ident(&column);
+                    if normalized == normalize_ident(&meta.primary_key) {
+                        let pk = match value {
+                            Value::Integer(n) => n,
+                            _ => {
+                                return Err(coded(
+                                    codes::IN_PK_TYPE_MISMATCH,
+                                    format!(
+                                        "PRIMARY KEY '{}' es INT; valor incompatible \
+                                     devuelto por la outer column referenciada",
+                                        meta.primary_key
+                                    ),
+                                ))
+                            }
+                        };
+                        Plan::ByPks(vec![pk])
+                    } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                        let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
+                        Plan::ByPks(pks)
+                    } else {
+                        return Err(coded(
+                            codes::IN_REQUIRES_PK_OR_INDEX,
+                            format!(
+                                "WHERE col = outer.col solo soporta PK ({}) o columnas \
+                             con índice secundario; '{}' no está indexada",
+                                meta.primary_key, column
+                            ),
+                        ));
+                    }
+                }
+                Some(WhereClause::Exists { subquery, negated }) => {
+                    // Llegamos acá SOLO si `subquery_has_outer_refs(...)` fue
+                    // false (las correlacionadas se desvían arriba al
+                    // post-filter). Pre-ejecutamos: si hay filas → outer queda
+                    // como FullScan; si no → outer queda vacío. `negated`
+                    // invierte la decisión.
+                    let inner = self.exec_select(*subquery)?;
+                    let has_rows = !inner.rows.is_empty();
+                    let pass = if negated { !has_rows } else { has_rows };
+                    if pass {
+                        Plan::FullScan
+                    } else {
+                        Plan::ByPks(Vec::new())
                     }
                 }
             }
@@ -1008,7 +1159,11 @@ impl<'a> Engine<'a> {
         // the scan as soon as `LIMIT` is satisfied. That turns
         // `SELECT … LIMIT 10` over a million-row table from a full
         // materialization into an O(offset + limit) leaf walk.
-        let defer_window = stmt.order_by.is_some();
+        // El post-filter de EXISTS correlacionado se aplica sobre la lista
+        // completa de filas, así que también necesita diferir el window —
+        // de lo contrario `LIMIT 10` cortaría antes de aplicar EXISTS y
+        // devolvería menos filas de las que en realidad matchean.
+        let defer_window = stmt.order_by.is_some() || exists_postfilter.is_some();
         let rows_bytes: Vec<KeyValue> = if defer_window {
             let mut catalog = Catalog::open(self.pager);
             match plan {
@@ -1067,6 +1222,37 @@ impl<'a> Engine<'a> {
                     window_rows(rows, stmt.offset, stmt.limit)
                 }
             }
+        };
+
+        // EXISTS correlacionado: re-evaluamos la subquery con cada fila del
+        // outer empujada en `outer_stack`. La fila sólo sobrevive si la
+        // condición EXISTS (o NOT EXISTS, según `negated`) se cumple. Si no
+        // hay ORDER BY, aplicamos el window acá mismo — el LeafCursor ya no
+        // pudo cortar porque forzamos `defer_window` arriba.
+        let rows_bytes: Vec<KeyValue> = if let Some((sub_stmt, negated)) = exists_postfilter {
+            let mut kept = Vec::with_capacity(rows_bytes.len());
+            for kv in rows_bytes {
+                let decoded = decode_row(&meta, &kv.value)?;
+                self.outer_stack.push(OuterRow {
+                    table: meta.name.clone(),
+                    values: decoded,
+                });
+                let inner_res = self.exec_select((*sub_stmt).clone());
+                self.outer_stack.pop();
+                let inner = inner_res?;
+                let has_rows = !inner.rows.is_empty();
+                let pass = if negated { !has_rows } else { has_rows };
+                if pass {
+                    kept.push(kv);
+                }
+            }
+            if stmt.order_by.is_none() {
+                window_rows(kept, stmt.offset, stmt.limit)
+            } else {
+                kept
+            }
+        } else {
+            rows_bytes
         };
 
         let mut rows: Vec<(HashMap<String, Value>, Vec<Value>)> =
@@ -2387,6 +2573,20 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     }
 }
 
+/// Walk the WHERE tree looking for `EqColumnRef` — the marker that this
+/// subquery references the outer scope and therefore must be re-executed
+/// per outer row. We descend through nested subqueries (IN, =, EXISTS) so
+/// a column ref two levels deep still flags the parent as correlated.
+fn subquery_has_outer_refs(stmt: &SelectStmt) -> bool {
+    match &stmt.where_clause {
+        Some(WhereClause::EqColumnRef { .. }) => true,
+        Some(WhereClause::Exists { subquery, .. })
+        | Some(WhereClause::In { subquery, .. })
+        | Some(WhereClause::EqSubquery { subquery, .. }) => subquery_has_outer_refs(subquery),
+        _ => false,
+    }
+}
+
 fn normalize_ident(value: &str) -> String {
     value
         .rsplit('.')
@@ -2394,6 +2594,31 @@ fn normalize_ident(value: &str) -> String {
         .unwrap_or(value)
         .trim()
         .to_ascii_lowercase()
+}
+
+/// Returns `true` when the identifier is actually one of the value-keywords
+/// that `expect_value` resolves (`TRUE`, `FALSE`, `NULL`). Used by the
+/// WHERE parser to decide if `col = <ident>` is a column reference or a
+/// boolean/null literal.
+fn is_value_keyword(text: &str) -> bool {
+    matches!(
+        text.to_ascii_uppercase().as_str(),
+        "TRUE" | "FALSE" | "NULL"
+    )
+}
+
+/// Splits a possibly-qualified identifier like `outer.col` into
+/// `(Some("outer"), "col")`. Bare identifiers like `col` become
+/// `(None, "col")`. Multi-dot identifiers keep only the LAST segment as
+/// the column name and the segment before it as the table.
+fn split_qualified_ident(raw: &str) -> (Option<String>, String) {
+    match raw.rsplit_once('.') {
+        Some((prefix, name)) => {
+            let table = prefix.rsplit('.').next().unwrap_or(prefix).trim();
+            (Some(table.to_string()), name.trim().to_string())
+        }
+        None => (None, raw.trim().to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2809,48 +3034,90 @@ impl Parser {
 
         let mut where_clause = None;
         if self.match_keyword("WHERE") {
-            let column = self.expect_ident()?;
-            if self.match_symbol("=") {
-                // Dispatch escalar-subquery vs literal: tras `=`, un `(`
-                // solo puede iniciar un `(SELECT ...)` — no hay agrupación
-                // de expresiones en este SQL. Cualquier otra cosa cae al
-                // parser de literales habitual.
-                if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
-                    self.expect_symbol("(")?;
-                    self.expect_keyword("SELECT")?;
-                    let subquery = self.parse_select_stmt()?;
-                    self.expect_symbol(")")?;
-                    where_clause = Some(WhereClause::EqSubquery {
-                        column,
-                        subquery: Box::new(subquery),
-                    });
-                } else {
-                    let value = self.expect_value()?;
-                    where_clause = Some(WhereClause::Eq { column, value });
+            // Primero: `[NOT] EXISTS (SELECT ...)` — no consume column.
+            let (is_exists, exists_negated) = if self.match_keyword("NOT") {
+                if !self.match_keyword("EXISTS") {
+                    return Err(coded(
+                        codes::WHERE_OPERATOR_UNSUPPORTED,
+                        "después de NOT se esperaba EXISTS",
+                    ));
                 }
-            } else if self.match_keyword("BETWEEN") {
-                let from = self.expect_integer()?;
-                self.expect_keyword("AND")?;
-                let to = self.expect_integer()?;
-                where_clause = Some(WhereClause::Between { column, from, to });
-            } else if self.match_keyword("IN") {
+                (true, true)
+            } else if self.match_keyword("EXISTS") {
+                (true, false)
+            } else {
+                (false, false)
+            };
+            if is_exists {
+                if !(self.peek().kind == TokenKind::Symbol && self.peek().text == "(") {
+                    return Err(coded(
+                        codes::EXISTS_REQUIRES_SUBQUERY,
+                        "EXISTS requiere '(SELECT ...)' a continuación",
+                    ));
+                }
                 self.expect_symbol("(")?;
                 self.expect_keyword("SELECT")?;
                 let subquery = self.parse_select_stmt()?;
                 self.expect_symbol(")")?;
-                where_clause = Some(WhereClause::In {
-                    column,
+                where_clause = Some(WhereClause::Exists {
                     subquery: Box::new(subquery),
+                    negated: exists_negated,
                 });
             } else {
-                return Err(coded(
-                    codes::WHERE_OPERATOR_UNSUPPORTED,
-                    format!(
-                        "WHERE soporta solo '=', BETWEEN o IN (SELECT ...) como operadores; \
-                         no se reconoció el operador después de la columna '{}'",
-                        column
-                    ),
-                ));
+                let column = self.expect_ident()?;
+                if self.match_symbol("=") {
+                    // Dispatch tras `=`:
+                    //   `(SELECT ...)` → subquery escalar
+                    //   ident no-keyword (eventualmente `otra.col`) → outer-column ref
+                    //     (solo válido dentro de subquery correlacionada; el engine valida)
+                    //   resto → literal
+                    if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+                        self.expect_symbol("(")?;
+                        self.expect_keyword("SELECT")?;
+                        let subquery = self.parse_select_stmt()?;
+                        self.expect_symbol(")")?;
+                        where_clause = Some(WhereClause::EqSubquery {
+                            column,
+                            subquery: Box::new(subquery),
+                        });
+                    } else if self.peek().kind == TokenKind::Ident
+                        && !is_value_keyword(&self.peek().text)
+                    {
+                        let raw = self.expect_ident()?;
+                        let (ref_table, ref_column) = split_qualified_ident(&raw);
+                        where_clause = Some(WhereClause::EqColumnRef {
+                            column,
+                            ref_table,
+                            ref_column,
+                        });
+                    } else {
+                        let value = self.expect_value()?;
+                        where_clause = Some(WhereClause::Eq { column, value });
+                    }
+                } else if self.match_keyword("BETWEEN") {
+                    let from = self.expect_integer()?;
+                    self.expect_keyword("AND")?;
+                    let to = self.expect_integer()?;
+                    where_clause = Some(WhereClause::Between { column, from, to });
+                } else if self.match_keyword("IN") {
+                    self.expect_symbol("(")?;
+                    self.expect_keyword("SELECT")?;
+                    let subquery = self.parse_select_stmt()?;
+                    self.expect_symbol(")")?;
+                    where_clause = Some(WhereClause::In {
+                        column,
+                        subquery: Box::new(subquery),
+                    });
+                } else {
+                    return Err(coded(
+                        codes::WHERE_OPERATOR_UNSUPPORTED,
+                        format!(
+                            "WHERE soporta solo '=', BETWEEN, IN (SELECT ...) o [NOT] EXISTS (SELECT ...) \
+                             como operadores; no se reconoció el operador después de la columna '{}'",
+                            column
+                        ),
+                    ));
+                }
             }
         }
 

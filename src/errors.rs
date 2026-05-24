@@ -142,6 +142,12 @@ pub mod codes {
     pub const IN_REQUIRES_PK_OR_INDEX: u32 = 4013;
     /// Subquery escalar `= (SELECT ...)` que devuelve más de una fila.
     pub const SCALAR_SUBQUERY_TOO_MANY_ROWS: u32 = 4014;
+    /// `EXISTS` / `NOT EXISTS` sin `(SELECT ...)` válido a continuación.
+    pub const EXISTS_REQUIRES_SUBQUERY: u32 = 4015;
+    /// Referencia a una columna del outer (`outer_tbl.col`) usada fuera de una
+    /// subquery correlacionada, o apuntando a una tabla/columna que el
+    /// outer-stack no provee.
+    pub const OUTER_COLUMN_REF_INVALID: u32 = 4016;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

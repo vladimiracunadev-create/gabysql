@@ -25,7 +25,8 @@
 | [`DELETE`](#delete) | DML | 🟢 |
 | `WHERE col IN (SELECT …)` (no-correlacionada, single-column) | DML | 🟢 |
 | `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
-| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `GROUP BY`, subqueries `EXISTS` / correlacionadas / derived tables | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
+| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `GROUP BY`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -513,10 +514,16 @@ select       ::= "SELECT" select_cols "FROM" identifier
                   ("LIMIT" integer)?
                   ("OFFSET" integer)?
 select_cols  ::= "*" | identifier ("," identifier)*
-where_clause ::= identifier "=" ( value | "(" select ")" )
+where_clause ::= identifier "=" ( value | "(" select ")" | qualified_ident )
                | identifier "BETWEEN" integer "AND" integer
                | identifier "IN" "(" select ")"
+               | ["NOT"] "EXISTS" "(" select ")"
+qualified_ident ::= identifier ( "." identifier )?
 ```
+
+> **Sobre `qualified_ident` en el RHS del `=`:** solo es válido **dentro de una subquery correlacionada** dentro de `EXISTS (...)`. Permite expresar `WHERE inner_col = outer_table.outer_col`, donde `outer_table` es la tabla del SELECT padre. Usarlo fuera de ese contexto devuelve `[GBY-4016]`.
+>
+> **Sobre `EXISTS`:** la subquery se ejecuta una sola vez si **no** referencia columnas del outer; cuando sí lo hace, se re-ejecuta una vez por cada fila del outer (post-filter). Esta variante correlacionada es O(N × costo_subquery), sin optimizer; tiene sentido cuando la subquery se reduce vía PK/índice con la outer-ref.
 
 > `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` funciona sobre la PK y sobre cualquier columna `INT` con índice secundario (índice `OrderedInt`, default automático al crear índice sobre `INT`; ver [ADR-0017](adr/0017-int-ordered-index-version-7.md)); para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados, `BETWEEN` queda en el [Camino A](COMMERCIAL_ROADMAP.md). `IN (SELECT …)` acepta subqueries **no-correlacionadas** (la subquery no referencia columnas del outer); la subquery debe devolver exactamente una columna, se ejecuta una sola vez y el resultado se materializa como set para filtrar el outer — la columna del outer debe ser la PK o tener índice secundario, igual que `=`. `ORDER BY` funciona sobre cualquier columna del schema (no requiere índice); el sort es en memoria post-scan, así que para tablas grandes con `LIMIT` chico conviene tener un `WHERE` que reduzca el conjunto antes del sort.
 
@@ -557,6 +564,18 @@ SELECT id, label FROM t WHERE id IN (SELECT ref_id FROM picks);
 -- Si devuelve >1 fila, error [GBY-4014] — usar IN (...) en su lugar.
 SELECT nombre FROM alumnos
  WHERE curso_id = (SELECT id FROM cursos WHERE nombre = 'matematica');
+
+-- EXISTS no-correlacionada: la subquery se ejecuta UNA vez.
+SELECT id FROM padre WHERE EXISTS (SELECT id FROM auditoria WHERE id = 1);
+
+-- EXISTS correlacionada: re-ejecuta por cada fila del outer.
+-- Padres que tienen al menos un hijo:
+SELECT id, nombre FROM padre
+ WHERE EXISTS (SELECT id FROM hijo WHERE parent_id = padre.id);
+
+-- NOT EXISTS correlacionado: padres sin hijos.
+SELECT id, nombre FROM padre
+ WHERE NOT EXISTS (SELECT id FROM hijo WHERE parent_id = padre.id);
 ```
 
 ### ❌ Errores típicos
@@ -571,6 +590,8 @@ SELECT nombre FROM alumnos
 | `subquery escalar debe devolver exactamente 1 columna; devolvió N` | igual que el anterior pero en `= (SELECT ...)` |
 | `subquery escalar en WHERE devolvió N filas; debe devolver a lo sumo 1` | la subquery escalar matcheó más de una fila — agregar `WHERE`/`LIMIT 1` o usar `IN (SELECT ...)` |
 | `WHERE IN solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | la columna del outer en `IN (...)` o `= (SELECT ...)` no es PK ni tiene `CREATE INDEX` |
+| `EXISTS requiere '(SELECT ...)' a continuación` `[GBY-4015]` | `EXISTS` no seguido por un paréntesis abriendo un `SELECT` |
+| `outer column 'X.Y' fuera de alcance` `[GBY-4016]` | `col = outer.col` usado fuera de un `EXISTS (...)` correlacionado, o la tabla outer no coincide con la del outer-stack |
 | `PRIMARY KEY 'X' es INT; valor incompatible en WHERE` | pasaste un string a una PK INT |
 
 ---
