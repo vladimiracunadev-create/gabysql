@@ -1756,6 +1756,63 @@ fn where_between_on_text_indexed_column_is_rejected() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn where_in_subquery_basic() -> Result<(), Box<dyn Error>> {
+    // Cubre el caso de uso reportado: SELECT … WHERE col IN (SELECT … FROM otra
+    // WHERE …). Se modelan dos tablas (cursos → alumnos) y se exige el filtro
+    // por subquery no-correlacionada.
+    let db = temp_db_path("in_subquery_basic");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE cursos (id INT PRIMARY KEY, nivel TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE alumnos (id INT PRIMARY KEY, nombre TEXT NOT NULL, curso_id INT);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_cursos_nivel ON cursos (nivel);")?;
+    run_sql(&db, "CREATE INDEX idx_alumnos_curso ON alumnos (curso_id);")?;
+
+    run_sql(
+        &db,
+        "INSERT INTO cursos (id,nivel) VALUES (1,'3 Medio');
+         INSERT INTO cursos (id,nivel) VALUES (2,'4 Medio');
+         INSERT INTO cursos (id,nivel) VALUES (3,'3 Medio');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id) VALUES (10,'Ana',1);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (11,'Beto',2);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (12,'Carla',3);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (13,'Dani',1);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT nombre FROM alumnos \
+         WHERE curso_id IN (SELECT id FROM cursos WHERE nivel = '3 Medio') \
+         ORDER BY nombre ASC;",
+    )?;
+    let names: Vec<&str> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.as_str(),
+            other => panic!("expected String, got {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Ana", "Carla", "Dani"]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn backup_roundtrip_verifies_end_to_end() -> Result<(), Box<dyn Error>> {
     let src = temp_db_path("backup-src");
     let dst = temp_db_path("backup-dst");
@@ -1893,6 +1950,112 @@ fn cross_process_lock_rejects_second_open() -> Result<(), Box<dyn Error>> {
 
     let mut third = Pager::open(&db)?;
     third.close()?;
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_in_subquery_pk_path_and_dedup() -> Result<(), Box<dyn Error>> {
+    // IN sobre PK directa: no requiere índice; debe deduplicar PKs repetidas
+    // que devuelva la subquery.
+    let db = temp_db_path("in_subquery_pk");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, label TEXT);")?;
+    run_sql(&db, "CREATE TABLE picks (pk INT PRIMARY KEY, ref_id INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,label) VALUES (1,'a');
+         INSERT INTO t (id,label) VALUES (2,'b');
+         INSERT INTO t (id,label) VALUES (3,'c');",
+    )?;
+    // ref_id repite el 2 dos veces a propósito.
+    run_sql(
+        &db,
+        "INSERT INTO picks (pk,ref_id) VALUES (10,2);
+         INSERT INTO picks (pk,ref_id) VALUES (11,2);
+         INSERT INTO picks (pk,ref_id) VALUES (12,3);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT id, label FROM t WHERE id IN (SELECT ref_id FROM picks) ORDER BY id ASC;",
+    )?;
+    // Debe devolver id=2 una sola vez (dedup) y id=3.
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    assert_eq!(res[0].rows[1][0], Value::Integer(3));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_in_subquery_empty_set() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("in_subquery_empty");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    run_sql(&db, "CREATE TABLE s (id INT PRIMARY KEY, ref_id INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id) VALUES (1); INSERT INTO t (id) VALUES (2);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE id IN (SELECT ref_id FROM s WHERE id = 9999);",
+    )?;
+    assert!(res[0].rows.is_empty());
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn where_in_subquery_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("in_subquery_errors");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(&db, "CREATE TABLE s (id INT PRIMARY KEY, a INT, b INT);")?;
+    run_sql(&db, "INSERT INTO t (id,name) VALUES (1,'x');")?;
+    run_sql(&db, "INSERT INTO s (id,a,b) VALUES (1,1,2);")?;
+
+    // Subquery con más de una columna → error claro.
+    let err = run_sql(&db, "SELECT id FROM t WHERE id IN (SELECT a, b FROM s);")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("exactamente 1 columna"),
+        "mensaje inesperado: {}",
+        err
+    );
+
+    // Columna outer no es PK y no tiene índice → error explícito.
+    let err = run_sql(&db, "SELECT id FROM t WHERE name IN (SELECT a FROM s);")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("no está indexada"),
+        "mensaje inesperado: {}",
+        err
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())

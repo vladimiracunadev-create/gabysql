@@ -114,7 +114,7 @@ pub mod codes {
     pub const PRIMARY_KEY_NULL: u32 = 3007;
 
     // ---------- SQL Surface (4000s) ----------
-    /// `WHERE` con operador no soportado (solo `=` y `BETWEEN`).
+    /// `WHERE` con operador no soportado (solo `=`, `BETWEEN` e `IN (SELECT ...)`).
     pub const WHERE_OPERATOR_UNSUPPORTED: u32 = 4001;
     /// `BETWEEN` sobre columna que no es PK ni `INT`-indexada.
     pub const BETWEEN_REQUIRES_PK_OR_INT_INDEX: u32 = 4002;
@@ -134,6 +134,12 @@ pub mod codes {
     pub const LIMIT_DUPLICATED: u32 = 4009;
     /// `OFFSET` aparece más de una vez en la query.
     pub const OFFSET_DUPLICATED: u32 = 4010;
+    /// Subquery dentro de `IN (...)` proyecta más (o menos) de una columna.
+    pub const SUBQUERY_MUST_RETURN_ONE_COLUMN: u32 = 4011;
+    /// Valor no-INT propuesto para una PK `INT` dentro de un `IN (SELECT ...)`.
+    pub const IN_PK_TYPE_MISMATCH: u32 = 4012;
+    /// `WHERE col IN (SELECT ...)` cuando `col` no es PK ni tiene índice secundario.
+    pub const IN_REQUIRES_PK_OR_INDEX: u32 = 4013;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

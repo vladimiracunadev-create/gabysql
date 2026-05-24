@@ -151,8 +151,19 @@ pub enum OrderDir {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereClause {
-    Eq { column: String, value: Value },
-    Between { column: String, from: i64, to: i64 },
+    Eq {
+        column: String,
+        value: Value,
+    },
+    Between {
+        column: String,
+        from: i64,
+        to: i64,
+    },
+    In {
+        column: String,
+        subquery: Box<SelectStmt>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -845,6 +856,72 @@ impl<'a> Engine<'a> {
                             meta.primary_key, column
                         ),
                     ));
+                }
+            }
+            Some(WhereClause::In { column, subquery }) => {
+                // Non-correlated IN: execute the subquery once, materialize
+                // its single-column result, then turn each value into a PK
+                // (direct or via secondary index lookup). The Plan stays
+                // `ByPks`, so the existing row-fetch path handles ORDER BY,
+                // LIMIT and OFFSET without changes.
+                let inner = self.exec_select(*subquery)?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery en IN debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                let values: Vec<Value> = inner
+                    .rows
+                    .into_iter()
+                    .filter_map(|mut row| row.pop())
+                    .filter(|v| !matches!(v, Value::Null))
+                    .collect();
+                if values.is_empty() {
+                    Plan::ByPks(Vec::new())
+                } else {
+                    let normalized = normalize_ident(&column);
+                    if normalized == normalize_ident(&meta.primary_key) {
+                        let mut pks = Vec::with_capacity(values.len());
+                        for v in values {
+                            match v {
+                                Value::Integer(n) => pks.push(n),
+                                _ => {
+                                    return Err(coded(
+                                        codes::IN_PK_TYPE_MISMATCH,
+                                        format!(
+                                            "PRIMARY KEY '{}' es INT; valor incompatible en IN",
+                                            meta.primary_key
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        pks.sort_unstable();
+                        pks.dedup();
+                        Plan::ByPks(pks)
+                    } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
+                        let mut pks: Vec<i64> = Vec::new();
+                        for v in values {
+                            let mut more = lookup_pks_via_index(self.pager, &meta, &idx, &v)?;
+                            pks.append(&mut more);
+                        }
+                        pks.sort_unstable();
+                        pks.dedup();
+                        Plan::ByPks(pks)
+                    } else {
+                        return Err(coded(
+                            codes::IN_REQUIRES_PK_OR_INDEX,
+                            format!(
+                                "WHERE IN solo soporta PK ({}) o columnas con índice secundario; \
+                                 '{}' no está indexada",
+                                meta.primary_key, column
+                            ),
+                        ));
+                    }
                 }
             }
         };
@@ -2382,7 +2459,8 @@ impl Parser {
             return self.parse_insert();
         }
         if self.match_keyword("SELECT") {
-            return self.parse_select();
+            let stmt = self.parse_select_stmt()?;
+            return Ok(Statement::Select(stmt));
         }
         if self.match_keyword("UPDATE") {
             return self.parse_update();
@@ -2656,7 +2734,7 @@ impl Parser {
         }))
     }
 
-    fn parse_select(&mut self) -> DbResult<Statement> {
+    fn parse_select_stmt(&mut self) -> DbResult<SelectStmt> {
         let columns = if self.match_symbol("*") {
             Vec::new()
         } else {
@@ -2676,11 +2754,20 @@ impl Parser {
                 self.expect_keyword("AND")?;
                 let to = self.expect_integer()?;
                 where_clause = Some(WhereClause::Between { column, from, to });
+            } else if self.match_keyword("IN") {
+                self.expect_symbol("(")?;
+                self.expect_keyword("SELECT")?;
+                let subquery = self.parse_select_stmt()?;
+                self.expect_symbol(")")?;
+                where_clause = Some(WhereClause::In {
+                    column,
+                    subquery: Box::new(subquery),
+                });
             } else {
                 return Err(coded(
                     codes::WHERE_OPERATOR_UNSUPPORTED,
                     format!(
-                        "WHERE soporta solo '=' o BETWEEN como operadores; \
+                        "WHERE soporta solo '=', BETWEEN o IN (SELECT ...) como operadores; \
                          no se reconoció el operador después de la columna '{}'",
                         column
                     ),
@@ -2751,14 +2838,14 @@ impl Parser {
             break;
         }
 
-        Ok(Statement::Select(SelectStmt {
+        Ok(SelectStmt {
             table,
             columns,
             where_clause,
             order_by,
             limit,
             offset,
-        }))
+        })
     }
 
     fn parse_ident_list(&mut self) -> DbResult<Vec<String>> {

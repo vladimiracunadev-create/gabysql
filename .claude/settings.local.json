@@ -41,12 +41,21 @@
       "Bash(git commit -m 'feat\\(web\\): gabymodeler — vanilla ER modeler that exports gabysql DDL *)",
       "Bash(MSYS_NO_PATHCONV=1 docker run --rm -v \"/c/dev/gabysql/.claude/worktrees/mystifying-ritchie-3fec2f:/app\" -v gabysql-target:/app/target -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm sh -c \"rustup component add rustfmt clippy 2>&1 >/dev/null && cargo fmt && cargo fmt --check && cargo clippy --all-targets -- -D warnings 2>&1 | tail -3 && cargo test --quiet 2>&1 | tail -8\")",
       "Bash(git commit -m 'docs: full sweep — DATABASE statements, gabymodeler, SQL surface *)",
-      "PowerShell(cargo --version)",
+      "Skill(security-audit)",
+      "Skill(security-audit:*)",
+      "Bash(python C:/Users/vbav/.claude/skills/security-audit/security_audit.py)",
+      "Bash(grep -n \"Cargo\\\\|cargo\\\\|crates\" C:/Users/vbav/.claude/skills/security-audit/security_audit.py | head -30)",
+      "Bash(cargo check *)",
+      "PowerShell(cargo check --tests 2>&1)",
+      "PowerShell(Get-ChildItem $env:USERPROFILE\\\\.cargo\\\\bin\\\\cargo.exe -ErrorAction SilentlyContinue; \\(Get-Command rustc -ErrorAction SilentlyContinue\\).Source)",
+      "Read(//c/Users/vbav/.cargo/**)",
+      "Read(//c/Program Files/**)",
+      "Bash(docker --version)",
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
-      "Bash(awk -F: '{print $1}')",
-      "Bash(grep -E '\"[a-záéíóúñ ]{1,30}\"')",
-      "Bash(grep -n 'DbError::new\\(\"[a-záéíóúñA-Z][^\"]\\\\{1,40\\\\}\"\\)' src/sql.rs)"
+      "Bash(git pull *)",
+      "Bash(git stash *)",
+      "Bash(git rebase *)"
     ]
   }
 }

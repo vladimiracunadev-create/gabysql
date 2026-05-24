@@ -219,13 +219,13 @@ El servidor alcanzó el techo de conexiones simultáneas (default `64`).
 
 ---
 
-## 🔎 `WHERE soporta solo '=' o BETWEEN`
+## 🔎 `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)`
 
 ### Causa
-La consulta usa operadores no implementados (`LIKE`, `>`, `<`, etc.).
+La consulta usa operadores no implementados (`LIKE`, `>`, `<`, `IN (lista, literal)`, etc.).
 
 ### Solución
-Restringe `WHERE` a la PK con `=` o `BETWEEN`, o a una columna con índice secundario (equality sobre cualquier tipo; `BETWEEN` solo si la columna es `INT` y por tanto tiene índice `OrderedInt`). `UPDATE` y `DELETE` solo aceptan `=`, no `BETWEEN`.
+Restringe `WHERE` a uno de los operadores soportados en `SELECT`: `=` (sobre PK o columna indexada), `BETWEEN` (sobre PK o columna `INT` con índice `OrderedInt`), o `IN (SELECT …)` (subquery no-correlacionada single-column; outer column debe ser PK o tener índice secundario). `UPDATE` y `DELETE` solo aceptan `=`, no `BETWEEN` ni `IN`.
 
 ---
 

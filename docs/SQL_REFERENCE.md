@@ -23,7 +23,8 @@
 | [`SELECT`](#select) | DML | 🟢 |
 | [`UPDATE`](#update) | DML | 🟢 |
 | [`DELETE`](#delete) | DML | 🟢 |
-| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `ORDER BY`, `GROUP BY`, subqueries | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| `WHERE col IN (SELECT …)` (no-correlacionada, single-column) | DML | 🟢 |
+| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `GROUP BY`, subqueries escalares / `EXISTS` / correlacionadas / derived tables | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -499,6 +500,7 @@ flowchart LR
     COL --> EQ{operador}
     EQ -- "=" --> V1[value]
     EQ -- "BETWEEN" --> V2[int] --> AND[AND] --> V3[int]
+    EQ -- "IN" --> LP["("] --> SUB[SELECT subquery] --> RP[")"]
 ```
 
 ### 📜 EBNF
@@ -512,9 +514,10 @@ select       ::= "SELECT" select_cols "FROM" identifier
 select_cols  ::= "*" | identifier ("," identifier)*
 where_clause ::= identifier "=" value
                | identifier "BETWEEN" integer "AND" integer
+               | identifier "IN" "(" select ")"
 ```
 
-> `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` funciona sobre la PK y sobre cualquier columna `INT` con índice secundario (índice `OrderedInt`, default automático al crear índice sobre `INT`; ver [ADR-0017](adr/0017-int-ordered-index-version-7.md)). Para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados, `BETWEEN` queda en el [Camino A](COMMERCIAL_ROADMAP.md). `ORDER BY` funciona sobre cualquier columna del schema (no requiere índice); el sort es en memoria post-scan, así que para tablas grandes con `LIMIT` chico conviene tener un `WHERE` que reduzca el conjunto antes del sort.
+> `=` funciona sobre la PK o sobre cualquier columna que tenga índice secundario. `BETWEEN` funciona sobre la PK y sobre cualquier columna `INT` con índice secundario (índice `OrderedInt`, default automático al crear índice sobre `INT`; ver [ADR-0017](adr/0017-int-ordered-index-version-7.md)); para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados, `BETWEEN` queda en el [Camino A](COMMERCIAL_ROADMAP.md). `IN (SELECT …)` acepta subqueries **no-correlacionadas** (la subquery no referencia columnas del outer); la subquery debe devolver exactamente una columna, se ejecuta una sola vez y el resultado se materializa como set para filtrar el outer — la columna del outer debe ser la PK o tener índice secundario, igual que `=`. `ORDER BY` funciona sobre cualquier columna del schema (no requiere índice); el sort es en memoria post-scan, así que para tablas grandes con `LIMIT` chico conviene tener un `WHERE` que reduzca el conjunto antes del sort.
 
 ### ✅ Ejemplos
 
@@ -539,6 +542,14 @@ SELECT id, name FROM users WHERE score BETWEEN 80 AND 100 LIMIT 25;
 SELECT id, name FROM users ORDER BY name ASC;
 SELECT id, name FROM users ORDER BY score DESC LIMIT 10;
 SELECT id FROM orders WHERE status = 'pending' ORDER BY total DESC LIMIT 5 OFFSET 10;
+
+-- IN (SELECT …) — subquery no-correlacionada
+-- Requiere: outer.curso_id indexado (o ser PK) e inner.nivel indexado (o ser PK).
+SELECT nombre FROM alumnos
+ WHERE curso_id IN (SELECT id FROM cursos WHERE nivel = '3 Medio');
+
+-- IN sobre PK directa (no requiere índice en el outer):
+SELECT id, label FROM t WHERE id IN (SELECT ref_id FROM picks);
 ```
 
 ### ❌ Errores típicos
@@ -548,7 +559,9 @@ SELECT id FROM orders WHERE status = 'pending' ORDER BY total DESC LIMIT 5 OFFSE
 | `tabla no existe: X` | la tabla no está creada en la DB |
 | `ORDER BY: columna 'X' no existe en 'Y'` | la columna del ORDER BY no está en el schema de la tabla |
 | `WHERE solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | filtro sobre columna no-PK sin índice — créalo o usa la PK |
-| `WHERE soporta solo '=' o BETWEEN` | operador no implementado (`<`, `>`, `LIKE`, etc.) |
+| `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)` | operador no implementado (`<`, `>`, `LIKE`, `IN (lista, literal)`, etc.) |
+| `subquery en IN debe devolver exactamente 1 columna; devolvió N` | la subquery proyectó más de una columna — reescribila con una sola |
+| `WHERE IN solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | la columna del outer en `IN (...)` no es PK ni tiene `CREATE INDEX` |
 | `PRIMARY KEY 'X' es INT; valor incompatible en WHERE` | pasaste un string a una PK INT |
 
 ---

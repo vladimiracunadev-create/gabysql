@@ -179,7 +179,7 @@ docker compose down
 | `duplicate primary key` | intento de insertar PK repetida |
 | `fila no existe: PK=N` | `UPDATE` o `DELETE` sobre una PK que no existe |
 | `no se permite cambiar la PRIMARY KEY en UPDATE` | un `UPDATE ... SET pk = ...` fue rechazado |
-| `WHERE soporta solo '=' o BETWEEN` | consulta fuera del subconjunto SQL actual |
+| `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)` | consulta fuera del subconjunto SQL actual |
 | `WHERE solo soporta PK` | un `UPDATE`/`DELETE`/`SELECT` filtró por columna no PK |
 | `server busy: N active connections (max M)` | el servidor alcanzó `-max-connections`; el cliente debe reintentar |
 | `401 unauthorized` | token faltante o incorrecto |

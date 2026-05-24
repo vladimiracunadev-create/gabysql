@@ -153,7 +153,7 @@ $apiToken = trim((string)($_GET['token'] ?? ''));
 $db = trim((string)($_GET['db'] ?? ''));
 $table = trim((string)($_GET['table'] ?? ''));
 $tab = $_GET['tab'] ?? 'browse';
-$sql = $_POST['sql'] ?? "-- Sentencias soportadas en gabysql (formato VERSION 4):\n--   CREATE TABLE | INSERT | SELECT | UPDATE | DELETE\n--   CREATE INDEX | DROP INDEX\n-- WHERE soporta: pk = N, pk BETWEEN a AND b, columna_indexada = valor\n\nSELECT * FROM users LIMIT 10;";
+$sql = $_POST['sql'] ?? "-- Sentencias soportadas en gabysql (formato VERSION 4):\n--   CREATE TABLE | INSERT | SELECT | UPDATE | DELETE\n--   CREATE INDEX | DROP INDEX\n-- WHERE soporta: pk = N, pk BETWEEN a AND b, columna_indexada = valor, col IN (SELECT col FROM otra [WHERE ...])\n\nSELECT * FROM users LIMIT 10;";
 
 [$dbsResp, $dbsErr] = http_get_json($server . '/dbs', $apiToken);
 $dbs = [];
