@@ -168,6 +168,15 @@ pub struct JoinClause {
 pub enum JoinKind {
     Inner,
     Cross,
+    /// `LEFT [OUTER] JOIN` — toda fila del lado izq se conserva, las
+    /// columnas del right se llenan con NULL si no hay match.
+    Left,
+    /// `RIGHT [OUTER] JOIN` — toda fila del lado der se conserva, las
+    /// columnas del left se llenan con NULL si no hay match.
+    Right,
+    /// `FULL [OUTER] JOIN` — unión de LEFT + RIGHT: filas sin match en
+    /// cualquiera de los dos lados aparecen con NULLs en el otro.
+    Full,
 }
 
 /// Predicado simple `t1.col = t2.col` para la cláusula `ON`. En este bloque
@@ -1381,13 +1390,20 @@ impl<'a> Engine<'a> {
         let mut current: Vec<HashMap<String, Value>> = self.scan_qualified(base)?;
 
         // --- 3. Aplicar cada JOIN en orden left-deep ---
+        //
+        // Para OUTER joins (LEFT/RIGHT/FULL) trackeamos qué filas
+        // matchearon de cada lado y luego rellenamos las que quedaron
+        // solas con NULL en las columnas del lado vacío. INNER/CROSS no
+        // rellenan: las no-matched simplemente se descartan.
         for (i, join) in stmt.joins.iter().enumerate() {
             let right = &scope.tables[i + 1];
             let right_rows = self.scan_qualified(right)?;
             let mut next: Vec<HashMap<String, Value>> =
                 Vec::with_capacity(current.len() * right_rows.len() / 2 + 1);
-            for left_row in &current {
-                for right_row in &right_rows {
+            let mut left_matched = vec![false; current.len()];
+            let mut right_matched = vec![false; right_rows.len()];
+            for (li, left_row) in current.iter().enumerate() {
+                for (ri, right_row) in right_rows.iter().enumerate() {
                     let pass = match &join.on {
                         None => true, // CROSS JOIN o comma-syntax
                         Some(pred) => evaluate_join_predicate(left_row, right_row, pred, &scope)?,
@@ -1395,6 +1411,8 @@ impl<'a> Engine<'a> {
                     if !pass {
                         continue;
                     }
+                    left_matched[li] = true;
+                    right_matched[ri] = true;
                     // Merge: las claves nunca chocan porque van prefijadas
                     // con alias/tabla únicos (validados arriba).
                     let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
@@ -1405,6 +1423,57 @@ impl<'a> Engine<'a> {
                         merged.insert(k.clone(), v.clone());
                     }
                     next.push(merged);
+                }
+            }
+            let needs_left_fill = matches!(join.kind, JoinKind::Left | JoinKind::Full);
+            let needs_right_fill = matches!(join.kind, JoinKind::Right | JoinKind::Full);
+            if needs_left_fill {
+                let right_null_keys: Vec<String> = scope.tables[i + 1]
+                    .meta
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}.{}",
+                            scope.tables[i + 1].qualifier,
+                            normalize_ident(&c.name)
+                        )
+                    })
+                    .collect();
+                for (li, left_row) in current.iter().enumerate() {
+                    if left_matched[li] {
+                        continue;
+                    }
+                    let mut filled = left_row.clone();
+                    for k in &right_null_keys {
+                        filled.insert(k.clone(), Value::Null);
+                    }
+                    next.push(filled);
+                }
+            }
+            if needs_right_fill {
+                let left_null_keys: Vec<String> = scope.tables[..=i]
+                    .iter()
+                    .flat_map(|t| {
+                        t.meta
+                            .columns
+                            .iter()
+                            .map(move |c| format!("{}.{}", t.qualifier, normalize_ident(&c.name)))
+                    })
+                    .collect();
+                for (ri, right_row) in right_rows.iter().enumerate() {
+                    if right_matched[ri] {
+                        continue;
+                    }
+                    let mut filled: HashMap<String, Value> =
+                        HashMap::with_capacity(left_null_keys.len() + right_row.len());
+                    for k in &left_null_keys {
+                        filled.insert(k.clone(), Value::Null);
+                    }
+                    for (k, v) in right_row {
+                        filled.insert(k.clone(), v.clone());
+                    }
+                    next.push(filled);
                 }
             }
             current = next;
@@ -3594,6 +3663,19 @@ impl Parser {
             } else if self.match_keyword("INNER") {
                 self.expect_keyword("JOIN")?;
                 (JoinKind::Inner, true)
+            } else if self.match_keyword("LEFT") {
+                // `LEFT [OUTER] JOIN` — el OUTER es opcional (estándar SQL).
+                let _ = self.match_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                (JoinKind::Left, true)
+            } else if self.match_keyword("RIGHT") {
+                let _ = self.match_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                (JoinKind::Right, true)
+            } else if self.match_keyword("FULL") {
+                let _ = self.match_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                (JoinKind::Full, true)
             } else if self.match_keyword("JOIN") {
                 // `JOIN` solo equivale a `INNER JOIN` (ANSI).
                 (JoinKind::Inner, true)
@@ -3618,11 +3700,13 @@ impl Parser {
                 }
                 Some(self.parse_join_predicate()?)
             } else {
-                if matches!(kind, JoinKind::Inner) {
+                // INNER, LEFT, RIGHT y FULL exigen ON; solo CROSS lo omite.
+                if !matches!(kind, JoinKind::Cross) {
                     return Err(coded(
                         codes::JOIN_PREDICATE_REQUIRED,
                         format!(
-                            "INNER JOIN sobre '{}' requiere cláusula ON l = r",
+                            "JOIN sobre '{}' requiere cláusula ON l = r \
+                             (CROSS JOIN es la única forma sin predicado)",
                             right.name
                         ),
                     ));

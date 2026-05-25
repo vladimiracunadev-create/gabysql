@@ -27,7 +27,8 @@
 | `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
-| `LEFT/RIGHT/FULL OUTER JOIN`, `USING (col)`, `NATURAL JOIN`, index-loop join optimization | DML | 🟡 (en bloques B/C/D del roadmap de JOINs) |
+| `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
+| `USING (col)`, `NATURAL JOIN`, index-loop join optimization | DML | 🟡 (en bloques C/D del roadmap de JOINs) |
 | `ALTER TABLE DROP/RENAME COLUMN`, `GROUP BY`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
@@ -530,11 +531,18 @@ from_clause ::= table_ref join_clause*
 table_ref   ::= identifier [ ["AS"] identifier ]
 join_clause ::= ( "," | "CROSS" "JOIN" ) table_ref
               | ( "INNER" "JOIN" | "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
+              | ( "LEFT"  ["OUTER"] "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
+              | ( "RIGHT" ["OUTER"] "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
+              | ( "FULL"  ["OUTER"] "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
 ```
 
 **Reglas:**
 - `INNER JOIN` (o `JOIN` solo, equivalente ANSI) requiere `ON l = r` con un único equi-predicado (`AND`/`OR` y operadores no-equi quedan para el bloque D).
 - `CROSS JOIN` (y la comma-syntax `FROM a, b`) NO admite `ON`. Producto cartesiano completo.
+- `LEFT [OUTER] JOIN`: preserva todas las filas del lado izquierdo. Cuando no hay match, las columnas del lado derecho aparecen como `NULL`.
+- `RIGHT [OUTER] JOIN`: simétrico — preserva todas las del derecho, NULL-fill en el izquierdo.
+- `FULL [OUTER] JOIN`: combina ambos comportamientos (toda fila de cualquier lado aparece, con NULL en el otro lado si no hay match).
+- El `OUTER` es opcional (estándar SQL): `LEFT JOIN` y `LEFT OUTER JOIN` son sinónimos.
 - Las tablas se pueden aliasar con `[AS] alias`. El alias **oculta** el nombre real (estándar SQL): si declarás `FROM alumnos a`, después tenés que usar `a.nombre`, no `alumnos.nombre`.
 - En SELECT/WHERE/ORDER BY, una columna que existe en >1 tabla **debe** ir cualificada (`tabla.col`); si no, `[GBY-4018]`.
 - `SELECT *` en JOIN expande a TODAS las columnas de TODAS las tablas, cada una prefijada con su qualifier para evitar colisiones.
@@ -622,6 +630,19 @@ SELECT e.nombre, j.nombre FROM empleado e
 SELECT alumnos.nombre FROM alumnos
   JOIN cursos ON alumnos.curso_id = cursos.id
  WHERE cursos.nivel = '3M';
+
+-- LEFT JOIN: padres sin hijos aparecen con etiqueta NULL
+SELECT padre.nombre, hijo.etiqueta FROM padre
+  LEFT JOIN hijo ON padre.id = hijo.parent_id
+ ORDER BY padre.id ASC;
+
+-- RIGHT JOIN: filas del derecho sin match aparecen con columnas del izq en NULL
+SELECT a.v, b.w FROM a
+  RIGHT JOIN b ON a.id = b.a_id;
+
+-- FULL OUTER JOIN: combina LEFT + RIGHT en un solo paso
+SELECT a.v, b.w FROM a
+  FULL OUTER JOIN b ON a.id = b.a_id;
 ```
 
 ### ❌ Errores típicos

@@ -37,7 +37,8 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Subqueries `WHERE [NOT] EXISTS (SELECT …)` | 🟢 | No-correlacionada: pre-ejecuta. Correlacionada single-eq: post-filter per-row con `outer_stack` (O(N × subquery)). `NOT` invierte el predicado. | [src/sql.rs](../src/sql.rs) |
 | Subqueries correlacionadas con múltiples predicados / CTE / window functions | 🔴 | Camino C. | — |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases, multi-tabla, self-join | 🟢 | Nested-loop puro O(N×M×…). WHERE/ORDER BY trabajan sobre filas joineadas. `SELECT *` expande prefijado. | [src/sql.rs](../src/sql.rs) |
-| `LEFT/RIGHT/FULL OUTER JOIN`, `USING (col)`, `NATURAL JOIN` | 🟡 | Bloques B y C del roadmap de JOINs. Diseño cerrado (NULL-fill, sugar para `ON`, auto-match por nombre). | — |
+| `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | 🟢 | Implementado vía tracking de matched-rows + NULL-fill por kind. `OUTER` opcional. Combinable en chains. | [src/sql.rs](../src/sql.rs) |
+| `USING (col)`, `NATURAL JOIN` | 🟡 | Bloque C del roadmap. Diseño cerrado (sugar para `ON`, auto-match por nombre). | — |
 | Index-loop join (optimización del nested-loop) | 🔴 | Bloque D: cuando el `ON` pega contra una columna indexada del right, reemplazar FullScan por index lookup. | — |
 | Parser SQL | 🟡 | CREATE TABLE (con `NOT NULL`/`UNIQUE`/`DEFAULT`/`REFERENCES`), DROP TABLE, ALTER TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE UNIQUE INDEX, CREATE/DROP DATABASE, SHOW DATABASES, INTEGRITY CHECK. Sin prepared statements. | [src/sql.rs](../src/sql.rs) |
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |

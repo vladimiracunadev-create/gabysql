@@ -2673,6 +2673,196 @@ fn join_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn join_left_outer_preserves_unmatched_left() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_left");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE padre (id INT PRIMARY KEY, nombre TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE hijo (id INT PRIMARY KEY, parent_id INT, etiqueta TEXT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO padre (id,nombre) VALUES (1,'Ana');
+         INSERT INTO padre (id,nombre) VALUES (2,'Beto');
+         INSERT INTO padre (id,nombre) VALUES (3,'Carla');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO hijo (id,parent_id,etiqueta) VALUES (10,1,'h1');
+         INSERT INTO hijo (id,parent_id,etiqueta) VALUES (11,3,'h2');",
+    )?;
+
+    // LEFT JOIN: Beto (sin hijos) aparece con etiqueta NULL.
+    let res = run_sql(
+        &db,
+        "SELECT padre.nombre, hijo.etiqueta FROM padre \
+         LEFT JOIN hijo ON padre.id = hijo.parent_id \
+         ORDER BY padre.id ASC;",
+    )?;
+    let pairs: Vec<(String, Value)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(n) => (n.clone(), r[1].clone()),
+            _ => panic!("expected String name"),
+        })
+        .collect();
+    assert_eq!(pairs.len(), 3);
+    assert_eq!(pairs[0], ("Ana".into(), Value::String("h1".into())));
+    assert_eq!(pairs[1], ("Beto".into(), Value::Null));
+    assert_eq!(pairs[2], ("Carla".into(), Value::String("h2".into())));
+
+    // `LEFT OUTER JOIN` (con OUTER explícito) — mismo resultado.
+    let res = run_sql(
+        &db,
+        "SELECT padre.nombre, hijo.etiqueta FROM padre \
+         LEFT OUTER JOIN hijo ON padre.id = hijo.parent_id \
+         ORDER BY padre.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_right_outer_preserves_unmatched_right() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_right");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, v TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w TEXT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id,v) VALUES (1,'x'); INSERT INTO a (id,v) VALUES (2,'y');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO b (id,a_id,w) VALUES (10,1,'p');
+         INSERT INTO b (id,a_id,w) VALUES (11,99,'huerfana');",
+    )?;
+
+    // RIGHT JOIN: la fila de b con a_id=99 (sin match) aparece con a.v NULL.
+    let res = run_sql(
+        &db,
+        "SELECT a.v, b.w FROM a RIGHT JOIN b ON a.id = b.a_id ORDER BY b.id ASC;",
+    )?;
+    let pairs: Vec<(Value, Value)> = res[0]
+        .rows
+        .iter()
+        .map(|r| (r[0].clone(), r[1].clone()))
+        .collect();
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(
+        pairs[0],
+        (Value::String("x".into()), Value::String("p".into()))
+    );
+    assert_eq!(pairs[1], (Value::Null, Value::String("huerfana".into())));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_full_outer_preserves_both_sides() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_full");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, v TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w TEXT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id,v) VALUES (1,'x');
+         INSERT INTO a (id,v) VALUES (2,'sola_a');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO b (id,a_id,w) VALUES (10,1,'p');
+         INSERT INTO b (id,a_id,w) VALUES (11,99,'sola_b');",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT a.v, b.w FROM a FULL OUTER JOIN b ON a.id = b.a_id;",
+    )?;
+    // 3 filas esperadas: (x,p) match; (sola_a,NULL) left-only; (NULL,sola_b) right-only.
+    assert_eq!(res[0].rows.len(), 3);
+    let mut combos: Vec<(Value, Value)> = res[0]
+        .rows
+        .iter()
+        .map(|r| (r[0].clone(), r[1].clone()))
+        .collect();
+    combos.sort_by_key(|(a, b)| (format!("{:?}", a), format!("{:?}", b)));
+    assert!(combos.contains(&(Value::String("x".into()), Value::String("p".into()))));
+    assert!(combos.contains(&(Value::String("sola_a".into()), Value::Null)));
+    assert!(combos.contains(&(Value::Null, Value::String("sola_b".into()))));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_left_anti_join_via_where_null() -> Result<(), Box<dyn Error>> {
+    // Patrón anti-join: LEFT JOIN + WHERE col_right IS NULL → outer-only.
+    // gabysql aún no tiene IS NULL operator, así que el patrón equivalente
+    // es WHERE hijo.id = NULL ... no, mejor verificamos con count post-filter
+    // manual. Aquí solo confirmamos que la fila LEFT-NULL existe en el output.
+    let db = temp_db_path("join_anti");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE padre (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE hijo (id INT PRIMARY KEY, parent_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO padre (id) VALUES (1); INSERT INTO padre (id) VALUES (2); INSERT INTO padre (id) VALUES (3);",
+    )?;
+    run_sql(&db, "INSERT INTO hijo (id,parent_id) VALUES (10,1);")?;
+
+    let res = run_sql(
+        &db,
+        "SELECT padre.id, hijo.id FROM padre LEFT JOIN hijo ON padre.id = hijo.parent_id ORDER BY padre.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    // Padre 2 y 3: hijo.id es NULL
+    let nulls: usize = res[0]
+        .rows
+        .iter()
+        .filter(|r| matches!(r[1], Value::Null))
+        .count();
+    assert_eq!(nulls, 2);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
