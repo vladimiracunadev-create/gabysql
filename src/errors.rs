@@ -175,6 +175,24 @@ pub mod codes {
     /// del WHERE; combinarlo con boolean operators queda para un bloque
     /// posterior.
     pub const WHERE_COMBINATOR_CORRELATED_UNSUPPORTED: u32 = 4024;
+    /// Función agregada usada fuera del SELECT list o HAVING (Bloque F).
+    /// `SUM(x) > 10` en `WHERE` o en `ORDER BY` no se acepta; debe ir en
+    /// `HAVING` o aliasearse en el SELECT y referirse por alias.
+    pub const AGGREGATE_OUTSIDE_HAVING_OR_SELECT: u32 = 4025;
+    /// Argumento inválido de función agregada (Bloque F). Casos:
+    /// `SUM(*)`, `AVG(DISTINCT x)`, `MIN(*)`, etc. Solo `COUNT(*)` y
+    /// `COUNT(DISTINCT col)` son combinaciones especiales aceptadas.
+    pub const AGGREGATE_ARG_INVALID: u32 = 4026;
+    /// `SELECT` mezcla columnas no-agregadas con agregadas sin que las
+    /// no-agregadas figuren en el `GROUP BY` (Bloque F). Cumple la regla
+    /// ANSI estricta. Solución: agregar la columna al `GROUP BY`, o
+    /// envolverla en una agregada (`MIN(col)` / `MAX(col)`).
+    pub const SELECT_COLUMN_NOT_IN_GROUP_BY: u32 = 4027;
+    /// `GROUP BY` / agregados sobre `SELECT` con JOIN (Bloque F).
+    /// El executor de JOIN aún no implementa el stage de agregación;
+    /// reescribir como subquery sobre tabla única o esperar al bloque
+    /// posterior que extienda F a multi-tabla.
+    pub const AGGREGATE_OVER_JOIN_UNSUPPORTED: u32 = 4028;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

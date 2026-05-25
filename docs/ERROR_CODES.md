@@ -115,6 +115,10 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4022` | `USING_COLUMN_INVALID` | `JOIN ... USING (col)` con col que no existe en ambas tablas, o USING con cantidad de columnas no soportada (este release: exactamente 1). | Verificar que `col` exista en ambos lados; reescribir con `ON` para multi-columna. |
 | `4023` | `NATURAL_JOIN_NO_COMMON_COLUMN` | `NATURAL JOIN` cuyas tablas no comparten exactamente 1 columna por nombre (0 o >1). | Usar `JOIN ... ON` o `USING` explícito. |
 | `4024` | `WHERE_COMBINATOR_CORRELATED_UNSUPPORTED` | `EXISTS` correlacionado o column-ref del outer (`col = otra.col`) usado dentro de un `AND`/`OR`/`NOT`. El dispatch correlacionado solo aplica cuando el predicado es el único átomo del WHERE. | Sacar el predicado correlacionado del combinador (dejarlo como único filtro) o reescribir vía JOIN/subquery no-correlacionada. |
+| `4025` | `AGGREGATE_OUTSIDE_HAVING_OR_SELECT` | Función agregada (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) usada fuera del SELECT list o HAVING — típicamente en `WHERE`. | Moverla a `HAVING`, o aliasearla en el `SELECT` y referirse por alias. |
+| `4026` | `AGGREGATE_ARG_INVALID` | Argumento inválido de función agregada: `SUM(*)`, `AVG(DISTINCT x)`, `MIN(*)`, o tipos no-numéricos en `SUM`/`AVG`. | Solo `COUNT(*)` y `COUNT(DISTINCT col)` son combinaciones especiales aceptadas. Para `SUM`/`AVG` usar columnas INT o FLOAT. |
+| `4027` | `SELECT_COLUMN_NOT_IN_GROUP_BY` | `SELECT` mezcla columnas no-agregadas que no figuran en `GROUP BY`. Cumple la regla ANSI estricta. | Agregar la columna al `GROUP BY` o envolverla en una función agregada (`MIN`/`MAX`). |
+| `4028` | `AGGREGATE_OVER_JOIN_UNSUPPORTED` | Agregados (`COUNT/SUM/AVG/MIN/MAX`) o `GROUP BY`/`HAVING` sobre un `SELECT` con `JOIN`. El executor de JOIN aún no implementa el stage de agregación. | Reescribir como subquery agregada sobre la tabla base (e.g. `SELECT COUNT(*) FROM (SELECT ...)` — pero los derived tables también están en backlog; por ahora separar la query). |
 
 ---
 

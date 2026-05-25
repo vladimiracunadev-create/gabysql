@@ -145,8 +145,23 @@ pub struct SelectStmt {
     /// pipeline single-table sigue intacto). Cada join se aplica en orden
     /// (left-deep tree).
     pub joins: Vec<JoinClause>,
-    pub columns: Vec<String>,
+    /// Bloque F: cada item del SELECT puede ser `*`, una columna explícita,
+    /// o una función agregada (`COUNT/SUM/AVG/MIN/MAX`). El SELECT list
+    /// puro `*` se representa como `vec![SelectItem::Star]`. Mezclar `*`
+    /// con otras formas no se acepta en este release.
+    pub columns: Vec<SelectItem>,
     pub where_clause: Option<WhereExpr>,
+    /// Bloque F: `SELECT DISTINCT` — dedup post-proyección.
+    pub distinct: bool,
+    /// Bloque F: columnas del `GROUP BY` (en orden). Vacío = sin
+    /// agrupamiento explícito. Si hay funciones agregadas en el SELECT
+    /// sin `GROUP BY`, se hace agregado global (UNA fila de salida).
+    pub group_by: Vec<String>,
+    /// Bloque F: filtro post-agregación. Reusa el mismo `WhereExpr` de
+    /// E1/E2 pero parseado con `allow_aggregates=true`: la LHS de un
+    /// átomo puede ser una función agregada (`SUM(price)`, `COUNT(*)`,
+    /// etc.) que el evaluador resuelve contra el bucket agrupado.
+    pub having: Option<WhereExpr>,
     pub order_by: Option<OrderClause>,
     pub limit: Option<usize>,
     pub offset: usize,
@@ -228,6 +243,91 @@ impl OrderClause {
 pub enum OrderDir {
     Asc,
     Desc,
+}
+
+/// Bloque F: ítem proyectable en el SELECT list. Pre-F el SELECT solo
+/// admitía `*` (encoded como `Vec::new()`) o una lista de idents. F
+/// extiende a un enum unificado: `Star` mantiene `SELECT *`, `Column`
+/// es la columna explícita, y `Aggregate` representa `func(arg) [AS alias]`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    Star,
+    Column(String),
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
+        /// Alias opcional (`AS total`). Cuando está presente sobrescribe
+        /// el nombre canónico en el header del ResultSet y se acepta
+        /// como referencia válida en `HAVING` y `ORDER BY`.
+        alias: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            AggFunc::Count => "COUNT",
+            AggFunc::Sum => "SUM",
+            AggFunc::Avg => "AVG",
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+        }
+    }
+    pub fn from_ident(text: &str) -> Option<Self> {
+        match text.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(AggFunc::Count),
+            "SUM" => Some(AggFunc::Sum),
+            "AVG" => Some(AggFunc::Avg),
+            "MIN" => Some(AggFunc::Min),
+            "MAX" => Some(AggFunc::Max),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggArg {
+    /// `COUNT(*)` — cuenta filas, no nulls. Solo válido con `Count`.
+    Star,
+    /// `COUNT(col)`, `SUM(col)`, etc. Los NULL se descartan al agregar.
+    Column(String),
+    /// `COUNT(DISTINCT col)`. P1 del roadmap; solo aplica a `Count`.
+    DistinctColumn(String),
+}
+
+impl SelectItem {
+    /// Nombre canónico que usa la columna en el ResultSet y en las
+    /// referencias de HAVING/ORDER BY. Cuando hay alias, el alias gana;
+    /// cuando no, se sintetiza una forma estable (e.g. `count_*`,
+    /// `sum_price`, `count_distinct_x`).
+    pub fn output_name(&self) -> String {
+        match self {
+            SelectItem::Star => "*".to_string(),
+            SelectItem::Column(name) => name.clone(),
+            SelectItem::Aggregate { func, arg, alias } => {
+                if let Some(a) = alias {
+                    return a.clone();
+                }
+                let func_lower = func.keyword().to_ascii_lowercase();
+                match arg {
+                    AggArg::Star => format!("{}_*", func_lower),
+                    AggArg::Column(c) => format!("{}_{}", func_lower, normalize_ident(c)),
+                    AggArg::DistinctColumn(c) => {
+                        format!("{}_distinct_{}", func_lower, normalize_ident(c))
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Árbol booleano que envuelve los predicados atómicos del `WHERE`
@@ -1055,11 +1155,28 @@ impl<'a> Engine<'a> {
                 .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
         };
 
-        let selected_columns = resolve_selected_columns(&meta, &stmt.columns)?;
-        let output_columns: Vec<String> = selected_columns
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
+        // Bloque F: detectar si la query necesita el stage de agregación
+        // (cualquier `SelectItem::Aggregate`, GROUP BY no vacío, o HAVING).
+        // Cuando lo necesita, el SELECT list puede mezclar columnas
+        // bare con agregadas — `resolve_selected_columns` no aplica
+        // porque la proyección se construye después de bucketear.
+        let needs_aggregation = stmt_needs_aggregation(&stmt);
+        let selected_columns = if needs_aggregation {
+            // Placeholder: para el path agregado, la proyección final se
+            // arma en exec_aggregate_pipeline. Devolvemos un vec vacío
+            // aquí para que el resto del flujo no lo use.
+            Vec::new()
+        } else {
+            resolve_selected_columns(&meta, &stmt.columns)?
+        };
+        let output_columns: Vec<String> = if needs_aggregation {
+            stmt.columns.iter().map(|i| i.output_name()).collect()
+        } else {
+            selected_columns
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
 
         // Si el WHERE es un EXISTS correlacionado, no podemos pre-ejecutar la
         // subquery: hay que evaluarla por cada fila del outer con la fila
@@ -1523,6 +1640,16 @@ impl<'a> Engine<'a> {
             rows_bytes
         };
 
+        // Bloque F: si la query es agregada, abandonamos el path normal y
+        // dejamos que `exec_aggregate_pipeline` se ocupe de bucketear,
+        // calcular agregados, aplicar HAVING, ORDER BY y window contra
+        // el esquema de salida. La descodificación de filas se hace
+        // dentro porque puede incluir COUNT(DISTINCT col) que necesita
+        // recorrer todos los valores antes de devolver la fila final.
+        if needs_aggregation {
+            return self.exec_aggregate_pipeline(&meta, &stmt, rows_bytes, output_columns);
+        }
+
         let mut rows: Vec<(HashMap<String, Value>, Vec<Value>)> =
             Vec::with_capacity(rows_bytes.len());
         for kv in rows_bytes {
@@ -1546,7 +1673,14 @@ impl<'a> Engine<'a> {
             };
             rows = rows.into_iter().skip(start).take(end - start).collect();
         }
-        let rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, r)| r).collect();
+        let mut rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, r)| r).collect();
+
+        // Bloque F: `SELECT DISTINCT` sin agregados — dedup post-proyección
+        // preservando el primer orden de aparición. Para queries con
+        // agregados, el bucketing ya hace dedup natural por GROUP BY.
+        if stmt.distinct {
+            rows = dedup_preserving_order(rows);
+        }
 
         Ok(ResultSet {
             columns: output_columns,
@@ -2897,13 +3031,476 @@ impl<'a> Engine<'a> {
             )),
         })
     }
+
+    /// Bloque F: pipeline de agregación. Se invoca desde `exec_select`
+    /// cuando la query tiene agregados, `GROUP BY` o `HAVING`. Recibe
+    /// las filas crudas YA filtradas por el `WHERE` y produce el
+    /// `ResultSet` final aplicando: bucketing → cálculo de agregados →
+    /// `HAVING` → `ORDER BY` → `OFFSET`/`LIMIT`.
+    fn exec_aggregate_pipeline(
+        &mut self,
+        meta: &TableMeta,
+        stmt: &SelectStmt,
+        rows_bytes: Vec<KeyValue>,
+        output_columns: Vec<String>,
+    ) -> DbResult<ResultSet> {
+        // 1. Validar invariantes ANSI antes de hacer trabajo.
+        validate_aggregate_select(stmt, meta)?;
+
+        // 2. Decodificar todas las filas que pasaron el WHERE. Materializar
+        //    es necesario porque el bucketing requiere ver todas las filas
+        //    para emitir UN resultado por bucket.
+        let mut decoded_rows: Vec<HashMap<String, Value>> = Vec::with_capacity(rows_bytes.len());
+        for kv in rows_bytes {
+            decoded_rows.push(decode_row(meta, &kv.value)?);
+        }
+
+        // 3. Particionar en buckets por las claves del GROUP BY. Las claves
+        //    se normalizan a lowercase. Cuando GROUP BY está vacío y hay
+        //    agregados, usamos un único bucket global (key = vec![]) que
+        //    produce UNA fila incluso si la entrada tiene 0 filas.
+        let group_keys: Vec<String> = stmt.group_by.iter().map(|c| normalize_ident(c)).collect();
+        for key in &group_keys {
+            if meta.column(key).is_none() {
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!("GROUP BY: columna '{}' no existe en '{}'", key, meta.name),
+                ));
+            }
+        }
+        // Vec<(key_tuple, Vec<row>)> preservando el orden de primera aparición.
+        let mut bucket_order: Vec<Vec<Value>> = Vec::new();
+        type GroupBucket = (Vec<Value>, Vec<HashMap<String, Value>>);
+        let mut buckets: HashMap<Vec<u8>, GroupBucket> = HashMap::new();
+        for row in decoded_rows {
+            let key_tuple: Vec<Value> = group_keys
+                .iter()
+                .map(|k| row.get(k).cloned().unwrap_or(Value::Null))
+                .collect();
+            let key_bytes = encode_group_key(&key_tuple);
+            buckets
+                .entry(key_bytes.clone())
+                .and_modify(|(_, rs)| rs.push(row.clone()))
+                .or_insert_with(|| {
+                    bucket_order.push(key_tuple.clone());
+                    (key_tuple, vec![row])
+                });
+        }
+
+        // Caso especial: sin GROUP BY explícito y SIN agregados es
+        // imposible llegar acá (needs_aggregation sería false). Si hay
+        // agregados pero buckets está vacío (0 filas pasaron el WHERE),
+        // ANSI dice que devolvemos UNA fila con los neutros (COUNT=0,
+        // SUM=NULL, etc.). Insertamos un bucket vacío sintético.
+        if group_keys.is_empty() && buckets.is_empty() {
+            buckets.insert(Vec::new(), (Vec::new(), Vec::new()));
+            bucket_order.push(Vec::new());
+        }
+
+        // 4. Por cada bucket, computar agregados y armar la fila de
+        //    salida (HashMap<output_name, Value>). Las columnas no-agg
+        //    son las del GROUP BY (mismo valor en todas las filas del
+        //    bucket, leemos del key_tuple).
+        let agg_items: Vec<(&SelectItem, String)> = stmt
+            .columns
+            .iter()
+            .filter(|it| matches!(it, SelectItem::Aggregate { .. }))
+            .map(|it| (it, it.output_name()))
+            .collect();
+
+        let mut output_rows: Vec<HashMap<String, Value>> = Vec::with_capacity(bucket_order.len());
+        for key_bytes in bucket_order.iter().map(|t| encode_group_key(t.as_slice())) {
+            let (key_tuple, rows) = buckets
+                .remove(&key_bytes)
+                .expect("bucket presente en bucket_order");
+            let mut out_row: HashMap<String, Value> = HashMap::new();
+            // Columnas del GROUP BY: clave normalizada + valor del tuple.
+            for (i, k) in group_keys.iter().enumerate() {
+                out_row.insert(k.clone(), key_tuple[i].clone());
+            }
+            // Cada agregado se computa contra todas las filas del bucket.
+            for (item, output_name) in &agg_items {
+                if let SelectItem::Aggregate { func, arg, .. } = item {
+                    let value = compute_aggregate(*func, arg, &rows)?;
+                    out_row.insert(output_name.clone(), value);
+                }
+            }
+            output_rows.push(out_row);
+        }
+
+        // 5. HAVING: filtrar buckets. El evaluador reusa el de WHERE pero
+        //    la fila es el bucket-aggregate, no la fila cruda.
+        if let Some(expr) = &stmt.having {
+            let mut kept = Vec::with_capacity(output_rows.len());
+            for row in output_rows {
+                let verdict = self.eval_where_expr_single(expr, meta, &row)?;
+                if matches!(verdict, Some(true)) {
+                    kept.push(row);
+                }
+            }
+            output_rows = kept;
+        }
+
+        // 6. Proyección final en el orden del SELECT list.
+        let mut projected: Vec<Vec<Value>> = output_rows
+            .iter()
+            .map(|row| {
+                stmt.columns
+                    .iter()
+                    .map(|item| {
+                        let name = item.output_name();
+                        let key = match item {
+                            SelectItem::Column(c) => normalize_ident(c),
+                            _ => name.clone(),
+                        };
+                        row.get(&key).cloned().unwrap_or(Value::Null)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // 7. DISTINCT (redundante si GROUP BY ya dedup, pero ANSI lo
+        //    permite — lo aplicamos por completitud).
+        if stmt.distinct {
+            projected = dedup_preserving_order(projected);
+        }
+
+        // 8. ORDER BY contra el esquema de salida. La columna referenciada
+        //    debe coincidir con un `output_name` (alias del agregado, nombre
+        //    canónico, o columna del GROUP BY). Si no, error.
+        if let Some(ord) = &stmt.order_by {
+            let target = ord.column.clone();
+            let target_norm = normalize_ident(&target);
+            let idx = output_columns
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(&target) || normalize_ident(n) == target_norm);
+            let idx = idx.ok_or_else(|| {
+                coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "ORDER BY: '{}' no figura en el SELECT list de una query agregada",
+                        target
+                    ),
+                )
+            })?;
+            projected.sort_by(|a, b| compare_values(Some(&a[idx]), Some(&b[idx])));
+            if matches!(ord.direction, OrderDir::Desc) {
+                projected.reverse();
+            }
+        }
+
+        // 9. OFFSET/LIMIT.
+        let total = projected.len();
+        let start = stmt.offset.min(total);
+        let end = match stmt.limit {
+            Some(l) => (start + l).min(total),
+            None => total,
+        };
+        let windowed: Vec<Vec<Value>> = projected
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .collect();
+
+        Ok(ResultSet {
+            columns: output_columns,
+            rows: windowed,
+            message: None,
+        })
+    }
+}
+
+/// Bloque F: true si la query requiere el stage de agregación
+/// (cualquier agregado en SELECT, `GROUP BY` no vacío, o `HAVING`).
+fn stmt_needs_aggregation(stmt: &SelectStmt) -> bool {
+    stmt.having.is_some()
+        || !stmt.group_by.is_empty()
+        || stmt
+            .columns
+            .iter()
+            .any(|i| matches!(i, SelectItem::Aggregate { .. }))
+}
+
+/// Bloque F: valida invariantes ANSI antes del bucketing.
+/// - Toda columna no-agregada en el SELECT debe figurar en `GROUP BY`.
+/// - Si hay JOINs, devolvemos error claro (agregados sobre JOINs es
+///   un release futuro).
+/// - Las columnas del GROUP BY deben existir.
+fn validate_aggregate_select(stmt: &SelectStmt, meta: &TableMeta) -> DbResult<()> {
+    if !stmt.joins.is_empty() {
+        return Err(coded(
+            codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
+            "agregados (COUNT/SUM/AVG/MIN/MAX) y GROUP BY/HAVING sobre SELECT con JOIN \
+             aún no se soportan; reescribir como subquery agregada sobre la tabla base",
+        ));
+    }
+    let group_set: HashSet<String> = stmt.group_by.iter().map(|c| normalize_ident(c)).collect();
+    for item in &stmt.columns {
+        match item {
+            SelectItem::Star => {
+                if !group_set.is_empty()
+                    || stmt
+                        .columns
+                        .iter()
+                        .any(|i| matches!(i, SelectItem::Aggregate { .. }))
+                {
+                    return Err(coded(
+                        codes::SELECT_COLUMN_NOT_IN_GROUP_BY,
+                        "SELECT *: no se permite combinar `*` con agregados o GROUP BY; \
+                         enumerar las columnas a proyectar (y agregarlas al GROUP BY)",
+                    ));
+                }
+            }
+            SelectItem::Column(c) => {
+                let key = normalize_ident(c);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("SELECT: columna '{}' no existe en '{}'", c, meta.name),
+                    ));
+                }
+                if !group_set.contains(&key) {
+                    return Err(coded(
+                        codes::SELECT_COLUMN_NOT_IN_GROUP_BY,
+                        format!(
+                            "SELECT: la columna '{}' no figura en GROUP BY ni es una función agregada — \
+                             agregala al GROUP BY o envolvela en MIN/MAX/SUM/AVG/COUNT",
+                            c
+                        ),
+                    ));
+                }
+            }
+            SelectItem::Aggregate { arg, .. } => match arg {
+                AggArg::Star => {}
+                AggArg::Column(c) | AggArg::DistinctColumn(c) => {
+                    let key = normalize_ident(c);
+                    if meta.column(&key).is_none() {
+                        return Err(coded(
+                            codes::COLUMN_NOT_FOUND,
+                            format!(
+                                "función agregada referencia columna '{}' que no existe en '{}'",
+                                c, meta.name
+                            ),
+                        ));
+                    }
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Bloque F: serialización determinística de una tupla de valores que
+/// sirve como clave de HashMap para los buckets del GROUP BY. NULL se
+/// representa por un byte sentinela (`0xFE`) distinto al de cualquier
+/// type-tag — todos los NULLs del mismo GROUP BY van al mismo bucket
+/// (consistente con la semántica de SQL: `NULL` agrupa con `NULL`).
+fn encode_group_key(values: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in values {
+        match v {
+            Value::Null => out.push(0xFE),
+            Value::Integer(n) => {
+                out.push(0x01);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Value::Float(f) => {
+                out.push(0x02);
+                out.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(0x03);
+                out.push(if *b { 1 } else { 0 });
+            }
+            Value::String(s) => {
+                out.push(0x04);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+        out.push(0xFF); // separador
+    }
+    out
+}
+
+/// Bloque F: cómputo de un agregado sobre una lista de filas del bucket.
+/// Semántica:
+/// - `COUNT(*)`: cuenta TODAS las filas del bucket (incluyendo las que
+///   tienen NULL en otras columnas).
+/// - `COUNT(col)`: cuenta filas donde `col` no es NULL.
+/// - `COUNT(DISTINCT col)`: cuenta valores distintos no-NULL.
+/// - `SUM(col)`: suma valores no-NULL (INT → INT, FLOAT → FLOAT, mixto → FLOAT).
+///   `SUM` sobre conjunto vacío o todo-NULL → `NULL` (ANSI).
+/// - `AVG(col)`: promedio de valores no-NULL como FLOAT.
+///   Conjunto vacío o todo-NULL → `NULL`.
+/// - `MIN(col)` / `MAX(col)`: ignora NULLs. Conjunto vacío o todo-NULL → `NULL`.
+fn compute_aggregate(
+    func: AggFunc,
+    arg: &AggArg,
+    rows: &[HashMap<String, Value>],
+) -> DbResult<Value> {
+    match (func, arg) {
+        (AggFunc::Count, AggArg::Star) => Ok(Value::Integer(rows.len() as i64)),
+        (AggFunc::Count, AggArg::Column(col)) => {
+            let key = normalize_ident(col);
+            let n = rows
+                .iter()
+                .filter(|r| !matches!(r.get(&key), Some(Value::Null) | None))
+                .count();
+            Ok(Value::Integer(n as i64))
+        }
+        (AggFunc::Count, AggArg::DistinctColumn(col)) => {
+            let key = normalize_ident(col);
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            for r in rows {
+                let v = r.get(&key).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                seen.insert(encode_group_key(&[v]));
+            }
+            Ok(Value::Integer(seen.len() as i64))
+        }
+        (AggFunc::Sum, AggArg::Column(col)) => {
+            let key = normalize_ident(col);
+            let mut acc_int: i128 = 0;
+            let mut acc_float: f64 = 0.0;
+            let mut any = false;
+            let mut as_float = false;
+            for r in rows {
+                match r.get(&key) {
+                    Some(Value::Integer(n)) => {
+                        any = true;
+                        if as_float {
+                            acc_float += *n as f64;
+                        } else {
+                            acc_int += *n as i128;
+                        }
+                    }
+                    Some(Value::Float(f)) => {
+                        any = true;
+                        if !as_float {
+                            acc_float = acc_int as f64 + *f;
+                            as_float = true;
+                        } else {
+                            acc_float += *f;
+                        }
+                    }
+                    Some(Value::Null) | None => {}
+                    other => {
+                        return Err(coded(
+                            codes::AGGREGATE_ARG_INVALID,
+                            format!(
+                                "SUM solo opera sobre INT o FLOAT; valor incompatible: {:?}",
+                                other
+                            ),
+                        ));
+                    }
+                }
+            }
+            if !any {
+                return Ok(Value::Null);
+            }
+            if as_float {
+                Ok(Value::Float(acc_float))
+            } else {
+                Ok(Value::Integer(acc_int as i64))
+            }
+        }
+        (AggFunc::Avg, AggArg::Column(col)) => {
+            let key = normalize_ident(col);
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for r in rows {
+                match r.get(&key) {
+                    Some(Value::Integer(n)) => {
+                        sum += *n as f64;
+                        count += 1;
+                    }
+                    Some(Value::Float(f)) => {
+                        sum += *f;
+                        count += 1;
+                    }
+                    Some(Value::Null) | None => {}
+                    other => {
+                        return Err(coded(
+                            codes::AGGREGATE_ARG_INVALID,
+                            format!(
+                                "AVG solo opera sobre INT o FLOAT; valor incompatible: {:?}",
+                                other
+                            ),
+                        ));
+                    }
+                }
+            }
+            if count == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Float(sum / count as f64))
+            }
+        }
+        (AggFunc::Min, AggArg::Column(col)) | (AggFunc::Max, AggArg::Column(col)) => {
+            let key = normalize_ident(col);
+            let pick_min = matches!(func, AggFunc::Min);
+            let mut best: Option<Value> = None;
+            for r in rows {
+                let v = r.get(&key).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                best = Some(match &best {
+                    None => v,
+                    Some(curr) => {
+                        let take = if pick_min {
+                            compare_values(Some(&v), Some(curr)).is_lt()
+                        } else {
+                            compare_values(Some(&v), Some(curr)).is_gt()
+                        };
+                        if take {
+                            v
+                        } else {
+                            curr.clone()
+                        }
+                    }
+                });
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        _ => Err(coded(
+            codes::AGGREGATE_ARG_INVALID,
+            format!(
+                "combinación inválida de función y argumento: {}({:?})",
+                func.keyword(),
+                arg
+            ),
+        )),
+    }
+}
+
+/// Bloque F: dedup preservando el orden de primera aparición. Usado por
+/// `SELECT DISTINCT`. Comparación basada en una serialización
+/// determinística — la misma que usan los buckets del GROUP BY.
+fn dedup_preserving_order(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let key = encode_group_key(&r);
+        if seen.insert(key) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 pub fn parse(sql_text: &str) -> DbResult<Vec<Statement>> {
     let mut statements = Vec::new();
     for chunk in split_statements(sql_text) {
         let tokens = tokenize(&chunk)?;
-        let mut parser = Parser { tokens, pos: 0 };
+        let mut parser = Parser {
+            tokens,
+            pos: 0,
+            in_having: false,
+        };
         let statement = parser.parse_statement()?;
         if !parser.is_eof() {
             return Err(DbError::new(format!(
@@ -3163,9 +3760,13 @@ fn project_row(
 
 fn resolve_selected_columns(
     meta: &TableMeta,
-    requested: &[String],
+    requested: &[SelectItem],
 ) -> DbResult<Vec<(String, String)>> {
-    if requested.is_empty() {
+    // Bloque F: el path no-agregado solo acepta columnas crudas o `*`.
+    // Si llegan `SelectItem::Aggregate` acá es bug del caller — el
+    // dispatcher (`needs_aggregation`) debería haber desviado al
+    // pipeline de agregación. Devolvemos error explícito por defensa.
+    if requested.is_empty() || (requested.len() == 1 && matches!(requested[0], SelectItem::Star)) {
         return Ok(meta
             .columns
             .iter()
@@ -3174,8 +3775,22 @@ fn resolve_selected_columns(
     }
 
     let mut out = Vec::with_capacity(requested.len());
-    for name in requested {
-        let normalized = normalize_ident(name);
+    for item in requested {
+        let name = match item {
+            SelectItem::Column(n) => n.clone(),
+            SelectItem::Star => {
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    "SELECT *: combinar `*` con columnas explícitas no se soporta — usá una lista",
+                ));
+            }
+            SelectItem::Aggregate { .. } => {
+                return Err(DbError::new(
+                    "interno: resolve_selected_columns no debe recibir agregados".to_string(),
+                ));
+            }
+        };
+        let normalized = normalize_ident(&name);
         let column = meta.column(&normalized).ok_or_else(|| {
             coded(
                 codes::COLUMN_NOT_FOUND,
@@ -4063,11 +4678,11 @@ fn derive_join_predicate(
 /// expande a TODAS las columnas de TODAS las tablas, en orden.
 fn resolve_joined_projection(
     scope: &JoinScope,
-    requested: &[String],
+    requested: &[SelectItem],
 ) -> DbResult<(Vec<String>, Vec<String>)> {
     let mut output = Vec::new();
     let mut keys = Vec::new();
-    if requested.is_empty() {
+    if requested.is_empty() || (requested.len() == 1 && matches!(requested[0], SelectItem::Star)) {
         // `SELECT *` → todas las columnas de todas las tablas, prefijadas
         // por qualifier. Omite las que quedaron "hidden" por USING/NATURAL
         // (ANSI: la columna común aparece una sola vez).
@@ -4083,9 +4698,26 @@ fn resolve_joined_projection(
         }
         return Ok((output, keys));
     }
-    for raw in requested {
-        output.push(raw.clone());
-        keys.push(resolve_joined_column_key(scope, raw)?);
+    for item in requested {
+        match item {
+            SelectItem::Column(raw) => {
+                output.push(raw.clone());
+                keys.push(resolve_joined_column_key(scope, raw)?);
+            }
+            SelectItem::Star => {
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    "SELECT *: combinar `*` con columnas explícitas no se soporta",
+                ));
+            }
+            SelectItem::Aggregate { .. } => {
+                return Err(coded(
+                    codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
+                    "agregados (COUNT/SUM/AVG/MIN/MAX) sobre SELECT con JOIN aún no se soportan; \
+                     reescribir como subquery agregada sobre la tabla base",
+                ));
+            }
+        }
     }
     Ok((output, keys))
 }
@@ -4398,6 +5030,16 @@ fn is_value_keyword(text: &str) -> bool {
     )
 }
 
+/// Bloque F: keywords que terminan el SELECT list. Se usa para decidir
+/// si un Ident tras un ítem del SELECT es alias o un keyword estructural
+/// (`FROM`, `WHERE`, `GROUP`, `HAVING`, `ORDER`, `LIMIT`, `OFFSET`).
+fn is_select_terminator_keyword(text: &str) -> bool {
+    matches!(
+        text.to_ascii_uppercase().as_str(),
+        "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "LIMIT" | "OFFSET"
+    )
+}
+
 /// Splits a possibly-qualified identifier like `outer.col` into
 /// `(Some("outer"), "col")`. Bare identifiers like `col` become
 /// `(None, "col")`. Multi-dot identifiers keep only the LAST segment as
@@ -4581,6 +5223,11 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Bloque F: flag scope-local que activa el parser de agregados
+    /// dentro de un átomo WHERE. Solo HAVING lo enciende (via
+    /// `parse_where_expr_with(true)`); WHERE normal lo deja en false
+    /// para rechazar `SUM(x) > 10` con error claro.
+    in_having: bool,
 }
 
 impl Parser {
@@ -4897,11 +5544,11 @@ impl Parser {
     }
 
     fn parse_select_stmt(&mut self) -> DbResult<SelectStmt> {
-        let columns = if self.match_symbol("*") {
-            Vec::new()
-        } else {
-            self.parse_ident_list()?
-        };
+        // Bloque F: `DISTINCT` opcional inmediatamente después de SELECT.
+        // No se combina con agregados sin GROUP BY de manera explícita —
+        // el executor valida la coherencia ANSI más abajo.
+        let distinct = self.match_keyword("DISTINCT");
+        let columns = self.parse_select_list()?;
         self.expect_keyword("FROM")?;
         // Base table + alias opcional (`AS` aceptado pero opcional).
         let table = self.expect_ident()?;
@@ -5020,6 +5667,25 @@ impl Parser {
             where_clause = Some(self.parse_where_expr()?);
         }
 
+        // Bloque F: GROUP BY <col> [, <col>]* — opcional, entre WHERE y
+        // HAVING/ORDER BY. Acepta columnas bare (single-table) o
+        // cualificadas (`tabla.col`); el executor las resuelve.
+        let mut group_by: Vec<String> = Vec::new();
+        if self.match_keyword("GROUP") {
+            self.expect_keyword("BY")?;
+            group_by.push(self.expect_ident()?);
+            while self.match_symbol(",") {
+                group_by.push(self.expect_ident()?);
+            }
+        }
+
+        // Bloque F: HAVING — mismo grammar que WHERE pero permite
+        // funciones agregadas como LHS de un átomo (`HAVING SUM(x) > 10`).
+        let mut having: Option<WhereExpr> = None;
+        if self.match_keyword("HAVING") {
+            having = Some(self.parse_where_expr_with(true)?);
+        }
+
         // Optional ORDER BY <ident> [ASC|DESC]. Has to come after WHERE
         // and before LIMIT/OFFSET — that's the standard SQL order and
         // also what most callers expect.
@@ -5089,10 +5755,107 @@ impl Parser {
             joins,
             columns,
             where_clause,
+            distinct,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// Bloque F: parsea el SELECT list. Acepta una mezcla de columnas
+    /// explícitas (`col` o `tabla.col`) y agregados (`COUNT(*)`,
+    /// `SUM(col)`, etc., con `AS alias` opcional). El símbolo `*` solo
+    /// es válido como único item (`SELECT *`).
+    fn parse_select_list(&mut self) -> DbResult<Vec<SelectItem>> {
+        if self.match_symbol("*") {
+            return Ok(vec![SelectItem::Star]);
+        }
+        let mut items = Vec::new();
+        items.push(self.parse_select_item()?);
+        while self.match_symbol(",") {
+            items.push(self.parse_select_item()?);
+        }
+        Ok(items)
+    }
+
+    /// Parsea un único ítem del SELECT list: o bien una función
+    /// agregada (cuando el ident es uno de COUNT/SUM/AVG/MIN/MAX seguido
+    /// inmediatamente de `(`) o una columna. Detecta el alias opcional
+    /// `[AS] alias` siempre que no choque con keywords del statement.
+    fn parse_select_item(&mut self) -> DbResult<SelectItem> {
+        // Lookahead: si el token actual es uno de los nombres de agregada
+        // y el siguiente es `(`, parseamos como agregado. Caso contrario
+        // es columna bare (que puede ir cualificada vía split_qualified_ident).
+        let head = self.peek().clone();
+        if head.kind == TokenKind::Ident {
+            if let Some(func) = AggFunc::from_ident(&head.text) {
+                let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                    kind: TokenKind::Eof,
+                    text: String::new(),
+                });
+                if next.kind == TokenKind::Symbol && next.text == "(" {
+                    self.pos += 1; // consume agg-func name
+                    self.expect_symbol("(")?;
+                    let arg = self.parse_agg_arg(func)?;
+                    self.expect_symbol(")")?;
+                    let alias = self.try_parse_select_alias()?;
+                    return Ok(SelectItem::Aggregate { func, arg, alias });
+                }
+            }
+        }
+        let column = self.expect_ident()?;
+        Ok(SelectItem::Column(column))
+    }
+
+    fn parse_agg_arg(&mut self, func: AggFunc) -> DbResult<AggArg> {
+        // `COUNT(*)` es el único caso con `*`; los demás operan sobre 1 columna.
+        if self.match_symbol("*") {
+            if !matches!(func, AggFunc::Count) {
+                return Err(coded(
+                    codes::AGGREGATE_ARG_INVALID,
+                    format!(
+                        "función agregada {}(*) no soportada — solo COUNT(*); el resto requiere una columna",
+                        func.keyword()
+                    ),
+                ));
+            }
+            return Ok(AggArg::Star);
+        }
+        if self.match_keyword("DISTINCT") {
+            if !matches!(func, AggFunc::Count) {
+                return Err(coded(
+                    codes::AGGREGATE_ARG_INVALID,
+                    format!(
+                        "DISTINCT dentro de {} no soportado en este release; solo COUNT(DISTINCT col)",
+                        func.keyword()
+                    ),
+                ));
+            }
+            let col = self.expect_ident()?;
+            return Ok(AggArg::DistinctColumn(col));
+        }
+        let col = self.expect_ident()?;
+        Ok(AggArg::Column(col))
+    }
+
+    /// Acepta `AS alias` o `alias` directo (bare). El alias bare se
+    /// detecta solo si el siguiente token es un Ident NO reservado
+    /// dentro del flujo del SELECT (`FROM`, `WHERE`, `GROUP`, `HAVING`,
+    /// `ORDER`, `LIMIT`, `OFFSET`, comma o EOF marcan el final del ítem).
+    fn try_parse_select_alias(&mut self) -> DbResult<Option<String>> {
+        if self.match_keyword("AS") {
+            let name = self.expect_ident()?;
+            return Ok(Some(name));
+        }
+        let t = self.peek();
+        if t.kind == TokenKind::Ident && !is_select_terminator_keyword(&t.text) {
+            let alias = self.peek().text.clone();
+            self.pos += 1;
+            return Ok(Some(alias));
+        }
+        Ok(None)
     }
 
     /// Parsea una expresión de WHERE con soporte completo de `AND`/`OR`/`NOT`
@@ -5100,7 +5863,17 @@ impl Parser {
     ///   `OR` (más baja) < `AND` < `NOT` < paréntesis / átomo (más alta).
     /// Asume que el caller ya consumió el keyword `WHERE`.
     fn parse_where_expr(&mut self) -> DbResult<WhereExpr> {
-        self.parse_where_or()
+        self.parse_where_expr_with(false)
+    }
+
+    /// Bloque F: variante que opcionalmente permite agregados como LHS
+    /// de los átomos de comparación (solo para HAVING).
+    fn parse_where_expr_with(&mut self, allow_aggregates: bool) -> DbResult<WhereExpr> {
+        let prev = self.in_having;
+        self.in_having = allow_aggregates;
+        let result = self.parse_where_or();
+        self.in_having = prev;
+        result
     }
 
     fn parse_where_or(&mut self) -> DbResult<WhereExpr> {
@@ -5194,7 +5967,7 @@ impl Parser {
     /// - `[NOT] LIKE 'patron'` (bloque E2)
     /// - `IS [NOT] NULL` (bloque E2)
     fn parse_where_atom(&mut self) -> DbResult<WhereClause> {
-        let column = self.expect_ident()?;
+        let column = self.parse_where_atom_lhs()?;
         // `=` exacto: misma lógica que pre-E2 (literal | subquery | outer-ref).
         if self.match_symbol("=") {
             if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
@@ -5348,6 +6121,48 @@ impl Parser {
             "<>" | "!=" => Some(CompareOp::Ne),
             _ => None,
         }
+    }
+
+    /// Bloque F: parsea el LHS de un átomo del WHERE/HAVING. En HAVING
+    /// (`self.in_having == true`) acepta también funciones agregadas
+    /// como `SUM(price)`, `COUNT(*)`, `COUNT(DISTINCT col)`; la salida
+    /// es el nombre canónico (e.g. `sum_price`, `count_*`,
+    /// `count_distinct_col`) que el evaluador busca en el bucket
+    /// agregado. En WHERE normal rechaza esa forma con un mensaje claro.
+    fn parse_where_atom_lhs(&mut self) -> DbResult<String> {
+        let head = self.peek().clone();
+        if head.kind == TokenKind::Ident {
+            if let Some(func) = AggFunc::from_ident(&head.text) {
+                let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                    kind: TokenKind::Eof,
+                    text: String::new(),
+                });
+                if next.kind == TokenKind::Symbol && next.text == "(" {
+                    if !self.in_having {
+                        return Err(coded(
+                            codes::AGGREGATE_OUTSIDE_HAVING_OR_SELECT,
+                            format!(
+                                "función agregada {} solo se permite en SELECT y HAVING; \
+                                 movela al SELECT con un alias y referencialo en el WHERE \
+                                 (no es válido — usá HAVING)",
+                                func.keyword()
+                            ),
+                        ));
+                    }
+                    self.pos += 1; // consume agg-func name
+                    self.expect_symbol("(")?;
+                    let arg = self.parse_agg_arg(func)?;
+                    self.expect_symbol(")")?;
+                    return Ok(SelectItem::Aggregate {
+                        func,
+                        arg,
+                        alias: None,
+                    }
+                    .output_name());
+                }
+            }
+        }
+        self.expect_ident()
     }
 
     /// Consume un literal string, rechazando cualquier otro tipo. Útil

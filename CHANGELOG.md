@@ -4,6 +4,62 @@
 
 ---
 
+## 2026-05-25 — Bloque F: agregaciones (`GROUP BY`, `HAVING`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `DISTINCT`)
+
+> **Un push a `main`** que destraba reporting básico. Cierra el hueco más grande del top-5 del roadmap.
+
+### 🧮 Funciones agregadas
+- `COUNT(*)` — cuenta todas las filas del bucket (incluyendo NULLs en otras columnas).
+- `COUNT(col)` — cuenta filas donde `col` no es NULL.
+- `COUNT(DISTINCT col)` — valores no-NULL distintos.
+- `SUM(col)` — INT preserva INT; mixto INT+FLOAT promueve a FLOAT. Conjunto vacío o todo-NULL → `NULL` (ANSI).
+- `AVG(col)` — promedio FLOAT sobre valores no-NULL.
+- `MIN(col)` / `MAX(col)` — ignora NULLs. Conjunto vacío o todo-NULL → `NULL`.
+
+### 🗂️ GROUP BY + HAVING
+- `GROUP BY <col> [, <col>]*` — bucketing por tupla (NULLs agrupan con NULLs, consistente con ANSI).
+- `HAVING <expr>` — filtro post-agregación. Reusa `WhereExpr` con `allow_aggregates=true`: la LHS de un átomo puede ser una función agregada (`HAVING SUM(price) > 100`) o un alias del SELECT (`HAVING total > 100`).
+- ANSI estricto: toda columna no-agregada en el SELECT debe figurar en `GROUP BY` — `[GBY-4027]` si no.
+
+### 🔀 DISTINCT
+- `SELECT DISTINCT col [, col]*` — dedup preservando el primer orden de aparición. Compatible con agregados (aunque suele ser redundante post-GROUP BY).
+
+### 🔧 AST
+- Nuevo enum `SelectItem { Star | Column(String) | Aggregate { func, arg, alias } }`. `SelectStmt.columns: Vec<String>` pasa a `Vec<SelectItem>`.
+- Nuevos campos en `SelectStmt`: `distinct: bool`, `group_by: Vec<String>`, `having: Option<WhereExpr>`.
+- Nuevo enum `AggFunc { Count, Sum, Avg, Min, Max }` y `AggArg { Star, Column, DistinctColumn }`.
+
+### 🚦 Executor
+- `exec_select` detecta `needs_aggregation` (cualquier agregado, GROUP BY, o HAVING presente) y desvía al nuevo `exec_aggregate_pipeline`. El path no-agregado mantiene fast-paths E1+E2+E3 intactos.
+- `exec_aggregate_pipeline`: valida ANSI → bucketea por GROUP BY tuple (encoded como bytes para HashMap) → calcula agregados → aplica HAVING → proyecta a `output_name` → DISTINCT → ORDER BY contra esquema de salida → window.
+- `dedup_preserving_order` helper para DISTINCT puro.
+
+### ⚠️ Limitaciones residuales
+- **Agregados sobre JOINs no se soportan todavía** — `[GBY-4028] AGGREGATE_OVER_JOIN_UNSUPPORTED`. Workaround: encapsular el JOIN en una subquery y agregar afuera.
+- `GROUP_CONCAT` / `STRING_AGG`, `JSON_AGG` / `ARRAY_AGG` — P2/P3, fuera de F.
+- Agregados en `ORDER BY` solo via alias o nombre canónico (`order by sum_x`) — no acepta la sintaxis cruda `ORDER BY SUM(x)`. Doable en una iteración menor.
+
+### 🧰 Códigos de error nuevos
+- `4025` `AGGREGATE_OUTSIDE_HAVING_OR_SELECT` — agregado en `WHERE` u otra cláusula prohibida.
+- `4026` `AGGREGATE_ARG_INVALID` — `SUM(*)`, `AVG(DISTINCT x)`, tipos incompatibles.
+- `4027` `SELECT_COLUMN_NOT_IN_GROUP_BY` — columna no-agregada que no figura en GROUP BY.
+- `4028` `AGGREGATE_OVER_JOIN_UNSUPPORTED` — agregado en SELECT con JOINs.
+
+### 🐛 Fixes incluidos
+- Tres tests `e3_update_*` que llamaban a `SELECT ... WHERE col_no_indexed = val` para verificar el efecto del UPDATE — falla con el fast-path indexado pre-existente. Reescritos para usar `WHERE … AND id > 0` (forza FullScan + 3VL).
+- `parser_returns_error_for_invalid_where` esperaba el mensaje legado "WHERE soporta solo" — actualizado al nuevo mensaje E2 y al código `[GBY-4001]`.
+- `update_and_delete_by_pk_roundtrip` esperaba error al hacer `DELETE FROM u WHERE name = 1` — ahora es válido (E3). Cambiado a verificar 0 borrados y filas intactas.
+- `secondary_index_lookup_and_maintenance` esperaba que `AND` no estuviera soportado — actualizado al comportamiento E1.
+
+### 🧪 Validación
+- 14 integration tests nuevos en `tests/integration_test.rs` (`f_*`): COUNT(*) global, COUNT(*) AS alias, COUNT(col) ignora NULL, SUM/AVG/MIN/MAX, GROUP BY single, GROUP BY multi, HAVING con agregada, HAVING con alias, DISTINCT, COUNT(DISTINCT), validación ANSI (col no-GROUP), agregado en WHERE rechazado, agregado sobre JOIN rechazado, input vacío con neutros.
+- `cargo check + cargo fmt --check + cargo clippy --all-targets -- -D warnings` limpios.
+
+### 📚 Documentación
+- (Se actualiza en el mismo push: SQL_REFERENCE, MISSING_COMMANDS.)
+
+---
+
 ## 2026-05-25 — Bloque E3: `UPDATE` / `DELETE` por cualquier `WHERE`
 
 > **Un push a `main`** que destraba mutaciones masivas y por columnas no-PK.

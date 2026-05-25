@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-25 contra `main` post-bloque **E3** (`UPDATE`/`DELETE` por columna indexada / subquery / cualquier WHERE).
+> Última verificación: 2026-05-25 contra `main` post-bloque **F** (agregaciones: `GROUP BY`, `HAVING`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `DISTINCT`).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -15,7 +15,7 @@ Si vas a ordenar bloques por ROI funcional, este es el orden:
 |---|---|---|---|
 | 1 | ~~**`AND` / `OR` / `NOT` en `WHERE`**~~ ✅ | Cerrado en E1 (2026-05-25) | E1 ✅ |
 | 2 | ~~**`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`**~~ ✅ | Cerrado en E2 (2026-05-25) | E2 ✅ |
-| 3 | **`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`** | Sin agregaciones no hay reporting | F |
+| 3 | ~~**`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`**~~ ✅ | Cerrado en F (2026-05-25; sin JOINs aún) | F ✅ |
 | 4 | ~~**`UPDATE` / `DELETE` por columna indexada o subquery**~~ ✅ | Cerrado en E3 (2026-05-25) | E3 ✅ |
 | 5 | **Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)** | Necesario para apps que componen mutaciones atómicas | T |
 
@@ -32,7 +32,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **E1** ✅ | `AND`/`OR`/`NOT` en `WHERE` + paréntesis | Alto (toca AST de WhereClause) | — (**cerrado 2026-05-25**) |
 | **E2** ✅ | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) (**cerrado 2026-05-25**) |
 | **E3** ✅ | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 (**cerrado 2026-05-25**) |
-| **F** | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 |
+| **F** ✅ | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 (**cerrado 2026-05-25**; limitación: sin JOINs aún) |
 | **G** | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` | Medio-Alto | E1 |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
 | **I** | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual | Medio | — |
@@ -86,16 +86,17 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 
 | Comando | Soportado | Prioridad |
 |---|:---:|:---:|
-| `GROUP BY <col>` (single) | ❌ | P0 |
-| `GROUP BY <col1>, <col2>` (multi) | ❌ | P0 |
-| `HAVING <cond>` | ❌ | P0 |
-| `COUNT(*)` | ❌ | P0 |
-| `COUNT(col)` | ❌ | P0 |
-| `SUM(col)` | ❌ | P0 |
-| `AVG(col)` | ❌ | P0 |
-| `MIN(col)` / `MAX(col)` | ❌ | P0 |
-| `DISTINCT` — `SELECT DISTINCT col` | ❌ | P0 |
-| `COUNT(DISTINCT col)` | ❌ | P1 |
+| `GROUP BY <col>` (single) | ✅ (F) | — |
+| `GROUP BY <col1>, <col2>` (multi) | ✅ (F) | — |
+| `HAVING <cond>` | ✅ (F; acepta agregados directos y por alias) | — |
+| `COUNT(*)` | ✅ (F) | — |
+| `COUNT(col)` | ✅ (F; ignora NULLs) | — |
+| `SUM(col)` | ✅ (F; INT/FLOAT con promoción) | — |
+| `AVG(col)` | ✅ (F; FLOAT) | — |
+| `MIN(col)` / `MAX(col)` | ✅ (F) | — |
+| `DISTINCT` — `SELECT DISTINCT col` | ✅ (F) | — |
+| `COUNT(DISTINCT col)` | ✅ (F) | — |
+| **Agregados sobre `SELECT` con `JOIN`** | ❌ ([GBY-4028]) | P1 |
 | `GROUP_CONCAT` / `STRING_AGG` | ❌ | P2 |
 | `JSON_AGG` / `ARRAY_AGG` | ❌ | P3 |
 

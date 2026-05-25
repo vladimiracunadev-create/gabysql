@@ -30,6 +30,7 @@
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
 | `WHERE` con `AND`/`OR`/`NOT` + paréntesis y 3VL para NULL (bloque E1) | DML | 🟢 |
 | `WHERE` con `<`, `>`, `<=`, `>=`, `<>`/`!=`, `[NOT] LIKE` (con `%`/`_`), `IS [NOT] NULL`, `[NOT] IN (lista)` (bloque E2) | DML | 🟢 |
+| Agregaciones: `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`, `DISTINCT` (bloque F) | DML | 🟢 (sin JOINs aún) |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
@@ -516,12 +517,18 @@ flowchart LR
 ### 📜 EBNF
 
 ```
-select       ::= "SELECT" select_cols "FROM" identifier
+select       ::= "SELECT" ["DISTINCT"] select_list "FROM" identifier
                   ("WHERE" where_clause)?
+                  ("GROUP" "BY" identifier ("," identifier)*)?
+                  ("HAVING" where_clause)?
                   ("ORDER" "BY" identifier ("ASC" | "DESC")?)?
                   ("LIMIT" integer)?
                   ("OFFSET" integer)?
-select_cols  ::= "*" | identifier ("," identifier)*
+select_list  ::= "*" | select_item ("," select_item)*
+select_item  ::= identifier
+              | agg_func "(" agg_arg ")" ["AS" identifier | identifier]
+agg_func     ::= "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+agg_arg      ::= "*" | "DISTINCT" identifier | identifier
 where_clause  ::= where_or
 where_or      ::= where_and ( "OR" where_and )*
 where_and     ::= where_not ( "AND" where_not )*
@@ -629,6 +636,27 @@ SELECT id FROM users WHERE deleted_at IS NULL;
 SELECT id FROM users WHERE id IN (1, 2, 3);
 SELECT id FROM users WHERE country NOT IN ('AR', 'BR');
 SELECT id FROM products WHERE code LIKE '50\%%';      -- LIKE literal '%' con escape
+
+-- Agregaciones (bloque F): COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING, DISTINCT
+SELECT COUNT(*) FROM users;
+SELECT COUNT(*) AS total FROM users WHERE active = TRUE;
+SELECT COUNT(monto), SUM(monto), AVG(monto) FROM ventas;
+SELECT region, SUM(monto) AS total
+   FROM ventas
+  GROUP BY region
+  ORDER BY total DESC;
+SELECT region, producto, COUNT(*) AS n
+   FROM ventas
+  GROUP BY region, producto
+ HAVING COUNT(*) > 1;
+SELECT DISTINCT category FROM products;
+SELECT COUNT(DISTINCT user_id) FROM sessions;
+
+-- Reglas ANSI estrictas:
+-- - Toda columna no-agregada en el SELECT debe figurar en GROUP BY ([GBY-4027]).
+-- - Las funciones agregadas solo se permiten en SELECT y HAVING, no en WHERE ([GBY-4025]).
+-- - Sin GROUP BY pero con agregados → UNA fila global (incluso sobre input vacío: COUNT=0, resto=NULL).
+-- - Aún no se soportan agregados sobre SELECT con JOIN ([GBY-4028]): reescribir como subquery agregada.
 
 -- AND / OR / NOT + paréntesis (bloque E1)
 SELECT id FROM users WHERE active = TRUE AND score BETWEEN 80 AND 100;

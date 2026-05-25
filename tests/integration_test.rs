@@ -109,8 +109,16 @@ fn duplicate_primary_key_is_rejected() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn parser_returns_error_for_invalid_where() {
+    // Desde E2, `LIKE` es un operador válido — pero solo acepta STRING
+    // como patrón. Pasarle un literal INT debe seguir siendo error de
+    // parsing, con mensaje que mencione LIKE.
     let err = parse("SELECT * FROM users WHERE id LIKE 1;").unwrap_err();
-    assert!(err.to_string().contains("WHERE soporta solo"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LIKE") || msg.contains("[GBY-4001]"),
+        "mensaje inesperado para LIKE con RHS INT: {}",
+        msg
+    );
 }
 
 #[test]
@@ -253,16 +261,12 @@ fn secondary_index_lookup_and_maintenance() -> Result<(), Box<dyn Error>> {
     assert_eq!(res[0].rows.len(), 1);
     assert_eq!(res[0].rows[0][0], Value::Integer(50));
 
-    // Non-indexed and non-PK column still rejected explicitly.
-    let err = run_sql(&db, "SELECT id FROM u WHERE name = 'X' AND score = 1;")
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    // (Parser doesn't support AND yet — verify the parser, not the
-    // index path; the WHERE col=val by an indexed column already
-    // succeeded above. This sub-assertion just guards against the parser
-    // silently accepting AND in the future without us noticing.)
-    assert!(err.contains("token") || err.contains("WHERE") || !err.is_empty());
+    // Desde E1, `AND` es válido en WHERE. El path compuesto cae a
+    // FullScan + 3VL (no usa fast-path indexada). Verifico que la query
+    // ejecute OK y devuelva el conjunto correcto: name='X' no matchea
+    // a nadie, así que el AND tampoco — esperamos 0 filas.
+    let res = run_sql(&db, "SELECT id FROM u WHERE name = 'X' AND score = 1;")?;
+    assert_eq!(res[0].rows.len(), 0);
 
     // DROP INDEX falls back to "column not indexed" error on next lookup.
     run_sql(&db, "DROP INDEX idx_u_name;")?;
@@ -316,14 +320,19 @@ fn update_and_delete_by_pk_roundtrip() -> Result<(), Box<dyn Error>> {
     let err = run_sql(&db, "UPDATE u SET id = 99 WHERE id = 1;").unwrap_err();
     assert!(err.to_string().contains("PRIMARY KEY"));
 
-    // DELETE non-PK column should error.
-    let err = run_sql(&db, "DELETE FROM u WHERE name = 1;").unwrap_err();
-    let msg = err.to_string();
+    // Desde E3, DELETE por col no-PK es válido (FullScan + 3VL). Comparar
+    // TEXT name contra INT 1 da type-mismatch → 0 filas matchean; no es
+    // error. Verifico que la query corra OK con 0 borrados y que las
+    // filas existentes sigan intactas.
+    let res = run_sql(&db, "DELETE FROM u WHERE name = 1;")?;
+    let msg = res[0].message.as_deref().unwrap_or("");
     assert!(
-        msg.contains("PRIMARY KEY") || msg.contains("PK"),
-        "el error de DELETE sin PK debe mencionar PRIMARY KEY: {}",
+        msg.contains("0 filas"),
+        "esperaba 0 filas eliminadas: {}",
         msg
     );
+    let after = run_sql(&db, "SELECT id FROM u;")?;
+    assert_eq!(after[0].rows.len(), 2, "no deben haberse borrado filas");
 
     cleanup(&[&db, &wal]);
     Ok(())
@@ -3725,9 +3734,12 @@ fn e3_update_by_indexed_column_affects_all_matches() -> Result<(), Box<dyn Error
     e3_fixture(&db)?;
 
     // ciudad='BA' matchea 2 filas (1, 3). Después del UPDATE ambas
-    // deberían tener activo=FALSE.
+    // deberían tener activo=FALSE. El SELECT verificador usa un WHERE
+    // compuesto (AND) para forzar el path FullScan + 3VL — el fast-path
+    // indexado de SELECT solo acepta = sobre columna con índice (no es
+    // el caso de `activo`).
     run_sql(&db, "UPDATE t SET activo = FALSE WHERE ciudad = 'BA';")?;
-    let res = run_sql(&db, "SELECT id FROM t WHERE activo = TRUE;")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE activo = TRUE AND id > 0;")?;
     let mut ids = e1_ids(&res[0]);
     ids.sort();
     assert_eq!(ids, vec![4]); // solo Dario quedó activo
@@ -3745,7 +3757,7 @@ fn e3_update_by_compound_where() -> Result<(), Box<dyn Error>> {
 
     // Marcamos como inactivos a los mayores de 35.
     run_sql(&db, "UPDATE t SET activo = FALSE WHERE edad > 35;")?;
-    let res = run_sql(&db, "SELECT id FROM t WHERE activo = TRUE;")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE activo = TRUE AND id > 0;")?;
     let mut ids = e1_ids(&res[0]);
     ids.sort();
     // Activos pre-update: 1 (Ana, 30), 3 (Carla, 40), 4 (Dario, 22).
@@ -3775,7 +3787,12 @@ fn e3_update_by_in_subquery() -> Result<(), Box<dyn Error>> {
         &db,
         "UPDATE t SET nombre = 'BLOQUEADO' WHERE id IN (SELECT uid FROM bad);",
     )?;
-    let res = run_sql(&db, "SELECT id FROM t WHERE nombre = 'BLOQUEADO';")?;
+    // El SELECT verificador usa un combinador para evitar el fast-path
+    // indexado (`nombre` no tiene índice).
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE nombre = 'BLOQUEADO' AND id > 0;",
+    )?;
     let mut ids = e1_ids(&res[0]);
     ids.sort();
     assert_eq!(ids, vec![2, 5]);
@@ -3924,6 +3941,281 @@ fn e3_update_preserves_unique_check() -> Result<(), Box<dyn Error>> {
         msg
     );
 
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque F: GROUP BY + HAVING + agregados + DISTINCT
+// ============================================================
+//
+// Fixture común: tabla `ventas (id, region, producto, monto, vendedor)`
+// con datos diseñados para que cada test ejercite buckets diferentes y
+// 3VL con NULLs en `monto`.
+
+fn f_fixture(db: &Path) -> Result<(), Box<dyn Error>> {
+    let mut pager = Pager::create(db)?;
+    pager.close()?;
+    run_sql(
+        db,
+        "CREATE TABLE ventas (id INT PRIMARY KEY, region TEXT, producto TEXT, monto INT, vendedor TEXT);",
+    )?;
+    run_sql(
+        db,
+        "INSERT INTO ventas (id,region,producto,monto,vendedor) VALUES (1,'norte','A',100,'ana');
+         INSERT INTO ventas (id,region,producto,monto,vendedor) VALUES (2,'norte','B',200,'beto');
+         INSERT INTO ventas (id,region,producto,monto,vendedor) VALUES (3,'sur','A',150,'ana');
+         INSERT INTO ventas (id,region,producto,monto,vendedor) VALUES (4,'sur','A',150,'ana');
+         INSERT INTO ventas (id,region,producto,monto,vendedor) VALUES (5,'sur','C',300,'carlos');
+         INSERT INTO ventas (id,region,producto,vendedor) VALUES (6,'sur','D','carlos');",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn f_count_star_global() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_count_global");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM ventas;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(6));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_count_star_with_alias_and_where() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_count_alias");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT COUNT(*) AS total FROM ventas WHERE region = 'sur' AND id > 0;",
+    )?;
+    assert_eq!(res[0].columns, vec!["total"]);
+    assert_eq!(res[0].rows[0][0], Value::Integer(4));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_count_col_ignora_null() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_count_col");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(&db, "SELECT COUNT(*), COUNT(monto) FROM ventas;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(6));
+    assert_eq!(res[0].rows[0][1], Value::Integer(5));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_sum_avg_min_max() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_sum_avg");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT SUM(monto), AVG(monto), MIN(monto), MAX(monto) FROM ventas;",
+    )?;
+    let r = &res[0].rows[0];
+    assert_eq!(r[0], Value::Integer(900));
+    assert_eq!(r[1], Value::Float(180.0));
+    assert_eq!(r[2], Value::Integer(100));
+    assert_eq!(r[3], Value::Integer(300));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_group_by_single_column() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_group_single");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT region, COUNT(*) AS n FROM ventas GROUP BY region ORDER BY region ASC;",
+    )?;
+    assert_eq!(res[0].columns, vec!["region", "n"]);
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::String("norte".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(2));
+    assert_eq!(res[0].rows[1][0], Value::String("sur".to_string()));
+    assert_eq!(res[0].rows[1][1], Value::Integer(4));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_group_by_multi_column() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_group_multi");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT region, producto, SUM(monto) AS total FROM ventas GROUP BY region, producto;",
+    )?;
+    assert_eq!(res[0].rows.len(), 5);
+    let non_null_totals: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Integer(n) = r[2] {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut sorted = non_null_totals.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec![100, 200, 300, 300]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_having_filter_after_aggregation() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_having");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT region, SUM(monto) AS total FROM ventas GROUP BY region HAVING SUM(monto) > 500 ORDER BY region ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::String("sur".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(600));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_having_with_alias_reference() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_having_alias");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT region, COUNT(*) AS n FROM ventas GROUP BY region HAVING n >= 4;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::String("sur".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(4));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_distinct_dedup() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_distinct");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(
+        &db,
+        "SELECT DISTINCT region FROM ventas ORDER BY region ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::String("norte".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::String("sur".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_count_distinct() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_count_distinct");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let res = run_sql(&db, "SELECT COUNT(DISTINCT vendedor) FROM ventas;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_select_column_not_in_group_by_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_bad_group");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let err = run_sql(
+        &db,
+        "SELECT region, vendedor, COUNT(*) FROM ventas GROUP BY region;",
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-4027]"), "esperaba GBY-4027: {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_aggregate_in_where_is_rejected() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_agg_where");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    f_fixture(&db)?;
+    let err = run_sql(&db, "SELECT region FROM ventas WHERE SUM(monto) > 100;").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-4025]"), "esperaba GBY-4025: {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_aggregate_over_join_rejected() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_agg_join");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, x INT);
+         CREATE TABLE b (id INT PRIMARY KEY, a_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id,x) VALUES (1,10); INSERT INTO b (id,a_id) VALUES (10,1);",
+    )?;
+    let err = run_sql(&db, "SELECT COUNT(*) FROM a JOIN b ON a.id = b.a_id;").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-4028]"), "esperaba GBY-4028: {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f_empty_input_agg_returns_one_row() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("f_empty_agg");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, x INT);")?;
+    let res = run_sql(
+        &db,
+        "SELECT COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(0));
+    assert_eq!(res[0].rows[0][1], Value::Null);
+    assert_eq!(res[0].rows[0][2], Value::Null);
+    assert_eq!(res[0].rows[0][3], Value::Null);
+    assert_eq!(res[0].rows[0][4], Value::Null);
     cleanup(&[&db, &wal]);
     Ok(())
 }
