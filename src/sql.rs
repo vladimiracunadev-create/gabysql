@@ -1996,10 +1996,9 @@ impl<'a> Engine<'a> {
                     _ => None,
                 })
             }
-            WhereExpr::Not(inner) => Ok(match self.eval_where_expr_joined(inner, row, scope)? {
-                Some(b) => Some(!b),
-                None => None,
-            }),
+            WhereExpr::Not(inner) => {
+                Ok(self.eval_where_expr_joined(inner, row, scope)?.map(|b| !b))
+            }
             WhereExpr::Atom(c) => self.eval_atom_joined(c, row, scope),
         }
     }
@@ -2273,10 +2272,7 @@ impl<'a> Engine<'a> {
                     _ => None,
                 })
             }
-            WhereExpr::Not(inner) => Ok(match self.eval_where_expr_single(inner, meta, row)? {
-                Some(b) => Some(!b),
-                None => None,
-            }),
+            WhereExpr::Not(inner) => Ok(self.eval_where_expr_single(inner, meta, row)?.map(|b| !b)),
             WhereExpr::Atom(c) => self.eval_atom_single(c, meta, row),
         }
     }
@@ -4300,10 +4296,7 @@ fn eval_in_list(lhs: Option<&Value>, values: &[Value], negated: bool) -> Option<
     } else {
         Some(false)
     };
-    match in_result {
-        Some(b) => Some(if negated { !b } else { b }),
-        None => None,
-    }
+    in_result.map(|b| if negated { !b } else { b })
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
@@ -4569,9 +4562,9 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                     });
                     index += 2;
                 } else {
-                    return Err(DbError::new(format!(
-                        "símbolo no soportado: '!' suelto; ¿quisiste decir '!='?"
-                    )));
+                    return Err(DbError::new(
+                        "símbolo no soportado: '!' suelto; ¿quisiste decir '!='?".to_string(),
+                    ));
                 }
             }
             _ => return Err(DbError::new(format!("carÃ¡cter no soportado: {}", ch))),
