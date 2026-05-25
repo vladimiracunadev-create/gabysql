@@ -306,6 +306,66 @@ pub enum WhereClause {
         subquery: Box<SelectStmt>,
         negated: bool,
     },
+    // ───────── Bloque E2: operadores de comparación / nulidad / pertenencia ─────────
+    //
+    // Ninguno tiene fast-path por índice en este release: todos se evalúan
+    // via FullScan + post-filter row-a-row con 3VL. Optimización indexada
+    // (range scan para `<`/`>`/`<=`/`>=` sobre OrderedInt, hash lookup para
+    // listas pequeñas, etc.) queda explícitamente fuera de E2.
+    /// `col <op> literal` con `<op>` en `<, >, <=, >=, <>/!=`.
+    /// Compatible con INT/FLOAT (orden numérico), TEXT (lexicográfico) y
+    /// BOOL (false < true). NULL en cualquiera de los dos lados → `NULL`
+    /// en el resultado (3VL).
+    Compare {
+        column: String,
+        op: CompareOp,
+        value: Value,
+    },
+    /// `col [NOT] LIKE 'patron'`. Wildcards estilo SQL estándar:
+    /// `%` = cero o más caracteres, `_` = exactamente uno. Solo TEXT;
+    /// otros tipos devuelven NULL (3VL). Escape con `\%` / `\_`.
+    Like {
+        column: String,
+        pattern: String,
+        negated: bool,
+    },
+    /// `col IS [NOT] NULL`. Único predicado que NO propaga NULL: `IS NULL`
+    /// sobre NULL devuelve `true` (no `NULL`). Es la forma explícita de
+    /// preguntar por ausencia.
+    IsNull { column: String, negated: bool },
+    /// `col [NOT] IN (lit1, lit2, ...)` con lista literal (no-subquery).
+    /// Si la columna es NULL → NULL (3VL). NULLs dentro de la lista se
+    /// ignoran (ANSI). `NOT IN` con un NULL en la lista propaga NULL
+    /// (semántica ANSI estricta).
+    InList {
+        column: String,
+        values: Vec<Value>,
+        negated: bool,
+    },
+}
+
+/// Operadores de comparación binarios soportados por [`WhereClause::Compare`]
+/// (Bloque E2). `Eq` queda fuera porque tiene su propio variant con
+/// fast-paths indexadas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Ne,
+}
+
+impl CompareOp {
+    pub fn lexeme(&self) -> &'static str {
+        match self {
+            CompareOp::Lt => "<",
+            CompareOp::Le => "<=",
+            CompareOp::Gt => ">",
+            CompareOp::Ge => ">=",
+            CompareOp::Ne => "<>",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1014,13 +1074,31 @@ impl<'a> Engine<'a> {
             _ => None,
         };
 
-        // Bloque E1: cuando el WHERE no es un único átomo, las fast-paths
-        // (PK directa, índice secundario, range scan) no aplican porque la
-        // combinación booleana puede mezclar predicados sobre columnas
-        // distintas. Caemos a FullScan + post-filter genérico row-a-row.
+        // Bloque E1+E2: el path por fast-path indexada solo aplica cuando
+        // el WHERE se reduce a un único átomo CON fast-path (los 6 pre-E2:
+        // Eq, Between, In subquery, EqSubquery, EqColumnRef, Exists). En
+        // cualquier otro caso (combinadores AND/OR/NOT, o átomos E2 que
+        // por ahora no tienen optimización indexada) caemos a FullScan +
+        // post-filter genérico 3VL.
         let generic_post_filter: Option<WhereExpr> = match &stmt.where_clause {
-            Some(expr) if expr.as_atom().is_none() => Some(expr.clone()),
-            _ => None,
+            Some(expr) => {
+                let force = match expr.as_atom() {
+                    None => true,
+                    Some(atom) => matches!(
+                        atom,
+                        WhereClause::Compare { .. }
+                            | WhereClause::Like { .. }
+                            | WhereClause::IsNull { .. }
+                            | WhereClause::InList { .. }
+                    ),
+                };
+                if force {
+                    Some(expr.clone())
+                } else {
+                    None
+                }
+            }
+            None => None,
         };
 
         // First decide what list of PKs we need (or whether we need a full
@@ -1291,6 +1369,15 @@ impl<'a> Engine<'a> {
                         Plan::ByPks(Vec::new())
                     }
                 }
+                // Átomos E2 (`Compare`, `Like`, `IsNull`, `InList`) nunca
+                // alcanzan este match porque `generic_post_filter` los
+                // intercepta arriba. Mantenemos un brazo defensivo para
+                // que el match siga exhaustivo si alguien agrega una
+                // fast-path indexada futura sin tocar este lugar.
+                Some(WhereClause::Compare { .. })
+                | Some(WhereClause::Like { .. })
+                | Some(WhereClause::IsNull { .. })
+                | Some(WhereClause::InList { .. }) => Plan::FullScan,
             }
         };
 
@@ -1998,6 +2085,31 @@ impl<'a> Engine<'a> {
                 "esta forma del WHERE (column-ref / EXISTS) aún no se combina con JOINs \
                  en este release; envolver el JOIN en una subquery o filtrar por valores literales",
             )),
+            WhereClause::Compare { column, op, value } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                Ok(eval_compare(row.get(&key), *op, value))
+            }
+            WhereClause::Like {
+                column,
+                pattern,
+                negated,
+            } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                Ok(eval_like(row.get(&key), pattern, *negated))
+            }
+            WhereClause::IsNull { column, negated } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let is_null = matches!(row.get(&key), Some(Value::Null) | None);
+                Ok(Some(if *negated { !is_null } else { is_null }))
+            }
+            WhereClause::InList {
+                column,
+                values,
+                negated,
+            } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                Ok(eval_in_list(row.get(&key), values, *negated))
+            }
         }
     }
 
@@ -2098,6 +2210,24 @@ impl<'a> Engine<'a> {
                 "esta forma del WHERE (column-ref / EXISTS) aún no se combina con JOINs \
                  en este release; envolver el JOIN en una subquery o filtrar por valores literales",
             )),
+            // Átomos E2 sobre JOIN: dispatch al evaluador 3VL que filtra
+            // fila-a-fila. La fast-path optimizada no aplica acá porque
+            // estos operadores ya forzaron generic_post_filter arriba.
+            WhereClause::Compare { .. }
+            | WhereClause::Like { .. }
+            | WhereClause::IsNull { .. }
+            | WhereClause::InList { .. } => {
+                let mut kept = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if matches!(
+                        self.eval_atom_joined(where_clause, &row, scope)?,
+                        Some(true)
+                    ) {
+                        kept.push(row);
+                    }
+                }
+                Ok(kept)
+            }
         }
     }
 
@@ -2276,6 +2406,55 @@ impl<'a> Engine<'a> {
                 "referencias a columnas del outer dentro de AND/OR/NOT no se soportan \
                  en este release; el column-ref correlacionado debe ser el único predicado",
             )),
+            WhereClause::Compare { column, op, value } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                Ok(eval_compare(row.get(&key), *op, value))
+            }
+            WhereClause::Like {
+                column,
+                pattern,
+                negated,
+            } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                Ok(eval_like(row.get(&key), pattern, *negated))
+            }
+            WhereClause::IsNull { column, negated } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                let is_null = matches!(row.get(&key), Some(Value::Null) | None);
+                Ok(Some(if *negated { !is_null } else { is_null }))
+            }
+            WhereClause::InList {
+                column,
+                values,
+                negated,
+            } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                Ok(eval_in_list(row.get(&key), values, *negated))
+            }
         }
     }
 
@@ -3914,6 +4093,129 @@ fn column_ref_to_raw(cref: &ColumnRef) -> String {
 
 /// Igualdad estricta para WHERE post-filter en JOINs. NULL != NULL (SQL
 /// standard). Mismo tipo a tipo. INT vs FLOAT promueve a FLOAT.
+/// Bloque E2: evalúa `lhs <op> rhs` con 3VL. NULL en cualquiera de los dos
+/// lados → `None` (unknown). Tipos compatibles: INT↔INT, FLOAT↔FLOAT,
+/// INT↔FLOAT (promoción), TEXT↔TEXT, BOOL↔BOOL. Cualquier otra combinación
+/// devuelve `Some(false)` (no son comparables → no matchean).
+fn eval_compare(lhs: Option<&Value>, op: CompareOp, rhs: &Value) -> Option<bool> {
+    let lhs = lhs?;
+    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+        return None;
+    }
+    use std::cmp::Ordering;
+    let ord: Option<Ordering> = match (lhs, rhs) {
+        (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    };
+    let ord = match ord {
+        Some(o) => o,
+        // Tipos incompatibles (ej. TEXT vs INT) no son comparables; ANSI
+        // strictamente devolvería error de tipo, pero gabysql elige
+        // `false` (la fila no matchea) para no abortar consultas mixtas.
+        None => return Some(false),
+    };
+    Some(match op {
+        CompareOp::Lt => ord == Ordering::Less,
+        CompareOp::Le => ord != Ordering::Greater,
+        CompareOp::Gt => ord == Ordering::Greater,
+        CompareOp::Ge => ord != Ordering::Less,
+        CompareOp::Ne => ord != Ordering::Equal,
+    })
+}
+
+/// Bloque E2: evalúa `lhs [NOT] LIKE patron`. Solo aplica sobre TEXT;
+/// cualquier otro tipo (incluido NULL) → `None`. Wildcards SQL estándar:
+/// `%` = cero o más chars, `_` = exactamente uno. Escape con `\%` / `\_`
+/// (los demás `\X` se interpretan literales). Implementación recursiva
+/// con memoization implícita por backtracking acotado al patrón.
+fn eval_like(lhs: Option<&Value>, pattern: &str, negated: bool) -> Option<bool> {
+    let s = match lhs? {
+        Value::String(s) => s.as_str(),
+        Value::Null => return None,
+        _ => return Some(false),
+    };
+    let m = like_match(s, pattern);
+    Some(if negated { !m } else { m })
+}
+
+/// Backtracking simple `s` vs `pattern` con wildcards `%` / `_`. La
+/// recursión es O(|s|·|pattern|) en el peor caso; alcanza para patrones
+/// realistas. Para patrones gigantes con muchos `%` un NFA sería mejor —
+/// queda para optimización futura.
+fn like_match(s: &str, pattern: &str) -> bool {
+    let s_chars: Vec<char> = s.chars().collect();
+    let p_chars: Vec<char> = pattern.chars().collect();
+    fn go(s: &[char], p: &[char]) -> bool {
+        if p.is_empty() {
+            return s.is_empty();
+        }
+        match p[0] {
+            '%' => {
+                // Match cero o más caracteres. Probamos sin consumir nada,
+                // y si falla consumimos uno y seguimos.
+                if go(s, &p[1..]) {
+                    return true;
+                }
+                if !s.is_empty() && go(&s[1..], p) {
+                    return true;
+                }
+                false
+            }
+            '_' => !s.is_empty() && go(&s[1..], &p[1..]),
+            '\\' if p.len() >= 2 => {
+                // Escape: el siguiente char se matchea literal (sin tratarlo
+                // como wildcard). Útil para buscar `%` o `_` literales.
+                !s.is_empty() && s[0] == p[1] && go(&s[1..], &p[2..])
+            }
+            c => !s.is_empty() && s[0] == c && go(&s[1..], &p[1..]),
+        }
+    }
+    go(&s_chars, &p_chars)
+}
+
+/// Bloque E2: evalúa `lhs [NOT] IN (v1, v2, ...)` con semántica ANSI 3VL.
+///
+/// - `lhs IS NULL` → `NULL` (unknown), independiente de la lista.
+/// - `lhs IN (lista)` → `true` si algún `v_i` matchea por igualdad;
+///   `NULL` si no hubo match y la lista contiene algún NULL;
+///   `false` si no hubo match y la lista no tiene NULLs.
+/// - `lhs NOT IN (lista)` = `NOT (lhs IN (lista))` con la misma 3VL: si
+///   la lista contiene NULL y no hubo match, el resultado es NULL.
+fn eval_in_list(lhs: Option<&Value>, values: &[Value], negated: bool) -> Option<bool> {
+    let lhs = lhs?;
+    if matches!(lhs, Value::Null) {
+        return None;
+    }
+    let mut had_null = false;
+    let mut matched = false;
+    for v in values {
+        if matches!(v, Value::Null) {
+            had_null = true;
+            continue;
+        }
+        if values_equal(lhs, v) {
+            matched = true;
+            break;
+        }
+    }
+    let in_result = if matched {
+        Some(true)
+    } else if had_null {
+        None
+    } else {
+        Some(false)
+    };
+    match in_result {
+        Some(b) => Some(if negated { !b } else { b }),
+        None => None,
+    }
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => false,
@@ -3955,7 +4257,13 @@ fn where_expr_has_outer_refs(expr: &WhereExpr) -> bool {
             WhereClause::Exists { subquery, .. }
             | WhereClause::In { subquery, .. }
             | WhereClause::EqSubquery { subquery, .. } => subquery_has_outer_refs(subquery),
-            _ => false,
+            // Átomos E2 no llevan subqueries ni referencias outer.
+            WhereClause::Eq { .. }
+            | WhereClause::Between { .. }
+            | WhereClause::Compare { .. }
+            | WhereClause::Like { .. }
+            | WhereClause::IsNull { .. }
+            | WhereClause::InList { .. } => false,
         },
     }
 }
@@ -4122,6 +4430,59 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                     text: ch.to_string(),
                 });
                 index += 1;
+            }
+            // Bloque E2: operadores de comparación. Reconocemos primero los
+            // bi-carácter (`<=`, `>=`, `<>`, `!=`) y luego los mono (`<`, `>`).
+            // `!` solo es válido como prefijo de `!=`; suelto es un error
+            // explícito para que el usuario no confunda con NOT.
+            '<' => {
+                if index + 1 < chars.len() && chars[index + 1] == '=' {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: "<=".to_string(),
+                    });
+                    index += 2;
+                } else if index + 1 < chars.len() && chars[index + 1] == '>' {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: "<>".to_string(),
+                    });
+                    index += 2;
+                } else {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: "<".to_string(),
+                    });
+                    index += 1;
+                }
+            }
+            '>' => {
+                if index + 1 < chars.len() && chars[index + 1] == '=' {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: ">=".to_string(),
+                    });
+                    index += 2;
+                } else {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: ">".to_string(),
+                    });
+                    index += 1;
+                }
+            }
+            '!' => {
+                if index + 1 < chars.len() && chars[index + 1] == '=' {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: "!=".to_string(),
+                    });
+                    index += 2;
+                } else {
+                    return Err(DbError::new(format!(
+                        "símbolo no soportado: '!' suelto; ¿quisiste decir '!='?"
+                    )));
+                }
             }
             _ => return Err(DbError::new(format!("carÃ¡cter no soportado: {}", ch))),
         }
@@ -4742,60 +5103,190 @@ impl Parser {
         Ok(subquery)
     }
 
-    /// Parsea un único predicado (átomo) del WHERE. Cubre las formas que
-    /// existían antes del bloque E1: `col = val`, `col = (SELECT ...)`,
-    /// `col = otra.col`, `col BETWEEN n AND m`, `col IN (SELECT ...)`.
-    /// Las combinaciones booleanas las arma `parse_where_*` por encima.
+    /// Parsea un único predicado (átomo) del WHERE. Las combinaciones
+    /// booleanas las arma `parse_where_*` por encima.
+    ///
+    /// Operadores soportados (después del nombre de columna):
+    /// - `=` literal / `(SELECT ...)` / `otra.col` (column-ref correlacionado)
+    /// - `<`, `>`, `<=`, `>=`, `<>`, `!=` (bloque E2)
+    /// - `BETWEEN n AND m`
+    /// - `[NOT] IN (...)` — lista literal o `(SELECT ...)` (bloque E2 añade lista)
+    /// - `[NOT] LIKE 'patron'` (bloque E2)
+    /// - `IS [NOT] NULL` (bloque E2)
     fn parse_where_atom(&mut self) -> DbResult<WhereClause> {
         let column = self.expect_ident()?;
+        // `=` exacto: misma lógica que pre-E2 (literal | subquery | outer-ref).
         if self.match_symbol("=") {
             if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
                 self.expect_symbol("(")?;
                 self.expect_keyword("SELECT")?;
                 let subquery = self.parse_select_stmt()?;
                 self.expect_symbol(")")?;
-                Ok(WhereClause::EqSubquery {
+                return Ok(WhereClause::EqSubquery {
                     column,
                     subquery: Box::new(subquery),
-                })
+                });
             } else if self.peek().kind == TokenKind::Ident
                 && !is_value_keyword(&self.peek().text)
             {
                 let raw = self.expect_ident()?;
                 let (ref_table, ref_column) = split_qualified_ident(&raw);
-                Ok(WhereClause::EqColumnRef {
+                return Ok(WhereClause::EqColumnRef {
                     column,
                     ref_table,
                     ref_column,
-                })
-            } else {
-                let value = self.expect_value()?;
-                Ok(WhereClause::Eq { column, value })
+                });
             }
-        } else if self.match_keyword("BETWEEN") {
+            let value = self.expect_value()?;
+            return Ok(WhereClause::Eq { column, value });
+        }
+        // Comparadores E2: `<`, `<=`, `<>`, `>`, `>=`, `!=`.
+        if let Some(op) = self.peek_compare_op() {
+            self.pos += 1;
+            let value = self.expect_value()?;
+            return Ok(WhereClause::Compare { column, op, value });
+        }
+        // `IS [NOT] NULL`. El keyword `IS` aún no aparece en otra parte del
+        // grammar, así que su consumo acá no choca con nada.
+        if self.match_keyword("IS") {
+            let negated = self.match_keyword("NOT");
+            if !self.match_keyword("NULL") {
+                return Err(coded(
+                    codes::WHERE_OPERATOR_UNSUPPORTED,
+                    format!(
+                        "se esperaba NULL después de IS{} sobre '{}'",
+                        if negated { " NOT" } else { "" },
+                        column
+                    ),
+                ));
+            }
+            return Ok(WhereClause::IsNull { column, negated });
+        }
+        if self.match_keyword("LIKE") {
+            let pattern = self.expect_string_literal("LIKE")?;
+            return Ok(WhereClause::Like {
+                column,
+                pattern,
+                negated: false,
+            });
+        }
+        if self.match_keyword("BETWEEN") {
             let from = self.expect_integer()?;
             self.expect_keyword("AND")?;
             let to = self.expect_integer()?;
-            Ok(WhereClause::Between { column, from, to })
-        } else if self.match_keyword("IN") {
-            self.expect_symbol("(")?;
-            self.expect_keyword("SELECT")?;
-            let subquery = self.parse_select_stmt()?;
-            self.expect_symbol(")")?;
-            Ok(WhereClause::In {
-                column,
-                subquery: Box::new(subquery),
-            })
-        } else {
-            Err(coded(
+            return Ok(WhereClause::Between { column, from, to });
+        }
+        if self.match_keyword("IN") {
+            return self.parse_in_body(column, false);
+        }
+        // Forma postfix con `NOT`: `NOT LIKE`, `NOT IN`. El `NOT` del
+        // combinador booleano se consume antes (en `parse_where_not`);
+        // si llegamos acá es porque el `NOT` apareció justo después de
+        // la columna, así que pertenece a un operador postfix.
+        if self.match_keyword("NOT") {
+            if self.match_keyword("LIKE") {
+                let pattern = self.expect_string_literal("NOT LIKE")?;
+                return Ok(WhereClause::Like {
+                    column,
+                    pattern,
+                    negated: true,
+                });
+            }
+            if self.match_keyword("IN") {
+                return self.parse_in_body(column, true);
+            }
+            return Err(coded(
                 codes::WHERE_OPERATOR_UNSUPPORTED,
                 format!(
-                    "WHERE soporta solo '=', BETWEEN, IN (SELECT ...) o [NOT] EXISTS (SELECT ...) \
-                     como operadores; no se reconoció el operador después de la columna '{}'",
+                    "después de NOT se esperaba LIKE o IN sobre la columna '{}'",
                     column
                 ),
-            ))
+            ));
         }
+        Err(coded(
+            codes::WHERE_OPERATOR_UNSUPPORTED,
+            format!(
+                "WHERE: no se reconoció el operador después de la columna '{}'. \
+                 Operadores soportados: =, <, >, <=, >=, <>, !=, BETWEEN ... AND, \
+                 IS [NOT] NULL, [NOT] LIKE, [NOT] IN (lista | SELECT)",
+                column
+            ),
+        ))
+    }
+
+    /// Después de consumir `IN` (o `NOT IN`), parsea el cuerpo:
+    /// `(SELECT ...)` (subquery) o `(lit, lit, ...)` (lista literal).
+    /// `negated` true sólo viene del path `NOT IN`.
+    fn parse_in_body(&mut self, column: String, negated: bool) -> DbResult<WhereClause> {
+        self.expect_symbol("(")?;
+        if self.peek().kind == TokenKind::Ident && self.peek().text.eq_ignore_ascii_case("SELECT") {
+            self.pos += 1;
+            let subquery = self.parse_select_stmt()?;
+            self.expect_symbol(")")?;
+            if negated {
+                // `NOT IN (SELECT ...)` aún no se desugara a un átomo
+                // dedicado en este release — el bloque H del roadmap lo
+                // generaliza junto con NOT IN correlacionado. Acá lo
+                // rechazamos explícitamente para no devolver semántica
+                // silenciosamente incorrecta.
+                return Err(coded(
+                    codes::WHERE_OPERATOR_UNSUPPORTED,
+                    "NOT IN (SELECT ...) no se soporta en este release; usar IN (SELECT ...) \
+                     dentro de NOT (...) tiene semántica distinta (3VL con NULLs) — esperar \
+                     al bloque H del roadmap",
+                ));
+            }
+            return Ok(WhereClause::In {
+                column,
+                subquery: Box::new(subquery),
+            });
+        }
+        // Lista literal: por lo menos un valor.
+        let mut values = vec![self.expect_value()?];
+        while self.match_symbol(",") {
+            values.push(self.expect_value()?);
+        }
+        self.expect_symbol(")")?;
+        Ok(WhereClause::InList {
+            column,
+            values,
+            negated,
+        })
+    }
+
+    /// Si el token actual es uno de los símbolos de comparación E2,
+    /// devuelve el `CompareOp` correspondiente sin avanzar el cursor.
+    /// El caller hace `self.pos += 1` al consumirlo.
+    fn peek_compare_op(&self) -> Option<CompareOp> {
+        let t = self.peek();
+        if t.kind != TokenKind::Symbol {
+            return None;
+        }
+        match t.text.as_str() {
+            "<" => Some(CompareOp::Lt),
+            "<=" => Some(CompareOp::Le),
+            ">" => Some(CompareOp::Gt),
+            ">=" => Some(CompareOp::Ge),
+            "<>" | "!=" => Some(CompareOp::Ne),
+            _ => None,
+        }
+    }
+
+    /// Consume un literal string, rechazando cualquier otro tipo. Útil
+    /// para operadores cuyo RHS debe ser texto (LIKE).
+    fn expect_string_literal(&mut self, context: &str) -> DbResult<String> {
+        let t = self.peek().clone();
+        if t.kind != TokenKind::String {
+            return Err(coded(
+                codes::WHERE_OPERATOR_UNSUPPORTED,
+                format!(
+                    "{} requiere un literal string como patrón; llegó '{}'",
+                    context, t.text
+                ),
+            ));
+        }
+        self.pos += 1;
+        Ok(t.text)
     }
 
     fn parse_ident_list(&mut self) -> DbResult<Vec<String>> {

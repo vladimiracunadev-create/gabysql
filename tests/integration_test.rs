@@ -3420,6 +3420,279 @@ fn e1_parser_rejects_dangling_combinator() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque E2: operadores <, >, <=, >=, <>, !=, LIKE, IS NULL, IN literal
+// ============================================================
+//
+// Reusa la fixture `e1_fixture` (tabla `e1` con (id, nombre, edad, ciudad,
+// activo) y fila 6 con NULLs deliberados). Cada test verifica una sola
+// operación o una combinación bien definida; cuando el orden importa se
+// agrega ORDER BY id ASC para hacer el assert estable.
+
+#[test]
+fn e2_lt_le_gt_ge_on_int() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_int_cmp");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad < 30;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // edad < 30: Beto(25), Dario(22). NullEdad descartada por 3VL.
+    assert_eq!(ids, vec![2, 4]);
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad <= 30;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 4]);
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad > 30;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![3, 5]);
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad >= 30;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_ne_operators() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_ne");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE ciudad <> 'BA';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // ciudad <> 'BA': MDQ y CBA matchean; fila 6 (NULL) → NULL → descartada.
+    assert_eq!(ids, vec![2, 4, 5]);
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE ciudad != 'BA';")?;
+    let mut ids2 = e1_ids(&res[0]);
+    ids2.sort();
+    assert_eq!(ids, ids2, "<> y != deben ser sinónimos");
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_compare_on_text_lex_order() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_text_cmp");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // 'C' es el primer char donde se separa Carla/Dario/Eva del resto.
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE nombre >= 'C';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // Carla, Dario, Eva, NullEdad (empieza con 'N').
+    assert_eq!(ids, vec![3, 4, 5, 6]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_like_basic_wildcards() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_like");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // `%a` — termina con 'a'. Ana, Carla, Eva.
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE nombre LIKE '%a';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3, 5]);
+
+    // `_eto` — 4 chars, termina con 'eto'. Beto.
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE nombre LIKE '_eto';")?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![2]);
+
+    // `D%` — empieza con D. Dario.
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE nombre LIKE 'D%';")?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![4]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_not_like() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_notlike");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE nombre NOT LIKE '%a';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // No terminan en 'a': Beto, Dario, NullEdad.
+    assert_eq!(ids, vec![2, 4, 6]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_is_null_and_is_not_null() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_isnull");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad IS NULL;")?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![6]);
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad IS NOT NULL;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_in_literal_list() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_inlit");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE id IN (1, 3, 5);")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3, 5]);
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE ciudad IN ('BA', 'CBA');")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3, 4]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_not_in_literal_list_with_null_semantics() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_notinlit");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // NOT IN sin NULLs en la lista: fila 6 (ciudad=NULL) → NULL → descartada.
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE ciudad NOT IN ('BA', 'CBA');")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_combines_with_e1_and_or() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_combo");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE edad > 25 AND ciudad IS NOT NULL AND nombre LIKE '%a';",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // edad>25: Ana(30), Carla(40), Eva(50). ciudad no-NULL: todos esos.
+    // nombre LIKE '%a': Ana, Carla, Eva. → {1, 3, 5}.
+    assert_eq!(ids, vec![1, 3, 5]);
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE id IN (1, 2, 3) OR ciudad IS NULL;",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3, 6]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_like_escape() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_like_esc");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,s) VALUES (1,'50%off');
+         INSERT INTO t (id,s) VALUES (2,'50xoff');
+         INSERT INTO t (id,s) VALUES (3,'a_b');",
+    )?;
+
+    let res = run_sql(&db, "SELECT id FROM t WHERE s LIKE '50\\%%';")?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![1]);
+
+    let res = run_sql(&db, "SELECT id FROM t WHERE s LIKE 'a\\_b';")?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![3]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e2_compare_with_join() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e2_join");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, tag TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, a_id INT, val INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id,tag) VALUES (1,'x'); INSERT INTO a (id,tag) VALUES (2,'y');
+         INSERT INTO b (id,a_id,val) VALUES (10,1,100);
+         INSERT INTO b (id,a_id,val) VALUES (11,1,200);
+         INSERT INTO b (id,a_id,val) VALUES (12,2,300);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT b.id FROM a INNER JOIN b ON a.id = b.a_id WHERE b.val >= 200;",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![11, 12]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

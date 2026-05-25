@@ -29,6 +29,7 @@
 | `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
 | `WHERE` con `AND`/`OR`/`NOT` + paréntesis y 3VL para NULL (bloque E1) | DML | 🟢 |
+| `WHERE` con `<`, `>`, `<=`, `>=`, `<>`/`!=`, `[NOT] LIKE` (con `%`/`_`), `IS [NOT] NULL`, `[NOT] IN (lista)` (bloque E2) | DML | 🟢 |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
@@ -531,8 +532,14 @@ where_primary ::= "(" where_or ")"
                 | "NOT" "EXISTS" "(" select ")"
                 | where_atom
 where_atom    ::= identifier "=" ( value | "(" select ")" | qualified_ident )
+                | identifier compare_op value
                 | identifier "BETWEEN" integer "AND" integer
+                | identifier "IS" ["NOT"] "NULL"
+                | identifier ["NOT"] "LIKE" string
+                | identifier ["NOT"] "IN" "(" value_list ")"
                 | identifier "IN" "(" select ")"
+compare_op    ::= "<" | "<=" | ">" | ">=" | "<>" | "!="
+value_list    ::= value ("," value)*
 qualified_ident ::= identifier ( "." identifier )?
 ```
 
@@ -610,6 +617,18 @@ SELECT id FROM orders WHERE status = 'pending' LIMIT 50;
 -- BETWEEN sobre columna INT indexada (índice OrderedInt, ADR-0017)
 -- CREATE INDEX idx_users_score ON users (score);  -- score INT
 SELECT id, name FROM users WHERE score BETWEEN 80 AND 100 LIMIT 25;
+
+-- Operadores E2: <, >, <=, >=, <>, !=, LIKE, IS NULL, IN literal
+SELECT id FROM users WHERE score < 50;
+SELECT id FROM users WHERE score >= 80 AND score <= 100;
+SELECT id FROM users WHERE name <> 'Ana';
+SELECT id FROM users WHERE name LIKE 'A%';            -- empieza con 'A'
+SELECT id FROM users WHERE name LIKE '_eto';          -- 4 chars, termina en 'eto'
+SELECT id FROM users WHERE description NOT LIKE '%spam%';
+SELECT id FROM users WHERE deleted_at IS NULL;
+SELECT id FROM users WHERE id IN (1, 2, 3);
+SELECT id FROM users WHERE country NOT IN ('AR', 'BR');
+SELECT id FROM products WHERE code LIKE '50\%%';      -- LIKE literal '%' con escape
 
 -- AND / OR / NOT + paréntesis (bloque E1)
 SELECT id FROM users WHERE active = TRUE AND score BETWEEN 80 AND 100;

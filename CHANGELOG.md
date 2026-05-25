@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-05-25 — Bloque E2: comparadores, `LIKE`, `IS NULL`, `IN literal`
+
+> **Un push a `main`** que cierra el set de operadores básicos del `WHERE`.
+
+### 🆕 Nuevos operadores
+- `<`, `<=`, `>`, `>=`, `<>`, `!=` sobre INT / FLOAT / TEXT (lex) / BOOL. NULL en cualquiera de los dos lados → `NULL` (3VL). Tipos incompatibles → `false` (no abortamos la query).
+- `[NOT] LIKE 'patron'` sobre TEXT. Wildcards SQL estándar (`%` = cero o más, `_` = exactamente uno) con escape `\%` / `\_`. Backtracking O(|s|·|p|), suficiente para patrones realistas.
+- `IS [NOT] NULL` — único predicado que NO propaga NULL (es la forma explícita de testear ausencia).
+- `[NOT] IN (lit1, lit2, ...)` con lista literal. Semántica ANSI: si la columna es NULL → NULL; si no hay match y la lista contiene NULL → NULL (especialmente sensible en `NOT IN`).
+
+### 🧬 Tokenizer
+- Nuevos símbolos: `<`, `<=`, `>`, `>=`, `<>`, `!=` (con lookahead de 1 char). `!` suelto sigue siendo error (sugerencia explícita en el mensaje).
+
+### 🧠 AST
+- `WhereClause` extendido con cuatro variants nuevos: `Compare { op: CompareOp, ... }`, `Like { pattern, negated }`, `IsNull { negated }`, `InList { values, negated }`. Ningún variant tiene fast-path indexada por ahora — todos van por `generic_post_filter` + evaluador 3VL.
+
+### 🚦 Executor
+- `generic_post_filter` ahora se activa también cuando el átomo único es E2 (Compare/Like/IsNull/InList). El path por PK/índice queda intacto para `=`, `BETWEEN`, `IN (SELECT)`, `= (SELECT)`, EXISTS y EqColumnRef.
+- Tres helpers puros: `eval_compare`, `eval_like`, `eval_in_list`. `like_match` es backtracking recursivo con soporte de escape.
+
+### ⚠️ Limitación residual
+- `NOT IN (SELECT ...)` (subquery) explícitamente rechazado por ahora — el desugar a `NOT (col IN (SELECT))` cambia la semántica con NULLs y queda para el bloque H. `NOT IN (lista literal)` sí está.
+- `<` / `>` / `<=` / `>=` no aprovechan el índice OrderedInt todavía (range scan optimization queda en backlog; correctitud antes que velocidad).
+
+### 🧪 Validación
+- 11 integration tests nuevos en `tests/integration_test.rs` (`e2_*`): comparadores INT, `<>`/`!=` sinónimos, comparación TEXT lex, LIKE básico, NOT LIKE, IS NULL / IS NOT NULL, IN literal, NOT IN con 3VL, combinaciones con AND/OR de E1, LIKE con escape, comparador con JOIN.
+- `cargo check --lib --tests` limpio.
+
+### 📚 Documentación
+- `docs/SQL_REFERENCE.md` — EBNF del WHERE actualizado, ejemplos de cada operador nuevo, fila E2 en la tabla de soporte.
+- `docs/MISSING_COMMANDS.md` — E2 marcado cerrado, hueco #2 del top-5 tachado, comparadores/LIKE/IS NULL/IN literal en ✅.
+
+---
+
 ## 2026-05-25 — Bloque E1: `AND` / `OR` / `NOT` + paréntesis en `WHERE`
 
 > **Un push a `main`** que destraba el filtro compuesto en cualquier `SELECT`.

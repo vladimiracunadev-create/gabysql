@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-25 contra `main` post-bloque **E1** (AND/OR/NOT en WHERE).
+> Última verificación: 2026-05-25 contra `main` post-bloque **E2** (operadores `<`, `>`, `LIKE`, `IS NULL`, `IN literal`).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -14,7 +14,7 @@ Si vas a ordenar bloques por ROI funcional, este es el orden:
 | # | Hueco | Impacto | Bloque sugerido |
 |---|---|---|---|
 | 1 | ~~**`AND` / `OR` / `NOT` en `WHERE`**~~ ✅ | Cerrado en E1 (2026-05-25) | E1 ✅ |
-| 2 | **`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`** | Operadores básicos que faltan | E2 |
+| 2 | ~~**`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`**~~ ✅ | Cerrado en E2 (2026-05-25) | E2 ✅ |
 | 3 | **`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`** | Sin agregaciones no hay reporting | F |
 | 4 | **`UPDATE` / `DELETE` por columna indexada o subquery** | Hoy solo `WHERE pk = N` | E3 |
 | 5 | **Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)** | Necesario para apps que componen mutaciones atómicas | T |
@@ -30,7 +30,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | Bloque | Contenido | Esfuerzo | Depende de |
 |---|---|---|---|
 | **E1** ✅ | `AND`/`OR`/`NOT` en `WHERE` + paréntesis | Alto (toca AST de WhereClause) | — (**cerrado 2026-05-25**) |
-| **E2** | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) |
+| **E2** ✅ | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) (**cerrado 2026-05-25**) |
 | **E3** | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 |
 | **F** | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 |
 | **G** | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` | Medio-Alto | E1 |
@@ -68,14 +68,15 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | Operador | Soportado | Prioridad |
 |---|:---:|:---:|
 | `=` | ✅ | — |
-| `<`, `>`, `<=`, `>=` | ❌ | P0 |
-| `<>` / `!=` | ❌ | P0 |
-| `LIKE` / `NOT LIKE` | ❌ | P1 |
+| `<`, `>`, `<=`, `>=` | ✅ (E2) | — |
+| `<>` / `!=` | ✅ (E2) | — |
+| `LIKE` / `NOT LIKE` | ✅ (E2; `%`/`_` + escape `\`) | — |
 | `ILIKE` (case-insensitive) | ❌ | P2 |
-| `IS NULL` / `IS NOT NULL` | ❌ | P0 |
+| `IS NULL` / `IS NOT NULL` | ✅ (E2) | — |
 | `IS TRUE` / `IS FALSE` | ❌ | P3 |
-| `IN (lista_literales)` — `id IN (1,2,3)` | ❌ | P0 (hoy solo `IN (SELECT…)`) |
-| `NOT IN (...)` | ❌ | P1 |
+| `IN (lista_literales)` — `id IN (1,2,3)` | ✅ (E2) | — |
+| `NOT IN (lista_literales)` | ✅ (E2; 3VL ANSI con NULLs en la lista) | — |
+| `NOT IN (SELECT ...)` | ❌ (esperar bloque H) | P1 |
 | `REGEXP` / `~` (regex) | ❌ | P3 |
 | `GLOB` (estilo SQLite) | ❌ | P3 |
 
