@@ -59,8 +59,10 @@ Leyenda: 🟢 = gana / 🟡 = empate o aceptable / 🔴 = pierde / ⚪ = no apli
 | **CRUD básico (INSERT/UPDATE/DELETE)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Índices secundarios (equality)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Índices compuestos / UNIQUE** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **JOIN** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **ORDER BY / GROUP BY / window** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **JOIN** (INNER/CROSS/LEFT/RIGHT/FULL/USING/NATURAL + index-loop) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Subqueries** (`IN`/`=`/`EXISTS` correlacionado) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **ORDER BY** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **GROUP BY / window** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Optimizer cost-based** | 🔴 | 🟡 | 🟢 | ⚪ | 🟢 | 🟢 | 🟡 |
 | **MVCC** | 🔴 | 🔴 | 🟢 | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Concurrencia (multi-writer)** | 🔴 (mutex) | 🔴 (single writer) | 🟢 | 🟡 | 🟢 | 🟢 | 🟢 |
@@ -126,8 +128,8 @@ Solo cambian las dimensiones que el camino A entrega:
 
 | Dimensión | HOY | Al final de A |
 | :--- | :---: | :---: |
-| Índices compuestos / UNIQUE | 🔴 | 🟢 |
-| ORDER BY (al menos por índice) | 🔴 | 🟢 |
+| Índices compuestos / UNIQUE | 🟡 (UNIQUE 🟢, compuestos 🔴) | 🟢 |
+| ORDER BY (al menos por índice) | 🟢 | 🟢 |
 | Constraints declarativas (NOT NULL/DEFAULT/UNIQUE) | 🔴 | 🟢 |
 | `integrity_check` + backup/restore con verificación | 🟢 | 🟢 |
 | Suite de benchmarks reproducible (`gabybench`) | 🔴 | 🟢 |
@@ -219,7 +221,7 @@ GROUP BY region;
 
 ## 🧠 Resumen ejecutivo: ¿cuándo elegir `gabysql`?
 
-> Hoy, sin caminar A todavía, `gabysql` es razonable si **(1) tu app es Rust nativa**, **(2) rechazas C en el core por compliance o gusto técnico**, **(3) tu workload es OLTP simple por PK + igualdad por columna indexada**, **(4) valoras supply-chain integrada** y **(5) puedes vivir con SQL minimalista por ahora**.
+> Hoy, sin caminar A todavía, `gabysql` es razonable si **(1) tu app es Rust nativa**, **(2) rechazas C en el core por compliance o gusto técnico**, **(3) tu workload es OLTP relacional clásico** (lookups por PK/índice, JOINs equi-predicado, subqueries `IN`/`EXISTS`), **(4) valoras supply-chain integrada** y **(5) podés vivir sin `GROUP BY` / window functions / CTE recursivas todavía**.
 
 Si rompes alguno de esos cinco puntos, hay un competidor mejor: SQLite, DuckDB, Postgres o SurrealDB según el caso.
 

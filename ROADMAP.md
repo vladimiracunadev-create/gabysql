@@ -110,5 +110,5 @@
 `gabysql` sigue apuntando a una base embebida tipo SQLite:
 - storage local
 - archivo único
-- superficie SQL pequeña pero robusta
-- foco en estabilidad, durabilidad y compatibilidad antes que en amplitud funcional
+- **superficie SQL relacional clásica completa**: DDL, DML, índices, FK, `ORDER BY`, `WHERE` con `IN`/`= (SELECT …)`/`[NOT] EXISTS`, todos los JOINs ANSI (INNER, CROSS, LEFT/RIGHT/FULL, USING, NATURAL, multi-tabla, self-join, index-loop optimization)
+- foco en estabilidad, durabilidad y compatibilidad antes que en amplitud OLAP (sin `GROUP BY`/window/CTE recursivas)

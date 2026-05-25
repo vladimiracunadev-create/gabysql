@@ -15,7 +15,7 @@ Hasta ahora la documentación del proyecto sugería que `gabysql` apuntaba a ser
 - No hay co-maintainer, sponsor, ni cliente piloto.
 - La inversión de tiempo no está orientada a vender, está orientada a entender.
 
-Pretender lo contrario distorsiona las decisiones técnicas. Ej.: "no soportamos JOIN porque el Camino A no lo requiere" suena a justificación de producto pero la verdad es "no soportamos JOIN porque no lo construí todavía y no es lo que me interesa aprender ahora". Esa segunda formulación es más honesta y más útil para decidir qué viene después.
+Pretender lo contrario distorsiona las decisiones técnicas. Ej.: por mucho tiempo dije "no soportamos JOIN porque el Camino A no lo requiere" — suena a justificación de producto pero la verdad es que "no lo había construido todavía y estaba explorando otras cosas". La formulación honesta resultó ser más útil: en mayo 2026 los implementé (subqueries + JOINs ANSI completos, ver [CHANGELOG.md](../CHANGELOG.md)) porque me interesaba entender el nested-loop join, el problema del schema combinado con qualifiers, y la diferencia operativa entre `EXISTS` correlacionada y `IN (SELECT ...)`. El aprendizaje justificó el trabajo aún sin usuarios.
 
 **Lo que `gabysql` realmente es:**
 
@@ -250,7 +250,8 @@ Cada fase tiene un **objetivo cognitivo** (qué quiero entender), no un objetivo
 
 Lista explícita para no perder foco:
 
-- **`JOIN`, `GROUP BY`, vistas, triggers, subconsultas, CTE, window functions.** Son features de "DB normal". Si las quiero, uso Postgres. Acá no aprendo nada distinto implementándolas — solo replico lo que ya existe en libros y otras DBs.
+- ~~**`JOIN`, subconsultas.**~~ — entregados en mayo 2026 porque el ejercicio de implementarlos enseñaba algo concreto (modelo de ejecución nested-loop, outer-stack para correlated, derivar predicates de USING/NATURAL, index-loop para optimizar). Ver [CHANGELOG.md](../CHANGELOG.md) y [docs/SQL_REFERENCE.md](SQL_REFERENCE.md).
+- **`GROUP BY`, vistas, triggers, CTE, window functions.** Son features de "DB normal" que replican lo que ya existe. Si aparece una pregunta de investigación que las requiera (ej. "¿cómo se le explica un plan de window function a un agente?"), entran; mientras tanto, no.
 - **Replicación, HA, clustering, sharding.** Fuera de scope. La pregunta central no es "cómo se distribuye una DB"; es "cómo se diseña una DB para agentes". Distribución es un problema ortogonal y enorme.
 - **Optimizer cost-based.** Sin workload real ni benchmarks maduros (fase α apenas arranca eso), un cost-based optimizer es teología. El planner actual (deterministic dispatch) es suficiente hasta que algo lo demande con datos.
 - **TLS nativo, multi-tenant, autenticación fuerte.** Si el proyecto algún día se expone a producción, esto entra. Hoy no.

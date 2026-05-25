@@ -111,9 +111,23 @@ SELECT id,name FROM users ORDER BY score DESC LIMIT 10;
 SELECT id FROM big LIMIT 10;
 SELECT id FROM big WHERE id BETWEEN 100 AND 200 LIMIT 5;
 
+-- Subqueries en WHERE
+SELECT name FROM users WHERE id IN (SELECT user_id FROM orders);
+SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE id = 10);
+SELECT id, name FROM users WHERE EXISTS (SELECT id FROM orders WHERE user_id = users.id);
+
+-- JOINs (cualquiera de los 5 kinds, con aliases opcionales)
+SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id;
+SELECT u.name, o.total FROM users u LEFT  JOIN orders o ON u.id = o.user_id;
+SELECT u.name, o.total FROM users u, orders o;              -- CROSS / cartesiano
+SELECT * FROM users JOIN orders USING (user_id);            -- USING (col)
+SELECT * FROM users NATURAL JOIN orders;                    -- auto-match por nombre
+
 UPDATE users SET name = 'Ana M', active = FALSE WHERE id = 1;
 DELETE FROM users WHERE id = 1;       -- cascade si hay FKs entrantes
 ```
+
+> `UPDATE` y `DELETE` siguen siendo single-table con `WHERE pk = N`. JOINs y subqueries solo aplican a `SELECT`. La complejidad por defecto del nested-loop es O(N×M); cuando el `ON` apunta contra PK o columna indexada del lado derecho (e.g. `o.user_id = u.id` con `u.id = PK`), el motor cambia automáticamente a index-loop O(N×logM) — transparente, sin hints.
 
 `INSERT` aplica DEFAULTs para columnas omitidas, valida `NOT NULL`, hace pre-check de `UNIQUE` y `FK` antes de tocar disco. `UPDATE` revalida sólo las constraints cuyas columnas cambiaron. `DELETE` resuelve cascade/restrict según FKs entrantes (worklist con cycle protection).
 

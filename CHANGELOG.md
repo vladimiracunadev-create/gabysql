@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-05-24 — Subqueries completas + roadmap de JOINs cerrado
+
+> **Siete pushes consecutivos a `main`** que cierran dos features grandes del motor SQL.
+
+### 🧩 Subqueries (3 bloques)
+- `WHERE col IN (SELECT …)` — no-correlacionada, single-column. Reusa lookup PK/índice.
+- `WHERE col = (SELECT …)` — subquery escalar (1 × ≤1). 0 filas o NULL → match vacío (ANSI). >1 fila → `[GBY-4014]`.
+- `WHERE [NOT] EXISTS (SELECT …)` — no-correlacionada (pre-ejecuta) y correlacionada single-eq (`inner_col = outer.col`, post-filter per-row con `outer_stack`).
+
+### 🔗 JOINs (4 bloques)
+- **A** — `INNER JOIN`, `CROSS JOIN`, comma-syntax (`FROM a, b`), aliases con `[AS]`, multi-tabla en chain (left-deep), self-join. Columnas cualificadas (`tabla.col` o `alias.col`). `SELECT *` expande prefijado.
+- **B** — `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill por kind. `OUTER` opcional (ANSI).
+- **C** — `JOIN ... USING (col)` (sugar para `ON l.col = r.col`) y `NATURAL JOIN` (auto-derive del USING). `SELECT *` omite la columna fusionada del right.
+- **D** — Index-loop join optimization transparente: cuando el `ON` (o el USING/NATURAL derivado) apunta contra PK o columna indexada del right Y el kind es INNER/LEFT, el engine reemplaza el FullScan del right por lookup dirigido. O(N×M) → O(N×log M) por JOIN.
+
+### 🧰 Códigos de error nuevos
+- `4011` `SUBQUERY_MUST_RETURN_ONE_COLUMN`
+- `4012` `IN_PK_TYPE_MISMATCH`
+- `4013` `IN_REQUIRES_PK_OR_INDEX`
+- `4014` `SCALAR_SUBQUERY_TOO_MANY_ROWS`
+- `4015` `EXISTS_REQUIRES_SUBQUERY`
+- `4016` `OUTER_COLUMN_REF_INVALID`
+- `4017` `TABLE_ALIAS_DUPLICATED`
+- `4018` `COLUMN_AMBIGUOUS`
+- `4019` `COLUMN_QUALIFIER_NOT_FOUND`
+- `4020` `JOIN_PREDICATE_REQUIRED`
+- `4021` `CROSS_JOIN_WITH_ON`
+- `4022` `USING_COLUMN_INVALID`
+- `4023` `NATURAL_JOIN_NO_COMMON_COLUMN`
+
+### 📚 Documentación
+- Doc barrido completo: `README.md`, `docs/SQL_REFERENCE.md`, `docs/STATUS.md`, `docs/ERROR_CODES.md`, `TROUBLESHOOTING.md`, `RUNBOOK.md`, `docs/POSITIONING.md`, `docs/COMPETITIVE_ANALYSIS.md`, `docs/ARCHITECTURE.md`, `docs/API.md`, `docs/TECHNICAL_SPECS.md`, `RECRUITER.md`, `ROADMAP.md`, `web/phpgabyadmin/index.php`.
+
+### 🧪 Validación
+- **71/71 tests** integración verdes (16 nuevos entre subqueries y JOINs).
+- `cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅.
+
+---
+
 ## 2026-05-18 — Vigesimoséptima intervención: reframe — `gabysql` es un proyecto de aprendizaje, no comercial
 
 > **Solo docs. Cero código.** Reescribe el marco operativo del proyecto.

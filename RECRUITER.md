@@ -63,7 +63,7 @@
 
 - compatibilidad SQL completa con Postgres / MySQL.
 - MVCC, replicación, clustering, sharding, wire protocol.
-- planner cost-based, joins, GROUP BY, subqueries, ORDER BY.
+- planner cost-based, `GROUP BY`, window functions, CTE/vistas, transacciones explícitas con savepoints.
 - soporte de producción comercial (no hay SLA).
 
 ## 🌐 Contacto

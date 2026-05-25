@@ -222,11 +222,19 @@ Enforcement en runtime:
 - `DROP TABLE [IF EXISTS] <name>` (catalog-only; páginas backing no liberadas)
 - `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
 - `INSERT INTO ... VALUES (...)`
-- `SELECT ... FROM ...`
+- `SELECT ... FROM ... [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n]`
 - `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)
 - `WHERE <col_indexada> = <valor>` (solo en `SELECT`)
 - `WHERE <pk> BETWEEN ... AND ...` (solo en `SELECT`)
 - `WHERE <col_int_indexada> BETWEEN ... AND ...` (solo en `SELECT`; requiere índice `OrderedInt`, default para INT)
+- `WHERE <col> IN (SELECT ...)` — subquery no-correlacionada single-column
+- `WHERE <col> = (SELECT ...)` — subquery escalar no-correlacionada (1×≤1)
+- `WHERE [NOT] EXISTS (SELECT ...)` — no-correlacionada y correlacionada single-eq (`inner = outer.col`)
+- `ORDER BY <col> [ASC|DESC]` (sort post-scan o por índice OrderedInt)
+- `FROM a [AS x] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN b [AS y] (ON l = r | USING (col))` y la comma-syntax
+- `FROM a NATURAL [INNER|LEFT|RIGHT|FULL] JOIN b`
+- Multi-tabla en cadena left-deep + self-join vía aliases
+- Index-loop join optimization (transparente: aplica auto cuando ON pega contra PK/índice del right e INNER/LEFT)
 - `LIMIT` / `OFFSET`
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N`
 - `DELETE FROM <tabla> WHERE <pk> = N`
@@ -236,14 +244,15 @@ Enforcement en runtime:
 - `INTEGRITY CHECK` (sweep operacional de páginas + índices + FKs)
 
 ### No soportado todavía
-- `JOIN`
-- `ORDER BY`
-- `GROUP BY`
-- `LIKE`
-- `WHERE` por columnas no PK ni indexadas
+- `GROUP BY`, agregaciones (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`)
+- `LIKE` y operadores no-`=` (`<`, `>`, `<=`, `>=`, `<>`)
+- `WHERE` con `AND` / `OR` / `NOT` en el outer (limitación de un solo predicado por WHERE)
+- `WHERE` por columnas no PK ni indexadas (en SELECT single-table)
 - `WHERE` sobre columna no-INT indexada con operador distinto a `=` (no `BETWEEN`, no `<`/`>`)
+- Subqueries correlacionadas con múltiples predicados; derived tables (`FROM (SELECT ...) t`); CTE; window functions
+- `JOIN` con predicados no-equi en `ON` (`<`, `>`, multi-cond con `AND`), `USING` multi-columna, `NATURAL` con >1 columna común
 - Índices compuestos (multi-columna)
-- `UPDATE` / `DELETE` por columnas no PK ni por rango
+- `UPDATE` / `DELETE` por columnas no PK ni por rango ni con JOINs
 
 ---
 

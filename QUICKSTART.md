@@ -48,6 +48,12 @@ cargo build --release --bin gabysql --bin gabysql-server
   CREATE INDEX idx_users_name ON users (name);
   SELECT id,email,name,score FROM users ORDER BY name ASC;
   SELECT * FROM users WHERE name = 'Ana';
+  -- INNER JOIN clásico con aliases y columnas cualificadas:
+  SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id ORDER BY u.name ASC;
+  -- LEFT JOIN: usuarios sin orders aparecen con o.total = NULL
+  SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id;
+  -- Subquery IN: usuarios que tienen al menos un order
+  SELECT name FROM users WHERE id IN (SELECT user_id FROM orders);
   UPDATE users SET score = 10 WHERE id = 1;
   DELETE FROM users WHERE id = 2;       -- cascade: tira orders.id=11 también
   INTEGRITY CHECK;
@@ -59,6 +65,8 @@ Lo que acabas de probar:
 - `INSERT` que aplica DEFAULTs (`score=0` para Beto), valida NOT NULL y UNIQUE.
 - Persistencia con WAL + CRC32 (cualquier reinicio recupera o rechaza explícitamente).
 - `ORDER BY name ASC` (sort en memoria post-scan; ASC es default; NULLs primero).
+- `INNER`/`LEFT JOIN` con aliases (`AS`) y columnas cualificadas (`tabla.col`). Index-loop automático: como `orders.user_id` matchea contra `users.id` (PK), el engine usa lookup directo en vez de full scan.
+- Subquery `WHERE col IN (SELECT ...)` no-correlacionada — la subquery se ejecuta una vez y se materializa como set.
 - Índice secundario sobre `name` con backfill automático.
 - `WHERE name = 'Ana'` resuelto por índice (no full scan).
 - `UPDATE`/`DELETE` por PK con mantenimiento automático del índice.

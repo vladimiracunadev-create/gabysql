@@ -83,6 +83,25 @@ cargo run --release --bin gabysql -- exec demo.db "INSERT INTO orders (id,user_i
 
 Ahora `DELETE FROM users WHERE id = 1` arrastra automáticamente la order 10 (cascade). Sin la FK, podrías borrar el usuario y dejar orders huérfanas.
 
+### 7c. Cruzar dos tablas con `JOIN`
+```powershell
+cargo run --release --bin gabysql -- exec demo.db "SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id;"
+```
+
+- `users u` y `orders o` son aliases — más cortos que repetir el nombre completo.
+- `u.id` / `o.user_id` son **columnas cualificadas**: en un `JOIN` cualquier columna que existe en más de una tabla **debe** ir cualificada.
+- Hay 4 kinds: `INNER` (default; descarta filas sin match), `LEFT JOIN` (conserva todas las del izq con NULL en el der sin match), `RIGHT`, `FULL OUTER`. Y `CROSS JOIN` para el producto cartesiano.
+- Si la columna del `ON` es la PK o tiene índice del lado derecho (como acá: `users.id` es PK), el motor hace lookup directo en vez de full scan — sin que tengas que pedirlo.
+
+### 7d. Filtrar con subqueries
+```powershell
+cargo run --release --bin gabysql -- exec demo.db "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders);"
+cargo run --release --bin gabysql -- exec demo.db "SELECT id, name FROM users WHERE EXISTS (SELECT id FROM orders WHERE user_id = users.id);"
+```
+
+- `IN (SELECT …)` y `= (SELECT …)` escalar: la subquery se ejecuta una sola vez.
+- `EXISTS (SELECT … WHERE inner = outer.col)`: subquery correlacionada — se re-evalúa por cada fila del outer. Útil para "padres que tienen al menos un hijo".
+
 ### 7b. Verificar consistencia
 ```powershell
 cargo run --release --bin gabysql -- exec demo.db "INTEGRITY CHECK;"

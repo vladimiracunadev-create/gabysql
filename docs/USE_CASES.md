@@ -27,6 +27,7 @@
 | 17 | [Comparativa side-by-side con SQLite](#17-comparativa-side-by-side-con-sqlite) | shell |
 | 18 | [Auditar imagen Docker antes de desplegar](#18-auditar-la-imagen-docker-antes-de-desplegarla) | grype |
 | 19 | [Rotar token del server (blue-green)](#19-generar-credenciales-y-rotar-token-del-server) | shell |
+| 20 | [Relacional clásico: JOINs + subqueries](#20-relacional-clasico-joins--subqueries) | SQL |
 
 ---
 
@@ -598,6 +599,59 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 ```
 
 Esto replica exactamente el job `container_scan` del workflow `security.yml` ([ADR-0006](adr/0006-grype-only-fixed.md)).
+
+---
+
+## 20. Relacional clásico: JOINs + subqueries
+
+**Escenario**: modelo padre/hijo (`alumnos` → `cursos`), reporting típico — todas las consultas se ejecutan en gabysql sin cambios.
+
+```bash
+cargo run --release --bin gabysql -- exec demo.db "
+  CREATE TABLE cursos (id INT PRIMARY KEY, nivel TEXT NOT NULL);
+  CREATE TABLE alumnos (id INT PRIMARY KEY, nombre TEXT NOT NULL, curso_id INT);
+  CREATE INDEX idx_alumnos_curso ON alumnos (curso_id);
+
+  INSERT INTO cursos (id,nivel)  VALUES (1,'3 Medio');
+  INSERT INTO cursos (id,nivel)  VALUES (2,'4 Medio');
+  INSERT INTO cursos (id,nivel)  VALUES (3,'3 Medio');
+  INSERT INTO alumnos (id,nombre,curso_id) VALUES (10,'Ana',1);
+  INSERT INTO alumnos (id,nombre,curso_id) VALUES (11,'Beto',2);
+  INSERT INTO alumnos (id,nombre,curso_id) VALUES (12,'Carla',3);
+  INSERT INTO alumnos (id,nombre,curso_id) VALUES (13,'Dani',1);
+
+  -- (a) JOIN: nombres de alumnos con el nivel de su curso
+  SELECT a.nombre, c.nivel
+    FROM alumnos a
+    INNER JOIN cursos c ON a.curso_id = c.id
+    ORDER BY a.nombre ASC;
+
+  -- (b) Subquery IN: alumnos cuyos cursos son de 3 Medio
+  SELECT nombre FROM alumnos
+   WHERE curso_id IN (SELECT id FROM cursos WHERE nivel = '3 Medio')
+   ORDER BY nombre ASC;
+
+  -- (c) EXISTS correlacionado: cursos que tienen al menos un alumno
+  SELECT id, nivel FROM cursos
+   WHERE EXISTS (SELECT id FROM alumnos WHERE curso_id = cursos.id);
+
+  -- (d) LEFT JOIN: todos los cursos, con el conteo manual via subquery por fila ya queda
+  --     fuera (no hay COUNT). Pero LEFT JOIN sigue funcionando para mostrar
+  --     cursos sin alumnos:
+  SELECT c.nivel, a.nombre FROM cursos c
+    LEFT JOIN alumnos a ON c.id = a.curso_id
+    ORDER BY c.id ASC;
+"
+```
+
+**Qué demuestra:**
+- `INNER JOIN` con aliases (`AS` opcional) y columnas cualificadas.
+- Subquery `IN (SELECT …)` no-correlacionada con el set materializado una sola vez.
+- `EXISTS` correlacionado con outer-ref (`cursos.id` referenciado desde la subquery).
+- `LEFT JOIN` con NULL-fill: cursos sin alumnos aparecen con `a.nombre = NULL`.
+- Index-loop transparente: como `a.curso_id` tiene índice y `c.id` es PK, el engine usa lookup directo en vez de full scan del derecho.
+
+> Para la gramática completa de `WHERE` y `FROM` (incluido `USING`, `NATURAL JOIN`, `RIGHT/FULL OUTER`), ver [docs/SQL_REFERENCE.md](SQL_REFERENCE.md).
 
 ---
 

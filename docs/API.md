@@ -239,11 +239,16 @@ Ejecuta una o más sentencias SQL dentro de una transacción. Acepta:
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB)*
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
-- `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
-- `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill)
+- `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `INSERT`, `UPDATE`, `DELETE`
+- `SELECT` con:
+  - `WHERE col {= val | = (SELECT …) | BETWEEN a AND b | IN (SELECT …)}` + `[NOT] EXISTS (SELECT …)`
+  - `ORDER BY <col> [ASC|DESC]`, `LIMIT n`, `OFFSET n`
+  - `FROM` con `[INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN ... (ON l = r | USING (col))` y `NATURAL JOIN` (multi-tabla, aliases, self-join)
+- `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill) y `CREATE UNIQUE INDEX`
 - `DROP INDEX <nombre>`
+- `INTEGRITY CHECK`
 
-`UPDATE` y `DELETE` solo aceptan `WHERE pk = N`; `SELECT` también acepta `WHERE col_indexada = val`.
+`UPDATE` y `DELETE` solo aceptan `WHERE pk = N` (single-table). `SELECT` con JOINs admite `WHERE` cualificado (`tabla.col = val`) como post-filter.
 
 > Las sentencias **DATABASE-level** (`CREATE/DROP/SHOW DATABASE`) **no** abren un `Pager` — el server las despacha contra el directorio configurado con `-dir`. **No se admite mezclarlas con sentencias de tabla en el mismo `/exec`**: el server retorna `400` si lo intentas. En modo single-DB (`-db`) responden `405`.
 

@@ -170,10 +170,13 @@ Las mejoras naturales siguientes son:
 - ~~`backup`/`restore`/`verify` CLI con CRC end-to-end~~ ✅ entregado (ADR-0015)
 - ~~prefetch en `LeafCursor` (warm-up de la próxima hoja)~~ ✅ entregado (ADR-0016)
 - ~~índice INT-ordenado + range scan por índice (VERSION 7)~~ ✅ entregado (ADR-0017)
+- ~~Subqueries (`IN (SELECT …)`, `= (SELECT …)` escalar, `[NOT] EXISTS` no-correlacionada/correlacionada single-eq)~~ ✅ entregado
+- ~~`JOIN` (INNER, CROSS, comma-syntax, aliases, multi-tabla, self-join, LEFT/RIGHT/FULL [OUTER], USING, NATURAL, index-loop optimization)~~ ✅ entregado
 - `Transaction` (Unit of Work) con cache de `TableMeta` — pendiente, ROI marginal hoy
 - WAL persistente estilo SQLite-WAL — diseño documentado, sin código (ver [ADR-0018](adr/0018-wal-mode-opt-in.md)); condiciones de salida: bottleneck medido en gabybench, workload write-heavy real, o necesidad de MVCC
 - índices compuestos
 - range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`
-- planner cost-based real (hoy: deterministic dispatch + plan enum cerrado)
-- `JOIN` y `GROUP BY`
+- planner cost-based real (hoy: deterministic dispatch + plan enum cerrado + index-loop join automático para INNER/LEFT con PK/índice)
+- `GROUP BY`, window functions, CTE, vistas
+- subqueries correlacionadas con múltiples predicados (`AND`/`OR` en `WHERE` interno) y derived tables (`FROM (SELECT ...) t`)
 - política formal de migración entre versiones del formato en disco
