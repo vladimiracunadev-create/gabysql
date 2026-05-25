@@ -3079,10 +3079,23 @@ impl<'a> Engine<'a> {
                 out_row.insert(k.clone(), key_tuple[i].clone());
             }
             // Cada agregado se computa contra todas las filas del bucket.
+            // Insertamos el valor bajo el `output_name` (alias si existe;
+            // canonical si no) Y también bajo el canonical key — eso
+            // permite que `HAVING SUM(monto) > 100` y `HAVING total > 100`
+            // (alias) ambos resuelvan al mismo bucket value.
             for (item, output_name) in &agg_items {
-                if let SelectItem::Aggregate { func, arg, .. } = item {
+                if let SelectItem::Aggregate { func, arg, alias } = item {
                     let value = compute_aggregate(*func, arg, &rows)?;
-                    out_row.insert(output_name.clone(), value);
+                    out_row.insert(output_name.clone(), value.clone());
+                    if alias.is_some() {
+                        let canonical = SelectItem::Aggregate {
+                            func: *func,
+                            arg: arg.clone(),
+                            alias: None,
+                        }
+                        .output_name();
+                        out_row.insert(canonical, value);
+                    }
                 }
             }
             output_rows.push(out_row);
