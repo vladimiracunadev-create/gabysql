@@ -1,0 +1,70 @@
+name: Pages
+
+# Builda y publica el sitio Jekyll desde `docs/` a GitHub Pages.
+# Se dispara con:
+#   - push a `main` que toque docs/ o el propio workflow.
+#   - tag `v*` (alinear el sitio con cada release).
+#   - workflow_dispatch (botón "Run workflow" en la pestaña Actions).
+#
+# Modelo de confianza (consistente con ci.yml y release.yml):
+#   - Workflow-level permissions = contents:read (default deny).
+#   - El job `deploy` eleva permisos solo a `pages:write` + `id-token:write`
+#     (lo que requiere actions/deploy-pages para autenticarse via OIDC,
+#     sin necesidad de PAT ni token persistido).
+#   - Third-party actions pinned a SHA.
+#   - persist-credentials:false en el checkout.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+      - 'CHANGELOG.md'      # para que el sidebar de "novedades" se refresque
+  workflow_dispatch:        # botón "Run workflow" en la pestaña Actions
+
+# Solo una build de Pages a la vez. Si llegan dos pushes en flight,
+# encolamos la última y descartamos la del medio para no bloquear el
+# pipeline.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b  # v5.0.0
+
+      - name: Build Jekyll site
+        uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697  # v1.0.13
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b  # v4.0.0
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@2533ba2dafde5172a984c0d2cd55fc824a76823a  # v4.0.5

@@ -3,10 +3,13 @@
 > **Motor embebido en Rust con archivo único `.db`, WAL simple, API HTTP y admin web liviano.**
 
 [![CI](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/ci.yml/badge.svg)](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/ci.yml)
+[![Pages](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/pages.yml/badge.svg)](https://vladimiracunadev-create.github.io/gabysql/)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 ![Status](https://img.shields.io/badge/status-base%20estable-2e8b57)
 ![Target](https://img.shields.io/badge/target-Windows%20%7C%20Linux%20%7C%20macOS-1f6feb)
 ![Storage](https://img.shields.io/badge/storage-single--file%20db%20%2B%20wal-8a5a2b)
+
+📖 **Documentación online**: <https://vladimiracunadev-create.github.io/gabysql/> (auto-deploy desde `docs/` en cada push a `main`).
 
 `gabysql` es **un proyecto de aprendizaje + exploración sobre cómo se construye una base de datos**, escrito en Rust desde cero, usando la pregunta *"¿cómo se vería una DB nativa de la era de los agentes LLM?"* como hilo conductor. **No es un producto comercial y no apunta a serlo**: no hay usuarios, no hay clientes, no hay validación externa, y eso está bien. El objetivo es entender bases de datos a fondo y, en paralelo, explorar qué cambia cuando el consumidor principal no es un humano escribiendo SQL ni una app, sino un agente que razona sobre datos.
 

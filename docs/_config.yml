@@ -1,0 +1,66 @@
+# Bloque de configuración Jekyll que GitHub Pages usa cuando el workflow
+# de pages.yml hace `jekyll build` sobre este directorio. Mantenido al
+# mínimo necesario: tema oficial de GitHub (cayman — limpio, sin deps
+# externas), exclusiones para no servir archivos de proceso, y la base
+# URL adecuada para el repo. Si más adelante migramos a just-the-docs
+# o a mkdocs-material, este archivo se reemplaza pero las .md del
+# directorio quedan intactas.
+
+title: gabysql
+description: >-
+  Base de datos relacional embebida en Rust con superficie SQL clásica
+  (DDL + DML + TCL completos) y archivo único portable.
+theme: jekyll-theme-cayman
+
+# `baseurl` queda vacío porque el sitio se sirve en
+# https://<usuario>.github.io/gabysql/ y todos los enlaces internos
+# son relativos. Si en algún momento se publica en un CNAME custom,
+# este campo no cambia.
+baseurl: ""
+
+# Excluir archivos auxiliares y subdirectorios que NO deberían
+# convertirse a HTML (worktrees temporales, imágenes binarias, etc.).
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .sass-cache
+  - .jekyll-cache
+  - node_modules
+  - tareas_pendientes
+  - interfaz_powerdesigner.jpg
+
+# Jekyll por defecto no procesa archivos que empiezan con `_` ni los
+# que están en subdirectorios sin layout. Marcamos los .md de adr/
+# como includes en lugar de archivos publicables — son densos y útiles
+# como referencia técnica, pero rompen la navegación principal si
+# entran al menú default.
+include:
+  - adr
+
+markdown: kramdown
+kramdown:
+  input: GFM             # GitHub Flavored Markdown
+  hard_wrap: false
+  syntax_highlighter: rouge
+
+# Plugins permitidos por GitHub Pages (whitelist documentada en
+# https://pages.github.com/versions/). jekyll-relative-links convierte
+# enlaces `[X](otro.md)` en links HTML correctos para el sitio.
+plugins:
+  - jekyll-relative-links
+  - jekyll-optional-front-matter
+  - jekyll-default-layout
+  - jekyll-titles-from-headings
+
+relative_links:
+  enabled: true
+  collections: true
+optional_front_matter:
+  remove_originals: true
+default_layout:
+  remove_originals: true
+titles_from_headings:
+  enabled: true
+  strip_title: true
+  collections: true
