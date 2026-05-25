@@ -270,25 +270,26 @@ La consulta usa `WHERE col = (SELECT ...)` pero la subquery matcheó más de una
 
 ---
 
-## 🔎 `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)`
+## 🔎 `WHERE: no se reconoció el operador después de la columna 'X'`
 
 ### Causa
-La consulta usa operadores no implementados (`LIKE`, `>`, `<`, `IN (lista, literal)`, etc.).
+La consulta usa un operador fuera de la gramática actual del WHERE. Desde los bloques **E1** y **E2** la lista soportada es: `=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN ... AND ...`, `IS [NOT] NULL`, `[NOT] LIKE 'patron'`, `[NOT] IN (lista | SELECT)`, `EXISTS (...)`, conectados con `AND`/`OR`/`NOT` y paréntesis.
 
 ### Solución
-Restringe `WHERE` a uno de los operadores soportados en `SELECT`: `=` (sobre PK o columna indexada), `BETWEEN` (sobre PK o columna `INT` con índice `OrderedInt`), o `IN (SELECT …)` (subquery no-correlacionada single-column; outer column debe ser PK o tener índice secundario). `UPDATE` y `DELETE` solo aceptan `=`, no `BETWEEN` ni `IN`.
+- Revisar la lista en [docs/SQL_REFERENCE.md §SELECT](docs/SQL_REFERENCE.md#select).
+- `ILIKE`, `REGEXP`, `GLOB`, `IS TRUE/FALSE` aún no se soportan — workaround con `LIKE` case-sensitive o reescritura.
 
 ---
 
 ## 🛑 `WHERE solo soporta PK (...) o columnas con índice secundario; '<col>' no está indexada`
 
 ### Causa
-Hiciste `SELECT ... WHERE col = val` sobre una columna que no es PK y no tiene índice secundario.
+Hiciste `SELECT ... WHERE col = val` o `SELECT ... WHERE col BETWEEN a AND b` sobre una columna que no es PK y no tiene índice secundario. Solo aplica al fast-path indexado de `SELECT`; el WHERE compuesto (AND/OR/NOT, `<`, `>`, `LIKE`, `IS NULL`, `IN literal`) cae a FullScan y no exige índice.
 
 ### Solución
-- crear el índice: `CREATE INDEX idx_<tabla>_<col> ON <tabla> (<col>);`
-- o filtrar por la PK
-- en `UPDATE` / `DELETE`, el filtro siempre debe ser `WHERE pk = N` (no se admite por columna no-PK aunque tenga índice).
+- Crear el índice: `CREATE INDEX idx_<tabla>_<col> ON <tabla> (<col>);` para que el SELECT con `=` o `BETWEEN` use lookup directo en vez de FullScan.
+- O filtrar por la PK.
+- En `UPDATE` / `DELETE` (desde el bloque E3) este mensaje no aparece: el WHERE puede ser cualquier expresión (FullScan + 3VL por defecto, fast-path solo para `pk = N` literal).
 
 ---
 

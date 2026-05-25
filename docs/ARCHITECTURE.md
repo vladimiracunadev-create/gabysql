@@ -103,7 +103,7 @@ Responsable de los **índices secundarios**:
 Responsable de:
 - tokenizar SQL
 - parsear `CREATE TABLE` (con constraints inline), `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `INSERT`, `SELECT` (con `ORDER BY`), `UPDATE`, `DELETE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INTEGRITY CHECK`
-- validar tipos y filtros (`WHERE pk = ...`, `WHERE pk BETWEEN ...`, `WHERE col_indexada = ...`)
+- validar tipos y filtros del `WHERE` (`WhereExpr` con átomos `Eq`/`Compare`/`Between`/`Like`/`IsNull`/`InList`/`In(SELECT)`/`EqSubquery`/`Exists`/`EqColumnRef` combinados con `And`/`Or`/`Not`; precedencia estándar SQL; lógica trivaluada para NULL)
 - serializar y deserializar filas (con tolerancia a EOF para columnas trailing ausentes — habilita `ALTER ADD COLUMN` sin reescritura)
 - ejecutar las sentencias contra el `Engine`:
     - `INSERT` aplica DEFAULTs, valida NOT NULL, pre-check de UNIQUE y FK antes de tocar disco; mantiene índices secundarios.

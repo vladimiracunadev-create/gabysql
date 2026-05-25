@@ -36,7 +36,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 ## 🚦 Estado actual del producto
 
 > **Estado**: 🟢 Fase 1 (Robustez funcional) cerrada · Fase 2 arrancada  
-> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT … [WHERE col {= val | = (SELECT …) | BETWEEN a AND b | IN (SELECT …)} | [NOT] EXISTS (SELECT …)] [ORDER BY <col> [ASC|DESC]] [LIMIT n] [OFFSET n]`, `UPDATE`, `DELETE` (con cascade), `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
+> **Superficie SQL**: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `INSERT`, `SELECT`/`UPDATE`/`DELETE` con `WHERE` completo (`=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN (lista | SELECT)`, `= (SELECT …)`, `[NOT] EXISTS (SELECT …)`, combinados con `AND`/`OR`/`NOT` y paréntesis — lógica trivaluada ANSI), `JOIN` (INNER/LEFT/RIGHT/FULL/CROSS, USING, NATURAL, index-loop), `ORDER BY`, `LIMIT`/`OFFSET`, `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `INTEGRITY CHECK`  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página, crash tests dirigidos  
 > **Formato en disco**: `VERSION = 7` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag + `IndexKind` Hash/OrderedInt, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
 > **Portabilidad**: Windows, Linux y macOS por CI · 45/45 tests de integración verdes · `/metrics` + `-log-json` para observabilidad básica · `gabysql backup/restore/verify` con CRC end-to-end · `WHERE col_int_idx BETWEEN a AND b` con índice ordenado  
@@ -234,7 +234,7 @@ El repositorio ya fue validado con:
 
 ## ⚠️ Limitaciones deliberadas
 
-- `UPDATE` y `DELETE` solo aceptan filtro `WHERE <pk> = N` (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
+- `UPDATE` no muta la PK. `UPDATE` y `DELETE` aceptan cualquier `WHERE` válido en `SELECT` (bloque E3) — multi-fila, por columna indexada, por subquery, con combinadores `AND`/`OR`/`NOT`. Fast-path por PK solo cuando el WHERE es exactamente `pk = N` literal; el resto cae a FullScan + filtro 3VL.
 - Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` (índice `OrderedInt`, ADR-0017). Índices compuestos y range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados quedan para Fase 2.
 - `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
 - `ORDER BY` ya está soportado. **`JOIN`** (4 bloques cerrados): A) `INNER`, `CROSS`, comma-syntax, aliases, multi-tabla; B) `LEFT/RIGHT/FULL [OUTER]` con NULL-fill; C) `USING (col)` y `NATURAL JOIN` con dedup en `SELECT *`; D) index-loop optimization (transparente, INNER/LEFT con PK/índice). `GROUP BY` queda en Fase 3.

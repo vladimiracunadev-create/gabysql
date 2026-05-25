@@ -129,7 +129,7 @@ Click en el flag **FK** de cualquier columna abre el mini-modal:
 Tres campos:
 
 - **Tabla referenciada**: el dropdown lista todas las tablas del modelo, incluida la propia (self-reference como `employee.manager_id → employee.id`).
-- **Columna referenciada (debe ser PK INT)**: filtra al solo PKs del target. En esta versión `gabysql VERSION 6` solo se admiten FKs contra la PK del parent.
+- **Columna referenciada (debe ser PK INT)**: filtra al solo PKs del target. El motor gabysql solo admite FKs contra la PK del parent (single-column INT). `ON DELETE SET NULL`/`SET DEFAULT` y `ON UPDATE …` quedan en backlog (ver [docs/MISSING_COMMANDS.md](../../docs/MISSING_COMMANDS.md)).
 - **ON DELETE**: `RESTRICT` (default) refusa el DELETE del parent si hay hijos; `CASCADE` borra los hijos.
 
 Tres acciones:
@@ -262,7 +262,7 @@ El round-trip **schema → server → import → emit** es **lossless**: el SQL 
 - Importar **reemplaza** el modelo, no hace merge.
 - Sin **undo/redo**. `localStorage` mantiene el último estado guardado; usá 🗑 con cuidado.
 - Sin **auto-layout**: las entidades importadas vienen en una grilla simple; reacomodalas a mano.
-- Las FKs solo apuntan a la **PK del parent** (limitación del motor en VERSION 6, no del modeler).
+- Las FKs solo apuntan a la **PK del parent** (limitación actual del motor, no del modeler).
 - Solo `ON DELETE RESTRICT` y `CASCADE`. `SET NULL`/`SET DEFAULT`/`NO ACTION` no están soportados.
 
 Para el detalle de la gramática SQL completa que entiende el motor: [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md).

@@ -3293,10 +3293,7 @@ fn e1_three_valued_logic_null() -> Result<(), Box<dyn Error>> {
     // Fila 6 tiene edad=NULL. `edad = 30` → NULL → descartada.
     // OR con un predicado siempre-true (ciudad nada matchea, ej. 'ZZZ')
     // mantiene NULL → descartada. Solo Ana (edad=30) sobrevive.
-    let res = run_sql(
-        &db,
-        "SELECT id FROM e1 WHERE edad = 30 OR ciudad = 'ZZZ';",
-    )?;
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE edad = 30 OR ciudad = 'ZZZ';")?;
     let mut ids = e1_ids(&res[0]);
     ids.sort();
     assert_eq!(ids, vec![1]);
@@ -3847,10 +3844,7 @@ fn e3_delete_with_combinator() -> Result<(), Box<dyn Error>> {
     cleanup(&[&db, &wal]);
     e3_fixture(&db)?;
 
-    run_sql(
-        &db,
-        "DELETE FROM t WHERE edad < 30 OR ciudad = 'BA';",
-    )?;
+    run_sql(&db, "DELETE FROM t WHERE edad < 30 OR ciudad = 'BA';")?;
     let res = run_sql(&db, "SELECT id FROM t;")?;
     let mut ids = e1_ids(&res[0]);
     ids.sort();
@@ -3874,10 +3868,7 @@ fn e3_delete_by_in_subquery() -> Result<(), Box<dyn Error>> {
         "INSERT INTO doomed (uid) VALUES (1); INSERT INTO doomed (uid) VALUES (3); INSERT INTO doomed (uid) VALUES (5);",
     )?;
 
-    run_sql(
-        &db,
-        "DELETE FROM t WHERE id IN (SELECT uid FROM doomed);",
-    )?;
+    run_sql(&db, "DELETE FROM t WHERE id IN (SELECT uid FROM doomed);")?;
     let res = run_sql(&db, "SELECT id FROM t;")?;
     let mut ids = e1_ids(&res[0]);
     ids.sort();
@@ -3927,7 +3918,11 @@ fn e3_update_preserves_unique_check() -> Result<(), Box<dyn Error>> {
     // queda intacta; lo importante es que el error explote).
     let err = run_sql(&db, "UPDATE u SET email = 'a@x' WHERE id > 0;").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("[GBY-3003]") || msg.contains("UNIQUE"), "esperaba violación UNIQUE: {}", msg);
+    assert!(
+        msg.contains("[GBY-3003]") || msg.contains("UNIQUE"),
+        "esperaba violación UNIQUE: {}",
+        msg
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())

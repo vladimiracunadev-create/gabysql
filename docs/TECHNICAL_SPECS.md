@@ -223,36 +223,34 @@ Enforcement en runtime:
 - `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ... [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n]`
-- `WHERE <pk> = ...` (en `SELECT`, `UPDATE`, `DELETE`)
-- `WHERE <col_indexada> = <valor>` (solo en `SELECT`)
-- `WHERE <pk> BETWEEN ... AND ...` (solo en `SELECT`)
-- `WHERE <col_int_indexada> BETWEEN ... AND ...` (solo en `SELECT`; requiere índice `OrderedInt`, default para INT)
-- `WHERE <col> IN (SELECT ...)` — subquery no-correlacionada single-column
-- `WHERE <col> = (SELECT ...)` — subquery escalar no-correlacionada (1×≤1)
-- `WHERE [NOT] EXISTS (SELECT ...)` — no-correlacionada y correlacionada single-eq (`inner = outer.col`)
+- `WHERE` con la siguiente gramática (idéntica en `SELECT`, `UPDATE`, `DELETE` desde el bloque E3):
+  - Operadores atómicos: `=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN n AND m`, `IS [NOT] NULL`, `[NOT] LIKE 'patron'` (wildcards `%`/`_` + escape `\`), `[NOT] IN (lit, ...)`, `IN (SELECT ...)`, `= (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`
+  - Combinadores: `AND`, `OR`, `NOT`, paréntesis. Precedencia estándar SQL (`OR` < `AND` < `NOT` < átomo).
+  - Lógica trivaluada (3VL) ANSI para NULL en todos los operadores (con la única excepción de `IS [NOT] NULL`).
+  - Fast-paths indexadas activas solo cuando el WHERE es un único átomo del tipo `=` (PK o índice), `BETWEEN` (PK o `OrderedInt`), `IN (SELECT)` (PK o índice), `= (SELECT)` (PK o índice), `EXISTS`. Cualquier otra forma (combinadores o átomos E2) cae a FullScan + filtro 3VL.
 - `ORDER BY <col> [ASC|DESC]` (sort post-scan o por índice OrderedInt)
 - `FROM a [AS x] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN b [AS y] (ON l = r | USING (col))` y la comma-syntax
 - `FROM a NATURAL [INNER|LEFT|RIGHT|FULL] JOIN b`
 - Multi-tabla en cadena left-deep + self-join vía aliases
 - Index-loop join optimization (transparente: aplica auto cuando ON pega contra PK/índice del right e INNER/LEFT)
 - `LIMIT` / `OFFSET`
-- `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N`
-- `DELETE FROM <tabla> WHERE <pk> = N`
+- `UPDATE <tabla> SET col = val[, ...] WHERE <where_clause>` (cualquier WHERE válido en SELECT; multi-fila)
+- `DELETE FROM <tabla> WHERE <where_clause>` (cualquier WHERE válido en SELECT; cascade FK por fila)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
 - `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` (backfill aborta en duplicados)
 - `DROP INDEX <nombre>`
 - `INTEGRITY CHECK` (sweep operacional de páginas + índices + FKs)
 
 ### No soportado todavía
-- `GROUP BY`, agregaciones (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`)
-- `LIKE` y operadores no-`=` (`<`, `>`, `<=`, `>=`, `<>`)
-- `WHERE` con `AND` / `OR` / `NOT` en el outer (limitación de un solo predicado por WHERE)
-- `WHERE` por columnas no PK ni indexadas (en SELECT single-table)
-- `WHERE` sobre columna no-INT indexada con operador distinto a `=` (no `BETWEEN`, no `<`/`>`)
-- Subqueries correlacionadas con múltiples predicados; derived tables (`FROM (SELECT ...) t`); CTE; window functions
+- `GROUP BY`, agregaciones (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), `DISTINCT`
+- `ILIKE`, `REGEXP`, `GLOB`, `IS TRUE`/`IS FALSE`
+- `WHERE` por columnas no PK ni indexadas usa FullScan (no es bloqueante — solo perf)
+- Optimización indexada para operadores no-`=`/no-`BETWEEN` (`<`, `>`, `LIKE`, `IN literal`) — hoy cae a FullScan aunque la columna tenga índice
+- Subqueries correlacionadas con AND/OR/NOT envolventes (devuelve `[GBY-4024]`); derived tables (`FROM (SELECT ...) t`); CTE; window functions
+- `NOT IN (SELECT ...)` — solo se soporta `NOT IN (lista literal)`; con subquery requiere semántica 3VL especial que queda para el bloque H
 - `JOIN` con predicados no-equi en `ON` (`<`, `>`, multi-cond con `AND`), `USING` multi-columna, `NATURAL` con >1 columna común
 - Índices compuestos (multi-columna)
-- `UPDATE` / `DELETE` por columnas no PK ni por rango ni con JOINs
+- `UPDATE ... FROM otra_tabla` (UPDATE con JOIN) y `DELETE ... JOIN`
 
 ---
 

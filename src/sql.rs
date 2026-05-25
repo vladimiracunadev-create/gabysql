@@ -337,7 +337,10 @@ pub enum WhereClause {
     /// `col IS [NOT] NULL`. Único predicado que NO propaga NULL: `IS NULL`
     /// sobre NULL devuelve `true` (no `NULL`). Es la forma explícita de
     /// preguntar por ausencia.
-    IsNull { column: String, negated: bool },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
     /// `col [NOT] IN (lit1, lit2, ...)` con lista literal (no-subquery).
     /// Si la columna es NULL → NULL (3VL). NULLs dentro de la lista se
     /// ignoran (ANSI). `NOT IN` con un NULL en la lista propaga NULL
@@ -1068,16 +1071,15 @@ impl<'a> Engine<'a> {
         // `Exists` correlacionado (sin AND/OR/NOT envolventes). Cuando hay
         // combinadores el filtrado entero se hace por la rama
         // `generic_post_filter` con el evaluador 3VL.
-        let exists_postfilter: Option<(Box<SelectStmt>, bool)> = match stmt
-            .where_clause
-            .as_ref()
-            .and_then(|e| e.as_atom())
-        {
-            Some(WhereClause::Exists { subquery, negated }) if subquery_has_outer_refs(subquery) => {
-                Some((subquery.clone(), *negated))
-            }
-            _ => None,
-        };
+        let exists_postfilter: Option<(Box<SelectStmt>, bool)> =
+            match stmt.where_clause.as_ref().and_then(|e| e.as_atom()) {
+                Some(WhereClause::Exists { subquery, negated })
+                    if subquery_has_outer_refs(subquery) =>
+                {
+                    Some((subquery.clone(), *negated))
+                }
+                _ => None,
+            };
 
         // Bloque E1+E2: el path por fast-path indexada solo aplica cuando
         // el WHERE se reduce a un único átomo CON fast-path (los 6 pre-E2:
@@ -1119,10 +1121,8 @@ impl<'a> Engine<'a> {
         // Extracto el átomo único del WHERE (si existe) para reusar el
         // dispatch original. Cuando hay combinadores `generic_post_filter`
         // se hace cargo y acá entramos por la rama `None`.
-        let where_atom: Option<WhereClause> = stmt
-            .where_clause
-            .clone()
-            .and_then(|e| e.into_atom().ok());
+        let where_atom: Option<WhereClause> =
+            stmt.where_clause.clone().and_then(|e| e.into_atom().ok());
 
         let plan = if exists_postfilter.is_some() || generic_post_filter.is_some() {
             // El filtrado real ocurre en el post-filter; el scan barre todo.
@@ -2533,9 +2533,12 @@ impl<'a> Engine<'a> {
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
-            message: Some(format!("OK ({} fila{} actualizada{})", updated,
+            message: Some(format!(
+                "OK ({} fila{} actualizada{})",
+                updated,
                 if updated == 1 { "" } else { "s" },
-                if updated == 1 { "" } else { "s" })),
+                if updated == 1 { "" } else { "s" }
+            )),
         })
     }
 
@@ -5210,9 +5213,7 @@ impl Parser {
                     column,
                     subquery: Box::new(subquery),
                 });
-            } else if self.peek().kind == TokenKind::Ident
-                && !is_value_keyword(&self.peek().text)
-            {
+            } else if self.peek().kind == TokenKind::Ident && !is_value_keyword(&self.peek().text) {
                 let raw = self.expect_ident()?;
                 let (ref_table, ref_column) = split_qualified_ident(&raw);
                 return Ok(WhereClause::EqColumnRef {

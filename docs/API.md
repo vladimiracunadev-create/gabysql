@@ -240,15 +240,15 @@ Ejecuta una o más sentencias SQL dentro de una transacción. Acepta:
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
 - `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `INSERT`, `UPDATE`, `DELETE`
-- `SELECT` con:
-  - `WHERE col {= val | = (SELECT …) | BETWEEN a AND b | IN (SELECT …)}` + `[NOT] EXISTS (SELECT …)`
-  - `ORDER BY <col> [ASC|DESC]`, `LIMIT n`, `OFFSET n`
-  - `FROM` con `[INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN ... (ON l = r | USING (col))` y `NATURAL JOIN` (multi-tabla, aliases, self-join)
+- `SELECT` / `UPDATE` / `DELETE` con:
+  - `WHERE` completo: atomos `=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN (lista | SELECT)`, `= (SELECT)`, `[NOT] EXISTS (SELECT)`. Combinadores `AND`, `OR`, `NOT`, paréntesis. Lógica trivaluada ANSI para NULL. Gramática detallada en [SQL_REFERENCE.md](SQL_REFERENCE.md).
+  - `ORDER BY <col> [ASC|DESC]`, `LIMIT n`, `OFFSET n` (solo en `SELECT`)
+  - `FROM` con `[INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN ... (ON l = r | USING (col))` y `NATURAL JOIN` (multi-tabla, aliases, self-join) — solo en `SELECT`
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill) y `CREATE UNIQUE INDEX`
 - `DROP INDEX <nombre>`
 - `INTEGRITY CHECK`
 
-`UPDATE` y `DELETE` solo aceptan `WHERE pk = N` (single-table). `SELECT` con JOINs admite `WHERE` cualificado (`tabla.col = val`) como post-filter.
+`UPDATE` y `DELETE` son single-table (sin `JOIN` ni `UPDATE ... FROM`) pero aceptan el WHERE completo y operan multi-fila (response `message` trae la cuenta). `SELECT` con JOINs admite `WHERE` cualificado (`tabla.col = val`) como post-filter.
 
 > Las sentencias **DATABASE-level** (`CREATE/DROP/SHOW DATABASE`) **no** abren un `Pager` — el server las despacha contra el directorio configurado con `-dir`. **No se admite mezclarlas con sentencias de tabla en el mismo `/exec`**: el server retorna `400` si lo intentas. En modo single-DB (`-db`) responden `405`.
 

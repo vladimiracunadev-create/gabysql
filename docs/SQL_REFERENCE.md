@@ -724,8 +724,8 @@ SELECT ciudad.nombre, pais.nombre_pais
 | :--- | :--- |
 | `tabla no existe: X` | la tabla no está creada en la DB |
 | `ORDER BY: columna 'X' no existe en 'Y'` | la columna del ORDER BY no está en el schema de la tabla |
-| `WHERE solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | filtro sobre columna no-PK sin índice — créalo o usa la PK |
-| `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)` | operador no implementado (`<`, `>`, `LIKE`, `IN (lista, literal)`, etc.) |
+| `WHERE solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` `[GBY-4001]` | aplica al fast-path indexado de `SELECT` (`=` o `BETWEEN` sobre columna sin índice). El WHERE compuesto con `AND`/`OR`/`NOT`/`<`/`>`/`LIKE`/`IS NULL`/`IN literal` cae a FullScan y no exige índice. |
+| `WHERE: no se reconoció el operador después de la columna 'X'` `[GBY-4001]` | operador fuera de la gramática actual del WHERE. Lista soportada: `=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN (lista | SELECT)`, `EXISTS`. |
 | `subquery en IN debe devolver exactamente 1 columna; devolvió N` | la subquery proyectó más de una columna — reescribila con una sola |
 | `subquery escalar debe devolver exactamente 1 columna; devolvió N` | igual que el anterior pero en `= (SELECT ...)` |
 | `subquery escalar en WHERE devolvió N filas; debe devolver a lo sumo 1` | la subquery escalar matcheó más de una fila — agregar `WHERE`/`LIMIT 1` o usar `IN (SELECT ...)` |

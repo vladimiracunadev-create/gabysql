@@ -124,10 +124,13 @@ SELECT * FROM users JOIN orders USING (user_id);            -- USING (col)
 SELECT * FROM users NATURAL JOIN orders;                    -- auto-match por nombre
 
 UPDATE users SET name = 'Ana M', active = FALSE WHERE id = 1;
-DELETE FROM users WHERE id = 1;       -- cascade si hay FKs entrantes
+UPDATE users SET active = FALSE WHERE city = 'BA' AND last_login < '2024-01-01';
+UPDATE users SET status = 'banned' WHERE id IN (SELECT uid FROM blacklist);
+DELETE FROM users WHERE id = 1;                          -- cascade si hay FKs entrantes
+DELETE FROM users WHERE name LIKE '%@spam.tld' OR email IS NULL;
 ```
 
-> `UPDATE` y `DELETE` siguen siendo single-table con `WHERE pk = N`. JOINs y subqueries solo aplican a `SELECT`. La complejidad por defecto del nested-loop es O(N×M); cuando el `ON` apunta contra PK o columna indexada del lado derecho (e.g. `o.user_id = u.id` con `u.id = PK`), el motor cambia automáticamente a index-loop O(N×logM) — transparente, sin hints.
+> Desde el bloque **E3**, `UPDATE` y `DELETE` aceptan el mismo `WHERE` que `SELECT` — combinadores `AND`/`OR`/`NOT`, todos los operadores E1+E2 (`<`, `>`, `LIKE`, `IS NULL`, `IN literal`, etc.) y subqueries. Siguen siendo single-table — `UPDATE ... FROM otra_tabla` y `DELETE ... JOIN` quedan en backlog. La complejidad por defecto del nested-loop es O(N×M); cuando el `ON` apunta contra PK o columna indexada del lado derecho (e.g. `o.user_id = u.id` con `u.id = PK`), el motor cambia automáticamente a index-loop O(N×logM) — transparente, sin hints.
 
 `INSERT` aplica DEFAULTs para columnas omitidas, valida `NOT NULL`, hace pre-check de `UNIQUE` y `FK` antes de tocar disco. `UPDATE` revalida sólo las constraints cuyas columnas cambiaron. `DELETE` resuelve cascade/restrict según FKs entrantes (worklist con cycle protection).
 
@@ -172,9 +175,8 @@ Sweep de solo lectura: valida CRCs de cada página, decodifica cada fila, verifi
 - La PK debe ser **una sola columna `INT`**. Esta versión no soporta PKs compuestas ni de otros tipos.
 - `PRIMARY KEY` no puede ser `NULL` y es implícitamente `NOT NULL`.
 - PK duplicada se rechaza al `INSERT`.
-- `WHERE col = val` funciona sobre la PK siempre, y sobre cualquier otra columna **solo si tiene un índice secundario**.
-- `WHERE col BETWEEN a AND b` funciona sobre la PK y sobre cualquier columna `INT` con índice secundario (índice `OrderedInt`, ADR-0017). Para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` queda en backlog.
-- `UPDATE` y `DELETE` solo aceptan `WHERE pk = N`, no por columna no-PK.
+- `WHERE col = val` y `WHERE col BETWEEN a AND b` usan **fast-path indexado** sobre la PK o cualquier columna con índice secundario (`BETWEEN` requiere índice `OrderedInt` — automático sobre `INT`, ADR-0017). Cualquier otro WHERE (combinadores `AND`/`OR`/`NOT`, `<`, `>`, `LIKE`, `IS NULL`, `IN literal`) cae a FullScan + filtro 3VL row-a-row — funciona sin índice pero a costo lineal.
+- `UPDATE` y `DELETE` aceptan exactamente el mismo `WHERE` que `SELECT` (bloque E3). Fast-path solo para `WHERE pk = N` literal; el resto va por FullScan + 3VL.
 - `UPDATE` no permite cambiar la PK; intentarlo devuelve error explícito.
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error (no son no-ops silenciosos).
 - `DELETE` en una tabla con FKs entrantes aplica cascade/restrict según `ON DELETE` declarado.

@@ -179,8 +179,8 @@ docker compose down
 | `duplicate primary key` | intento de insertar PK repetida |
 | `fila no existe: PK=N` | `UPDATE` o `DELETE` sobre una PK que no existe |
 | `no se permite cambiar la PRIMARY KEY en UPDATE` | un `UPDATE ... SET pk = ...` fue rechazado |
-| `WHERE soporta solo '=', BETWEEN o IN (SELECT ...)` | consulta fuera del subconjunto SQL actual |
-| `WHERE solo soporta PK` | un `UPDATE`/`DELETE`/`SELECT` filtró por columna no PK |
+| `WHERE: no se reconoció el operador después de la columna 'X'` | operador fuera de la gramática del WHERE — ver [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) para la lista actual (`=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN`, `[NOT] LIKE`, `IS [NOT] NULL`, `[NOT] IN`, `EXISTS`) |
+| `WHERE solo soporta PK (X) o columnas con índice secundario` (en `SELECT`) | filtro `=` o `BETWEEN` sobre columna no-PK sin índice — crear índice o cambiar el WHERE. En `UPDATE`/`DELETE` ya no aplica desde el bloque E3 (acepta WHERE completo). |
 | `server busy: N active connections (max M)` | el servidor alcanzó `-max-connections`; el cliente debe reintentar |
 | `401 unauthorized` | token faltante o incorrecto |
 | `db inválida` | nombre de DB no aceptado en modo `-dir` |
