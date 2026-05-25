@@ -96,6 +96,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 - `SELECT ... WHERE <col> IN (SELECT <col> FROM ... [WHERE ...])` *(subquery no-correlacionada, single-column; outer column debe ser PK o tener índice)*
 - `SELECT ... WHERE <col> = (SELECT <col> FROM ... [WHERE ...])` *(subquery escalar no-correlacionada; 1 columna × ≤1 fila; 0 filas o NULL → match vacío)*
 - `SELECT ... WHERE [NOT] EXISTS (SELECT ... FROM ... [WHERE col = outer_table.col])` *(no-correlacionada O correlacionada single-eq; correlacionada usa post-filter per-row → O(N × subquery))*
+- `SELECT ... FROM a [AS x] [INNER] JOIN b [AS y] ON x.col = y.col [JOIN c ON ...]` *(INNER + CROSS + comma-syntax + aliases + multi-tabla + self-join; nested-loop O(N×M); LEFT/RIGHT/FULL/USING/NATURAL en bloques siguientes)*
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (valida NOT NULL/UNIQUE/FK; mantiene índices)
 - `DELETE FROM <tabla> WHERE <pk> = N` (cascade/restrict según FKs entrantes; mantiene índices)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
@@ -233,7 +234,7 @@ El repositorio ya fue validado con:
 - `UPDATE` y `DELETE` solo aceptan filtro `WHERE <pk> = N` (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
 - Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` (índice `OrderedInt`, ADR-0017). Índices compuestos y range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados quedan para Fase 2.
 - `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
-- `ORDER BY` ya está soportado; **`JOIN` y `GROUP BY` no** (Fase 2/3).
+- `ORDER BY` ya está soportado. **`JOIN` está soportado parcialmente**: `INNER JOIN`, `CROSS JOIN`, comma-syntax, aliases y multi-tabla (bloque A). `LEFT/RIGHT/FULL OUTER`, `USING (col)`, `NATURAL JOIN` quedan en bloques B/C; `GROUP BY` queda en Fase 3.
 - Subqueries: `WHERE col IN (SELECT ...)`, `WHERE col = (SELECT ...)` y `WHERE [NOT] EXISTS (SELECT ...)`. `IN` y `=` solo no-correlacionados; `EXISTS` soporta correlacionado single-eq (`inner_col = outer.col`). Derived tables (`FROM (SELECT ...) t`), correlacionadas con múltiples predicados y CTE/window functions quedan en backlog.
 - Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).
 - La PK debe ser una sola columna `INT`. `ALTER TABLE ADD COLUMN` no admite agregar PK.

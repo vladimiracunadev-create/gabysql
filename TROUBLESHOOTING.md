@@ -219,6 +219,25 @@ El servidor alcanzó el techo de conexiones simultáneas (default `64`).
 
 ---
 
+## 🔗 Errores de JOIN
+
+### `[GBY-4017]` alias/nombre de tabla duplicado
+Dos tablas del `FROM` quedaron expuestas bajo el mismo qualifier (alias o nombre). Reescribir con alias distintos: `FROM users AS u JOIN orders AS o`.
+
+### `[GBY-4018]` columna ambigua
+Una columna sin qualifier existe en más de una tabla del `FROM`. Cualificar con `tabla.col` o `alias.col`. Ejemplo: `SELECT u.id` en vez de `SELECT id`.
+
+### `[GBY-4019]` qualifier no encontrado
+`tabla.col` donde `tabla` no coincide con ningún nombre ni alias del `FROM`. Verificar que la tabla esté en el FROM y que estés usando el alias correcto (el alias **oculta** el nombre real).
+
+### `[GBY-4020]` INNER JOIN sin ON
+`INNER JOIN ...` siempre requiere `ON l = r`. Si querés cartesiano usar `CROSS JOIN` o la comma-syntax `FROM a, b`.
+
+### `[GBY-4021]` CROSS JOIN con ON
+`CROSS JOIN` es producto cartesiano puro y no admite predicado. Cambiar a `INNER JOIN ... ON ...`.
+
+---
+
 ## 🔎 `EXISTS requiere '(SELECT ...)' a continuación` `[GBY-4015]`
 
 ### Causa

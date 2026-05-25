@@ -107,6 +107,11 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4014` | `SCALAR_SUBQUERY_TOO_MANY_ROWS` | `WHERE col = (SELECT ...)` cuya subquery devolvió más de 1 fila. | Restringir la subquery con un `WHERE`/`LIMIT 1`, o usar `IN (SELECT ...)` en lugar de `=`. |
 | `4015` | `EXISTS_REQUIRES_SUBQUERY` | `EXISTS`/`NOT EXISTS` no seguido por `(SELECT ...)`. | Escribir `EXISTS (SELECT ... FROM ... [WHERE ...])`. |
 | `4016` | `OUTER_COLUMN_REF_INVALID` | `col = outer_table.col` usado fuera de una subquery correlacionada, o la tabla outer / columna outer no están en el alcance. | Mover la referencia dentro de un `EXISTS (SELECT ... WHERE inner_col = outer_table.outer_col)`, o usar un literal/subquery escalar. |
+| `4017` | `TABLE_ALIAS_DUPLICATED` | Dos tablas del `FROM` expuestas con el mismo qualifier (alias o nombre). | Asignar alias distintos: `FROM t AS a JOIN otra AS b`. |
+| `4018` | `COLUMN_AMBIGUOUS` | Columna sin qualifier que existe en más de una tabla del `FROM`. | Cualificar con `tabla.col` o `alias.col`. |
+| `4019` | `COLUMN_QUALIFIER_NOT_FOUND` | `tabla.col` donde `tabla` no es nombre ni alias del FROM, o `col` no existe en ninguna tabla. | Verificar el nombre y los alias declarados. |
+| `4020` | `JOIN_PREDICATE_REQUIRED` | `INNER JOIN ...` sin `ON l = r`. | Agregar `ON tabla1.col = tabla2.col` (o usar `CROSS JOIN` si querés cartesiano). |
+| `4021` | `CROSS_JOIN_WITH_ON` | `CROSS JOIN ... ON ...` — el cartesian product no admite predicado. | Cambiar a `INNER JOIN ... ON ...`. |
 
 ---
 

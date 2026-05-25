@@ -129,7 +129,17 @@ pub struct InsertStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    /// Base table del FROM. En SELECTs con JOIN sigue siendo "la primera"
+    /// tabla declarada (las demás viven en `joins`). Se mantiene como
+    /// `String` plano para no romper la API pública preexistente.
     pub table: String,
+    /// Alias opcional de la base table (`FROM alumnos a`). Aplica también
+    /// cuando hay JOINs — es la forma estándar de des-ambiguar columnas.
+    pub table_alias: Option<String>,
+    /// JOINs adicionales a la base. Vacío = SELECT single-table (todo el
+    /// pipeline single-table sigue intacto). Cada join se aplica en orden
+    /// (left-deep tree).
+    pub joins: Vec<JoinClause>,
     pub columns: Vec<String>,
     pub where_clause: Option<WhereClause>,
     pub order_by: Option<OrderClause>,
@@ -137,10 +147,60 @@ pub struct SelectStmt {
     pub offset: usize,
 }
 
+/// Tabla referenciada en el FROM (base o lado derecho de un JOIN).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub right: TableRef,
+    /// `None` solo en `CROSS JOIN` (y en la comma-syntax, que se desazucara
+    /// a CROSS). `INNER JOIN ... ON` siempre lleva predicado: si falta el
+    /// parser devuelve `[GBY-4020]`.
+    pub on: Option<JoinPredicate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Cross,
+}
+
+/// Predicado simple `t1.col = t2.col` para la cláusula `ON`. En este bloque
+/// (foundation) soporta UN solo equi-predicado; `AND`/`OR` y comparadores
+/// no-equi quedan para el bloque D.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinPredicate {
+    pub left: ColumnRef,
+    pub right: ColumnRef,
+}
+
+/// Referencia a una columna posiblemente cualificada (`tabla.col` o `col`).
+/// El qualifier matchea contra el nombre real de la tabla o su alias
+/// (case-insensitive).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnRef {
+    pub qualifier: Option<String>,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderClause {
     pub column: String,
     pub direction: OrderDir,
+}
+
+impl OrderClause {
+    /// Devuelve el raw del ORDER BY tal cual lo escribió el user (puede
+    /// venir cualificado `tabla.col` o bare `col`). El engine de JOIN lo
+    /// resuelve contra el `JoinScope`.
+    pub fn qualified_input(&self) -> DbResult<String> {
+        Ok(self.column.clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,6 +911,13 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
+        // SELECT con JOINs sigue una ruta distinta (nested-loop, schema
+        // combinado, WHERE como post-filter). El single-table path queda
+        // exactamente como estaba — sin regresión en performance ni
+        // semántica para queries que no usan JOIN.
+        if !stmt.joins.is_empty() {
+            return self.exec_select_joined(stmt);
+        }
         let meta = {
             let mut catalog = Catalog::open(self.pager);
             catalog
@@ -1285,6 +1352,279 @@ impl<'a> Engine<'a> {
             rows,
             message: None,
         })
+    }
+
+    /// Ejecuta un SELECT con JOINs vía nested-loop sobre filas materializadas.
+    ///
+    /// Estrategia (deliberadamente simple, sin optimizer):
+    ///   1. Cargar el metadata de cada tabla del FROM (base + cada JOIN).
+    ///   2. Para cada tabla armar un FullScan a `HashMap<String, Value>` con
+    ///      claves cualificadas (`alias.col` o `tabla.col`).
+    ///   3. Empezar con las filas de la base y, para cada JOIN, hacer
+    ///      cross-product y evaluar el `ON` — left-deep, en el orden en que
+    ///      aparecen los JOIN.
+    ///   4. Aplicar el `WHERE` como post-filter (Eq, Between, In sobre las
+    ///      joined-rows; los predicados con subqueries siguen funcionando
+    ///      porque la subquery se ejecuta una vez antes del scan).
+    ///   5. Ordenar (`ORDER BY`), proyectar, aplicar `OFFSET`/`LIMIT`.
+    ///
+    /// Complejidad: O(N1 × N2 × … × Nk) en el peor caso (nested loop puro).
+    /// El bloque D del roadmap agregará index-loop join: cuando el `ON`
+    /// pega contra una columna indexada del lado derecho, reemplazar el
+    /// FullScan del right por un index lookup.
+    fn exec_select_joined(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
+        // --- 1. Construir el scope (lista de tablas con sus aliases) ---
+        let scope = self.build_join_scope(&stmt)?;
+
+        // --- 2. Materializar la base table como joined-rows ---
+        let base = &scope.tables[0];
+        let mut current: Vec<HashMap<String, Value>> = self.scan_qualified(base)?;
+
+        // --- 3. Aplicar cada JOIN en orden left-deep ---
+        for (i, join) in stmt.joins.iter().enumerate() {
+            let right = &scope.tables[i + 1];
+            let right_rows = self.scan_qualified(right)?;
+            let mut next: Vec<HashMap<String, Value>> =
+                Vec::with_capacity(current.len() * right_rows.len() / 2 + 1);
+            for left_row in &current {
+                for right_row in &right_rows {
+                    let pass = match &join.on {
+                        None => true, // CROSS JOIN o comma-syntax
+                        Some(pred) => evaluate_join_predicate(left_row, right_row, pred, &scope)?,
+                    };
+                    if !pass {
+                        continue;
+                    }
+                    // Merge: las claves nunca chocan porque van prefijadas
+                    // con alias/tabla únicos (validados arriba).
+                    let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
+                    for (k, v) in left_row {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    for (k, v) in right_row {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    next.push(merged);
+                }
+            }
+            current = next;
+        }
+
+        // --- 4. WHERE como post-filter ---
+        if let Some(where_clause) = stmt.where_clause.clone() {
+            current = self.filter_joined_rows(current, &where_clause, &scope)?;
+        }
+
+        // --- 5. Resolver columnas proyectadas (output_columns = lo que escribió el user) ---
+        let (output_columns, projected_keys) = resolve_joined_projection(&scope, &stmt.columns)?;
+
+        // --- 6. ORDER BY sobre la fila joined ---
+        if let Some(ord) = &stmt.order_by {
+            let key = resolve_joined_column_key(&scope, &ord.qualified_input()?)?;
+            current.sort_by(|a, b| compare_values(a.get(&key), b.get(&key)));
+            if matches!(ord.direction, OrderDir::Desc) {
+                current.reverse();
+            }
+        }
+
+        // --- 7. Proyectar + OFFSET/LIMIT ---
+        let take = stmt.limit.unwrap_or(usize::MAX);
+        let rows: Vec<Vec<Value>> = current
+            .into_iter()
+            .skip(stmt.offset)
+            .take(take)
+            .map(|row| {
+                projected_keys
+                    .iter()
+                    .map(|k| row.get(k).cloned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect();
+
+        Ok(ResultSet {
+            columns: output_columns,
+            rows,
+            message: None,
+        })
+    }
+
+    /// FullScan de una tabla devolviendo HashMaps con claves `alias.col`
+    /// (lower-case). Se usa como entrada al nested-loop join.
+    fn scan_qualified(&mut self, entry: &JoinTable) -> DbResult<Vec<HashMap<String, Value>>> {
+        let raw = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(entry.meta.root_page, 0, None)?
+        };
+        let mut out = Vec::with_capacity(raw.len());
+        for kv in raw {
+            let decoded = decode_row(&entry.meta, &kv.value)?;
+            let mut qualified = HashMap::with_capacity(decoded.len());
+            for (col, val) in decoded {
+                qualified.insert(format!("{}.{}", entry.qualifier, col), val);
+            }
+            out.push(qualified);
+        }
+        Ok(out)
+    }
+
+    /// Resuelve `stmt.table` + `stmt.joins` cargando los `TableMeta` y
+    /// validando que no haya dos tablas expuestas con el mismo qualifier
+    /// (alias preferido; nombre real si no hay alias).
+    fn build_join_scope(&mut self, stmt: &SelectStmt) -> DbResult<JoinScope> {
+        let mut tables: Vec<JoinTable> = Vec::with_capacity(1 + stmt.joins.len());
+        let base = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_table(&stmt.table)?
+                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        };
+        let base_qualifier = stmt
+            .table_alias
+            .clone()
+            .unwrap_or_else(|| stmt.table.clone())
+            .to_ascii_lowercase();
+        tables.push(JoinTable {
+            meta: base,
+            qualifier: base_qualifier.clone(),
+            raw_name: stmt.table.clone(),
+            alias: stmt.table_alias.clone(),
+        });
+        for join in &stmt.joins {
+            let meta = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog
+                    .get_table(&join.right.name)?
+                    .ok_or_else(|| DbError::new(format!("tabla no existe: {}", join.right.name)))?
+            };
+            let qualifier = join
+                .right
+                .alias
+                .clone()
+                .unwrap_or_else(|| join.right.name.clone())
+                .to_ascii_lowercase();
+            if tables.iter().any(|t| t.qualifier == qualifier) {
+                return Err(coded(
+                    codes::TABLE_ALIAS_DUPLICATED,
+                    format!(
+                        "alias/nombre de tabla '{}' duplicado en el FROM — \
+                         usá `AS otroalias` para des-ambiguar",
+                        qualifier
+                    ),
+                ));
+            }
+            tables.push(JoinTable {
+                meta,
+                qualifier,
+                raw_name: join.right.name.clone(),
+                alias: join.right.alias.clone(),
+            });
+        }
+        Ok(JoinScope { tables })
+    }
+
+    /// Aplica un `WHERE` sobre el conjunto de filas joineadas. Las formas
+    /// soportadas son las que se pueden evaluar fila-a-fila sobre el
+    /// schema combinado: `Eq`, `Between`. `In`/`EqSubquery` se evalúan
+    /// pre-computando el set una sola vez. `EqColumnRef`/`Exists` con
+    /// JOINs no se soportan en este bloque.
+    fn filter_joined_rows(
+        &mut self,
+        rows: Vec<HashMap<String, Value>>,
+        where_clause: &WhereClause,
+        scope: &JoinScope,
+    ) -> DbResult<Vec<HashMap<String, Value>>> {
+        match where_clause {
+            WhereClause::Eq { column, value } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let expected = value.clone();
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| {
+                        r.get(&key)
+                            .map(|v| values_equal(v, &expected))
+                            .unwrap_or(false)
+                    })
+                    .collect())
+            }
+            WhereClause::Between { column, from, to } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let lo = *from;
+                let hi = *to;
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| match r.get(&key) {
+                        Some(Value::Integer(n)) => *n >= lo && *n <= hi,
+                        _ => false,
+                    })
+                    .collect())
+            }
+            WhereClause::In { column, subquery } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let inner = self.exec_select((**subquery).clone())?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery en IN debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                let set: Vec<Value> = inner
+                    .rows
+                    .into_iter()
+                    .filter_map(|mut r| r.pop())
+                    .filter(|v| !matches!(v, Value::Null))
+                    .collect();
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| {
+                        r.get(&key)
+                            .map(|v| set.iter().any(|s| values_equal(v, s)))
+                            .unwrap_or(false)
+                    })
+                    .collect())
+            }
+            WhereClause::EqSubquery { column, subquery } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let inner = self.exec_select((**subquery).clone())?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                if inner.rows.len() > 1 {
+                    return Err(coded(
+                        codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
+                        format!(
+                            "subquery escalar en WHERE devolvió {} filas; debe devolver a lo sumo 1",
+                            inner.rows.len()
+                        ),
+                    ));
+                }
+                let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
+                match scalar {
+                    None | Some(Value::Null) => Ok(Vec::new()),
+                    Some(expected) => Ok(rows
+                        .into_iter()
+                        .filter(|r| {
+                            r.get(&key)
+                                .map(|v| values_equal(v, &expected))
+                                .unwrap_or(false)
+                        })
+                        .collect()),
+                }
+            }
+            WhereClause::EqColumnRef { .. } | WhereClause::Exists { .. } => Err(coded(
+                codes::WHERE_OPERATOR_UNSUPPORTED,
+                "esta forma del WHERE (column-ref / EXISTS) aún no se combina con JOINs \
+                 en este release; envolver el JOIN en una subquery o filtrar por valores literales",
+            )),
+        }
     }
 
     fn exec_update(&mut self, stmt: UpdateStmt) -> DbResult<ResultSet> {
@@ -2573,6 +2913,155 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     }
 }
 
+/// Scope de un SELECT con JOINs: la lista de tablas en orden left-deep
+/// con su qualifier ya resuelto (alias si existe, nombre real si no).
+/// Construido una sola vez por `build_join_scope`; consumido por la
+/// resolución de columnas, el WHERE post-filter y el ORDER BY.
+struct JoinScope {
+    tables: Vec<JoinTable>,
+}
+
+struct JoinTable {
+    meta: TableMeta,
+    /// Lower-case del alias (preferido) o nombre real. Es el prefix con
+    /// el que viven las columnas en la HashMap de joined-rows.
+    qualifier: String,
+    /// El nombre real de la tabla. Se acepta como qualifier alternativo
+    /// solo si la tabla NO tiene alias declarado (regla SQL standard).
+    raw_name: String,
+    alias: Option<String>,
+}
+
+/// Convierte una columna del SELECT (`*`, `col` o `tabla.col`) en el par
+/// `(output_label, lookup_key)` que necesitamos para proyectar. `*` se
+/// expande a TODAS las columnas de TODAS las tablas, en orden.
+fn resolve_joined_projection(
+    scope: &JoinScope,
+    requested: &[String],
+) -> DbResult<(Vec<String>, Vec<String>)> {
+    let mut output = Vec::new();
+    let mut keys = Vec::new();
+    if requested.is_empty() {
+        // `SELECT *` → todas las columnas de todas las tablas, prefijadas
+        // por qualifier (así dos columnas con mismo nombre no chocan).
+        for t in &scope.tables {
+            for col in &t.meta.columns {
+                output.push(format!("{}.{}", t.qualifier, col.name));
+                keys.push(format!("{}.{}", t.qualifier, normalize_ident(&col.name)));
+            }
+        }
+        return Ok((output, keys));
+    }
+    for raw in requested {
+        output.push(raw.clone());
+        keys.push(resolve_joined_column_key(scope, raw)?);
+    }
+    Ok((output, keys))
+}
+
+/// Toma una referencia de columna como string raw (`col` o `tabla.col`)
+/// y devuelve la clave canónica en `qualifier.normalized_col` para buscar
+/// en la HashMap de joined-rows.
+fn resolve_joined_column_key(scope: &JoinScope, raw: &str) -> DbResult<String> {
+    let (qualifier, name) = split_qualified_ident(raw);
+    let normalized = normalize_ident(&name);
+    if let Some(q) = qualifier {
+        let q_lc = q.to_ascii_lowercase();
+        // Match contra alias preferido; nombre real solo si la tabla
+        // NO tiene alias (SQL standard: alias hides original name).
+        let table = scope.tables.iter().find(|t| {
+            t.qualifier == q_lc || (t.alias.is_none() && t.raw_name.eq_ignore_ascii_case(&q))
+        });
+        let table = table.ok_or_else(|| {
+            coded(
+                codes::COLUMN_QUALIFIER_NOT_FOUND,
+                format!(
+                    "qualifier '{}' no coincide con ninguna tabla/alias del FROM",
+                    q
+                ),
+            )
+        })?;
+        if table.meta.column(&normalized).is_none() {
+            return Err(coded(
+                codes::COLUMN_QUALIFIER_NOT_FOUND,
+                format!(
+                    "columna '{}' no existe en la tabla '{}'",
+                    name, table.raw_name
+                ),
+            ));
+        }
+        Ok(format!("{}.{}", table.qualifier, normalized))
+    } else {
+        // Sin qualifier: buscar en todas las tablas. Si está en más de
+        // una → ambiguous (error 4018).
+        let matches: Vec<&JoinTable> = scope
+            .tables
+            .iter()
+            .filter(|t| t.meta.column(&normalized).is_some())
+            .collect();
+        if matches.is_empty() {
+            return Err(coded(
+                codes::COLUMN_QUALIFIER_NOT_FOUND,
+                format!("columna '{}' no existe en ninguna tabla del FROM", name),
+            ));
+        }
+        if matches.len() > 1 {
+            let tables: Vec<&str> = matches.iter().map(|t| t.qualifier.as_str()).collect();
+            return Err(coded(
+                codes::COLUMN_AMBIGUOUS,
+                format!(
+                    "columna '{}' es ambigua: existe en {} — usá tabla.col para des-ambiguar",
+                    name,
+                    tables.join(", ")
+                ),
+            ));
+        }
+        Ok(format!("{}.{}", matches[0].qualifier, normalized))
+    }
+}
+
+/// Evalúa un equi-predicado `l.col = r.col` sobre dos sub-rows. Las
+/// columnas se resuelven contra el scope completo (las dos pueden vivir
+/// en cualquier tabla ya joineada o en el nuevo right).
+fn evaluate_join_predicate(
+    left_row: &HashMap<String, Value>,
+    right_row: &HashMap<String, Value>,
+    pred: &JoinPredicate,
+    scope: &JoinScope,
+) -> DbResult<bool> {
+    let lkey = resolve_joined_column_key(scope, &column_ref_to_raw(&pred.left))?;
+    let rkey = resolve_joined_column_key(scope, &column_ref_to_raw(&pred.right))?;
+    let lv = left_row.get(&lkey).or_else(|| right_row.get(&lkey));
+    let rv = right_row.get(&rkey).or_else(|| left_row.get(&rkey));
+    match (lv, rv) {
+        (Some(a), Some(b)) => Ok(values_equal(a, b)),
+        _ => Ok(false),
+    }
+}
+
+fn column_ref_to_raw(cref: &ColumnRef) -> String {
+    match &cref.qualifier {
+        Some(q) => format!("{}.{}", q, cref.name),
+        None => cref.name.clone(),
+    }
+}
+
+/// Igualdad estricta para WHERE post-filter en JOINs. NULL != NULL (SQL
+/// standard). Mismo tipo a tipo. INT vs FLOAT promueve a FLOAT.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
+            (*x as f64) == *y
+        }
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Walk the WHERE tree looking for `EqColumnRef` — the marker that this
 /// subquery references the outer scope and therefore must be re-executed
 /// per outer row. We descend through nested subqueries (IN, =, EXISTS) so
@@ -2594,6 +3083,31 @@ fn normalize_ident(value: &str) -> String {
         .unwrap_or(value)
         .trim()
         .to_ascii_lowercase()
+}
+
+/// Keywords that pueden aparecer inmediatamente después del nombre (o
+/// alias) de una tabla. Si vemos uno de estos, NO es un alias — es la
+/// continuación natural del SELECT. Esto evita que `FROM t WHERE ...`
+/// engulla `WHERE` como alias de `t`.
+fn is_post_table_keyword(text: &str) -> bool {
+    matches!(
+        text.to_ascii_uppercase().as_str(),
+        "WHERE"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "INNER"
+            | "CROSS"
+            | "JOIN"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "ON"
+            | "USING"
+            | "GROUP"
+            | "HAVING"
+            | "AS"
+    )
 }
 
 /// Returns `true` when the identifier is actually one of the value-keywords
@@ -3023,6 +3537,38 @@ impl Parser {
         }))
     }
 
+    /// Parsea `[AS] <ident>` como alias opcional. Devuelve `None` si el
+    /// próximo token NO es un alias válido (ej. otra keyword reservada de
+    /// la sentencia o final del FROM).
+    fn try_parse_alias(&mut self) -> DbResult<Option<String>> {
+        // `AS` es opcional. Si está, después tiene que venir un ident.
+        if self.match_keyword("AS") {
+            let alias = self.expect_ident()?;
+            return Ok(Some(alias));
+        }
+        // Sin `AS`: el alias es opcional. Para no engullir keywords de la
+        // continuación del SELECT, sólo lo agarramos si el peek es un
+        // Ident y no coincide con una keyword conocida en este punto.
+        if self.peek().kind == TokenKind::Ident && !is_post_table_keyword(&self.peek().text) {
+            let alias = self.expect_ident()?;
+            return Ok(Some(alias));
+        }
+        Ok(None)
+    }
+
+    fn parse_join_predicate(&mut self) -> DbResult<JoinPredicate> {
+        let left = self.parse_column_ref()?;
+        self.expect_symbol("=")?;
+        let right = self.parse_column_ref()?;
+        Ok(JoinPredicate { left, right })
+    }
+
+    fn parse_column_ref(&mut self) -> DbResult<ColumnRef> {
+        let raw = self.expect_ident()?;
+        let (qualifier, name) = split_qualified_ident(&raw);
+        Ok(ColumnRef { qualifier, name })
+    }
+
     fn parse_select_stmt(&mut self) -> DbResult<SelectStmt> {
         let columns = if self.match_symbol("*") {
             Vec::new()
@@ -3030,7 +3576,61 @@ impl Parser {
             self.parse_ident_list()?
         };
         self.expect_keyword("FROM")?;
+        // Base table + alias opcional (`AS` aceptado pero opcional).
         let table = self.expect_ident()?;
+        let table_alias = self.try_parse_alias()?;
+
+        // Cero o más JOINs en cadena. Aceptamos tres formas:
+        //   - `, b` (comma-syntax) → CROSS JOIN sin ON
+        //   - `CROSS JOIN b`        → CROSS JOIN sin ON (error si lleva ON)
+        //   - `[INNER] JOIN b ON l = r` → INNER JOIN equi-predicado
+        let mut joins: Vec<JoinClause> = Vec::new();
+        loop {
+            let (kind, parsed) = if self.match_symbol(",") {
+                (JoinKind::Cross, true)
+            } else if self.match_keyword("CROSS") {
+                self.expect_keyword("JOIN")?;
+                (JoinKind::Cross, true)
+            } else if self.match_keyword("INNER") {
+                self.expect_keyword("JOIN")?;
+                (JoinKind::Inner, true)
+            } else if self.match_keyword("JOIN") {
+                // `JOIN` solo equivale a `INNER JOIN` (ANSI).
+                (JoinKind::Inner, true)
+            } else {
+                (JoinKind::Inner, false)
+            };
+            if !parsed {
+                break;
+            }
+            let right_name = self.expect_ident()?;
+            let right_alias = self.try_parse_alias()?;
+            let right = TableRef {
+                name: right_name,
+                alias: right_alias,
+            };
+            let on = if self.match_keyword("ON") {
+                if matches!(kind, JoinKind::Cross) {
+                    return Err(coded(
+                        codes::CROSS_JOIN_WITH_ON,
+                        "CROSS JOIN no admite ON; usá INNER JOIN si necesitás predicado",
+                    ));
+                }
+                Some(self.parse_join_predicate()?)
+            } else {
+                if matches!(kind, JoinKind::Inner) {
+                    return Err(coded(
+                        codes::JOIN_PREDICATE_REQUIRED,
+                        format!(
+                            "INNER JOIN sobre '{}' requiere cláusula ON l = r",
+                            right.name
+                        ),
+                    ));
+                }
+                None
+            };
+            joins.push(JoinClause { kind, right, on });
+        }
 
         let mut where_clause = None;
         if self.match_keyword("WHERE") {
@@ -3186,6 +3786,8 @@ impl Parser {
 
         Ok(SelectStmt {
             table,
+            table_alias,
+            joins,
             columns,
             where_clause,
             order_by,

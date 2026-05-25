@@ -26,7 +26,9 @@
 | `WHERE col IN (SELECT …)` (no-correlacionada, single-column) | DML | 🟢 |
 | `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
-| `ALTER TABLE DROP/RENAME COLUMN`, `JOIN`, `GROUP BY`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
+| `LEFT/RIGHT/FULL OUTER JOIN`, `USING (col)`, `NATURAL JOIN`, index-loop join optimization | DML | 🟡 (en bloques B/C/D del roadmap de JOINs) |
+| `ALTER TABLE DROP/RENAME COLUMN`, `GROUP BY`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -521,6 +523,24 @@ where_clause ::= identifier "=" ( value | "(" select ")" | qualified_ident )
 qualified_ident ::= identifier ( "." identifier )?
 ```
 
+### 🔗 FROM con JOINs (bloque A del roadmap)
+
+```
+from_clause ::= table_ref join_clause*
+table_ref   ::= identifier [ ["AS"] identifier ]
+join_clause ::= ( "," | "CROSS" "JOIN" ) table_ref
+              | ( "INNER" "JOIN" | "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
+```
+
+**Reglas:**
+- `INNER JOIN` (o `JOIN` solo, equivalente ANSI) requiere `ON l = r` con un único equi-predicado (`AND`/`OR` y operadores no-equi quedan para el bloque D).
+- `CROSS JOIN` (y la comma-syntax `FROM a, b`) NO admite `ON`. Producto cartesiano completo.
+- Las tablas se pueden aliasar con `[AS] alias`. El alias **oculta** el nombre real (estándar SQL): si declarás `FROM alumnos a`, después tenés que usar `a.nombre`, no `alumnos.nombre`.
+- En SELECT/WHERE/ORDER BY, una columna que existe en >1 tabla **debe** ir cualificada (`tabla.col`); si no, `[GBY-4018]`.
+- `SELECT *` en JOIN expande a TODAS las columnas de TODAS las tablas, cada una prefijada con su qualifier para evitar colisiones.
+
+**Complejidad:** nested-loop puro `O(N1 × N2 × … × Nk)`. Para reducirla cuando el `ON` pega contra una columna indexada del lado derecho, ver bloque D del roadmap (index-loop join).
+
 > **Sobre `qualified_ident` en el RHS del `=`:** solo es válido **dentro de una subquery correlacionada** dentro de `EXISTS (...)`. Permite expresar `WHERE inner_col = outer_table.outer_col`, donde `outer_table` es la tabla del SELECT padre. Usarlo fuera de ese contexto devuelve `[GBY-4016]`.
 >
 > **Sobre `EXISTS`:** la subquery se ejecuta una sola vez si **no** referencia columnas del outer; cuando sí lo hace, se re-ejecuta una vez por cada fila del outer (post-filter). Esta variante correlacionada es O(N × costo_subquery), sin optimizer; tiene sentido cuando la subquery se reduce vía PK/índice con la outer-ref.
@@ -576,6 +596,32 @@ SELECT id, nombre FROM padre
 -- NOT EXISTS correlacionado: padres sin hijos.
 SELECT id, nombre FROM padre
  WHERE NOT EXISTS (SELECT id FROM hijo WHERE parent_id = padre.id);
+
+-- INNER JOIN clásico con aliases y columnas cualificadas
+SELECT a.nombre, c.nombre FROM alumnos a
+ INNER JOIN cursos c ON a.curso_id = c.id
+ ORDER BY a.nombre ASC;
+
+-- JOIN de 3 tablas en cadena (left-deep)
+SELECT persona.nombre, ciudad.nombre, pais.nombre
+  FROM persona
+  JOIN ciudad ON persona.ciudad_id = ciudad.id
+  JOIN pais   ON ciudad.pais_id = pais.id;
+
+-- CROSS JOIN explícito (cartesian product)
+SELECT a.v, b.w FROM a CROSS JOIN b;
+
+-- Comma-syntax = CROSS JOIN
+SELECT a.v, b.w FROM a, b;
+
+-- Self-join vía aliases distintos
+SELECT e.nombre, j.nombre FROM empleado e
+  INNER JOIN empleado j ON e.jefe_id = j.id;
+
+-- WHERE sobre columna cualificada de cualquier tabla
+SELECT alumnos.nombre FROM alumnos
+  JOIN cursos ON alumnos.curso_id = cursos.id
+ WHERE cursos.nivel = '3M';
 ```
 
 ### ❌ Errores típicos

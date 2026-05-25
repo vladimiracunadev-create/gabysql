@@ -148,6 +148,21 @@ pub mod codes {
     /// subquery correlacionada, o apuntando a una tabla/columna que el
     /// outer-stack no provee.
     pub const OUTER_COLUMN_REF_INVALID: u32 = 4016;
+    /// Dos tablas del FROM expuestas con el mismo alias (o el mismo nombre
+    /// sin alias). Imposible resolver columnas no-cualificadas.
+    pub const TABLE_ALIAS_DUPLICATED: u32 = 4017;
+    /// Columna sin qualifier que aparece en más de una tabla del FROM.
+    /// Hace falta `tabla.col` para des-ambiguar.
+    pub const COLUMN_AMBIGUOUS: u32 = 4018;
+    /// `tabla.col` donde `tabla` no es ni nombre ni alias de ninguna tabla
+    /// del FROM, o `col` que no existe en ninguna tabla del FROM.
+    pub const COLUMN_QUALIFIER_NOT_FOUND: u32 = 4019;
+    /// `INNER JOIN ...` sin cláusula `ON`. En este bloque toda forma INNER
+    /// exige predicado (CROSS JOIN es la forma sin predicado).
+    pub const JOIN_PREDICATE_REQUIRED: u32 = 4020;
+    /// `CROSS JOIN ... ON ...` — la cartesian product no admite predicado;
+    /// usar `INNER JOIN` en su lugar.
+    pub const CROSS_JOIN_WITH_ON: u32 = 4021;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

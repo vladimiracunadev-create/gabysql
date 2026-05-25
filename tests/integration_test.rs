@@ -2365,6 +2365,314 @@ fn where_exists_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn join_inner_two_tables_with_aliases() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_inner_basic");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE cursos (id INT PRIMARY KEY, nombre TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE alumnos (id INT PRIMARY KEY, nombre TEXT NOT NULL, curso_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO cursos (id,nombre) VALUES (1,'mate');
+         INSERT INTO cursos (id,nombre) VALUES (2,'historia');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id) VALUES (10,'Ana',1);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (11,'Beto',2);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (12,'Carla',1);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (13,'Dani',99);",
+    )?;
+
+    // INNER JOIN con alias + qualified columns + ORDER BY qualified
+    let res = run_sql(
+        &db,
+        "SELECT a.nombre, c.nombre FROM alumnos a \
+         INNER JOIN cursos c ON a.curso_id = c.id \
+         ORDER BY a.nombre ASC;",
+    )?;
+    assert_eq!(
+        res[0].rows.len(),
+        3,
+        "Dani no debería aparecer (curso_id=99)"
+    );
+    let pairs: Vec<(String, String)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::String(a), Value::String(b)) => (a.clone(), b.clone()),
+            _ => panic!("expected String pair"),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ana".to_string(), "mate".to_string()),
+            ("Beto".to_string(), "historia".to_string()),
+            ("Carla".to_string(), "mate".to_string()),
+        ]
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_inner_three_tables_chain() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_chain");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE pais (id INT PRIMARY KEY, nombre TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE ciudad (id INT PRIMARY KEY, nombre TEXT, pais_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE persona (id INT PRIMARY KEY, nombre TEXT, ciudad_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO pais (id,nombre) VALUES (1,'AR'); INSERT INTO pais (id,nombre) VALUES (2,'CL');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO ciudad (id,nombre,pais_id) VALUES (10,'BA',1);
+         INSERT INTO ciudad (id,nombre,pais_id) VALUES (20,'SCL',2);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO persona (id,nombre,ciudad_id) VALUES (100,'Ana',10);
+         INSERT INTO persona (id,nombre,ciudad_id) VALUES (101,'Beto',20);
+         INSERT INTO persona (id,nombre,ciudad_id) VALUES (102,'Carla',10);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT persona.nombre, ciudad.nombre, pais.nombre \
+         FROM persona \
+         JOIN ciudad ON persona.ciudad_id = ciudad.id \
+         JOIN pais ON ciudad.pais_id = pais.id \
+         ORDER BY persona.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    let names: Vec<(String, String, String)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1], &r[2]) {
+            (Value::String(a), Value::String(b), Value::String(c)) => {
+                (a.clone(), b.clone(), c.clone())
+            }
+            _ => panic!("expected 3 strings"),
+        })
+        .collect();
+    assert_eq!(names[0], ("Ana".into(), "BA".into(), "AR".into()));
+    assert_eq!(names[1], ("Beto".into(), "SCL".into(), "CL".into()));
+    assert_eq!(names[2], ("Carla".into(), "BA".into(), "AR".into()));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_cross_product_and_comma_syntax() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_cross");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, v TEXT);")?;
+    run_sql(&db, "CREATE TABLE b (id INT PRIMARY KEY, w TEXT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id,v) VALUES (1,'x'); INSERT INTO a (id,v) VALUES (2,'y');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO b (id,w) VALUES (1,'p'); INSERT INTO b (id,w) VALUES (2,'q'); INSERT INTO b (id,w) VALUES (3,'r');",
+    )?;
+
+    // CROSS JOIN explícito → 2 × 3 = 6 filas
+    let res = run_sql(&db, "SELECT a.v, b.w FROM a CROSS JOIN b;")?;
+    assert_eq!(res[0].rows.len(), 6);
+
+    // Comma-syntax = CROSS JOIN
+    let res = run_sql(&db, "SELECT a.v, b.w FROM a, b;")?;
+    assert_eq!(res[0].rows.len(), 6);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_self_join_via_alias() -> Result<(), Box<dyn Error>> {
+    // Empleados con jefe → self-join sobre la misma tabla
+    let db = temp_db_path("join_self");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE empleado (id INT PRIMARY KEY, nombre TEXT NOT NULL, jefe_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO empleado (id,nombre,jefe_id) VALUES (1,'CEO',NULL);
+         INSERT INTO empleado (id,nombre,jefe_id) VALUES (2,'CTO',1);
+         INSERT INTO empleado (id,nombre,jefe_id) VALUES (3,'Dev1',2);
+         INSERT INTO empleado (id,nombre,jefe_id) VALUES (4,'Dev2',2);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT e.nombre, j.nombre FROM empleado e \
+         INNER JOIN empleado j ON e.jefe_id = j.id \
+         ORDER BY e.id ASC;",
+    )?;
+    let pairs: Vec<(String, String)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::String(a), Value::String(b)) => (a.clone(), b.clone()),
+            _ => panic!("expected pair"),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("CTO".into(), "CEO".into()),
+            ("Dev1".into(), "CTO".into()),
+            ("Dev2".into(), "CTO".into()),
+        ]
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_where_filter_qualified() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_where");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE cursos (id INT PRIMARY KEY, nivel TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE alumnos (id INT PRIMARY KEY, nombre TEXT, curso_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO cursos (id,nivel) VALUES (1,'3M'); INSERT INTO cursos (id,nivel) VALUES (2,'4M');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id) VALUES (10,'Ana',1);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (11,'Beto',2);
+         INSERT INTO alumnos (id,nombre,curso_id) VALUES (12,'Carla',1);",
+    )?;
+
+    // WHERE sobre columna cualificada del lado right
+    let res = run_sql(
+        &db,
+        "SELECT alumnos.nombre FROM alumnos \
+         JOIN cursos ON alumnos.curso_id = cursos.id \
+         WHERE cursos.nivel = '3M' \
+         ORDER BY alumnos.nombre ASC;",
+    )?;
+    let names: Vec<&str> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.as_str(),
+            _ => panic!("expected String"),
+        })
+        .collect();
+    assert_eq!(names, vec!["Ana", "Carla"]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn join_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_errors");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, x INT);")?;
+    run_sql(&db, "CREATE TABLE b (id INT PRIMARY KEY, x INT);")?;
+    run_sql(&db, "INSERT INTO a (id,x) VALUES (1,10);")?;
+    run_sql(&db, "INSERT INTO b (id,x) VALUES (1,10);")?;
+
+    // INNER JOIN sin ON → [GBY-4020]
+    let err = run_sql(&db, "SELECT a.id FROM a INNER JOIN b;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4020"), "got: {}", err);
+
+    // CROSS JOIN con ON → [GBY-4021]
+    let err = run_sql(&db, "SELECT a.id FROM a CROSS JOIN b ON a.id = b.id;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4021"), "got: {}", err);
+
+    // Columna ambigua (sin qualifier; `x` está en a y b) → [GBY-4018]
+    let err = run_sql(&db, "SELECT x FROM a JOIN b ON a.id = b.id;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4018"), "got: {}", err);
+
+    // Qualifier inexistente → [GBY-4019]
+    let err = run_sql(&db, "SELECT zzz.x FROM a JOIN b ON a.id = b.id;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4019"), "got: {}", err);
+
+    // Alias duplicado → [GBY-4017]
+    let err = run_sql(&db, "SELECT a.id FROM a JOIN b AS a ON a.id = a.id;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4017"), "got: {}", err);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
