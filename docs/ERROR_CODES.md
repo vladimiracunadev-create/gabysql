@@ -93,7 +93,7 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | :---: | :--- | :--- | :--- |
 | `4001` | `WHERE_OPERATOR_UNSUPPORTED` | `WHERE` con un operador distinto a `=` o `BETWEEN`. | Esta versión solo soporta `=` y `BETWEEN`. Ver [SQL_REFERENCE.md](SQL_REFERENCE.md). |
 | `4002` | `BETWEEN_REQUIRES_PK_OR_INT_INDEX` | `WHERE col BETWEEN a AND b` sobre una columna que no es PK ni tiene índice `OrderedInt` (solo INT con índice). | Usar `=` en su lugar, indexar la columna si es `INT`, o filtrar por PK. Ver [ADR-0017](adr/0017-int-ordered-index-version-7.md). |
-| `4003` | `UPDATE_DELETE_REQUIRES_PK_FILTER` | `UPDATE` o `DELETE` con `WHERE` sobre una columna que no es la PK. | Esta versión solo admite `UPDATE`/`DELETE` por PK exacta. |
+| `4003` | `UPDATE_DELETE_REQUIRES_PK_FILTER` | (Histórico) `UPDATE` o `DELETE` con `WHERE` sobre columna no-PK. **Inactivo desde el bloque E3 (2026-05-25)**: `UPDATE`/`DELETE` ahora aceptan cualquier `WHERE`. La constante se conserva por estabilidad — nunca se reemite. | — |
 | `4004` | `LIMIT_NEGATIVE` | `LIMIT n` con `n < 0`. | `LIMIT` admite valores `>= 0`. |
 | `4005` | `OFFSET_NEGATIVE` | `OFFSET n` con `n < 0`. | `OFFSET` admite valores `>= 0`. |
 | `4006` | `STRING_LITERAL_UNTERMINATED` | Literal `'...'` sin la comilla de cierre. | Cerrar el literal o escapar la comilla interna duplicándola (`''`). |

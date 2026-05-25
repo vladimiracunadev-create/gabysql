@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-25 contra `main` post-bloque **E2** (operadores `<`, `>`, `LIKE`, `IS NULL`, `IN literal`).
+> Última verificación: 2026-05-25 contra `main` post-bloque **E3** (`UPDATE`/`DELETE` por columna indexada / subquery / cualquier WHERE).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -16,7 +16,7 @@ Si vas a ordenar bloques por ROI funcional, este es el orden:
 | 1 | ~~**`AND` / `OR` / `NOT` en `WHERE`**~~ ✅ | Cerrado en E1 (2026-05-25) | E1 ✅ |
 | 2 | ~~**`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`**~~ ✅ | Cerrado en E2 (2026-05-25) | E2 ✅ |
 | 3 | **`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`** | Sin agregaciones no hay reporting | F |
-| 4 | **`UPDATE` / `DELETE` por columna indexada o subquery** | Hoy solo `WHERE pk = N` | E3 |
+| 4 | ~~**`UPDATE` / `DELETE` por columna indexada o subquery**~~ ✅ | Cerrado en E3 (2026-05-25) | E3 ✅ |
 | 5 | **Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)** | Necesario para apps que componen mutaciones atómicas | T |
 
 Estos 5 bloques cierran >80% de las quejas previsibles de un usuario portando una app SQL clásica.
@@ -31,7 +31,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 |---|---|---|---|
 | **E1** ✅ | `AND`/`OR`/`NOT` en `WHERE` + paréntesis | Alto (toca AST de WhereClause) | — (**cerrado 2026-05-25**) |
 | **E2** ✅ | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) (**cerrado 2026-05-25**) |
-| **E3** | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 |
+| **E3** ✅ | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 (**cerrado 2026-05-25**) |
 | **F** | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 |
 | **G** | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` | Medio-Alto | E1 |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
@@ -203,11 +203,13 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `INSERT INTO t SELECT ...` | ❌ | P0 | J |
 | `INSERT ... ON CONFLICT DO UPDATE` / `UPSERT` | ❌ | P1 | J |
 | `REPLACE INTO` (SQLite-style) | ❌ | P2 | J |
-| `UPDATE ... WHERE col_indexada = val` | ❌ | P0 | E3 |
-| `UPDATE ... WHERE col IN (SELECT ...)` | ❌ | P1 | E3 |
+| `UPDATE ... WHERE col_indexada = val` | ✅ (E3) | — | — |
+| `UPDATE ... WHERE col IN (SELECT ...)` | ✅ (E3) | — | — |
+| `UPDATE ... WHERE` con AND/OR/NOT, LIKE, IS NULL, etc. | ✅ (E3) | — | — |
 | `UPDATE ... FROM otra_tabla` (UPDATE con JOIN) | ❌ | P2 | J |
-| `DELETE ... WHERE col_indexada = val` | ❌ | P0 | E3 |
-| `DELETE` con JOIN o subquery en WHERE | ❌ | P1 | E3 |
+| `DELETE ... WHERE col_indexada = val` | ✅ (E3) | — | — |
+| `DELETE` con subquery en WHERE | ✅ (E3) | — | — |
+| `DELETE` con JOIN | ❌ | P1 | (futuro) |
 | `TRUNCATE TABLE` | ❌ | P2 | J |
 | `RETURNING` clause (`UPDATE ... RETURNING id`) | ❌ | P2 | J |
 

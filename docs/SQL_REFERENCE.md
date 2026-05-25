@@ -23,8 +23,8 @@
 | [`DROP INDEX`](#drop-index) | DDL | 🟢 |
 | [`INSERT`](#insert) | DML | 🟢 |
 | [`SELECT`](#select) | DML | 🟢 |
-| [`UPDATE`](#update) | DML | 🟢 |
-| [`DELETE`](#delete) | DML | 🟢 |
+| [`UPDATE`](#update) (WHERE completo desde bloque E3 — multi-fila, indexado, subquery) | DML | 🟢 |
+| [`DELETE`](#delete) (WHERE completo desde bloque E3 — multi-fila, indexado, subquery) | DML | 🟢 |
 | `WHERE col IN (SELECT …)` (no-correlacionada, single-column) | DML | 🟢 |
 | `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
@@ -759,30 +759,49 @@ flowchart LR
 
 ```
 update       ::= "UPDATE" identifier "SET" assignment ("," assignment)*
-                  "WHERE" identifier "=" integer
+                  "WHERE" where_clause
 assignment   ::= identifier "=" value
 ```
+
+Desde el bloque **E3** el `WHERE` de `UPDATE` acepta exactamente la misma
+gramática que `SELECT`: combinadores `AND`/`OR`/`NOT`, paréntesis, todos los
+operadores E1+E2 (`=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`,
+`IN literal`, `BETWEEN`) y subqueries (`IN (SELECT)`, `= (SELECT)`,
+`EXISTS`). El `UPDATE` se aplica a **todas** las filas que el `WHERE`
+matchee; el `message` del response trae la cuenta.
 
 ### ✅ Ejemplos
 
 ```sql
+-- Por PK directa
 UPDATE users SET name = 'Ana M' WHERE id = 1;
 
+-- Multi-asignación
 UPDATE orders
    SET status = 'paid', total = 199.50
  WHERE id = 42;
+
+-- Por columna indexada (afecta a todas las filas matcheadas)
+UPDATE users SET active = FALSE WHERE city = 'BA';
+
+-- Por predicado compuesto (E1+E2)
+UPDATE products SET on_sale = TRUE
+ WHERE price < 100 AND stock > 0 AND name LIKE '%demo%';
+
+-- Por subquery
+UPDATE users SET status = 'banned'
+ WHERE id IN (SELECT uid FROM blacklist);
 ```
 
 ### ❌ Errores típicos
 
 | Mensaje | Causa |
 | :--- | :--- |
-| `fila no existe: PK=N` | la PK del WHERE no está en la tabla — no es no-op silencioso |
+| `fila no existe: PK=N` | el WHERE era `pk = N` y N no está en la tabla. Solo aplica al fast-path de PK literal; un WHERE compuesto con 0 matches devuelve OK con cuenta 0. |
 | `no se permite cambiar la PRIMARY KEY en UPDATE (esta versión)` | se intentó `SET pk = ...` |
-| `WHERE solo soporta PK (pk_name)` | filtro por columna no-PK |
 | `columna duplicada en SET` | dos asignaciones a la misma columna |
 
-> Solo los índices cuya columna está en el `SET` se tocan; los demás no pagan costo. Ver [src/sql.rs:exec_update](../src/sql.rs).
+> Solo los índices cuya columna está en el `SET` se tocan; los demás no pagan costo. La resolución del WHERE en E3 hace **FullScan + filtro 3VL** salvo cuando el WHERE es exactamente `pk = N` (fast-path por PK). La optimización para `= col_indexada` y `IN (SELECT)` queda en backlog (correctitud primero). Ver [src/sql.rs:exec_update](../src/sql.rs).
 
 ---
 
@@ -799,21 +818,34 @@ flowchart LR
 ### 📜 EBNF
 
 ```
-delete  ::= "DELETE" "FROM" identifier "WHERE" identifier "=" integer
+delete  ::= "DELETE" "FROM" identifier "WHERE" where_clause
 ```
+
+Mismo `where_clause` que `SELECT` y `UPDATE` (bloque E3). Borra todas las
+filas matcheadas en orden de PK ascendente; las FK con `ON DELETE CASCADE`
+se aplican fila por fila. El `message` del response trae la cuenta.
 
 ### ✅ Ejemplos
 
 ```sql
+-- Por PK
 DELETE FROM users WHERE id = 5;
+
+-- Por columna indexada (multi-fila)
+DELETE FROM logs WHERE level = 'debug';
+
+-- Por subquery
+DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE banned = TRUE);
+
+-- Por predicado compuesto
+DELETE FROM tickets WHERE status = 'closed' AND updated_at < '2024-01-01';
 ```
 
 ### ❌ Errores típicos
 
 | Mensaje | Causa |
 | :--- | :--- |
-| `fila no existe: PK=N` | PK inexistente — explícito, no silent no-op |
-| `WHERE solo soporta PK (pk_name)` | no se admite `DELETE` por columna no-PK |
+| `fila no existe: PK=N` | el WHERE era `pk = N` y N no está. Con WHERE compuesto, 0 matches es OK. |
 | `violación de FK: 'X.col' referencia 'Y' (ON DELETE RESTRICT, N fila(s) afectadas)` | hay filas hijas y la FK fue declarada `ON DELETE RESTRICT` (default) |
 
 > Antes de borrar la fila, el engine la lee para evictar la entrada correspondiente de cada índice secundario. Si la tabla tiene FKs entrantes, el motor resuelve cascade/restrict iterativamente con un worklist y cycle protection (visited set sobre `(tabla, pk)`). Para tablas grandes con FKs entrantes, **se recomienda crear un índice secundario sobre la columna FK del hijo** — el engine lo usa automáticamente para que el lookup de hijos sea O(log n) en vez de full scan.

@@ -3693,6 +3693,246 @@ fn e2_compare_with_join() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque E3: UPDATE / DELETE por columna indexada y por subquery
+// ============================================================
+//
+// Verifica que UPDATE/DELETE acepten cualquier WHERE soportado por SELECT
+// (E1+E2 + subqueries) y que actúen sobre todas las filas que matchean,
+// no sólo sobre `pk = N`. Cada test cuenta filas con un SELECT siguiente.
+
+fn e3_fixture(db: &Path) -> Result<(), Box<dyn Error>> {
+    let mut pager = Pager::create(db)?;
+    pager.close()?;
+    run_sql(
+        db,
+        "CREATE TABLE t (id INT PRIMARY KEY, nombre TEXT, edad INT, ciudad TEXT, activo BOOL);",
+    )?;
+    run_sql(db, "CREATE INDEX idx_t_ciudad ON t (ciudad);")?;
+    run_sql(
+        db,
+        "INSERT INTO t (id,nombre,edad,ciudad,activo) VALUES (1,'Ana',30,'BA',TRUE);
+         INSERT INTO t (id,nombre,edad,ciudad,activo) VALUES (2,'Beto',25,'MDQ',FALSE);
+         INSERT INTO t (id,nombre,edad,ciudad,activo) VALUES (3,'Carla',40,'BA',TRUE);
+         INSERT INTO t (id,nombre,edad,ciudad,activo) VALUES (4,'Dario',22,'CBA',TRUE);
+         INSERT INTO t (id,nombre,edad,ciudad,activo) VALUES (5,'Eva',50,'MDQ',FALSE);",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn e3_update_by_indexed_column_affects_all_matches() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_upd_idx");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    // ciudad='BA' matchea 2 filas (1, 3). Después del UPDATE ambas
+    // deberían tener activo=FALSE.
+    run_sql(&db, "UPDATE t SET activo = FALSE WHERE ciudad = 'BA';")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE activo = TRUE;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![4]); // solo Dario quedó activo
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_update_by_compound_where() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_upd_compound");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    // Marcamos como inactivos a los mayores de 35.
+    run_sql(&db, "UPDATE t SET activo = FALSE WHERE edad > 35;")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE activo = TRUE;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // Activos pre-update: 1 (Ana, 30), 3 (Carla, 40), 4 (Dario, 22).
+    // edad>35: Carla(3), Eva(5 — ya FALSE). Carla pasa a FALSE.
+    // Quedan activos: 1 (Ana), 4 (Dario).
+    assert_eq!(ids, vec![1, 4]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_update_by_in_subquery() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_upd_subq");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    // Una segunda tabla con los IDs a desactivar.
+    run_sql(&db, "CREATE TABLE bad (uid INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "INSERT INTO bad (uid) VALUES (2); INSERT INTO bad (uid) VALUES (5);",
+    )?;
+
+    run_sql(
+        &db,
+        "UPDATE t SET nombre = 'BLOQUEADO' WHERE id IN (SELECT uid FROM bad);",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE nombre = 'BLOQUEADO';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_update_zero_matches_is_not_error() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_upd_zero");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    // Con WHERE compuesto, 0 matches es OK (SQL estándar). El message
+    // refleja "0 filas actualizadas".
+    let res = run_sql(&db, "UPDATE t SET activo = FALSE WHERE edad > 999;")?;
+    let msg = res[0].message.as_deref().unwrap_or("");
+    assert!(msg.contains("0"), "message inesperado: {}", msg);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_update_by_pk_still_errors_when_not_found() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_upd_pk_404");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    // El fast-path de `pk = N` debe seguir devolviendo
+    // [GBY-3006] ROW_NOT_FOUND_FOR_PK cuando la fila no existe (compat
+    // con apps pre-E3).
+    let err = run_sql(&db, "UPDATE t SET nombre = 'X' WHERE id = 999;").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-3006]"), "esperaba GBY-3006: {}", msg);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_delete_by_indexed_column_removes_all_matches() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_del_idx");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    run_sql(&db, "DELETE FROM t WHERE ciudad = 'MDQ';")?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // MDQ tenía filas 2 y 5. Deben desaparecer.
+    assert_eq!(ids, vec![1, 3, 4]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_delete_with_combinator() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_del_combo");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    run_sql(
+        &db,
+        "DELETE FROM t WHERE edad < 30 OR ciudad = 'BA';",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // <30 → {2,4}. ciudad='BA' → {1,3}. Unión → {1,2,3,4}. Queda 5.
+    assert_eq!(ids, vec![5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_delete_by_in_subquery() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_del_subq");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    run_sql(&db, "CREATE TABLE doomed (uid INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "INSERT INTO doomed (uid) VALUES (1); INSERT INTO doomed (uid) VALUES (3); INSERT INTO doomed (uid) VALUES (5);",
+    )?;
+
+    run_sql(
+        &db,
+        "DELETE FROM t WHERE id IN (SELECT uid FROM doomed);",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 4]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_delete_by_like_pattern() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_del_like");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    // Nombres terminados en 'a': Ana, Carla, Eva → ids 1, 3, 5.
+    run_sql(&db, "DELETE FROM t WHERE nombre LIKE '%a';")?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 4]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_update_preserves_unique_check() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e3_upd_unique");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, email TEXT NOT NULL UNIQUE);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO u (id,email) VALUES (1,'a@x'); INSERT INTO u (id,email) VALUES (2,'b@x');",
+    )?;
+
+    // UPDATE masivo que generaría colisión UNIQUE — debe fallar antes
+    // de tocar nada (idealmente la primera fila falla y la segunda
+    // queda intacta; lo importante es que el error explote).
+    let err = run_sql(&db, "UPDATE u SET email = 'a@x' WHERE id > 0;").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-3003]") || msg.contains("UNIQUE"), "esperaba violación UNIQUE: {}", msg);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

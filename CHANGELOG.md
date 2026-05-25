@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-05-25 — Bloque E3: `UPDATE` / `DELETE` por cualquier `WHERE`
+
+> **Un push a `main`** que destraba mutaciones masivas y por columnas no-PK.
+
+### 🔧 Cambios
+- `UpdateStmt` y `DeleteStmt` ahora llevan `where_clause: WhereExpr` (mismo grammar que `SELECT`). El campo legacy `where_column + where_pk: i64` desaparece.
+- `parse_update` / `parse_delete` reusan `parse_where_expr()` — todos los operadores de E1+E2 + subqueries `IN (SELECT)` / `= (SELECT)` / `EXISTS` se aceptan sin tocar el parser.
+- Nuevo helper `Engine::resolve_target_pks` que devuelve la lista de PKs matcheadas:
+  - **Fast-path** para `WHERE pk = N` literal (preserva el comportamiento pre-E3, incluyendo el error `[GBY-3006] ROW_NOT_FOUND_FOR_PK` cuando N no existe).
+  - **Fallback genérico**: FullScan + evaluador `eval_where_expr_single` (mismo motor 3VL que SELECT). Sin optimización por índice todavía — correctitud primero, perf en backlog.
+- `exec_update` extrae la lógica per-fila a `apply_update_to_pk` y la invoca por cada PK del lote. Las validaciones (NOT NULL, UNIQUE, FK) corren por-fila — un UNIQUE conflict en la fila K corta el batch y deja las K-1 anteriores commiteadas dentro de la misma transacción (la decisión de revert depende del wrapping en el cliente).
+- `exec_delete` resuelve PKs **antes** de borrar para evitar interferencia con cascadas FK que tocan otras tablas o self-refs. Cada cascade tolera filas ya eliminadas (idempotente).
+- Response `message` ahora trae la cuenta: `"OK (3 filas actualizadas)"` / `"OK (2 filas eliminadas)"`.
+
+### ⚠️ Limitaciones residuales
+- `UPDATE ... FROM otra_tabla` (UPDATE con JOIN) y `DELETE ... JOIN` no se soportan — requieren parser de FROM compartido con SELECT y queda para un bloque futuro.
+- `<` / `>` / `LIKE` / `IS NULL` sobre PK o columna indexada **no aprovechan el índice** todavía — todos van por FullScan. Optimización indexada para `=` sobre columna indexada queda en backlog.
+- El error `[GBY-4003] UPDATE_DELETE_REQUIRES_PK_FILTER` queda inactivo. La constante permanece en `errors.rs` por el contrato de estabilidad (nunca se reusa) — futuras versiones nunca volverán a emitirla.
+
+### 🧪 Validación
+- 10 integration tests nuevos en `tests/integration_test.rs` (`e3_*`): UPDATE por columna indexada, por predicado compuesto, por subquery, 0 matches, fast-path PK con error legado, DELETE por col indexada / combinador / subquery / LIKE, UPDATE preservando UNIQUE.
+- `cargo check --lib --tests` limpio sin warnings.
+
+### 📚 Documentación
+- `docs/SQL_REFERENCE.md` — EBNF de UPDATE/DELETE actualizada, ejemplos nuevos, errores típicos al día.
+- `docs/MISSING_COMMANDS.md` — E3 marcado cerrado, hueco #4 del top-5 tachado.
+- `docs/ERROR_CODES.md` — entry `4003` marcada como histórica.
+
+---
+
 ## 2026-05-25 — Bloque E2: comparadores, `LIKE`, `IS NULL`, `IN literal`
 
 > **Un push a `main`** que cierra el set de operadores básicos del `WHERE`.

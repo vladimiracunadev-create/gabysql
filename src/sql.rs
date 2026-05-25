@@ -81,15 +81,20 @@ pub struct DropIndexStmt {
 pub struct UpdateStmt {
     pub table: String,
     pub assignments: Vec<(String, Value)>,
-    pub where_column: String,
-    pub where_pk: i64,
+    /// Bloque E3: el WHERE de UPDATE/DELETE es un `WhereExpr` completo —
+    /// admite los mismos operadores que `SELECT.where_clause` (=, BETWEEN,
+    /// <, >, LIKE, IS NULL, IN literal/SELECT, AND/OR/NOT, etc.). Es
+    /// obligatorio: las mutaciones masivas sin WHERE quedan deshabilitadas
+    /// hasta un release explícito.
+    pub where_clause: WhereExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStmt {
     pub table: String,
-    pub where_column: String,
-    pub where_pk: i64,
+    /// Bloque E3: ver doc de `UpdateStmt::where_clause`. Mismo grammar,
+    /// mismas reglas.
+    pub where_clause: WhereExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2465,8 +2470,8 @@ impl<'a> Engine<'a> {
                 .get_table(&stmt.table)?
                 .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
         };
-        ensure_pk_filter(&meta, &stmt.where_column)?;
 
+        // Validar assignments una sola vez (no depende del WHERE).
         let mut overrides: HashMap<String, Value> = HashMap::new();
         for (column_name, value) in stmt.assignments {
             let normalized = normalize_ident(&column_name);
@@ -2499,28 +2504,67 @@ impl<'a> Engine<'a> {
             }
         }
 
+        // Bloque E3: resolver target PKs según el WHERE. Fast-path para
+        // Eq sobre PK literal (preserva el comportamiento pre-E3); el
+        // resto cae a FullScan + 3VL. `was_explicit_single_pk` se usa
+        // abajo: cuando el WHERE pidió una PK concreta y la fila no
+        // existe, devolvemos `ROW_NOT_FOUND_FOR_PK` para no romper la
+        // semántica anterior; con WHERE compuesto, 0 matches es OK
+        // (UPDATE de 0 filas, igual que SQL estándar).
+        let (target_pks, was_explicit_single_pk) =
+            self.resolve_target_pks(&meta, &stmt.where_clause, "UPDATE")?;
+
+        if target_pks.is_empty() && was_explicit_single_pk {
+            // El WHERE original era `pk = N` y N no existe. Mantenemos el
+            // error legado para que callers existentes (CLI, tests) sigan
+            // observando el mismo código.
+            return Err(coded(
+                codes::ROW_NOT_FOUND_FOR_PK,
+                format!("UPDATE sobre '{}': fila no existe", meta.name),
+            ));
+        }
+
+        let mut updated = 0usize;
+        for pk in &target_pks {
+            self.apply_update_to_pk(&meta, *pk, &overrides)?;
+            updated += 1;
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("OK ({} fila{} actualizada{})", updated,
+                if updated == 1 { "" } else { "s" },
+                if updated == 1 { "" } else { "s" })),
+        })
+    }
+
+    /// Bloque E3: aplica los `overrides` (SET column=value) a la fila
+    /// con PK dada. Encapsula todas las validaciones por-fila (NOT NULL,
+    /// UNIQUE, FK), el upsert y el mantenimiento de índices. Se invoca
+    /// una vez por cada PK matcheada por el WHERE — pre-E3 esto ocurría
+    /// inline en `exec_update` para una única fila.
+    fn apply_update_to_pk(
+        &mut self,
+        meta: &TableMeta,
+        pk: i64,
+        overrides: &HashMap<String, Value>,
+    ) -> DbResult<()> {
         let existing = {
             let mut catalog = Catalog::open(self.pager);
-            catalog
-                .get_row(meta.root_page, stmt.where_pk)?
-                .ok_or_else(|| {
-                    coded(
-                        codes::ROW_NOT_FOUND_FOR_PK,
-                        format!(
-                            "UPDATE sobre '{}': fila no existe PK={}",
-                            meta.name, stmt.where_pk
-                        ),
-                    )
-                })?
+            catalog.get_row(meta.root_page, pk)?.ok_or_else(|| {
+                coded(
+                    codes::ROW_NOT_FOUND_FOR_PK,
+                    format!("UPDATE sobre '{}': fila no existe PK={}", meta.name, pk),
+                )
+            })?
         };
-        let old_row = decode_row(&meta, &existing)?;
+        let old_row = decode_row(meta, &existing)?;
         let mut current = old_row.clone();
-        for (key, value) in &overrides {
+        for (key, value) in overrides {
             current.insert(key.clone(), value.clone());
         }
 
-        // NOT NULL: any assignment that lands a NULL on a NOT NULL column
-        // must be rejected before we touch storage.
         for column in &meta.columns {
             if !column.not_null {
                 continue;
@@ -2540,8 +2584,6 @@ impl<'a> Engine<'a> {
             }
         }
 
-        // UNIQUE pre-check on every changed indexed column (excluding
-        // self pk so updating to the same value is a no-op).
         for idx in &meta.indexes {
             if !idx.unique {
                 continue;
@@ -2558,30 +2600,24 @@ impl<'a> Engine<'a> {
             })?;
             let new_value = current.get(&normalized).cloned().unwrap_or(Value::Null);
             let new_bytes = encode_column_value(column, &new_value)?;
-            check_unique_conflict(self.pager, idx, &new_bytes, Some(stmt.where_pk))?;
+            check_unique_conflict(self.pager, idx, &new_bytes, Some(pk))?;
         }
 
-        // FK pre-check on every changed FK column. We pass `where_pk`
-        // as the self-ref-allowed pk so updating a self-FK column to
-        // point at the same row stays valid.
-        enforce_fk_on_update(self.pager, &meta, &old_row, &current, stmt.where_pk)?;
+        enforce_fk_on_update(self.pager, meta, &old_row, &current, pk)?;
 
-        let (pk, row_bytes) = encode_row(&meta, &current)?;
-        if pk != stmt.where_pk {
+        let (encoded_pk, row_bytes) = encode_row(meta, &current)?;
+        if encoded_pk != pk {
             return Err(DbError::new(format!(
                 "inconsistencia interna en UPDATE sobre '{}': la PK reconstruida del row \
                  es {} pero el WHERE pidió pk={}",
-                meta.name, pk, stmt.where_pk
+                meta.name, encoded_pk, pk
             )));
         }
         {
             let mut catalog = Catalog::open(self.pager);
-            catalog.upsert_row(meta.root_page, pk, row_bytes)?;
+            catalog.upsert_row(meta.root_page, encoded_pk, row_bytes)?;
         }
 
-        // Maintain only the indexes whose column was actually mutated, and
-        // only when the new value differs from the old one. That keeps
-        // UPDATEs that don't touch indexed columns free of index work.
         for idx in &meta.indexes {
             let normalized = normalize_ident(&idx.column);
             if !overrides.contains_key(&normalized) {
@@ -2600,15 +2636,64 @@ impl<'a> Engine<'a> {
             }
             let old_bytes = encode_column_value(column, &old_value)?;
             let new_bytes = encode_column_value(column, &new_value)?;
-            index_remove_pk(self.pager, idx.root_page, idx.kind, &old_bytes, pk)?;
-            index_upsert_pk(self.pager, idx.root_page, idx.kind, &new_bytes, pk)?;
+            index_remove_pk(self.pager, idx.root_page, idx.kind, &old_bytes, encoded_pk)?;
+            index_upsert_pk(self.pager, idx.root_page, idx.kind, &new_bytes, encoded_pk)?;
         }
 
-        Ok(ResultSet {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            message: Some("OK".to_string()),
-        })
+        Ok(())
+    }
+
+    /// Bloque E3: dado un WHERE arbitrario sobre una tabla, devuelve la
+    /// lista de PKs cuyas filas matchean. Estrategia:
+    /// 1. Si el WHERE es exactamente `Eq` sobre la PK con literal INT,
+    ///    devolvemos `vec![n]` directo (sin tocar disco) — flag
+    ///    `was_explicit_single_pk = true` para preservar el error
+    ///    legado `ROW_NOT_FOUND_FOR_PK` cuando la fila no existe.
+    /// 2. En cualquier otro caso: FullScan de la tabla + evaluador 3VL
+    ///    fila-a-fila. Correcto para todos los operadores del WHERE
+    ///    (E1+E2 + subqueries). Sin optimización indexada — queda en
+    ///    backlog para no duplicar el dispatcher de SELECT.
+    ///
+    /// `op_label` se usa solo para mensajes de error (e.g. "UPDATE" /
+    /// "DELETE").
+    fn resolve_target_pks(
+        &mut self,
+        meta: &TableMeta,
+        where_clause: &WhereExpr,
+        _op_label: &str,
+    ) -> DbResult<(Vec<i64>, bool)> {
+        // Fast-path: `WHERE pk = literal` (compatibilidad pre-E3).
+        if let WhereExpr::Atom(WhereClause::Eq { column, value }) = where_clause {
+            if normalize_ident(column) == normalize_ident(&meta.primary_key) {
+                let pk = match value {
+                    Value::Integer(n) => *n,
+                    _ => {
+                        return Err(DbError::new(format!(
+                            "PRIMARY KEY '{}' es INT; valor incompatible en WHERE",
+                            meta.primary_key
+                        )))
+                    }
+                };
+                return Ok((vec![pk], true));
+            }
+        }
+        // Fallback genérico: FullScan + evaluador 3VL. Reusa el mismo
+        // evaluador del SELECT (`eval_where_expr_single`) — la única
+        // diferencia es que acá necesitamos las PKs, no las filas
+        // proyectadas, así que iteramos sobre los `KeyValue` crudos.
+        let rows = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(meta.root_page, 0, None)?
+        };
+        let mut pks = Vec::new();
+        for kv in rows {
+            let decoded = decode_row(meta, &kv.value)?;
+            let verdict = self.eval_where_expr_single(where_clause, meta, &decoded)?;
+            if matches!(verdict, Some(true)) {
+                pks.push(kv.key);
+            }
+        }
+        Ok((pks, false))
     }
 
     fn exec_create_index(&mut self, stmt: CreateIndexStmt) -> DbResult<ResultSet> {
@@ -2766,35 +2851,51 @@ impl<'a> Engine<'a> {
                 .get_table(&stmt.table)?
                 .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
         };
-        ensure_pk_filter(&meta, &stmt.where_column)?;
 
-        // Refuse the DELETE up front if the target row doesn't exist,
-        // matching the pre-FK behaviour. The cascade walker tolerates
-        // already-deleted rows (cycles, multi-path), so we have to
-        // gate the entry point ourselves.
-        let exists = {
-            let mut catalog = Catalog::open(self.pager);
-            catalog.get_row(meta.root_page, stmt.where_pk)?.is_some()
-        };
-        if !exists {
+        // Bloque E3: resolver PKs igual que UPDATE — fast-path para
+        // `WHERE pk = N` (que mantiene el error legado si no existe la
+        // fila), fallback FullScan + 3VL para todo lo demás.
+        let (target_pks, was_explicit_single_pk) =
+            self.resolve_target_pks(&meta, &stmt.where_clause, "DELETE")?;
+
+        if target_pks.is_empty() && was_explicit_single_pk {
             return Err(coded(
                 codes::ROW_NOT_FOUND_FOR_PK,
-                format!(
-                    "DELETE FROM '{}': fila no existe PK={}",
-                    meta.name, stmt.where_pk
-                ),
+                format!("DELETE FROM '{}': fila no existe", meta.name),
             ));
         }
 
-        // delete_with_cascade resolves the FK graph, applies RESTRICT
-        // by aborting before any write happens, and on CASCADE
-        // iteratively removes child rows + their secondary-index entries.
-        delete_with_cascade(self.pager, &meta.name, stmt.where_pk)?;
+        // Resolvemos las PKs ANTES de empezar a borrar — si borráramos
+        // mientras iteramos un FullScan, los efectos de las primeras
+        // cascadas podrían modificar la lista en flight (especialmente
+        // crítico con FK ON DELETE CASCADE que toca otras tablas pero
+        // también con cascadas dentro de la misma vía self-ref).
+        let mut deleted = 0usize;
+        for pk in target_pks {
+            // El cascade walker tolera filas ya borradas (cycles,
+            // multi-path), así que un borrado intermedio no es fatal.
+            // Comprobamos existencia primero para no contar borrados
+            // que ya hizo una cascade previa en este mismo lote.
+            let still_there = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.get_row(meta.root_page, pk)?.is_some()
+            };
+            if !still_there {
+                continue;
+            }
+            delete_with_cascade(self.pager, &meta.name, pk)?;
+            deleted += 1;
+        }
 
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
-            message: Some("OK".to_string()),
+            message: Some(format!(
+                "OK ({} fila{} eliminada{})",
+                deleted,
+                if deleted == 1 { "" } else { "s" },
+                if deleted == 1 { "" } else { "s" }
+            )),
         })
     }
 }
@@ -3085,20 +3186,6 @@ fn resolve_selected_columns(
         out.push((column.name.clone(), normalize_ident(&column.name)));
     }
     Ok(out)
-}
-
-fn ensure_pk_filter(meta: &TableMeta, column: &str) -> DbResult<()> {
-    if meta.primary_key.eq_ignore_ascii_case(column) {
-        return Ok(());
-    }
-    Err(coded(
-        codes::UPDATE_DELETE_REQUIRES_PK_FILTER,
-        format!(
-            "UPDATE/DELETE solo soportan WHERE sobre la PRIMARY KEY ({}); \
-             '{}' no es la PK de '{}'",
-            meta.primary_key, column, meta.name
-        ),
-    ))
 }
 
 fn window_rows<T: Clone>(rows: Vec<T>, offset: usize, limit: Option<usize>) -> Vec<T> {
@@ -4549,15 +4636,15 @@ impl Parser {
                 break;
             }
         }
+        // Bloque E3: WHERE obligatorio, gramática completa (reusa la del
+        // SELECT: WhereExpr con AND/OR/NOT/paréntesis + todos los átomos
+        // E1+E2). Si falta, expect_keyword devuelve error.
         self.expect_keyword("WHERE")?;
-        let where_column = self.expect_ident()?;
-        self.expect_symbol("=")?;
-        let where_pk = self.expect_integer()?;
+        let where_clause = self.parse_where_expr()?;
         Ok(Statement::Update(UpdateStmt {
             table,
             assignments,
-            where_column,
-            where_pk,
+            where_clause,
         }))
     }
 
@@ -4565,13 +4652,10 @@ impl Parser {
         self.expect_keyword("FROM")?;
         let table = self.expect_ident()?;
         self.expect_keyword("WHERE")?;
-        let where_column = self.expect_ident()?;
-        self.expect_symbol("=")?;
-        let where_pk = self.expect_integer()?;
+        let where_clause = self.parse_where_expr()?;
         Ok(Statement::Delete(DeleteStmt {
             table,
-            where_column,
-            where_pk,
+            where_clause,
         }))
     }
 
