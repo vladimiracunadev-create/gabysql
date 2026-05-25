@@ -3029,6 +3029,112 @@ fn join_using_and_natural_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn join_index_loop_pk_correctness() -> Result<(), Box<dyn Error>> {
+    // El index-loop debe producir EXACTAMENTE los mismos resultados que el
+    // nested-loop. Aquí el predicate es `a.b_id = b.id` con b.id = PK, así
+    // que dispara el path PK directo.
+    let db = temp_db_path("join_idx_pk");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE b (id INT PRIMARY KEY, w TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, b_id INT, v TEXT);",
+    )?;
+    for i in 1..=20i64 {
+        run_sql(
+            &db,
+            &format!("INSERT INTO b (id,w) VALUES ({},'w{}');", i, i),
+        )?;
+    }
+    for i in 1..=30i64 {
+        let b_ref = ((i - 1) % 20) + 1; // FK al rango b.id
+        run_sql(
+            &db,
+            &format!(
+                "INSERT INTO a (id,b_id,v) VALUES ({},{},'v{}');",
+                i, b_ref, i
+            ),
+        )?;
+    }
+
+    let res = run_sql(
+        &db,
+        "SELECT a.id, b.w FROM a INNER JOIN b ON a.b_id = b.id ORDER BY a.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 30);
+    // Spot-check: a.id=1 → b.id=1 → w='w1'
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::String("w1".into()));
+
+    // LEFT JOIN debe seguir igual: incluye fila con NULL si no hay match.
+    run_sql(
+        &db,
+        "INSERT INTO a (id,b_id,v) VALUES (100,9999,'huerfana');",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT a.id, b.w FROM a LEFT JOIN b ON a.b_id = b.id WHERE a.id = 100;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(100));
+    assert!(matches!(res[0].rows[0][1], Value::Null));
+
+    Ok(())
+}
+
+#[test]
+fn join_index_loop_secondary_index() -> Result<(), Box<dyn Error>> {
+    // El predicate apunta contra una columna no-PK del right que sí tiene
+    // índice. Debe usar el path Index(idx) y producir resultados correctos.
+    let db = temp_db_path("join_idx_sec");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(
+        &db,
+        "CREATE TABLE pais (id INT PRIMARY KEY, codigo TEXT, nombre TEXT);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_pais_codigo ON pais (codigo);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE ciudad (id INT PRIMARY KEY, nombre TEXT, pais_codigo TEXT);",
+    )?;
+
+    run_sql(
+        &db,
+        "INSERT INTO pais (id,codigo,nombre) VALUES (1,'AR','Argentina');
+         INSERT INTO pais (id,codigo,nombre) VALUES (2,'CL','Chile');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO ciudad (id,nombre,pais_codigo) VALUES (10,'BA','AR');
+         INSERT INTO ciudad (id,nombre,pais_codigo) VALUES (11,'SCL','CL');
+         INSERT INTO ciudad (id,nombre,pais_codigo) VALUES (12,'huerfana','XX');",
+    )?;
+
+    // INNER JOIN: predicate ciudad.pais_codigo = pais.codigo (col indexada).
+    let res = run_sql(
+        &db,
+        "SELECT ciudad.nombre, pais.nombre FROM ciudad INNER JOIN pais ON ciudad.pais_codigo = pais.codigo ORDER BY ciudad.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2); // huerfana excluida
+    assert_eq!(res[0].rows[0][0], Value::String("BA".into()));
+    assert_eq!(res[0].rows[0][1], Value::String("Argentina".into()));
+    assert_eq!(res[0].rows[1][0], Value::String("SCL".into()));
+    assert_eq!(res[0].rows[1][1], Value::String("Chile".into()));
+
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

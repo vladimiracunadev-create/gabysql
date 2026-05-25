@@ -1403,8 +1403,6 @@ impl<'a> Engine<'a> {
         // solas con NULL en las columnas del lado vacío. INNER/CROSS no
         // rellenan: las no-matched simplemente se descartan.
         for (i, join) in stmt.joins.iter().enumerate() {
-            let right = &scope.tables[i + 1];
-            let right_rows = self.scan_qualified(right)?;
             // Derivar el predicate efectivo: explícito (ON), USING o NATURAL.
             // El derive también puede marcar columnas como `hidden_in_star`
             // — necesario para SELECT * sin duplicar la columna común.
@@ -1414,6 +1412,28 @@ impl<'a> Engine<'a> {
             }
             let effective_on: Option<&JoinPredicate> =
                 derived.predicate.as_ref().or(join.on.as_ref());
+
+            // --- Index-loop fast path (bloque D del roadmap) ---
+            // Cuando el JOIN es INNER o LEFT y el predicate apunta contra
+            // la PK o una columna indexada del right, evitamos materializar
+            // todo el right table: por cada left_row hacemos un lookup
+            // dirigido. Complejidad: O(N1 × log N2) vs O(N1 × N2).
+            //
+            // RIGHT/FULL no se optimizan porque necesitarían además saber
+            // qué filas del right NO matchearon — eso requiere un scan
+            // paralelo y no aporta vs el nested-loop actual.
+            if matches!(join.kind, JoinKind::Inner | JoinKind::Left) {
+                if let Some(pred) = effective_on {
+                    if let Some(plan) = plan_index_loop(&scope, i, pred)? {
+                        current = self.run_index_loop_join(current, i, join.kind, &plan, &scope)?;
+                        continue;
+                    }
+                }
+            }
+
+            // --- Fallback: nested-loop puro ---
+            let right = &scope.tables[i + 1];
+            let right_rows = self.scan_qualified(right)?;
             let mut next: Vec<HashMap<String, Value>> =
                 Vec::with_capacity(current.len() * right_rows.len() / 2 + 1);
             let mut left_matched = vec![false; current.len()];
@@ -1535,6 +1555,122 @@ impl<'a> Engine<'a> {
 
     /// FullScan de una tabla devolviendo HashMaps con claves `alias.col`
     /// (lower-case). Se usa como entrada al nested-loop join.
+    /// Ejecuta el JOIN con index-loop: por cada fila del current (lado
+    /// "left"), saca el valor del predicate y hace lookup directo en el
+    /// right (vía PK o índice secundario). Mucho más barato que materializar
+    /// el right entero cuando el right es grande.
+    fn run_index_loop_join(
+        &mut self,
+        current: Vec<HashMap<String, Value>>,
+        join_idx: usize,
+        kind: JoinKind,
+        plan: &IndexLoopPlan,
+        scope: &JoinScope,
+    ) -> DbResult<Vec<HashMap<String, Value>>> {
+        let right = &scope.tables[join_idx + 1];
+        let needs_left_fill = matches!(kind, JoinKind::Left);
+        let right_null_keys: Vec<String> = if needs_left_fill {
+            right
+                .meta
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", right.qualifier, normalize_ident(&c.name)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut next: Vec<HashMap<String, Value>> = Vec::with_capacity(current.len());
+        for left_row in current.iter() {
+            let left_value = match left_row.get(&plan.left_key).cloned() {
+                Some(v) => v,
+                None => Value::Null,
+            };
+            // NULL del left nunca matchea (semántica SQL standard).
+            if matches!(left_value, Value::Null) {
+                if needs_left_fill {
+                    let mut filled = left_row.clone();
+                    for k in &right_null_keys {
+                        filled.insert(k.clone(), Value::Null);
+                    }
+                    next.push(filled);
+                }
+                continue;
+            }
+            let matched = self.lookup_right_rows(right, plan, &left_value)?;
+            if matched.is_empty() {
+                if needs_left_fill {
+                    let mut filled = left_row.clone();
+                    for k in &right_null_keys {
+                        filled.insert(k.clone(), Value::Null);
+                    }
+                    next.push(filled);
+                }
+                continue;
+            }
+            for right_row in matched {
+                let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
+                for (k, v) in left_row {
+                    merged.insert(k.clone(), v.clone());
+                }
+                for (k, v) in right_row {
+                    merged.insert(k.clone(), v);
+                }
+                next.push(merged);
+            }
+        }
+        Ok(next)
+    }
+
+    /// Hace el lookup en el right según el plan: PK directa
+    /// (`Catalog::get_row`) o columna indexada (`lookup_pks_via_index`
+    /// + fetch). Devuelve las filas matched ya como HashMap qualified.
+    fn lookup_right_rows(
+        &mut self,
+        right: &JoinTable,
+        plan: &IndexLoopPlan,
+        left_value: &Value,
+    ) -> DbResult<Vec<HashMap<String, Value>>> {
+        match &plan.right_strategy {
+            RightLookup::Pk => {
+                let pk = match left_value {
+                    Value::Integer(n) => *n,
+                    _ => return Ok(Vec::new()),
+                };
+                let row_bytes = {
+                    let mut catalog = Catalog::open(self.pager);
+                    catalog.get_row(right.meta.root_page, pk)?
+                };
+                match row_bytes {
+                    None => Ok(Vec::new()),
+                    Some(bytes) => {
+                        let decoded = decode_row(&right.meta, &bytes)?;
+                        let mut qualified = HashMap::with_capacity(decoded.len());
+                        for (col, val) in decoded {
+                            qualified.insert(format!("{}.{}", right.qualifier, col), val);
+                        }
+                        Ok(vec![qualified])
+                    }
+                }
+            }
+            RightLookup::Index(idx) => {
+                let pks = lookup_pks_via_index(self.pager, &right.meta, idx, left_value)?;
+                let mut out = Vec::with_capacity(pks.len());
+                let mut catalog = Catalog::open(self.pager);
+                for pk in pks {
+                    if let Some(bytes) = catalog.get_row(right.meta.root_page, pk)? {
+                        let decoded = decode_row(&right.meta, &bytes)?;
+                        let mut qualified = HashMap::with_capacity(decoded.len());
+                        for (col, val) in decoded {
+                            qualified.insert(format!("{}.{}", right.qualifier, col), val);
+                        }
+                        out.push(qualified);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     fn scan_qualified(&mut self, entry: &JoinTable) -> DbResult<Vec<HashMap<String, Value>>> {
         let raw = {
             let mut catalog = Catalog::open(self.pager);
@@ -3023,6 +3159,100 @@ struct JoinTable {
     /// solo si la tabla NO tiene alias declarado (regla SQL standard).
     raw_name: String,
     alias: Option<String>,
+}
+
+/// Plan de ejecución index-loop para un JOIN específico. Solo se construye
+/// cuando el predicate efectivo apunta a la PK o a una columna indexada
+/// del right (es decir, podemos hacer lookup dirigido en vez de scan).
+struct IndexLoopPlan {
+    /// Clave canónica `qualifier.col` en la fila joineada actual (left)
+    /// de donde sale el valor para hacer el lookup.
+    left_key: String,
+    /// Cómo buscar en el right: por PK directa o por índice secundario.
+    right_strategy: RightLookup,
+}
+
+enum RightLookup {
+    Pk,
+    Index(IndexMeta),
+}
+
+/// Decide si el predicate puede ejecutarse como index-loop sobre el right.
+/// Devuelve `Some(plan)` cuando una de las dos columnas del predicate
+/// apunta a la PK o a una columna indexada del right (y la otra reside en
+/// alguna tabla previa del scope). Devuelve `None` si no califica — el
+/// caller cae al nested-loop.
+fn plan_index_loop(
+    scope: &JoinScope,
+    join_idx: usize,
+    pred: &JoinPredicate,
+) -> DbResult<Option<IndexLoopPlan>> {
+    let right = &scope.tables[join_idx + 1];
+    let left_candidate = column_ref_to_raw(&pred.left);
+    let right_candidate = column_ref_to_raw(&pred.right);
+    // Tratamos las dos orientaciones del predicate: `left.col = right.col`
+    // y `right.col = left.col`. Para que califique, una de las columnas
+    // debe vivir en el right table y la otra en alguna tabla previa.
+    for (right_side, left_side) in [
+        (&right_candidate, &left_candidate),
+        (&left_candidate, &right_candidate),
+    ] {
+        let (right_qual, right_col) = split_qualified_ident(right_side);
+        let right_normalized = normalize_ident(&right_col);
+        let right_qualifies = right_qual
+            .as_deref()
+            .map(|q| {
+                q.eq_ignore_ascii_case(&right.qualifier)
+                    || (right.alias.is_none() && q.eq_ignore_ascii_case(&right.raw_name))
+            })
+            .unwrap_or(false);
+        if !right_qualifies {
+            continue;
+        }
+        if right.meta.column(&right_normalized).is_none() {
+            continue;
+        }
+        // El "left" del predicate debe poder resolverse en cualquier
+        // tabla previa al join_idx (osea no en el right). Reusamos
+        // resolve_joined_column_key sobre un sub-scope sin el right.
+        let sub_scope = JoinScope {
+            tables: scope
+                .tables
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i <= join_idx)
+                .map(|(_, t)| JoinTable {
+                    meta: t.meta.clone(),
+                    qualifier: t.qualifier.clone(),
+                    raw_name: t.raw_name.clone(),
+                    alias: t.alias.clone(),
+                })
+                .collect(),
+            hidden_in_star: HashSet::new(),
+        };
+        let left_key = match resolve_joined_column_key(&sub_scope, left_side) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        // Strategy: PK directa si el target es la PK del right; índice
+        // secundario si existe; ninguna si la columna no es indexable.
+        let strategy = if right
+            .meta
+            .primary_key
+            .eq_ignore_ascii_case(&right_normalized)
+        {
+            RightLookup::Pk
+        } else if let Some(idx) = right.meta.index_for_column(&right_normalized).cloned() {
+            RightLookup::Index(idx)
+        } else {
+            continue;
+        };
+        return Ok(Some(IndexLoopPlan {
+            left_key,
+            right_strategy: strategy,
+        }));
+    }
+    Ok(None)
 }
 
 /// Resultado de derivar el predicate efectivo de un JOIN. `predicate` es

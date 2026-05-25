@@ -236,7 +236,7 @@ El repositorio ya fue validado con:
 - `UPDATE` y `DELETE` solo aceptan filtro `WHERE <pk> = N` (no por columna no-PK ni por rango); `UPDATE` no muta la PK.
 - Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` ya está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` (índice `OrderedInt`, ADR-0017). Índices compuestos y range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados quedan para Fase 2.
 - `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
-- `ORDER BY` ya está soportado. **`JOIN`**: `INNER`, `CROSS`, comma-syntax, aliases, multi-tabla (bloque A); `LEFT/RIGHT/FULL [OUTER]` con NULL-fill (bloque B); `USING (col)` y `NATURAL JOIN` con dedup en `SELECT *` (bloque C). Index-loop optimization queda en bloque D; `GROUP BY` en Fase 3.
+- `ORDER BY` ya está soportado. **`JOIN`** (4 bloques cerrados): A) `INNER`, `CROSS`, comma-syntax, aliases, multi-tabla; B) `LEFT/RIGHT/FULL [OUTER]` con NULL-fill; C) `USING (col)` y `NATURAL JOIN` con dedup en `SELECT *`; D) index-loop optimization (transparente, INNER/LEFT con PK/índice). `GROUP BY` queda en Fase 3.
 - Subqueries: `WHERE col IN (SELECT ...)`, `WHERE col = (SELECT ...)` y `WHERE [NOT] EXISTS (SELECT ...)`. `IN` y `=` solo no-correlacionados; `EXISTS` soporta correlacionado single-eq (`inner_col = outer.col`). Derived tables (`FROM (SELECT ...) t`), correlacionadas con múltiples predicados y CTE/window functions quedan en backlog.
 - Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).
 - La PK debe ser una sola columna `INT`. `ALTER TABLE ADD COLUMN` no admite agregar PK.
