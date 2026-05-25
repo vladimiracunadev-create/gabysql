@@ -163,6 +163,12 @@ pub mod codes {
     /// `CROSS JOIN ... ON ...` — la cartesian product no admite predicado;
     /// usar `INNER JOIN` en su lugar.
     pub const CROSS_JOIN_WITH_ON: u32 = 4021;
+    /// `JOIN ... USING (col)` donde `col` no existe en ambas tablas, o el
+    /// USING soporta más columnas de las que este release acepta.
+    pub const USING_COLUMN_INVALID: u32 = 4022;
+    /// `NATURAL JOIN` cuyas tablas no comparten exactamente una columna por
+    /// nombre. 0 columnas en común o >1 → error explícito en este release.
+    pub const NATURAL_JOIN_NO_COMMON_COLUMN: u32 = 4023;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -162,6 +162,13 @@ pub struct JoinClause {
     /// a CROSS). `INNER JOIN ... ON` siempre lleva predicado: si falta el
     /// parser devuelve `[GBY-4020]`.
     pub on: Option<JoinPredicate>,
+    /// `JOIN ... USING (col)` — el engine deriva `ON l.col = r.col`. En
+    /// este release soporta exactamente UNA columna en la lista.
+    pub using: Option<Vec<String>>,
+    /// `NATURAL JOIN` — el engine deriva un USING usando la columna con
+    /// el mismo nombre presente en ambos lados (exactamente una en este
+    /// release; 0 o >1 → `[GBY-4023]`).
+    pub natural: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1383,7 +1390,7 @@ impl<'a> Engine<'a> {
     /// FullScan del right por un index lookup.
     fn exec_select_joined(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
         // --- 1. Construir el scope (lista de tablas con sus aliases) ---
-        let scope = self.build_join_scope(&stmt)?;
+        let mut scope = self.build_join_scope(&stmt)?;
 
         // --- 2. Materializar la base table como joined-rows ---
         let base = &scope.tables[0];
@@ -1398,13 +1405,22 @@ impl<'a> Engine<'a> {
         for (i, join) in stmt.joins.iter().enumerate() {
             let right = &scope.tables[i + 1];
             let right_rows = self.scan_qualified(right)?;
+            // Derivar el predicate efectivo: explícito (ON), USING o NATURAL.
+            // El derive también puede marcar columnas como `hidden_in_star`
+            // — necesario para SELECT * sin duplicar la columna común.
+            let derived = derive_join_predicate(&scope, i, join)?;
+            for hidden in &derived.hidden_keys {
+                scope.hidden_in_star.insert(hidden.clone());
+            }
+            let effective_on: Option<&JoinPredicate> =
+                derived.predicate.as_ref().or(join.on.as_ref());
             let mut next: Vec<HashMap<String, Value>> =
                 Vec::with_capacity(current.len() * right_rows.len() / 2 + 1);
             let mut left_matched = vec![false; current.len()];
             let mut right_matched = vec![false; right_rows.len()];
             for (li, left_row) in current.iter().enumerate() {
                 for (ri, right_row) in right_rows.iter().enumerate() {
-                    let pass = match &join.on {
+                    let pass = match effective_on {
                         None => true, // CROSS JOIN o comma-syntax
                         Some(pred) => evaluate_join_predicate(left_row, right_row, pred, &scope)?,
                     };
@@ -1588,7 +1604,10 @@ impl<'a> Engine<'a> {
                 alias: join.right.alias.clone(),
             });
         }
-        Ok(JoinScope { tables })
+        Ok(JoinScope {
+            tables,
+            hidden_in_star: HashSet::new(),
+        })
     }
 
     /// Aplica un `WHERE` sobre el conjunto de filas joineadas. Las formas
@@ -2988,6 +3007,11 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
 /// resolución de columnas, el WHERE post-filter y el ORDER BY.
 struct JoinScope {
     tables: Vec<JoinTable>,
+    /// Claves `qualifier.col` que NO deben aparecer en `SELECT *` porque
+    /// fueron "fusionadas" via USING/NATURAL — la columna del lado
+    /// izquierdo ya cubre la del derecho (semántica ANSI: la columna
+    /// común aparece una sola vez).
+    hidden_in_star: HashSet<String>,
 }
 
 struct JoinTable {
@@ -3001,6 +3025,116 @@ struct JoinTable {
     alias: Option<String>,
 }
 
+/// Resultado de derivar el predicate efectivo de un JOIN. `predicate` es
+/// `Some` cuando proviene de USING/NATURAL (el ON explícito se evalúa por
+/// el path normal). `hidden_keys` son las claves canónicas del lado right
+/// que `SELECT *` debe omitir para no duplicar la columna fusionada.
+struct DerivedJoin {
+    predicate: Option<JoinPredicate>,
+    hidden_keys: Vec<String>,
+}
+
+fn derive_join_predicate(
+    scope: &JoinScope,
+    join_idx: usize,
+    join: &JoinClause,
+) -> DbResult<DerivedJoin> {
+    let right = &scope.tables[join_idx + 1];
+    if join.natural {
+        // Buscar columnas comunes entre el right y cualquier tabla previa
+        // (en chains multi-tabla `a NATURAL JOIN b NATURAL JOIN c`, la
+        // columna común puede estar en `a` o en `b` para el segundo NATURAL).
+        let right_cols: Vec<&str> = right.meta.columns.iter().map(|c| c.name.as_str()).collect();
+        let mut commons: Vec<(String, String)> = Vec::new(); // (left_qualifier, col_name)
+        for prev in &scope.tables[..=join_idx] {
+            for prev_col in &prev.meta.columns {
+                let matches_right = right_cols
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(&prev_col.name));
+                let already_picked = commons
+                    .iter()
+                    .any(|(_, c)| c.eq_ignore_ascii_case(&prev_col.name));
+                if matches_right && !already_picked {
+                    commons.push((prev.qualifier.clone(), prev_col.name.clone()));
+                }
+            }
+        }
+        if commons.len() != 1 {
+            return Err(coded(
+                codes::NATURAL_JOIN_NO_COMMON_COLUMN,
+                format!(
+                    "NATURAL JOIN sobre '{}' espera exactamente 1 columna común; \
+                     se detectaron {} (este release soporta single-column NATURAL)",
+                    right.raw_name,
+                    commons.len()
+                ),
+            ));
+        }
+        let (left_qual, col) = &commons[0];
+        let pred = JoinPredicate {
+            left: ColumnRef {
+                qualifier: Some(left_qual.clone()),
+                name: col.clone(),
+            },
+            right: ColumnRef {
+                qualifier: Some(right.qualifier.clone()),
+                name: col.clone(),
+            },
+        };
+        let hidden = vec![format!("{}.{}", right.qualifier, normalize_ident(col))];
+        return Ok(DerivedJoin {
+            predicate: Some(pred),
+            hidden_keys: hidden,
+        });
+    }
+    if let Some(using_cols) = &join.using {
+        if using_cols.len() != 1 {
+            return Err(coded(
+                codes::USING_COLUMN_INVALID,
+                format!(
+                    "USING con {} columnas; este release acepta exactamente 1 columna en USING",
+                    using_cols.len()
+                ),
+            ));
+        }
+        let col = &using_cols[0];
+        let normalized = normalize_ident(col);
+        let right_has = right.meta.column(&normalized).is_some();
+        let left_match = scope.tables[..=join_idx]
+            .iter()
+            .find(|t| t.meta.column(&normalized).is_some());
+        if !right_has || left_match.is_none() {
+            return Err(coded(
+                codes::USING_COLUMN_INVALID,
+                format!(
+                    "USING ({}) requiere que '{}' exista en ambos lados del JOIN",
+                    col, col
+                ),
+            ));
+        }
+        let left_qual = left_match.unwrap().qualifier.clone();
+        let pred = JoinPredicate {
+            left: ColumnRef {
+                qualifier: Some(left_qual),
+                name: col.clone(),
+            },
+            right: ColumnRef {
+                qualifier: Some(right.qualifier.clone()),
+                name: col.clone(),
+            },
+        };
+        let hidden = vec![format!("{}.{}", right.qualifier, normalized)];
+        return Ok(DerivedJoin {
+            predicate: Some(pred),
+            hidden_keys: hidden,
+        });
+    }
+    Ok(DerivedJoin {
+        predicate: None,
+        hidden_keys: Vec::new(),
+    })
+}
+
 /// Convierte una columna del SELECT (`*`, `col` o `tabla.col`) en el par
 /// `(output_label, lookup_key)` que necesitamos para proyectar. `*` se
 /// expande a TODAS las columnas de TODAS las tablas, en orden.
@@ -3012,11 +3146,16 @@ fn resolve_joined_projection(
     let mut keys = Vec::new();
     if requested.is_empty() {
         // `SELECT *` → todas las columnas de todas las tablas, prefijadas
-        // por qualifier (así dos columnas con mismo nombre no chocan).
+        // por qualifier. Omite las que quedaron "hidden" por USING/NATURAL
+        // (ANSI: la columna común aparece una sola vez).
         for t in &scope.tables {
             for col in &t.meta.columns {
+                let key = format!("{}.{}", t.qualifier, normalize_ident(&col.name));
+                if scope.hidden_in_star.contains(&key) {
+                    continue;
+                }
                 output.push(format!("{}.{}", t.qualifier, col.name));
-                keys.push(format!("{}.{}", t.qualifier, normalize_ident(&col.name)));
+                keys.push(key);
             }
         }
         return Ok((output, keys));
@@ -3171,6 +3310,8 @@ fn is_post_table_keyword(text: &str) -> bool {
             | "LEFT"
             | "RIGHT"
             | "FULL"
+            | "NATURAL"
+            | "OUTER"
             | "ON"
             | "USING"
             | "GROUP"
@@ -3655,16 +3796,17 @@ impl Parser {
         //   - `[INNER] JOIN b ON l = r` → INNER JOIN equi-predicado
         let mut joins: Vec<JoinClause> = Vec::new();
         loop {
-            let (kind, parsed) = if self.match_symbol(",") {
+            // `NATURAL` puede preceder a INNER/LEFT/RIGHT/FULL/JOIN (no a CROSS).
+            let natural = self.match_keyword("NATURAL");
+            let (kind, parsed) = if !natural && self.match_symbol(",") {
                 (JoinKind::Cross, true)
-            } else if self.match_keyword("CROSS") {
+            } else if !natural && self.match_keyword("CROSS") {
                 self.expect_keyword("JOIN")?;
                 (JoinKind::Cross, true)
             } else if self.match_keyword("INNER") {
                 self.expect_keyword("JOIN")?;
                 (JoinKind::Inner, true)
             } else if self.match_keyword("LEFT") {
-                // `LEFT [OUTER] JOIN` — el OUTER es opcional (estándar SQL).
                 let _ = self.match_keyword("OUTER");
                 self.expect_keyword("JOIN")?;
                 (JoinKind::Left, true)
@@ -3677,9 +3819,14 @@ impl Parser {
                 self.expect_keyword("JOIN")?;
                 (JoinKind::Full, true)
             } else if self.match_keyword("JOIN") {
-                // `JOIN` solo equivale a `INNER JOIN` (ANSI).
                 (JoinKind::Inner, true)
             } else {
+                if natural {
+                    return Err(coded(
+                        codes::JOIN_PREDICATE_REQUIRED,
+                        "NATURAL debe ir seguido por JOIN (o LEFT/RIGHT/FULL/INNER JOIN)",
+                    ));
+                }
                 (JoinKind::Inner, false)
             };
             if !parsed {
@@ -3691,29 +3838,64 @@ impl Parser {
                 name: right_name,
                 alias: right_alias,
             };
-            let on = if self.match_keyword("ON") {
+            // Resolución de la cláusula del JOIN — pueden venir ON, USING
+            // o nada (CROSS o NATURAL). Mutuamente excluyentes.
+            let mut on: Option<JoinPredicate> = None;
+            let mut using: Option<Vec<String>> = None;
+            if self.match_keyword("ON") {
                 if matches!(kind, JoinKind::Cross) {
                     return Err(coded(
                         codes::CROSS_JOIN_WITH_ON,
                         "CROSS JOIN no admite ON; usá INNER JOIN si necesitás predicado",
                     ));
                 }
-                Some(self.parse_join_predicate()?)
+                if natural {
+                    return Err(coded(
+                        codes::CROSS_JOIN_WITH_ON,
+                        "NATURAL JOIN ya implica el predicado — no se puede combinar con ON",
+                    ));
+                }
+                on = Some(self.parse_join_predicate()?);
+            } else if self.match_keyword("USING") {
+                if matches!(kind, JoinKind::Cross) {
+                    return Err(coded(
+                        codes::CROSS_JOIN_WITH_ON,
+                        "CROSS JOIN no admite USING; usá INNER JOIN si necesitás predicado",
+                    ));
+                }
+                if natural {
+                    return Err(coded(
+                        codes::CROSS_JOIN_WITH_ON,
+                        "NATURAL JOIN ya implica el predicado — no se puede combinar con USING",
+                    ));
+                }
+                self.expect_symbol("(")?;
+                let mut cols = vec![self.expect_ident()?];
+                while self.match_symbol(",") {
+                    cols.push(self.expect_ident()?);
+                }
+                self.expect_symbol(")")?;
+                using = Some(cols);
             } else {
-                // INNER, LEFT, RIGHT y FULL exigen ON; solo CROSS lo omite.
-                if !matches!(kind, JoinKind::Cross) {
+                // Sin ON ni USING: válido solo si CROSS o NATURAL.
+                if !matches!(kind, JoinKind::Cross) && !natural {
                     return Err(coded(
                         codes::JOIN_PREDICATE_REQUIRED,
                         format!(
-                            "JOIN sobre '{}' requiere cláusula ON l = r \
+                            "JOIN sobre '{}' requiere cláusula ON l = r, USING (col) o NATURAL \
                              (CROSS JOIN es la única forma sin predicado)",
                             right.name
                         ),
                     ));
                 }
-                None
-            };
-            joins.push(JoinClause { kind, right, on });
+            }
+            joins.push(JoinClause {
+                kind,
+                right,
+                on,
+                using,
+                natural,
+            });
         }
 
         let mut where_clause = None;

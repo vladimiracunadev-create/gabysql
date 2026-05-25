@@ -2863,6 +2863,172 @@ fn join_left_anti_join_via_where_null() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn join_using_basic() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_using");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    // Ambas tablas tienen una columna `pais_id` — USING (pais_id) genera
+    // automáticamente `ON a.pais_id = b.pais_id`.
+    run_sql(
+        &db,
+        "CREATE TABLE ciudad (id INT PRIMARY KEY, nombre TEXT, pais_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE pais (id INT PRIMARY KEY, pais_id INT, nombre_pais TEXT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO ciudad (id,nombre,pais_id) VALUES (1,'BA',10);
+         INSERT INTO ciudad (id,nombre,pais_id) VALUES (2,'SCL',20);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO pais (id,pais_id,nombre_pais) VALUES (100,10,'Argentina');
+         INSERT INTO pais (id,pais_id,nombre_pais) VALUES (101,20,'Chile');",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT ciudad.nombre, pais.nombre_pais FROM ciudad JOIN pais USING (pais_id) ORDER BY ciudad.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    let names: Vec<(String, String)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::String(a), Value::String(b)) => (a.clone(), b.clone()),
+            _ => panic!("expected pair"),
+        })
+        .collect();
+    assert_eq!(names[0], ("BA".into(), "Argentina".into()));
+    assert_eq!(names[1], ("SCL".into(), "Chile".into()));
+
+    Ok(())
+}
+
+#[test]
+fn join_using_star_dedup() -> Result<(), Box<dyn Error>> {
+    // SELECT * con USING omite la columna del lado derecho (ANSI).
+    let db = temp_db_path("join_using_star");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, k INT, v TEXT);")?;
+    run_sql(&db, "CREATE TABLE b (id INT PRIMARY KEY, k INT, w TEXT);")?;
+    run_sql(&db, "INSERT INTO a (id,k,v) VALUES (1,10,'va');")?;
+    run_sql(&db, "INSERT INTO b (id,k,w) VALUES (1,10,'wb');")?;
+
+    let res = run_sql(&db, "SELECT * FROM a JOIN b USING (k);")?;
+    // Columnas esperadas: a.id, a.k, a.v, b.id, b.w  (NO b.k porque fue dedup)
+    let cols = &res[0].columns;
+    assert!(cols.iter().any(|c| c.ends_with("a.id")));
+    assert!(cols.iter().any(|c| c.ends_with("a.k")));
+    assert!(cols.iter().any(|c| c.ends_with("a.v")));
+    assert!(cols.iter().any(|c| c.ends_with("b.id")));
+    assert!(cols.iter().any(|c| c.ends_with("b.w")));
+    assert!(
+        !cols.iter().any(|c| c.eq_ignore_ascii_case("b.k")),
+        "b.k debería estar dedup en USING: cols={:?}",
+        cols
+    );
+
+    Ok(())
+}
+
+#[test]
+fn join_natural_basic() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_natural");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    // Solo `pais_id` es común entre ciudad y pais → NATURAL JOIN matchea por esa.
+    run_sql(
+        &db,
+        "CREATE TABLE ciudad (id INT PRIMARY KEY, nombre TEXT, pais_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE pais (pais_id INT PRIMARY KEY, nombre_pais TEXT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO ciudad (id,nombre,pais_id) VALUES (1,'BA',10);
+         INSERT INTO ciudad (id,nombre,pais_id) VALUES (2,'SCL',20);
+         INSERT INTO ciudad (id,nombre,pais_id) VALUES (3,'huerfana',99);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO pais (pais_id,nombre_pais) VALUES (10,'AR'); INSERT INTO pais (pais_id,nombre_pais) VALUES (20,'CL');",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT ciudad.nombre, pais.nombre_pais FROM ciudad NATURAL JOIN pais ORDER BY ciudad.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2, "huerfana NO debería aparecer");
+    let pairs: Vec<(String, String)> = res[0]
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::String(a), Value::String(b)) => (a.clone(), b.clone()),
+            _ => panic!("expected pair"),
+        })
+        .collect();
+    assert_eq!(pairs[0], ("BA".into(), "AR".into()));
+    assert_eq!(pairs[1], ("SCL".into(), "CL".into()));
+
+    Ok(())
+}
+
+#[test]
+fn join_using_and_natural_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("join_using_err");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE a (id INT PRIMARY KEY, x INT);")?;
+    run_sql(&db, "CREATE TABLE b (id INT PRIMARY KEY, y INT);")?;
+    run_sql(&db, "INSERT INTO a (id,x) VALUES (1,10);")?;
+    run_sql(&db, "INSERT INTO b (id,y) VALUES (1,20);")?;
+
+    // USING (col) cuando col no existe en ambas → [GBY-4022]
+    let err = run_sql(&db, "SELECT a.id FROM a JOIN b USING (zzz);")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4022"), "got: {}", err);
+
+    // NATURAL JOIN con 0 columnas comunes (id está pero también en ambas,
+    // así que sí hay una común). Hagamos 2 comunes: tablas con id e id2.
+    run_sql(&db, "CREATE TABLE c (id INT PRIMARY KEY, x INT);")?;
+    run_sql(&db, "CREATE TABLE d (id INT PRIMARY KEY, x INT);")?;
+    run_sql(&db, "INSERT INTO c (id,x) VALUES (1,10);")?;
+    run_sql(&db, "INSERT INTO d (id,x) VALUES (1,10);")?;
+    // c y d comparten 2 columnas (id, x) → este release solo soporta 1 → [GBY-4023]
+    let err = run_sql(&db, "SELECT c.id FROM c NATURAL JOIN d;")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("GBY-4023"), "got: {}", err);
+
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

@@ -28,7 +28,8 @@
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
-| `USING (col)`, `NATURAL JOIN`, index-loop join optimization | DML | 🟡 (en bloques C/D del roadmap de JOINs) |
+| `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
+| Index-loop join optimization | DML | 🟡 (bloque D del roadmap de JOINs) |
 | `ALTER TABLE DROP/RENAME COLUMN`, `GROUP BY`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
@@ -534,6 +535,8 @@ join_clause ::= ( "," | "CROSS" "JOIN" ) table_ref
               | ( "LEFT"  ["OUTER"] "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
               | ( "RIGHT" ["OUTER"] "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
               | ( "FULL"  ["OUTER"] "JOIN" ) table_ref "ON" qualified_ident "=" qualified_ident
+              | ( "INNER" | "LEFT" ["OUTER"] | "RIGHT" ["OUTER"] | "FULL" ["OUTER"] | ε ) "JOIN" table_ref "USING" "(" identifier ")"
+              | "NATURAL" ( "INNER" | "LEFT" ["OUTER"] | "RIGHT" ["OUTER"] | "FULL" ["OUTER"] | ε ) "JOIN" table_ref
 ```
 
 **Reglas:**
@@ -543,6 +546,8 @@ join_clause ::= ( "," | "CROSS" "JOIN" ) table_ref
 - `RIGHT [OUTER] JOIN`: simétrico — preserva todas las del derecho, NULL-fill en el izquierdo.
 - `FULL [OUTER] JOIN`: combina ambos comportamientos (toda fila de cualquier lado aparece, con NULL en el otro lado si no hay match).
 - El `OUTER` es opcional (estándar SQL): `LEFT JOIN` y `LEFT OUTER JOIN` son sinónimos.
+- `JOIN ... USING (col)` es sugar para `JOIN ... ON l.col = r.col`. La columna `col` aparece **una sola vez** en `SELECT *` (ANSI). En este release soporta exactamente UNA columna en la lista (multi-col en backlog).
+- `NATURAL JOIN` deriva automáticamente un `USING` con la columna que ambas tablas comparten por nombre. Si las tablas comparten 0 o >1 columnas comunes en este release → `[GBY-4023]`.
 - Las tablas se pueden aliasar con `[AS] alias`. El alias **oculta** el nombre real (estándar SQL): si declarás `FROM alumnos a`, después tenés que usar `a.nombre`, no `alumnos.nombre`.
 - En SELECT/WHERE/ORDER BY, una columna que existe en >1 tabla **debe** ir cualificada (`tabla.col`); si no, `[GBY-4018]`.
 - `SELECT *` en JOIN expande a TODAS las columnas de TODAS las tablas, cada una prefijada con su qualifier para evitar colisiones.
@@ -643,6 +648,14 @@ SELECT a.v, b.w FROM a
 -- FULL OUTER JOIN: combina LEFT + RIGHT en un solo paso
 SELECT a.v, b.w FROM a
   FULL OUTER JOIN b ON a.id = b.a_id;
+
+-- USING (col) — sugar para ON l.col = r.col; SELECT * dedup la columna
+SELECT ciudad.nombre, pais.nombre_pais
+  FROM ciudad JOIN pais USING (pais_id);
+
+-- NATURAL JOIN — auto-detecta la columna común por nombre
+SELECT ciudad.nombre, pais.nombre_pais
+  FROM ciudad NATURAL JOIN pais;
 ```
 
 ### ❌ Errores típicos

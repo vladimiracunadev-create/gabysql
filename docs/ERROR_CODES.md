@@ -112,6 +112,8 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4019` | `COLUMN_QUALIFIER_NOT_FOUND` | `tabla.col` donde `tabla` no es nombre ni alias del FROM, o `col` no existe en ninguna tabla. | Verificar el nombre y los alias declarados. |
 | `4020` | `JOIN_PREDICATE_REQUIRED` | `INNER JOIN ...` sin `ON l = r`. | Agregar `ON tabla1.col = tabla2.col` (o usar `CROSS JOIN` si querés cartesiano). |
 | `4021` | `CROSS_JOIN_WITH_ON` | `CROSS JOIN ... ON ...` — el cartesian product no admite predicado. | Cambiar a `INNER JOIN ... ON ...`. |
+| `4022` | `USING_COLUMN_INVALID` | `JOIN ... USING (col)` con col que no existe en ambas tablas, o USING con cantidad de columnas no soportada (este release: exactamente 1). | Verificar que `col` exista en ambos lados; reescribir con `ON` para multi-columna. |
+| `4023` | `NATURAL_JOIN_NO_COMMON_COLUMN` | `NATURAL JOIN` cuyas tablas no comparten exactamente 1 columna por nombre (0 o >1). | Usar `JOIN ... ON` o `USING` explícito. |
 
 ---
 
