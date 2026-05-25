@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | default: site.title }} · {{ site.title }}</title>
+  <meta name="description" content="{{ page.description | default: site.description }}">
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+  <link rel="icon" type="image/svg+xml" href="{{ '/assets/favicon.svg' | relative_url }}">
+  <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fafaf7" media="(prefers-color-scheme: light)">
+</head>
+<body class="doc">
+  <header class="site-header">
+    <div class="container nav">
+      <a class="brand" href="{{ '/' | relative_url }}">
+        <span class="brand-mark">▣</span> gabysql
+      </a>
+      <nav class="primary-nav">
+        <a href="{{ '/SQL_REFERENCE.html' | relative_url }}">SQL</a>
+        <a href="{{ '/ERROR_CODES.html' | relative_url }}">Errors</a>
+        <a href="{{ '/MISSING_COMMANDS.html' | relative_url }}">Roadmap</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/releases/latest">Download</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql" class="ghub">GitHub →</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container doc-main">
+    {{ content }}
+  </main>
+
+  <footer class="site-footer">
+    <div class="container foot-grid">
+      <div>
+        <strong>gabysql</strong> · base de datos relacional embebida en Rust.<br>
+        Single-file. SQL clásico completo. Zero-deps en el core.
+      </div>
+      <div class="foot-links">
+        <a href="https://github.com/vladimiracunadev-create/gabysql">Repo</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/releases">Releases</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/issues">Issues</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/blob/main/LICENSE">MIT</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

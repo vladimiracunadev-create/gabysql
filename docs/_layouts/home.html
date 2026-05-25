@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ site.title }} · {{ site.description }}</title>
+  <meta name="description" content="{{ site.description }}">
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+  <link rel="icon" type="image/svg+xml" href="{{ '/assets/favicon.svg' | relative_url }}">
+  <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fafaf7" media="(prefers-color-scheme: light)">
+
+  <!-- OpenGraph / social -->
+  <meta property="og:title" content="gabysql · base de datos embebida en Rust">
+  <meta property="og:description" content="Archivo único portable, SQL clásico completo (DDL+DML+TCL), zero-deps en el core.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://vladimiracunadev-create.github.io/gabysql/">
+</head>
+<body class="home">
+  <header class="site-header">
+    <div class="container nav">
+      <a class="brand" href="{{ '/' | relative_url }}">
+        <span class="brand-mark">▣</span> gabysql
+      </a>
+      <nav class="primary-nav">
+        <a href="{{ '/SQL_REFERENCE.html' | relative_url }}">SQL</a>
+        <a href="{{ '/ERROR_CODES.html' | relative_url }}">Errors</a>
+        <a href="{{ '/MISSING_COMMANDS.html' | relative_url }}">Roadmap</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/releases/latest">Download</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql" class="ghub">GitHub →</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="container hero-grid">
+      <div class="hero-copy">
+        <div class="eyebrow">
+          <span class="dot"></span> v0.1.0 · Fase 2 cerrada · 2026-05-25
+        </div>
+        <h1>Una base de datos relacional<br><span class="grad">en un solo archivo</span>.</h1>
+        <p class="lede">
+          Motor SQL clásico escrito desde cero en Rust. WAL + B+Tree real + CRC32 por página.
+          Single-file portable (<code>.db</code> + <code>.wal</code>). Sin C en el core,
+          sin servidor obligatorio, sin dependencias runtime.
+        </p>
+
+        <div class="install-block">
+          <div class="install-tabs">
+            <span class="install-tab active">Windows</span>
+            <span class="install-tab muted">Linux / macOS · <a href="https://github.com/vladimiracunadev-create/gabysql/releases/latest">descargar tar.gz</a></span>
+          </div>
+          <pre class="install-code"><code>iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1 | iex</code></pre>
+          <p class="install-hint">PowerShell · sin admin · agrega al PATH del usuario · verifica SHA256.</p>
+        </div>
+
+        <div class="cta-row">
+          <a class="btn btn-primary" href="{{ '/SQL_REFERENCE.html' | relative_url }}">Leer la referencia SQL</a>
+          <a class="btn btn-ghost" href="https://github.com/vladimiracunadev-create/gabysql">Ver código</a>
+        </div>
+      </div>
+
+      <div class="hero-demo">
+        <div class="window">
+          <div class="window-bar">
+            <span class="dotw red"></span><span class="dotw amber"></span><span class="dotw green"></span>
+            <span class="window-title">gabysql repl demo.db</span>
+          </div>
+<pre class="window-body"><code><span class="c-com">-- Bloques cerrados en v0.1.0: E1+E2+E3+F+T+J+J2</span>
+<span class="c-kw">CREATE TABLE</span> ventas (
+  id <span class="c-ty">INT PRIMARY KEY</span>,
+  region <span class="c-ty">TEXT NOT NULL</span>,
+  monto <span class="c-ty">INT</span>,
+  fecha <span class="c-ty">DATE</span>
+);
+<span class="c-out">OK</span>
+
+<span class="c-kw">BEGIN</span>;
+<span class="c-kw">INSERT INTO</span> ventas (id, region, monto, fecha) <span class="c-kw">VALUES</span>
+  (1, <span class="c-str">'norte'</span>, 100, <span class="c-str">'2026-01-15'</span>),
+  (2, <span class="c-str">'sur'</span>,   250, <span class="c-str">'2026-01-20'</span>),
+  (3, <span class="c-str">'sur'</span>,   180, <span class="c-str">'2026-02-03'</span>)
+<span class="c-kw">ON CONFLICT</span> (id) <span class="c-kw">DO UPDATE SET</span> monto = 0
+<span class="c-kw">RETURNING</span> id, region;
+<span class="c-out">OK (3 filas insertadas)</span>
+<span class="c-out">┌────┬────────┐</span>
+<span class="c-out">│ id │ region │</span>
+<span class="c-out">├────┼────────┤</span>
+<span class="c-out">│  1 │ norte  │</span>
+<span class="c-out">│  2 │ sur    │</span>
+<span class="c-out">│  3 │ sur    │</span>
+<span class="c-out">└────┴────────┘</span>
+
+<span class="c-kw">SELECT</span> region, <span class="c-fn">SUM</span>(monto) <span class="c-kw">AS</span> total
+  <span class="c-kw">FROM</span> ventas
+ <span class="c-kw">WHERE</span> monto <span class="c-kw">IS NOT NULL</span> <span class="c-kw">AND</span> region <span class="c-kw">LIKE</span> <span class="c-str">'%r%'</span>
+ <span class="c-kw">GROUP BY</span> region
+<span class="c-kw">HAVING</span> <span class="c-fn">SUM</span>(monto) &gt; 100
+ <span class="c-kw">ORDER BY</span> total <span class="c-kw">DESC</span>;
+<span class="c-out">┌────────┬───────┐</span>
+<span class="c-out">│ region │ total │</span>
+<span class="c-out">├────────┼───────┤</span>
+<span class="c-out">│ sur    │   430 │</span>
+<span class="c-out">└────────┴───────┘</span>
+
+<span class="c-kw">COMMIT</span>;
+<span class="c-out">OK</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band">
+    <div class="container band-grid">
+      <div class="stat"><span class="num">v0.1.0</span><span class="lbl">primer release publicado</span></div>
+      <div class="stat"><span class="num">7</span><span class="lbl">bloques cerrados (E1+E2+E3+F+T+J+J2)</span></div>
+      <div class="stat"><span class="num">~165</span><span class="lbl">integration tests verdes</span></div>
+      <div class="stat"><span class="num">3</span><span class="lbl">OS soportados (Win/Linux/macOS)</span></div>
+    </div>
+  </section>
+
+  <section class="features">
+    <div class="container">
+      <h2 class="section-h">Qué sabe hacer hoy</h2>
+      <p class="section-sub">Superficie SQL relacional clásica completa. Pensada para OLTP, scripts y embebidos — no para OLAP ni analytics distribuido.</p>
+      <div class="features-grid">
+        <article class="feat">
+          <h3>DDL completo</h3>
+          <p><code>CREATE TABLE</code> con PK, NOT NULL, UNIQUE, DEFAULT, REFERENCES con <code>ON DELETE RESTRICT/CASCADE</code>. <code>ALTER TABLE ADD COLUMN</code>. <code>CREATE [UNIQUE] INDEX</code>. <code>TRUNCATE</code>.</p>
+        </article>
+        <article class="feat">
+          <h3>DML completo</h3>
+          <p>Multi-row <code>INSERT</code>, <code>INSERT...SELECT</code>, <code>UPSERT</code> (<code>ON CONFLICT DO NOTHING/UPDATE</code>), <code>REPLACE INTO</code>, <code>RETURNING *</code>. <code>UPDATE</code>/<code>DELETE</code> con WHERE completo, multi-fila, por subquery.</p>
+        </article>
+        <article class="feat">
+          <h3>WHERE expresivo</h3>
+          <p>Todos los operadores: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>&lt;&gt;</code>, <code>BETWEEN</code>, <code>LIKE</code> con escape, <code>IS NULL</code>, <code>IN</code>, <code>EXISTS</code>. Combinaciones con <code>AND</code>/<code>OR</code>/<code>NOT</code> + paréntesis. <strong>3VL ANSI</strong>.</p>
+        </article>
+        <article class="feat">
+          <h3>JOINs ANSI</h3>
+          <p><code>INNER</code>, <code>LEFT</code>, <code>RIGHT</code>, <code>FULL</code>, <code>CROSS</code>, <code>USING</code>, <code>NATURAL</code>, multi-tabla, self-join. <strong>Index-loop optimization</strong> transparente para INNER/LEFT contra PK/índice del right.</p>
+        </article>
+        <article class="feat">
+          <h3>Agregados + GROUP BY</h3>
+          <p><code>COUNT(*)</code>, <code>COUNT(DISTINCT col)</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code>. <code>GROUP BY</code> multi-columna, <code>HAVING</code> con agregados directos o por alias, <code>SELECT DISTINCT</code>. Reporting básico cubierto.</p>
+        </article>
+        <article class="feat">
+          <h3>Transacciones</h3>
+          <p><code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code> explícitos. WAL después-imagen con CRC32 por página y replay completo en cada arranque. Backup/restore/verify con checksum end-to-end via CLI.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="modos">
+    <div class="container">
+      <h2 class="section-h">Cuatro modos de uso, un solo motor</h2>
+      <div class="modos-table">
+        <div class="mode">
+          <div class="mode-name">📟 CLI</div>
+          <div class="mode-when">Scripts, automatización, REPL interactivo.</div>
+          <div class="mode-cmd"><code>gabysql exec mi.db "SELECT ...;"</code></div>
+        </div>
+        <div class="mode">
+          <div class="mode-name">🌐 HTTP server</div>
+          <div class="mode-when">App que conecta por red, multi-cliente.</div>
+          <div class="mode-cmd"><code>gabysql-server -db mi.db -addr :8080</code></div>
+        </div>
+        <div class="mode">
+          <div class="mode-name">📦 Crate Rust</div>
+          <div class="mode-when">App Rust nativa, embebido, cero red.</div>
+          <div class="mode-cmd"><code>use gabysql::{sql, storage};</code></div>
+        </div>
+        <div class="mode">
+          <div class="mode-name">🐳 Docker</div>
+          <div class="mode-when">Demo rápida con UI web (phpgabyadmin).</div>
+          <div class="mode-cmd"><code>docker compose up -d</code></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="compare">
+    <div class="container">
+      <h2 class="section-h">¿Dónde encaja?</h2>
+      <div class="compare-grid">
+        <div class="compare-col yes">
+          <h3>Sí, para esto</h3>
+          <ul>
+            <li>Apps Rust embebidas que necesitan SQL real (no un KV).</li>
+            <li>OLTP clásico: lookups por PK + índices + JOINs equi-predicado.</li>
+            <li>Reporting básico con <code>GROUP BY</code> + agregados single-table.</li>
+            <li>Proyectos que valoran <em>supply chain</em> Rust pura.</li>
+            <li>Casos donde SQLite es restrictivo pero Postgres es overkill.</li>
+          </ul>
+        </div>
+        <div class="compare-col no">
+          <h3>No (todavía)</h3>
+          <ul>
+            <li>OLAP analítico — DuckDB es la respuesta.</li>
+            <li>MVCC / multi-writer concurrente — Postgres.</li>
+            <li>Window functions, CTE recursivas, vistas materializadas.</li>
+            <li>Agregados sobre <code>SELECT</code> con <code>JOIN</code> (bloque futuro).</li>
+            <li>Compatibilidad wire-protocol con Postgres/MySQL.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="docs-nav">
+    <div class="container">
+      <h2 class="section-h">Documentación</h2>
+      <div class="doc-grid">
+        <a class="doc-card" href="{{ '/SQL_REFERENCE.html' | relative_url }}">
+          <h3>SQL Reference →</h3>
+          <p>Gramática EBNF + railroad diagrams + ejemplos por cláusula. La fuente de verdad de qué entiende el motor.</p>
+        </a>
+        <a class="doc-card" href="{{ '/ERROR_CODES.html' | relative_url }}">
+          <h3>Error Codes →</h3>
+          <p>Catálogo <code>[GBY-NNNN]</code> con causa y remediación. Cada error que el motor puede emitir, documentado.</p>
+        </a>
+        <a class="doc-card" href="{{ '/MISSING_COMMANDS.html' | relative_url }}">
+          <h3>Roadmap SQL →</h3>
+          <p>Inventario exhaustivo de lo que falta del SQL clásico, con prioridades P0–P3 y secuencia de bloques.</p>
+        </a>
+        <a class="doc-card" href="{{ '/ARCHITECTURE.html' | relative_url }}">
+          <h3>Architecture →</h3>
+          <p>Diseño interno: storage, B+Tree, catálogo, executor. Para quien quiera modificar o entender el motor.</p>
+        </a>
+        <a class="doc-card" href="{{ '/TECHNICAL_SPECS.html' | relative_url }}">
+          <h3>Technical Specs →</h3>
+          <p>Formato en disco (VERSION 7), subset SQL soportado exacto, características operacionales.</p>
+        </a>
+        <a class="doc-card" href="https://github.com/vladimiracunadev-create/gabysql/blob/main/CHANGELOG.md">
+          <h3>Changelog →</h3>
+          <p>Historia de cambios por release. Cada bloque cerrado con fecha, alcance y limitaciones residuales.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="site-footer">
+    <div class="container foot-grid">
+      <div>
+        <strong>gabysql</strong> · base de datos relacional embebida en Rust.<br>
+        Single-file. SQL clásico completo. Zero-deps en el core. MIT.
+      </div>
+      <div class="foot-links">
+        <a href="https://github.com/vladimiracunadev-create/gabysql">Repo</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/releases">Releases</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/issues">Issues</a>
+        <a href="https://github.com/vladimiracunadev-create/gabysql/blob/main/LICENSE">MIT</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

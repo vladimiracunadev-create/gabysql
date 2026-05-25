@@ -10,7 +10,10 @@ title: gabysql
 description: >-
   Base de datos relacional embebida en Rust con superficie SQL clásica
   (DDL + DML + TCL completos) y archivo único portable.
-theme: jekyll-theme-cayman
+# Sin theme externo: usamos layouts custom en `_layouts/` y CSS en
+# `assets/css/style.css`. Eso nos da control fino del HTML (necesario
+# para la hero de la landing) y mantiene el binary chico (sin pulling
+# de gems extras del tema cayman).
 
 # `baseurl` queda vacío porque el sitio se sirve en
 # https://<usuario>.github.io/gabysql/ y todos los enlaces internos
