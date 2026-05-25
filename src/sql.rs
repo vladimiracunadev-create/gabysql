@@ -2420,12 +2420,7 @@ impl<'a> Engine<'a> {
         match atom {
             WhereClause::Eq { column, value } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 match row.get(&key) {
                     Some(Value::Null) | None => Ok(None),
                     Some(v) => match value {
@@ -2436,12 +2431,7 @@ impl<'a> Engine<'a> {
             }
             WhereClause::Between { column, from, to } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 match row.get(&key) {
                     Some(Value::Integer(n)) => Ok(Some(*n >= *from && *n <= *to)),
                     Some(Value::Null) | None => Ok(None),
@@ -2450,12 +2440,7 @@ impl<'a> Engine<'a> {
             }
             WhereClause::In { column, subquery } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 // NOTA E1: la subquery se re-ejecuta por cada fila del
                 // outer cuando vive dentro de un AND/OR/NOT. Es correcto
                 // pero no óptimo — un caching pre-loop queda para futuros
@@ -2485,12 +2470,7 @@ impl<'a> Engine<'a> {
             }
             WhereClause::EqSubquery { column, subquery } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 let inner = self.exec_select((**subquery).clone())?;
                 if inner.columns.len() != 1 {
                     return Err(coded(
@@ -2543,12 +2523,7 @@ impl<'a> Engine<'a> {
             )),
             WhereClause::Compare { column, op, value } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 Ok(eval_compare(row.get(&key), *op, value))
             }
             WhereClause::Like {
@@ -2557,22 +2532,12 @@ impl<'a> Engine<'a> {
                 negated,
             } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 Ok(eval_like(row.get(&key), pattern, *negated))
             }
             WhereClause::IsNull { column, negated } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 let is_null = matches!(row.get(&key), Some(Value::Null) | None);
                 Ok(Some(if *negated { !is_null } else { is_null }))
             }
@@ -2582,12 +2547,7 @@ impl<'a> Engine<'a> {
                 negated,
             } => {
                 let key = normalize_ident(column);
-                if meta.column(&key).is_none() {
-                    return Err(coded(
-                        codes::COLUMN_NOT_FOUND,
-                        format!("columna '{}' no existe en '{}'", column, meta.name),
-                    ));
-                }
+                ensure_column_visible(meta, &key, column, row)?;
                 Ok(eval_in_list(row.get(&key), values, *negated))
             }
         }
@@ -4929,6 +4889,30 @@ fn eval_in_list(lhs: Option<&Value>, values: &[Value], negated: bool) -> Option<
         Some(false)
     };
     in_result.map(|b| if negated { !b } else { b })
+}
+
+/// Bloque F: validación de columna usada por `eval_atom_single`. La
+/// columna está OK si o bien existe en el meta de la tabla, o bien
+/// ya está materializada como clave en la fila — eso último cubre las
+/// "columnas virtuales" que vienen del pipeline de agregación (output
+/// names de COUNT/SUM/AVG/MIN/MAX y aliases del SELECT que viven en
+/// el bucket pero no en el schema físico). Pre-F este chequeo era
+/// solo `meta.column(...).is_none()`; la extensión preserva el UX de
+/// "columna inexistente" en WHERE/UPDATE/DELETE y al mismo tiempo
+/// deja pasar las referencias virtuales en HAVING.
+fn ensure_column_visible(
+    meta: &TableMeta,
+    key: &str,
+    raw_name: &str,
+    row: &HashMap<String, Value>,
+) -> DbResult<()> {
+    if meta.column(key).is_some() || row.contains_key(key) {
+        return Ok(());
+    }
+    Err(coded(
+        codes::COLUMN_NOT_FOUND,
+        format!("columna '{}' no existe en '{}'", raw_name, meta.name),
+    ))
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
