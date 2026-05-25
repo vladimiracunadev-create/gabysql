@@ -15,11 +15,13 @@ description: >-
 # para la hero de la landing) y mantiene el binary chico (sin pulling
 # de gems extras del tema cayman).
 
-# `baseurl` queda vacío porque el sitio se sirve en
-# https://<usuario>.github.io/gabysql/ y todos los enlaces internos
-# son relativos. Si en algún momento se publica en un CNAME custom,
-# este campo no cambia.
-baseurl: ""
+# El sitio se sirve en https://<usuario>.github.io/gabysql/ — necesitamos
+# que `relative_url` (usado por los layouts para enlazar CSS, favicon,
+# .html internos) prefije `/gabysql` a las rutas. Si no, `/assets/css/
+# style.css` apunta al root del dominio del usuario (que es OTRO sitio
+# de GitHub Pages distinto) y la página queda sin CSS. Con CNAME
+# custom este campo debería volver a "".
+baseurl: "/gabysql"
 
 # Excluir archivos auxiliares y subdirectorios que NO deberían
 # convertirse a HTML (worktrees temporales, imágenes binarias, etc.).
