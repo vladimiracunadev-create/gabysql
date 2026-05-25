@@ -209,10 +209,10 @@ Abre el SQL completo en un modal con scroll, listo para copiar/descargar:
 
 ### Garantías del SQL emitido
 
-1. **Orden topológico**: las tablas referenciadas (parents) se emiten antes que las que las referencian (children). Pegar el SQL en una sola transacción siempre funciona.
+1. **Orden topológico**: las tablas referenciadas (parents) se emiten antes que las que las referencian (children). Pegar el SQL en una sola transacción (batch HTTP auto-commit, o envolviéndolo en `BEGIN; ... COMMIT;` explícito desde el bloque T del 2026-05-25) siempre funciona.
 2. **Constraints inline**: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, `REFERENCES <tabla>(<col>) [ON DELETE ...]` van todas dentro del `CREATE TABLE`.
 3. **Quoting tipado**: los DEFAULTs se quotean según el tipo (`'pending'` para TEXT, `0` para INT, `TRUE` para BOOL).
-4. **Header informativo**: las dos primeras líneas son comentarios con el timestamp y el target (`gabysql VERSION 6`).
+4. **Header informativo**: las dos primeras líneas son comentarios con el timestamp y el target (`gabysql VERSION 7`).
 
 Pegalo en `phpgabyadmin → SQL`, o mandalo al endpoint `/exec` con un POST JSON.
 

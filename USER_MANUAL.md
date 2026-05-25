@@ -284,7 +284,7 @@ php -S localhost:8000 -t web
 ### Pestañas disponibles
 - **Browse** — paginación de filas, export CSV, import CSV.
 - **Structure** — columnas + tipos + PK + columna marcada como indexada; **lista de índices secundarios** con botón `DROP` por índice y formulario inline `CREATE INDEX` que filtra automáticamente PK y JSON.
-- **SQL** — editor con snippets de un click para `SELECT` / `SELECT por PK` / `SELECT por columna indexada` / `INSERT` / `UPDATE` / `DELETE` / `CREATE INDEX` / `DROP INDEX`. Cada ejecución es Begin → Exec → Commit; múltiples sentencias separadas por `;` entran en la misma transacción.
+- **SQL** — editor con snippets de un click para `SELECT` / `SELECT por PK` / `SELECT por columna indexada` / `INSERT` / `UPDATE` / `DELETE` / `CREATE INDEX` / `DROP INDEX`. Cada ejecución es Begin → Exec → Commit (auto-commit por batch); múltiples sentencias separadas por `;` entran en la misma transacción. Desde el bloque T (2026-05-25) podés usar `BEGIN` / `COMMIT` / `ROLLBACK` explícitos dentro del batch para abortar a mitad de camino — ver [SQL_REFERENCE §Transacciones explícitas](docs/SQL_REFERENCE.md).
 
 ### Seguridad del admin
 - Si defines `GABYADMIN_TOKEN`, el admin pedirá login

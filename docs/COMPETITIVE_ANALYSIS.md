@@ -58,7 +58,8 @@ Leyenda: 🟢 = gana / 🟡 = empate o aceptable / 🔴 = pierde / ⚪ = no apli
 | **Wire protocol (Postgres/MySQL)** | 🔴 | 🔴 | 🟡 | ⚪ | 🟢 | 🟢 | 🟡 |
 | **CRUD básico (INSERT/UPDATE/DELETE)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Índices secundarios (equality)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **Índices compuestos / UNIQUE** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **`UNIQUE` (single-column, inline + standalone)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Índices compuestos / multi-column UNIQUE** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **JOIN** (INNER/CROSS/LEFT/RIGHT/FULL/USING/NATURAL + index-loop) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Subqueries** (`IN`/`=`/`EXISTS` correlacionado) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **ORDER BY** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |

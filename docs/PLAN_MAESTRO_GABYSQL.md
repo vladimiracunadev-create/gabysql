@@ -95,7 +95,7 @@ Congelar una base confiable antes de tocar componentes críticos.
 
 ## Fase 1 — Integridad del storage y recovery
 
-> **Estado**: parcialmente entregada (2026-05-03). Ver [CHANGELOG](../CHANGELOG.md) para los hitos. Falta `integrity_check` operacional y crash tests dirigidos.
+> **Estado**: entregada — `INTEGRITY CHECK` operacional, crash tests dirigidos y WAL recovery por `COMMIT` funcionando desde 2026-05 (ver hitos completos en [CHANGELOG](../CHANGELOG.md), con superficie SQL extendida en la sesión del 2026-05-25 con E1+E2+E3+F+T+J+J2).
 
 ### Objetivo
 Endurecer el corazón del motor sin ampliar demasiado la superficie SQL.
@@ -141,7 +141,7 @@ Corromper compatibilidad de archivos o recovery.
 
 ## Fase 2 — Correctitud funcional básica
 
-> **Estado**: arrancada (2026-05-03). `UPDATE` y `DELETE` por PK ya están en main; faltan constraints declarativas.
+> **Estado**: superficie SQL relacional clásica cerrada el 2026-05-25. Bloques entregados en esta sesión: E1+E2+E3 (`WHERE` compuesto + comparadores E2 + `UPDATE`/`DELETE` multi-fila), F (agregados + `GROUP BY`/`HAVING`/`DISTINCT`), T (`BEGIN`/`COMMIT`/`ROLLBACK` explícito batch-local), J+J2 (multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, UPSERT, `REPLACE INTO`, `RETURNING`). Pendientes priorizados: bloques G (funciones escalares), H (subqueries restantes), I (set ops), K (DDL faltante incluyendo índices compuestos), L (constraints CHECK/SET NULL).
 
 ### Objetivo
 Completar las operaciones esenciales del motor y dejar reglas de datos más serias.
@@ -184,7 +184,7 @@ Completar las operaciones esenciales del motor y dejar reglas de datos más seri
 
 ## Fase 3 — Índices y consultas usables
 
-> **Estado**: arrancada (2026-05-04). Índices secundarios simples + `WHERE` por columna no-PK ya están en main; quedan los compuestos y `ORDER BY`.
+> **Estado**: parcialmente entregada. `ORDER BY`, índices secundarios simples (Hash y OrderedInt para INT con range scan vía ADR-0017) + `WHERE` por columna no-PK + JOINs ANSI (INNER/LEFT/RIGHT/FULL/CROSS/USING/NATURAL con index-loop) + agregados single-table (bloque F) ya están en main al 2026-05-25. **Pendientes**: índices compuestos (multi-columna) y partial indexes — bloque K del roadmap; range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`.
 
 ### Objetivo
 Quitar a la PK la carga de ser la única vía eficiente de consulta.

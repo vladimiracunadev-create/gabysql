@@ -11,7 +11,7 @@
 ## 🚦 Estado actual
 
 - Core reescrito en Rust
-- Pager con header, páginas fijas y formato en disco **versión `6`**
+- Pager con header, páginas fijas y formato en disco **versión `7`**
 - Cada página persistida lleva trailer CRC32-IEEE (4 bytes); corrupción se detecta al leer y al replay del WAL
 - WAL after-image con replay por `COMMIT` y verificación CRC del payload de cada página
 - **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits
@@ -110,7 +110,7 @@
 `gabysql` sigue apuntando a una base embebida tipo SQLite:
 - storage local
 - archivo único
-- **superficie SQL relacional clásica completa**: DDL, DML, índices, FK, `ORDER BY`, `WHERE` con todos los operadores E1+E2 (`=`/`<`/`>`/`<=`/`>=`/`<>`/`!=`/`BETWEEN`/`LIKE`/`IS NULL`/`IN literal`/`IN (SELECT)`/`= (SELECT)`/`[NOT] EXISTS`) combinados con `AND`/`OR`/`NOT` y paréntesis (3VL ANSI), todos los JOINs ANSI (INNER, CROSS, LEFT/RIGHT/FULL, USING, NATURAL, multi-tabla, self-join, index-loop optimization), `UPDATE`/`DELETE` con `WHERE` completo (E3), agregaciones single-table (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)`) — bloque F
-- foco en estabilidad, durabilidad y compatibilidad antes que en amplitud OLAP (sin window functions / CTE recursivas, sin agregados sobre JOIN aún)
+- **superficie SQL relacional clásica completa** (post-sesión 2026-05-25): DDL (incluyendo `TRUNCATE`), DML completo (`INSERT` single/multi-row/`SELECT`, `UPSERT` con `ON CONFLICT`, `REPLACE INTO`, `RETURNING`), índices secundarios + UNIQUE + range scan sobre INT, FK con cascade/restrict, `ORDER BY`, `WHERE` con todos los operadores E1+E2 (`=`/`<`/`>`/`<=`/`>=`/`<>`/`!=`/`BETWEEN`/`LIKE`/`IS NULL`/`IN literal`/`IN (SELECT)`/`= (SELECT)`/`[NOT] EXISTS`) combinados con `AND`/`OR`/`NOT` y paréntesis (3VL ANSI), todos los JOINs ANSI (INNER, CROSS, LEFT/RIGHT/FULL, USING, NATURAL, multi-tabla, self-join, index-loop optimization), `UPDATE`/`DELETE` con `WHERE` completo (E3), agregaciones single-table (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` — bloque F), **transacciones explícitas** `BEGIN`/`COMMIT`/`ROLLBACK` batch-local (bloque T)
+- foco en estabilidad, durabilidad y compatibilidad antes que en amplitud OLAP (sin window functions / CTE recursivas, sin agregados sobre JOIN aún, sin `EXCLUDED.col` en UPSERT, sin `UPDATE ... FROM`, sin `SAVEPOINT`)
 
-> Para el **inventario exhaustivo de comandos SQL que faltan** (con prioridades P0–P3 y la secuencia de bloques `E1 → E2 → E3 → F → G → T → …` para cerrar la línea de comandos completa), ver [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md).
+> Para el **inventario exhaustivo de comandos SQL que faltan** (con prioridades P0–P3 y la secuencia de bloques cerrados `E1 → E2 → E3 → F → T → J → J2` y pendientes `G → H → I → K → L → ...`), ver [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md).

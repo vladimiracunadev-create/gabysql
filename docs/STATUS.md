@@ -1,12 +1,12 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-07 contra `main` post-constraints declarativas.
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-25 contra `main` post-bloques E1+E2+E3+F+T+J+J2 (WHERE compuesto + comparadores + UPDATE/DELETE multi-fila + agregados + transacciones explícitas + DML masivo + UPSERT/REPLACE/RETURNING).
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-7-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-45%2F45-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-~165%2F~165-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -49,7 +49,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Engine (executor) | 🟡 | `LeafCursor` lazy para `SELECT … LIMIT N` sin ORDER BY (O(N+offset) IO) + prefetch one-leaf-ahead (ADR-0016) que warm-a la PageCache para la próxima leaf transition. Sin spill-to-disk para sort grande, sin plan lógico/físico explícito. | [src/sql.rs](../src/sql.rs), [src/bptree.rs](../src/bptree.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
 | `EXPLAIN` | 🔴 | Camino A.5+. | — |
-| Transacciones | 🟡 | Implícita por `exec`; sin savepoints, sin isolation levels explícitos. | [src/storage.rs](../src/storage.rs) |
+| Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`) | 🟢 | Bloque T (2026-05-25): batch-local, alias ANSI (`START TRANSACTION`/`END`) y MySQL (`WORK`) aceptados. **Pendiente**: `SAVEPOINT`/`ROLLBACK TO`, isolation levels, read-only y cross-request (HTTP session state). | [src/sql.rs](../src/sql.rs), [src/storage.rs](../src/storage.rs) |
 | MVCC | 🔴 | Camino C. | — |
 | Manejo de errores | 🟢 | Guía canónica + ~210 mensajes en español con contexto (qué/por qué/cómo). Ver [ERROR_HANDLING.md](ERROR_HANDLING.md). | [src/lib.rs](../src/lib.rs) |
 | Concurrencia | 🟡 | Mutex global de proceso para escrituras. | [src/server.rs](../src/server.rs) |
@@ -107,8 +107,19 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximo bloque (Fase 2 avanzada)
+## 🔭 Próximos bloques (post sesión 2026-05-25)
 
-> **Fase 1 cerrada · Fase 2 en marcha.** Entregado: `ORDER BY`, `LeafCursor` (Iterator pattern · ADR-0008), `PageCache` LRU acotado (memoria server bounded · ADR-0009). Lo que sigue de Fase 2: índices compuestos, range scan por índice secundario (`WHERE col_indexada BETWEEN ...`), checkpoint del WAL, y eventualmente `Transaction` (Unit of Work) cuando aparezca un workload de INSERT masivo medible.
+> **Fase 1 cerrada · Fase 2 con superficie SQL relacional clásica completa.** Entregado en esta sesión (7 bloques): E1 (`AND`/`OR`/`NOT` + paréntesis), E2 (comparadores `<`/`>`/`LIKE`/`IS NULL`/`IN literal`), E3 (`UPDATE`/`DELETE` con WHERE completo), F (agregaciones + `GROUP BY`/`HAVING`/`DISTINCT`), T (`BEGIN`/`COMMIT`/`ROLLBACK` explícitos), J (multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`), J2 (UPSERT, `REPLACE INTO`, `RETURNING`).
+>
+> **Pendientes priorizados** (orden recomendado, ver [MISSING_COMMANDS.md](MISSING_COMMANDS.md)):
+> - **G** — funciones escalares (`LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF`, `CASE WHEN`, `CAST`).
+> - **H** — subqueries restantes: derived tables (`FROM (SELECT ...) t`), `NOT IN (SELECT)`, subquery en SELECT list, `ANY`/`ALL`.
+> - **I** — set operations: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual.
+> - **K** — DDL faltante: PK compuesta, índices compuestos, `CREATE TABLE AS SELECT`, `ALTER TABLE DROP/RENAME COLUMN`, `RENAME TABLE`.
+> - **L** — constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE …`, multi-column UNIQUE.
+> - **Sub-pendientes de J2**: `EXCLUDED.col` en `DO UPDATE`, `UPDATE ... FROM otra_tabla`.
+> - **Sub-pendientes de T**: `SAVEPOINT`/`ROLLBACK TO`, cross-request transactions vía session state HTTP, isolation levels, read-only.
+> - **Sub-pendientes de F**: agregados sobre `SELECT` con JOIN (hoy `[GBY-4028]`).
+> - **Optimizer**: range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`, checkpoint del WAL (ADR-0018).
 
 Ver [ROADMAP.md](../ROADMAP.md) para el plan completo de bloques en `main`.
