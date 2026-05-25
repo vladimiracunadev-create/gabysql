@@ -43,23 +43,20 @@ jobs:
         with:
           persist-credentials: false
 
-      # Excepción al pin-to-SHA del repo: las acciones oficiales
-      # `actions/*-pages*` se referencian por tag mayor (`@v5`, `@v1`,
-      # `@v3`) porque son del propio org de GitHub y no de un third-party.
-      # Mantener SHAs invenntados rompió el workflow en el primer intento
-      # (commit 0d93e31 → run 26423829070); el tag mayor garantiza que
-      # GitHub resuelva al último release minor estable.
+      # SHAs reales de los últimos releases (resueltos vía gh api).
+      # Política del repo (workflow-security.yml) exige pin a SHA en
+      # TODAS las third-party actions, incluso las oficiales `actions/*`.
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
 
       - name: Build Jekyll site
-        uses: actions/jekyll-build-pages@v1
+        uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697  # v1.0.13
         with:
           source: ./docs
           destination: ./_site
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
 
   deploy:
     needs: build
@@ -73,4 +70,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4   # ver nota en job `build` sobre @v* en acciones oficiales
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0

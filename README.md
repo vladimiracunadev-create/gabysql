@@ -3,13 +3,18 @@
 > **Motor embebido en Rust con archivo único `.db`, WAL simple, API HTTP y admin web liviano.**
 
 [![CI](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/ci.yml/badge.svg)](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/ci.yml)
+[![Security Scan](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/security.yml/badge.svg)](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/security.yml)
+[![Workflow security](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/workflow-security.yml/badge.svg)](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/workflow-security.yml)
+[![Release](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/release.yml/badge.svg)](https://github.com/vladimiracunadev-create/gabysql/releases/latest)
 [![Pages](https://github.com/vladimiracunadev-create/gabysql/actions/workflows/pages.yml/badge.svg)](https://vladimiracunadev-create.github.io/gabysql/)
+[![Latest release](https://img.shields.io/github/v/release/vladimiracunadev-create/gabysql?include_prereleases&sort=semver)](https://github.com/vladimiracunadev-create/gabysql/releases/latest)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
-![Status](https://img.shields.io/badge/status-base%20estable-2e8b57)
 ![Target](https://img.shields.io/badge/target-Windows%20%7C%20Linux%20%7C%20macOS-1f6feb)
 ![Storage](https://img.shields.io/badge/storage-single--file%20db%20%2B%20wal-8a5a2b)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 📖 **Documentación online**: <https://vladimiracunadev-create.github.io/gabysql/> (auto-deploy desde `docs/` en cada push a `main`).
+📦 **Instalar en Windows**: `iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1 | iex` — ver [INSTALL.md](INSTALL.md).
 
 `gabysql` es **un proyecto de aprendizaje + exploración sobre cómo se construye una base de datos**, escrito en Rust desde cero, usando la pregunta *"¿cómo se vería una DB nativa de la era de los agentes LLM?"* como hilo conductor. **No es un producto comercial y no apunta a serlo**: no hay usuarios, no hay clientes, no hay validación externa, y eso está bien. El objetivo es entender bases de datos a fondo y, en paralelo, explorar qué cambia cuando el consumidor principal no es un humano escribiendo SQL ni una app, sino un agente que razona sobre datos.
 
