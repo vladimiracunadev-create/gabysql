@@ -32,6 +32,7 @@
 | `WHERE` con `<`, `>`, `<=`, `>=`, `<>`/`!=`, `[NOT] LIKE` (con `%`/`_`), `IS [NOT] NULL`, `[NOT] IN (lista)` (bloque E2) | DML | 🟢 |
 | Agregaciones: `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`, `DISTINCT` (bloque F) | DML | 🟢 (sin JOINs aún) |
 | Transacciones explícitas: `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, `ROLLBACK` (bloque T) | TCL | 🟢 (batch-local; `SAVEPOINT` y cross-request pendientes) |
+| Multi-row `INSERT` `VALUES (...), (...)`, `INSERT INTO t SELECT ...`, `TRUNCATE [TABLE]` (bloque J) | DML | 🟢 (UPSERT/RETURNING pendientes) |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
@@ -459,19 +460,42 @@ flowchart LR
 ### 📜 EBNF
 
 ```
-insert      ::= "INSERT" "INTO" identifier "(" col_list ")" "VALUES" "(" value_list ")"
+insert      ::= "INSERT" "INTO" identifier "(" col_list ")" insert_source
+insert_source ::= "VALUES" "(" value_list ")" ("," "(" value_list ")")*
+                | "SELECT" select_body
 col_list    ::= identifier ("," identifier)*
 value_list  ::= value ("," value)*
 value       ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
 string      ::= "'" ([^'] | "''")* "'"
 ```
 
+Desde el bloque **J** (2026-05-25) el `INSERT` admite tres formas:
+- Single-row: `INSERT INTO t (cols) VALUES (a, b, c);`
+- Multi-row: `INSERT INTO t (cols) VALUES (a, b), (c, d), (e, f);`
+- Por subquery: `INSERT INTO t (cols) SELECT ... FROM ...;` — el `SELECT` puede usar cualquier feature del SELECT (WHERE/JOIN/GROUP BY/ORDER BY). Se materializa primero, después se insertan filas en orden.
+
+El `message` del response trae la cuenta: `"OK (3 filas insertadas)"`.
+
 ### ✅ Ejemplos
 
 ```sql
+-- Single-row (compat pre-J)
 INSERT INTO users (id, name, active, score) VALUES (1, 'Ana', TRUE, 9.5);
-INSERT INTO users (id, name, active) VALUES (2, 'Beto', FALSE);
 INSERT INTO products (id, name, price) VALUES (10, 'Café o''rgánico', 4500.50);
+
+-- Multi-row (bloque J)
+INSERT INTO users (id, name, active) VALUES
+  (2, 'Beto',  FALSE),
+  (3, 'Carla', TRUE),
+  (4, 'Dario', TRUE);
+
+-- INSERT...SELECT (bloque J)
+INSERT INTO users_backup (id, name, active)
+SELECT id, name, active FROM users WHERE active = TRUE;
+
+-- Con agregados del bloque F
+INSERT INTO sales_summary (region, total)
+SELECT region, SUM(monto) FROM ventas GROUP BY region;
 ```
 
 ### ❌ Errores típicos
@@ -878,6 +902,36 @@ DELETE FROM tickets WHERE status = 'closed' AND updated_at < '2024-01-01';
 | `violación de FK: 'X.col' referencia 'Y' (ON DELETE RESTRICT, N fila(s) afectadas)` | hay filas hijas y la FK fue declarada `ON DELETE RESTRICT` (default) |
 
 > Antes de borrar la fila, el engine la lee para evictar la entrada correspondiente de cada índice secundario. Si la tabla tiene FKs entrantes, el motor resuelve cascade/restrict iterativamente con un worklist y cycle protection (visited set sobre `(tabla, pk)`). Para tablas grandes con FKs entrantes, **se recomienda crear un índice secundario sobre la columna FK del hijo** — el engine lo usa automáticamente para que el lookup de hijos sea O(log n) en vez de full scan.
+
+---
+
+## TRUNCATE
+
+> Bloque J (2026-05-25). Borra todas las filas de la tabla manteniendo
+> el schema (columnas, índices, FKs). Implementación naive: scan de
+> todas las PKs + `delete_with_cascade` por fila. **Respeta** las
+> declaraciones `ON DELETE CASCADE` / `RESTRICT` de FKs entrantes —
+> no es un O(1) hack como en Postgres/MySQL.
+
+### 📜 EBNF
+
+```
+truncate ::= "TRUNCATE" ["TABLE"] identifier
+```
+
+### ✅ Ejemplos
+
+```sql
+TRUNCATE TABLE logs;          -- borra todo `logs`
+TRUNCATE staging;             -- la palabra TABLE es opcional
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `tabla no existe: X` | la tabla no está en el catálogo |
+| `violación de FK: ... ON DELETE RESTRICT, N fila(s) afectadas` | hay filas hijas con FK `ON DELETE RESTRICT` apuntando a la tabla — no se puede vaciar sin borrar primero los hijos |
 
 ---
 

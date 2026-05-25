@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-05-25 — Bloque J: DML masivo (multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`)
+
+> **Un push a `main`** que destraba inserts en bloque y limpieza de tabla.
+
+### 🆕 Sentencias nuevas
+- `INSERT INTO t (cols) VALUES (a,b),(c,d),...` — multi-row.
+- `INSERT INTO t (cols) SELECT ...` — copia masiva desde otra query (puede tener WHERE/ORDER BY/JOIN/GROUP BY del bloque F).
+- `TRUNCATE [TABLE] t` — borra todas las filas de la tabla manteniendo el schema. Implementación naive (scan-all-pks + delete_with_cascade); respeta FKs `ON DELETE`. No es O(1) como en PG/MySQL.
+
+### 🔧 Refactor
+- `InsertStmt.values: Vec<Value>` → `source: InsertSource { Values(Vec<Vec<Value>>) | Select(Box<SelectStmt>) }`. Single-row queda como caso particular de `Values(vec![row])`.
+- `exec_insert` validara columnas + dedup UNA vez y luego itera filas-fuente delegando en el nuevo `apply_insert_row` (que encapsula NOT NULL/UNIQUE/FK/encode/insert/index-maintenance per-row).
+- Response `message` ahora trae cuenta: `"OK (3 filas insertadas)"`.
+
+### ⚠️ Comportamiento
+- Multi-row no es transaccionalmente atómico **por sí solo** — fila K que falla deja las K-1 anteriores en el cache. El wrap del batch (auto-commit del `/exec` o `BEGIN`/`ROLLBACK` explícito del bloque T) define el alcance del rollback.
+- `INSERT...SELECT` ejecuta la subquery completa antes de empezar a insertar (materializa primero). Para queries grandes esto es O(filas) en memoria.
+
+### ⚠️ Limitaciones residuales del bloque J
+- `INSERT ... ON CONFLICT DO UPDATE` / `UPSERT` (P1) — pendiente.
+- `REPLACE INTO` (P2) — pendiente.
+- `RETURNING` clause (P2) — pendiente; requiere extender `ResultSet` con filas devueltas.
+- `UPDATE ... FROM otra_tabla` (P2) — pendiente.
+
+### 🧪 Validación
+- 8 integration tests nuevos en `tests/integration_test.rs` (`j_*`): multi-row INSERT, aridad mismatch aborta, INSERT...SELECT copia, INSERT...SELECT con WHERE, INSERT...SELECT aridad mismatch, TRUNCATE TABLE preserva schema, TRUNCATE sin keyword TABLE, multi-row con conflicto UNIQUE aborta.
+- `cargo check + cargo fmt --check + cargo clippy --all-targets -- -D warnings` limpios.
+
+### 📚 Documentación
+- (Se actualiza en el mismo push: SQL_REFERENCE, MISSING_COMMANDS.)
+
+---
+
 ## 2026-05-25 — Bloque T: transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)
 
 > **Un push a `main`** que cierra el último P0 del top-5 del roadmap.

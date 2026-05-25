@@ -4384,6 +4384,190 @@ fn t_begin_can_be_followed_by_begin_after_commit() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+// ============================================================
+// Bloque J: DML masivo — multi-row INSERT, INSERT...SELECT, TRUNCATE
+// ============================================================
+
+#[test]
+fn j_multi_row_insert() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_multi");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    let res = run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);",
+    )?;
+    let msg = res[0].message.as_deref().unwrap_or("");
+    assert!(msg.contains("3 filas"), "message inesperado: {}", msg);
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_multi_row_arity_mismatch_aborts_batch() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_arity");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10), (2);").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4007]"),
+        "esperaba GBY-4007: {}",
+        err
+    );
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_insert_select_copies_rows() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_isel");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, v INT);
+         CREATE TABLE dst (id INT PRIMARY KEY, v INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO src (id, v) VALUES (1, 100), (2, 200), (3, 300);",
+    )?;
+    run_sql(&db, "INSERT INTO dst (id, v) SELECT id, v FROM src;")?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM dst;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    let res = run_sql(&db, "SELECT v FROM dst WHERE id = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(200));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_insert_select_with_where_filter() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_isel_where");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, v INT);
+         CREATE TABLE dst (id INT PRIMARY KEY, v INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO src (id, v) VALUES (1, 50), (2, 150), (3, 250), (4, 350);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO dst (id, v) SELECT id, v FROM src WHERE v > 100 AND id > 0;",
+    )?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM dst;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_insert_select_arity_mismatch() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_isel_bad");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, a INT, b INT);
+         CREATE TABLE dst (id INT PRIMARY KEY, v INT);",
+    )?;
+    run_sql(&db, "INSERT INTO src (id, a, b) VALUES (1, 10, 20);")?;
+    let err = run_sql(&db, "INSERT INTO dst (id, v) SELECT id, a, b FROM src;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4007]"),
+        "esperaba GBY-4007: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_truncate_empties_table_preserving_schema() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_trunc");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);",
+    )?;
+    let res = run_sql(&db, "TRUNCATE TABLE t;")?;
+    let msg = res[0].message.as_deref().unwrap_or("");
+    assert!(msg.contains("3 filas"), "message inesperado: {}", msg);
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(0));
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (99, 999);")?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE id = 99;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_truncate_without_table_keyword() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_trunc2");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (1);")?;
+    run_sql(&db, "TRUNCATE t;")?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j_multi_row_with_unique_conflict_aborts() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j_uniq");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, email TEXT NOT NULL UNIQUE);",
+    )?;
+    let err = run_sql(
+        &db,
+        "INSERT INTO u (id, email) VALUES (1, 'a@x'), (2, 'a@x');",
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[GBY-3003]") || msg.contains("UNIQUE"),
+        "esperaba violación UNIQUE: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

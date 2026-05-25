@@ -43,6 +43,12 @@ pub enum Statement {
     /// (CLI/server) ya garantiza atomicidad de batch; `BEGIN` permite
     /// además abortar el batch a mitad de camino con `ROLLBACK`.
     Begin,
+    /// Bloque J: `TRUNCATE [TABLE] <name>` — borra todas las filas de la
+    /// tabla. Implementación: iteración sobre todas las PKs aplicando
+    /// `delete_with_cascade` por fila (no es O(1) como en PG/MySQL, pero
+    /// respeta FKs `ON DELETE` declaradas). Restricciones diferidas no
+    /// se soportan.
+    Truncate(TruncateStmt),
     /// Bloque T: `COMMIT` / `END` — cierra la transacción explícita
     /// activa: persiste lo acumulado y re-abre una tx fresca para que
     /// el wrap del caller siga válido.
@@ -144,7 +150,29 @@ pub struct ForeignKeyDef {
 pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
-    pub values: Vec<Value>,
+    /// Bloque J: el origen de filas de un INSERT puede ser una lista de
+    /// tuplas literales (multi-row) o un SELECT (INSERT...SELECT).
+    /// Pre-J era `values: Vec<Value>` (single row); el wrapping en un
+    /// enum unifica el tratamiento y mantiene el camino single-row como
+    /// caso particular de `Values(vec![row])`.
+    pub source: InsertSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (a,b,c), (d,e,f), ...`. Cada tupla interior debe tener
+    /// la misma aridad que `columns`. La lista exterior tiene ≥1 tupla.
+    Values(Vec<Vec<Value>>),
+    /// `SELECT ...`. El executor materializa la query, exige que su
+    /// número de columnas coincida con `columns` del INSERT y mapea
+    /// cada fila a un row a insertar. Subqueries con agregados o
+    /// JOINs son válidas — la ejecución usa el mismo `exec_select`.
+    Select(Box<SelectStmt>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruncateStmt {
+    pub table: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -550,6 +578,7 @@ impl<'a> Engine<'a> {
             Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
             Statement::DropIndex(stmt) => self.exec_drop_index(stmt),
             Statement::IntegrityCheck => self.exec_integrity_check(),
+            Statement::Truncate(stmt) => self.exec_truncate(stmt),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -1079,17 +1108,9 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_insert(&mut self, stmt: InsertStmt) -> DbResult<ResultSet> {
-        if stmt.columns.len() != stmt.values.len() {
-            return Err(coded(
-                codes::INSERT_COLS_VS_VALUES_MISMATCH,
-                format!(
-                    "INSERT INTO '{}': cantidad de columnas ({}) no coincide con cantidad de valores ({})",
-                    stmt.table,
-                    stmt.columns.len(),
-                    stmt.values.len()
-                ),
-            ));
-        }
+        // Bloque J: validamos columnas y normalizamos UNA vez para todo
+        // el batch (single-row, multi-row o INSERT...SELECT). Después
+        // iteramos las filas-fuente delegando en `apply_insert_row`.
         let meta = {
             let mut catalog = Catalog::open(self.pager);
             catalog.get_table(&stmt.table)?.ok_or_else(|| {
@@ -1099,11 +1120,12 @@ impl<'a> Engine<'a> {
                 )
             })?
         };
-
+        // Validar nombres de columnas y dedup. Producimos la lista de
+        // claves normalizadas en el orden del INSERT.
         let mut seen = HashSet::new();
-        let mut values = HashMap::new();
-        for (column_name, value) in stmt.columns.into_iter().zip(stmt.values) {
-            let normalized = normalize_ident(&column_name);
+        let mut normalized_cols = Vec::with_capacity(stmt.columns.len());
+        for column_name in &stmt.columns {
+            let normalized = normalize_ident(column_name);
             if !seen.insert(normalized.clone()) {
                 return Err(coded(
                     codes::DUPLICATE_COLUMN_NAME,
@@ -1122,20 +1144,84 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
-            values.insert(normalized, value);
+            normalized_cols.push(normalized);
         }
 
-        // Apply DEFAULT for columns the user omitted, then enforce NOT NULL
-        // on the final view of the row. We do this here (not inside
-        // encode_row) so UPDATE keeps its own simpler "merge into existing"
-        // semantics without re-running defaults.
-        apply_defaults(&meta, &mut values);
-        enforce_not_null_on_insert(&meta, &values)?;
+        // Recolectamos la lista de filas-fuente. Para `Values` salen
+        // directo del AST; para `Select` ejecutamos la subquery y
+        // extraemos las filas en el orden de columnas del SELECT.
+        let rows_to_insert: Vec<Vec<Value>> = match stmt.source {
+            InsertSource::Values(rows) => {
+                for (i, row) in rows.iter().enumerate() {
+                    if row.len() != stmt.columns.len() {
+                        return Err(coded(
+                            codes::INSERT_COLS_VS_VALUES_MISMATCH,
+                            format!(
+                                "INSERT INTO '{}': fila {} tiene {} valores pero hay {} columnas",
+                                stmt.table,
+                                i + 1,
+                                row.len(),
+                                stmt.columns.len()
+                            ),
+                        ));
+                    }
+                }
+                rows
+            }
+            InsertSource::Select(sub) => {
+                let inner = self.exec_select(*sub)?;
+                if inner.columns.len() != stmt.columns.len() {
+                    return Err(coded(
+                        codes::INSERT_COLS_VS_VALUES_MISMATCH,
+                        format!(
+                            "INSERT INTO '{}' SELECT: el SELECT devolvió {} columnas pero el INSERT espera {}",
+                            stmt.table,
+                            inner.columns.len(),
+                            stmt.columns.len()
+                        ),
+                    ));
+                }
+                inner.rows
+            }
+        };
 
-        // UNIQUE pre-check: walk every unique secondary index and refuse
-        // the INSERT before touching disk if a conflicting (value, pk)
-        // already lives in the bucket. This is cheap (one B+Tree get per
-        // unique index) and keeps the failure path side-effect free.
+        let mut inserted = 0usize;
+        for row_values in rows_to_insert {
+            self.apply_insert_row(&meta, &normalized_cols, row_values)?;
+            inserted += 1;
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK ({} fila{} insertada{})",
+                inserted,
+                if inserted == 1 { "" } else { "s" },
+                if inserted == 1 { "" } else { "s" }
+            )),
+        })
+    }
+
+    /// Bloque J: aplica UN row al storage. Encapsula todas las
+    /// validaciones (NOT NULL, UNIQUE, FK), el encode + insert y el
+    /// mantenimiento de índices que pre-J vivían inline en `exec_insert`.
+    /// Se invoca una vez por fila del batch (single-row, multi-row VALUES
+    /// o INSERT...SELECT).
+    fn apply_insert_row(
+        &mut self,
+        meta: &TableMeta,
+        normalized_cols: &[String],
+        row_values: Vec<Value>,
+    ) -> DbResult<()> {
+        let mut values = HashMap::new();
+        for (key, value) in normalized_cols.iter().zip(row_values) {
+            values.insert(key.clone(), value);
+        }
+
+        apply_defaults(meta, &mut values);
+        enforce_not_null_on_insert(meta, &values)?;
+
         for idx in &meta.indexes {
             if !idx.unique {
                 continue;
@@ -1154,18 +1240,13 @@ impl<'a> Engine<'a> {
             check_unique_conflict(self.pager, idx, &value_bytes, None)?;
         }
 
-        let (pk, row_bytes) = encode_row(&meta, &values)?;
-        // FK pre-check uses the *new* PK so a self-referencing INSERT
-        // pointing at itself succeeds (the row will exist after this
-        // statement commits).
-        enforce_fk_on_insert(self.pager, &meta, &values, pk)?;
+        let (pk, row_bytes) = encode_row(meta, &values)?;
+        enforce_fk_on_insert(self.pager, meta, &values, pk)?;
         {
             let mut catalog = Catalog::open(self.pager);
             catalog.insert_row(meta.root_page, pk, row_bytes)?;
         }
 
-        // Maintain every secondary index: hash the new column value and
-        // upsert (value_bytes, pk) into the index bucket.
         for idx in &meta.indexes {
             let column = meta.column(&idx.column).ok_or_else(|| {
                 DbError::new(format!(
@@ -1181,10 +1262,53 @@ impl<'a> Engine<'a> {
             index_upsert_pk(self.pager, idx.root_page, idx.kind, &value_bytes, pk)?;
         }
 
+        Ok(())
+    }
+
+    /// Bloque J: `TRUNCATE [TABLE] <name>`. Implementación naive: scan
+    /// completo de PKs + `delete_with_cascade` por fila. NO es O(1) como
+    /// en Postgres/MySQL (que re-asignan el segmento); preferimos
+    /// respetar `ON DELETE` declarado (cascade/restrict) y mantener
+    /// índices secundarios consistentes vía el path normal de delete.
+    fn exec_truncate(&mut self, stmt: TruncateStmt) -> DbResult<ResultSet> {
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("tabla no existe: {}", stmt.table),
+                )
+            })?
+        };
+        let pks: Vec<i64> = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .scan_rows(meta.root_page, 0, None)?
+                .into_iter()
+                .map(|kv| kv.key)
+                .collect()
+        };
+        let mut deleted = 0usize;
+        for pk in pks {
+            let still_there = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.get_row(meta.root_page, pk)?.is_some()
+            };
+            if !still_there {
+                continue;
+            }
+            delete_with_cascade(self.pager, &meta.name, pk)?;
+            deleted += 1;
+        }
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
-            message: Some("OK".to_string()),
+            message: Some(format!(
+                "OK ({} fila{} eliminada{})",
+                deleted,
+                if deleted == 1 { "" } else { "s" },
+                if deleted == 1 { "" } else { "s" }
+            )),
         })
     }
 
@@ -5352,6 +5476,13 @@ impl Parser {
             self.expect_keyword("CHECK")?;
             return Ok(Statement::IntegrityCheck);
         }
+        if self.match_keyword("TRUNCATE") {
+            // Bloque J: `TRUNCATE TABLE <name>` (palabra TABLE opcional,
+            // como en MySQL/SQLite).
+            let _ = self.match_keyword("TABLE");
+            let table = self.expect_ident()?;
+            return Ok(Statement::Truncate(TruncateStmt { table }));
+        }
         // Bloque T: transacciones explícitas. `BEGIN` y `START TRANSACTION`
         // son sinónimos (ANSI); `COMMIT` y `END` son sinónimos (también
         // ANSI). `ROLLBACK` no tiene alias estándar relevante en este
@@ -5381,7 +5512,7 @@ impl Parser {
             return Ok(Statement::Rollback);
         }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW/INTEGRITY/BEGIN/COMMIT/ROLLBACK)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW/INTEGRITY/TRUNCATE/BEGIN/COMMIT/ROLLBACK)",
         ))
     }
 
@@ -5619,14 +5750,35 @@ impl Parser {
         self.expect_symbol("(")?;
         let columns = self.parse_ident_list()?;
         self.expect_symbol(")")?;
-        self.expect_keyword("VALUES")?;
-        self.expect_symbol("(")?;
-        let values = self.parse_value_list()?;
-        self.expect_symbol(")")?;
+        // Bloque J: dos fuentes posibles tras el header del INSERT —
+        // `VALUES (...), (...), ...` (multi-row) o `SELECT ...`.
+        let source = if self.match_keyword("VALUES") {
+            let mut rows = Vec::new();
+            self.expect_symbol("(")?;
+            rows.push(self.parse_value_list()?);
+            self.expect_symbol(")")?;
+            while self.match_symbol(",") {
+                self.expect_symbol("(")?;
+                rows.push(self.parse_value_list()?);
+                self.expect_symbol(")")?;
+            }
+            InsertSource::Values(rows)
+        } else if self.match_keyword("SELECT") {
+            let subquery = self.parse_select_stmt()?;
+            InsertSource::Select(Box::new(subquery))
+        } else {
+            return Err(coded(
+                codes::INSERT_COLS_VS_VALUES_MISMATCH,
+                format!(
+                    "INSERT INTO '{}': se esperaba VALUES (…) o SELECT … después de la lista de columnas",
+                    table
+                ),
+            ));
+        };
         Ok(Statement::Insert(InsertStmt {
             table,
             columns,
-            values,
+            source,
         }))
     }
 

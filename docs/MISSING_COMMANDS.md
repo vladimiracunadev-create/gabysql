@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-25 contra `main` post-bloque **T** (transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK`).
+> Última verificación: 2026-05-25 contra `main` post-bloque **J** (DML masivo: multi-row INSERT, INSERT...SELECT, TRUNCATE).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -36,7 +36,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **G** | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` | Medio-Alto | E1 |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
 | **I** | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual | Medio | — |
-| **J** | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `UPSERT`/`ON CONFLICT`, `RETURNING`, `TRUNCATE` | Medio | E3 |
+| **J** 🟡 | DML masivo: multi-row `INSERT` ✅, `INSERT...SELECT` ✅, `TRUNCATE` ✅, `UPSERT`/`ON CONFLICT` ❌, `RETURNING` ❌ | Medio | E3 (**parcial 2026-05-25**) |
 | **K** | DDL faltante: PK compuesta, `CREATE TABLE AS SELECT`, `DROP/RENAME COLUMN`, `RENAME TABLE`, índices compuestos y partial indexes | Alto | — |
 | **L** | Constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE ...`, multi-column UNIQUE | Medio | K |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
@@ -200,10 +200,10 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Comando | Soportado | Prioridad | Bloque |
 |---|:---:|:---:|:---:|
 | `INSERT ... VALUES (...)` (single row) | ✅ | — | — |
-| `INSERT ... VALUES (a,b),(c,d)` multi-row | ❌ | P0 | J |
-| `INSERT INTO t SELECT ...` | ❌ | P0 | J |
-| `INSERT ... ON CONFLICT DO UPDATE` / `UPSERT` | ❌ | P1 | J |
-| `REPLACE INTO` (SQLite-style) | ❌ | P2 | J |
+| `INSERT ... VALUES (a,b),(c,d)` multi-row | ✅ (J) | — | — |
+| `INSERT INTO t SELECT ...` | ✅ (J) | — | — |
+| `INSERT ... ON CONFLICT DO UPDATE` / `UPSERT` | ❌ | P1 | J (pendiente) |
+| `REPLACE INTO` (SQLite-style) | ❌ | P2 | J (pendiente) |
 | `UPDATE ... WHERE col_indexada = val` | ✅ (E3) | — | — |
 | `UPDATE ... WHERE col IN (SELECT ...)` | ✅ (E3) | — | — |
 | `UPDATE ... WHERE` con AND/OR/NOT, LIKE, IS NULL, etc. | ✅ (E3) | — | — |
@@ -211,8 +211,8 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `DELETE ... WHERE col_indexada = val` | ✅ (E3) | — | — |
 | `DELETE` con subquery en WHERE | ✅ (E3) | — | — |
 | `DELETE` con JOIN | ❌ | P1 | (futuro) |
-| `TRUNCATE TABLE` | ❌ | P2 | J |
-| `RETURNING` clause (`UPDATE ... RETURNING id`) | ❌ | P2 | J |
+| `TRUNCATE [TABLE]` | ✅ (J; scan + cascade respeta FK ON DELETE) | — | — |
+| `RETURNING` clause (`UPDATE ... RETURNING id`) | ❌ | P2 | J (pendiente) |
 
 ---
 
