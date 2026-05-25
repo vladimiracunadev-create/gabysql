@@ -1,0 +1,152 @@
+name: Release
+
+# Trigger: push de un tag `v*` (ej: `v0.2.0`).
+# Compila gabysql.exe + gabysql-server.exe en Windows/Linux/macOS, los
+# empaqueta como zips y publica un GitHub Release con los assets.
+#
+# Modelo de confianza (mismo que ci.yml):
+#   - Workflow-level permissions = contents:read (default deny).
+#   - El job `release` eleva a contents:write solo para crear el release.
+#   - persist-credentials:false en checkout — el step de release usa
+#     `gh release create` con GITHUB_TOKEN explícito, no la credencial
+#     persistida del checkout.
+#   - Acciones third-party pinned a SHA. Usamos `gh` CLI (oficial,
+#     preinstalado en runners) para crear el release — evita depender
+#     de una action third-party más.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target-name: linux-x86_64
+            ext: ''
+            archive: tar.gz
+          - os: windows-latest
+            target-name: windows-x86_64
+            ext: '.exe'
+            archive: zip
+          - os: macos-latest
+            target-name: macos-arm64
+            ext: ''
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+
+      - name: cargo build release
+        run: cargo build --release --bin gabysql --bin gabysql-server
+
+      - name: Stage release files
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target-name }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          # Ensamblamos un directorio `gabysql-${TAG}-${TARGET}/` con los
+          # binarios + docs mínimas. Esa carpeta es la que se comprime —
+          # cuando el usuario descomprime, queda todo bajo un solo
+          # subdirectorio prolijo (no se le cae el .exe en cwd suelto).
+          DIR="gabysql-${TAG}-${TARGET}"
+          mkdir -p "dist/${DIR}"
+          cp "target/release/gabysql${EXT}"        "dist/${DIR}/"
+          cp "target/release/gabysql-server${EXT}" "dist/${DIR}/"
+          cp README.md LICENSE CHANGELOG.md QUICKSTART.md INSTALL.md "dist/${DIR}/"
+
+      - name: Compress (zip on Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target-name }}
+        run: |
+          $dir = "gabysql-$env:TAG-$env:TARGET"
+          Compress-Archive -Path "dist/$dir" -DestinationPath "dist/$dir.zip" -Force
+
+      - name: Compress (tar.gz on Linux/macOS)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target-name }}
+        run: |
+          DIR="gabysql-${TAG}-${TARGET}"
+          tar -czf "dist/${DIR}.tar.gz" -C dist "${DIR}"
+
+      - name: Compute SHA256
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target-name }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          # Hash del archivo final. Lo subimos como asset adicional para
+          # que el script de install pueda verificar la descarga.
+          DIR="gabysql-${TAG}-${TARGET}"
+          ARTIFACT="dist/${DIR}.${ARCHIVE}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          else
+            shasum -a 256 "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          fi
+          cat "${ARTIFACT}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: gabysql-${{ matrix.target-name }}
+          path: |
+            dist/*.${{ matrix.archive }}
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # crear release + subir assets
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Usamos `gh release create` con --generate-notes para que GitHub
+          # arme el changelog automáticamente desde los PRs/commits desde
+          # el tag anterior. Si querés notas custom, reemplazá por
+          # `--notes-file RELEASE_NOTES.md`.
+          gh release create "${TAG}" \
+            --title "gabysql ${TAG}" \
+            --generate-notes \
+            dist/*

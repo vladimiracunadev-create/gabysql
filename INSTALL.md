@@ -32,19 +32,91 @@ Consulta también [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).
 
 ## 🪟 Windows
 
-### Build nativo
-1. Instala `rustup` y el toolchain estable.
-2. Si quieres correr `cargo test` nativo en Windows, instala además:
+Hay **tres rutas** según qué quieras: instalar listo para usar, descargar manualmente, o compilar desde fuentes.
+
+### Ruta A — Instalador one-liner (recomendado para usuarios)
+
+Desde PowerShell, una sola línea:
+
+```powershell
+iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1 | iex
+```
+
+Esto:
+1. Consulta el último release publicado en GitHub.
+2. Descarga `gabysql-<tag>-windows-x86_64.zip` y verifica el SHA256.
+3. Extrae los binarios (`gabysql.exe`, `gabysql-server.exe`) a `%LOCALAPPDATA%\Programs\gabysql\`.
+4. Agrega ese directorio al `PATH` del usuario (no toca el PATH del sistema, no requiere admin).
+
+Después abrí **una nueva terminal** (las terminales abiertas no ven el PATH refrescado) y verificá:
+
+```powershell
+gabysql --version
+gabysql init mi-base.db
+gabysql exec mi-base.db "SELECT 1;"
+```
+
+Variantes:
+
+```powershell
+# Instalar una versión específica
+& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1).Content)) -Version v0.2.0
+
+# Sin modificar el PATH (uso con ruta absoluta)
+& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1).Content)) -NoPath
+
+# Directorio destino custom
+& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1).Content)) -InstallDir 'D:\tools\gabysql'
+```
+
+> Si PowerShell rechaza el script con un error de política, corré una vez (solo para tu usuario):
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+
+**Para desinstalar**: borrar `%LOCALAPPDATA%\Programs\gabysql` y sacar esa entrada del PATH del usuario (Configuración → Sistema → Acerca de → Configuración avanzada → Variables de entorno).
+
+### Ruta B — Descarga manual del release
+
+Si no querés ejecutar el script:
+
+1. Ir a [Releases](https://github.com/vladimiracunadev-create/gabysql/releases).
+2. Descargar `gabysql-<tag>-windows-x86_64.zip`.
+3. Descomprimir donde quieras (ej: `C:\gabysql\`).
+4. Opcional: agregá esa carpeta al `PATH` para tener `gabysql` accesible desde cualquier `cmd`/`pwsh`.
+
+### Ruta C — Build nativo desde fuentes
+
+Si querés compilar (porque vas a modificar el motor, o porque querés validar la cadena de build):
+
+1. Instalá [`rustup`](https://rustup.rs) y el toolchain estable.
+2. Para que `cargo test` y `cargo build` funcionen en Windows, instalá:
    - Visual Studio Build Tools
    - MSVC C++ build tools
    - Windows SDK
-3. Compila:
+3. Compilá:
+   ```powershell
+   git clone https://github.com/vladimiracunadev-create/gabysql.git
+   cd gabysql
+   cargo build --release --bin gabysql --bin gabysql-server
+   ```
+4. Los binarios quedan en `target\release\gabysql.exe` y `target\release\gabysql-server.exe`. Copiá donde quieras y agregá al `PATH`.
+
+### Si fallan `link.exe` o `kernel32.lib`
+
+Falta el toolchain MSVC. Dos opciones: instalá Visual Studio Build Tools (la solución correcta para la Ruta C) o usá la **Ruta A / Ruta B** que no requieren toolchain.
+
+### Primer uso (cualquier ruta)
+
 ```powershell
-cargo build --release --bin gabysql --bin gabysql-server
+gabysql init demo.db
+gabysql exec demo.db "CREATE TABLE notas (id INT PRIMARY KEY, texto TEXT);"
+gabysql exec demo.db "INSERT INTO notas (id, texto) VALUES (1, 'hola');"
+gabysql exec demo.db "SELECT * FROM notas;"
+gabysql repl demo.db   # REPL interactivo
 ```
 
-### Nota importante
-Si te faltan `link.exe` o bibliotecas como `kernel32.lib`, usa Docker mientras terminas de instalar el toolchain nativo.
+La base de datos es **un archivo único** (`demo.db` + su `demo.db.wal`). Para backup: `gabysql backup demo.db backup.gby`. Para diagnóstico: `gabysql info demo.db`.
 
 ---
 
