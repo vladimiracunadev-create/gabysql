@@ -112,3 +112,5 @@
 - archivo único
 - **superficie SQL relacional clásica completa**: DDL, DML, índices, FK, `ORDER BY`, `WHERE` con `IN`/`= (SELECT …)`/`[NOT] EXISTS`, todos los JOINs ANSI (INNER, CROSS, LEFT/RIGHT/FULL, USING, NATURAL, multi-tabla, self-join, index-loop optimization)
 - foco en estabilidad, durabilidad y compatibilidad antes que en amplitud OLAP (sin `GROUP BY`/window/CTE recursivas)
+
+> Para el **inventario exhaustivo de comandos SQL que faltan** (con prioridades P0–P3 y la secuencia de bloques `E1 → E2 → E3 → F → G → T → …` para cerrar la línea de comandos completa), ver [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md).

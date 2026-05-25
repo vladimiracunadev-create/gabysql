@@ -27,6 +27,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 | 📐 | [SQL_REFERENCE](docs/SQL_REFERENCE.md) | gramática con railroad diagrams + EBNF + ejemplos |
 | 🛡️ | [SECURITY_LAYERS](docs/SECURITY_LAYERS.md) | mapa completo de las 6 capas de seguridad |
 | 🚨 | [ERROR_CODES](docs/ERROR_CODES.md) | catálogo numerado de errores `[GBY-NNNN]` (estilo MySQL `ER_*`) |
+| 🚧 | [MISSING_COMMANDS](docs/MISSING_COMMANDS.md) | **inventario exhaustivo de lo que falta** del SQL clásico — roadmap concreto para cerrar la línea de comandos |
 | 📜 | [ADRs](docs/adr/) | decisiones arquitectónicas (contexto, alternativas, consecuencias) |
 | 🏛️ | Históricos: [POSITIONING](docs/POSITIONING.md) · [COMMERCIAL_ROADMAP](docs/COMMERCIAL_ROADMAP.md) · [COMPETITIVE_ANALYSIS](docs/COMPETITIVE_ANALYSIS.md) | artefactos del intento de pensar `gabysql` como producto. **No son agenda operativa**. |
 
