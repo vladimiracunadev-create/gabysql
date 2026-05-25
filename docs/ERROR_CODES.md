@@ -114,6 +114,7 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4021` | `CROSS_JOIN_WITH_ON` | `CROSS JOIN ... ON ...` — el cartesian product no admite predicado. | Cambiar a `INNER JOIN ... ON ...`. |
 | `4022` | `USING_COLUMN_INVALID` | `JOIN ... USING (col)` con col que no existe en ambas tablas, o USING con cantidad de columnas no soportada (este release: exactamente 1). | Verificar que `col` exista en ambos lados; reescribir con `ON` para multi-columna. |
 | `4023` | `NATURAL_JOIN_NO_COMMON_COLUMN` | `NATURAL JOIN` cuyas tablas no comparten exactamente 1 columna por nombre (0 o >1). | Usar `JOIN ... ON` o `USING` explícito. |
+| `4024` | `WHERE_COMBINATOR_CORRELATED_UNSUPPORTED` | `EXISTS` correlacionado o column-ref del outer (`col = otra.col`) usado dentro de un `AND`/`OR`/`NOT`. El dispatch correlacionado solo aplica cuando el predicado es el único átomo del WHERE. | Sacar el predicado correlacionado del combinador (dejarlo como único filtro) o reescribir vía JOIN/subquery no-correlacionada. |
 
 ---
 

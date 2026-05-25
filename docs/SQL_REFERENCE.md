@@ -28,6 +28,7 @@
 | `WHERE col IN (SELECT …)` (no-correlacionada, single-column) | DML | 🟢 |
 | `WHERE col = (SELECT …)` (subquery escalar no-correlacionada) | DML | 🟢 |
 | `WHERE [NOT] EXISTS (SELECT …)` (no-correlacionada y correlacionada single-eq) | DML | 🟢 |
+| `WHERE` con `AND`/`OR`/`NOT` + paréntesis y 3VL para NULL (bloque E1) | DML | 🟢 |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
@@ -520,12 +521,39 @@ select       ::= "SELECT" select_cols "FROM" identifier
                   ("LIMIT" integer)?
                   ("OFFSET" integer)?
 select_cols  ::= "*" | identifier ("," identifier)*
-where_clause ::= identifier "=" ( value | "(" select ")" | qualified_ident )
-               | identifier "BETWEEN" integer "AND" integer
-               | identifier "IN" "(" select ")"
-               | ["NOT"] "EXISTS" "(" select ")"
+where_clause  ::= where_or
+where_or      ::= where_and ( "OR" where_and )*
+where_and     ::= where_not ( "AND" where_not )*
+where_not     ::= "NOT" where_not
+                | where_primary
+where_primary ::= "(" where_or ")"
+                | "EXISTS" "(" select ")"
+                | "NOT" "EXISTS" "(" select ")"
+                | where_atom
+where_atom    ::= identifier "=" ( value | "(" select ")" | qualified_ident )
+                | identifier "BETWEEN" integer "AND" integer
+                | identifier "IN" "(" select ")"
 qualified_ident ::= identifier ( "." identifier )?
 ```
+
+**Precedencia** (de más baja a más alta): `OR` < `AND` < `NOT` < paréntesis / átomo.
+Es la convención estándar SQL: `a OR b AND c` se interpreta como `a OR (b AND c)`.
+Los paréntesis fuerzan agrupaciones distintas.
+
+**Lógica trivaluada (3VL)** — el WHERE evalúa con la tabla de verdad de SQL
+estándar para NULL:
+
+- `NULL AND false` → `false`; `NULL AND true` → `NULL`; `NULL AND NULL` → `NULL`
+- `NULL OR true`  → `true`;  `NULL OR false` → `NULL`; `NULL OR NULL` → `NULL`
+- `NOT NULL` → `NULL`
+- Una fila sobrevive el filtro solo si la expresión evalúa a `true`;
+  `false` y `NULL` (unknown) la descartan.
+
+**Limitación E1**: `EXISTS` correlacionado y `col = otra.col` (column-ref del
+outer) **solo se permiten como único átomo del WHERE**. Combinarlos con
+`AND`/`OR`/`NOT` devuelve `[GBY-4024]` — soporte completo queda para un
+bloque posterior. Subqueries no-correlacionadas (`IN (SELECT)`, `= (SELECT)`,
+`EXISTS` no-correlacionado) sí se pueden combinar libremente.
 
 ### 🔗 FROM con JOINs (bloque A del roadmap)
 
@@ -582,6 +610,15 @@ SELECT id FROM orders WHERE status = 'pending' LIMIT 50;
 -- BETWEEN sobre columna INT indexada (índice OrderedInt, ADR-0017)
 -- CREATE INDEX idx_users_score ON users (score);  -- score INT
 SELECT id, name FROM users WHERE score BETWEEN 80 AND 100 LIMIT 25;
+
+-- AND / OR / NOT + paréntesis (bloque E1)
+SELECT id FROM users WHERE active = TRUE AND score BETWEEN 80 AND 100;
+SELECT id FROM users WHERE city = 'BA' OR city = 'MDQ';
+SELECT id FROM users WHERE NOT status = 'banned';
+SELECT id FROM users WHERE (city = 'BA' OR city = 'MDQ') AND active = TRUE;
+-- Precedencia estándar: AND ata más fuerte que OR.
+SELECT id FROM users WHERE city = 'BA' OR city = 'MDQ' AND active = TRUE;
+-- Equivale a: city = 'BA' OR (city = 'MDQ' AND active = TRUE)
 
 -- ORDER BY (cualquier columna; ASC default; NULLs primero)
 SELECT id, name FROM users ORDER BY name ASC;

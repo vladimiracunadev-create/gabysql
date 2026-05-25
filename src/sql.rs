@@ -141,7 +141,7 @@ pub struct SelectStmt {
     /// (left-deep tree).
     pub joins: Vec<JoinClause>,
     pub columns: Vec<String>,
-    pub where_clause: Option<WhereClause>,
+    pub where_clause: Option<WhereExpr>,
     pub order_by: Option<OrderClause>,
     pub limit: Option<usize>,
     pub offset: usize,
@@ -223,6 +223,52 @@ impl OrderClause {
 pub enum OrderDir {
     Asc,
     Desc,
+}
+
+/// Árbol booleano que envuelve los predicados atómicos del `WHERE`
+/// (Bloque E1). Antes de E1 el `WHERE` era un único `WhereClause`; ahora
+/// puede ser una combinación arbitraria con `AND`/`OR`/`NOT` y paréntesis.
+///
+/// `Atom` lleva el predicado existente sin tocar — eso preserva todas las
+/// fast-paths (PK directo, índice secundario, range scan, EXISTS
+/// correlacionado) cuando el `WHERE` se reduce a un único átomo.
+///
+/// Lógica trivaluada (3VL) de NULL:
+/// - `NOT NULL = NULL`
+/// - `NULL AND false = false`, `NULL AND true = NULL`, `NULL AND NULL = NULL`
+/// - `NULL OR true = true`,  `NULL OR false = NULL`, `NULL OR NULL = NULL`
+/// - una fila sobrevive el filtro solo si la expresión evalúa a `true`;
+///   `NULL` (unknown) y `false` la descartan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WhereExpr {
+    And(Box<WhereExpr>, Box<WhereExpr>),
+    Or(Box<WhereExpr>, Box<WhereExpr>),
+    Not(Box<WhereExpr>),
+    Atom(WhereClause),
+}
+
+impl WhereExpr {
+    /// Si la expresión es exactamente un átomo (sin AND/OR/NOT envolventes),
+    /// devuelve referencia al `WhereClause` interno. Se usa en `exec_select`
+    /// para decidir si aplica una fast-path optimizada (PK directa, índice,
+    /// range scan) o si hay que caer al post-filter row-a-row.
+    pub fn as_atom(&self) -> Option<&WhereClause> {
+        match self {
+            WhereExpr::Atom(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Versión owned de [`as_atom`]: si la expresión es un átomo, consume
+    /// `self` y devuelve el `WhereClause`; en caso contrario devuelve la
+    /// expresión sin modificar dentro de `Err` para que el caller pueda
+    /// seguir usándola en el path general.
+    pub fn into_atom(self) -> Result<WhereClause, WhereExpr> {
+        match self {
+            WhereExpr::Atom(c) => Ok(c),
+            other => Err(other),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -952,12 +998,28 @@ impl<'a> Engine<'a> {
         // actual empujada en `outer_stack`. El resto del flujo (plan, scan,
         // ORDER BY, LIMIT/OFFSET) se mantiene; el filtro se aplica entre la
         // materialización de `rows_bytes` y la proyección.
-        let exists_postfilter: Option<(Box<SelectStmt>, bool)> = match &stmt.where_clause {
-            Some(WhereClause::Exists { subquery, negated })
-                if subquery_has_outer_refs(subquery) =>
-            {
+        //
+        // Bloque E1: el fast-path solo aplica cuando el WHERE es UN átomo
+        // `Exists` correlacionado (sin AND/OR/NOT envolventes). Cuando hay
+        // combinadores el filtrado entero se hace por la rama
+        // `generic_post_filter` con el evaluador 3VL.
+        let exists_postfilter: Option<(Box<SelectStmt>, bool)> = match stmt
+            .where_clause
+            .as_ref()
+            .and_then(|e| e.as_atom())
+        {
+            Some(WhereClause::Exists { subquery, negated }) if subquery_has_outer_refs(subquery) => {
                 Some((subquery.clone(), *negated))
             }
+            _ => None,
+        };
+
+        // Bloque E1: cuando el WHERE no es un único átomo, las fast-paths
+        // (PK directa, índice secundario, range scan) no aplican porque la
+        // combinación booleana puede mezclar predicados sobre columnas
+        // distintas. Caemos a FullScan + post-filter genérico row-a-row.
+        let generic_post_filter: Option<WhereExpr> = match &stmt.where_clause {
+            Some(expr) if expr.as_atom().is_none() => Some(expr.clone()),
             _ => None,
         };
 
@@ -971,11 +1033,19 @@ impl<'a> Engine<'a> {
             Range { from: i64, to: i64 },
         }
 
-        let plan = if exists_postfilter.is_some() {
+        // Extracto el átomo único del WHERE (si existe) para reusar el
+        // dispatch original. Cuando hay combinadores `generic_post_filter`
+        // se hace cargo y acá entramos por la rama `None`.
+        let where_atom: Option<WhereClause> = stmt
+            .where_clause
+            .clone()
+            .and_then(|e| e.into_atom().ok());
+
+        let plan = if exists_postfilter.is_some() || generic_post_filter.is_some() {
             // El filtrado real ocurre en el post-filter; el scan barre todo.
             Plan::FullScan
         } else {
-            match stmt.where_clause.clone() {
+            match where_atom {
                 None => Plan::FullScan,
                 Some(WhereClause::Eq { column, value }) => {
                     let normalized = normalize_ident(&column);
@@ -1246,7 +1316,8 @@ impl<'a> Engine<'a> {
         // completa de filas, así que también necesita diferir el window —
         // de lo contrario `LIMIT 10` cortaría antes de aplicar EXISTS y
         // devolvería menos filas de las que en realidad matchean.
-        let defer_window = stmt.order_by.is_some() || exists_postfilter.is_some();
+        let defer_window =
+            stmt.order_by.is_some() || exists_postfilter.is_some() || generic_post_filter.is_some();
         let rows_bytes: Vec<KeyValue> = if defer_window {
             let mut catalog = Catalog::open(self.pager);
             match plan {
@@ -1326,6 +1397,28 @@ impl<'a> Engine<'a> {
                 let has_rows = !inner.rows.is_empty();
                 let pass = if negated { !has_rows } else { has_rows };
                 if pass {
+                    kept.push(kv);
+                }
+            }
+            if stmt.order_by.is_none() {
+                window_rows(kept, stmt.offset, stmt.limit)
+            } else {
+                kept
+            }
+        } else {
+            rows_bytes
+        };
+
+        // Bloque E1: post-filter genérico cuando el WHERE no es un único
+        // átomo (AND/OR/NOT/paréntesis). Recorremos row-a-row decodificando
+        // y evaluando con 3VL. La fila sobrevive solo si la expresión
+        // evalúa a `Some(true)` (NULL/unknown descarta, como en ANSI SQL).
+        let rows_bytes: Vec<KeyValue> = if let Some(expr) = generic_post_filter {
+            let mut kept = Vec::with_capacity(rows_bytes.len());
+            for kv in rows_bytes {
+                let decoded = decode_row(&meta, &kv.value)?;
+                let verdict = self.eval_where_expr_single(&expr, &meta, &decoded)?;
+                if matches!(verdict, Some(true)) {
                     kept.push(kv);
                 }
             }
@@ -1517,7 +1610,7 @@ impl<'a> Engine<'a> {
 
         // --- 4. WHERE como post-filter ---
         if let Some(where_clause) = stmt.where_clause.clone() {
-            current = self.filter_joined_rows(current, &where_clause, &scope)?;
+            current = self.filter_joined_rows_expr(current, &where_clause, &scope)?;
         }
 
         // --- 5. Resolver columnas proyectadas (output_columns = lo que escribió el user) ---
@@ -1751,7 +1844,164 @@ impl<'a> Engine<'a> {
     /// schema combinado: `Eq`, `Between`. `In`/`EqSubquery` se evalúan
     /// pre-computando el set una sola vez. `EqColumnRef`/`Exists` con
     /// JOINs no se soportan en este bloque.
-    fn filter_joined_rows(
+    /// Bloque E1: aplica un `WhereExpr` arbitrario (con `AND`/`OR`/`NOT`)
+    /// sobre filas joined. Para cada fila evaluamos la expresión con
+    /// 3VL: solo sobrevive si devuelve `Some(true)`. Internamente reusa
+    /// `filter_joined_rows_atom` para evaluar átomos.
+    fn filter_joined_rows_expr(
+        &mut self,
+        rows: Vec<HashMap<String, Value>>,
+        expr: &WhereExpr,
+        scope: &JoinScope,
+    ) -> DbResult<Vec<HashMap<String, Value>>> {
+        // Fast-path: si es un único átomo, dispatchamos al evaluador atómico
+        // original (mantiene la semántica/perfomance que ya existía).
+        if let WhereExpr::Atom(c) = expr {
+            return self.filter_joined_rows_atom(rows, c, scope);
+        }
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            let verdict = self.eval_where_expr_joined(expr, &row, scope)?;
+            if matches!(verdict, Some(true)) {
+                kept.push(row);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Evalúa un `WhereExpr` sobre una única fila joined con lógica
+    /// trivaluada (3VL). Devuelve `Some(true)`/`Some(false)`/`None` donde
+    /// `None` representa NULL/unknown. AND/OR aplican short-circuit
+    /// estándar; NOT propaga NULL.
+    fn eval_where_expr_joined(
+        &mut self,
+        expr: &WhereExpr,
+        row: &HashMap<String, Value>,
+        scope: &JoinScope,
+    ) -> DbResult<Option<bool>> {
+        match expr {
+            WhereExpr::And(a, b) => {
+                let la = self.eval_where_expr_joined(a, row, scope)?;
+                if let Some(false) = la {
+                    return Ok(Some(false));
+                }
+                let lb = self.eval_where_expr_joined(b, row, scope)?;
+                Ok(match (la, lb) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+            }
+            WhereExpr::Or(a, b) => {
+                let la = self.eval_where_expr_joined(a, row, scope)?;
+                if let Some(true) = la {
+                    return Ok(Some(true));
+                }
+                let lb = self.eval_where_expr_joined(b, row, scope)?;
+                Ok(match (la, lb) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+            }
+            WhereExpr::Not(inner) => Ok(match self.eval_where_expr_joined(inner, row, scope)? {
+                Some(b) => Some(!b),
+                None => None,
+            }),
+            WhereExpr::Atom(c) => self.eval_atom_joined(c, row, scope),
+        }
+    }
+
+    /// Evalúa un único `WhereClause` sobre una fila joined, devolviendo 3VL.
+    /// `EqColumnRef`/correlated `EXISTS` no se soportan acá (mismo límite
+    /// que en pre-E1) — `[GBY-4001]`.
+    fn eval_atom_joined(
+        &mut self,
+        atom: &WhereClause,
+        row: &HashMap<String, Value>,
+        scope: &JoinScope,
+    ) -> DbResult<Option<bool>> {
+        match atom {
+            WhereClause::Eq { column, value } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                match row.get(&key) {
+                    Some(Value::Null) => Ok(None),
+                    Some(v) => match value {
+                        Value::Null => Ok(None),
+                        other => Ok(Some(values_equal(v, other))),
+                    },
+                    None => Ok(Some(false)),
+                }
+            }
+            WhereClause::Between { column, from, to } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                match row.get(&key) {
+                    Some(Value::Integer(n)) => Ok(Some(*n >= *from && *n <= *to)),
+                    Some(Value::Null) | None => Ok(None),
+                    _ => Ok(Some(false)),
+                }
+            }
+            WhereClause::In { column, subquery } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let inner = self.exec_select((**subquery).clone())?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery en IN debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                let set: Vec<Value> = inner
+                    .rows
+                    .into_iter()
+                    .filter_map(|mut r| r.pop())
+                    .filter(|v| !matches!(v, Value::Null))
+                    .collect();
+                match row.get(&key) {
+                    Some(Value::Null) | None => Ok(None),
+                    Some(v) => Ok(Some(set.iter().any(|s| values_equal(v, s)))),
+                }
+            }
+            WhereClause::EqSubquery { column, subquery } => {
+                let key = resolve_joined_column_key(scope, column)?;
+                let inner = self.exec_select((**subquery).clone())?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                if inner.rows.len() > 1 {
+                    return Err(coded(
+                        codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
+                        format!(
+                            "subquery escalar en WHERE devolvió {} filas; debe devolver a lo sumo 1",
+                            inner.rows.len()
+                        ),
+                    ));
+                }
+                let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
+                match (scalar, row.get(&key)) {
+                    (None, _) | (Some(Value::Null), _) | (_, Some(Value::Null)) | (_, None) => {
+                        Ok(None)
+                    }
+                    (Some(expected), Some(v)) => Ok(Some(values_equal(v, &expected))),
+                }
+            }
+            WhereClause::EqColumnRef { .. } | WhereClause::Exists { .. } => Err(coded(
+                codes::WHERE_OPERATOR_UNSUPPORTED,
+                "esta forma del WHERE (column-ref / EXISTS) aún no se combina con JOINs \
+                 en este release; envolver el JOIN en una subquery o filtrar por valores literales",
+            )),
+        }
+    }
+
+    fn filter_joined_rows_atom(
         &mut self,
         rows: Vec<HashMap<String, Value>>,
         where_clause: &WhereClause,
@@ -1847,6 +2097,184 @@ impl<'a> Engine<'a> {
                 codes::WHERE_OPERATOR_UNSUPPORTED,
                 "esta forma del WHERE (column-ref / EXISTS) aún no se combina con JOINs \
                  en este release; envolver el JOIN en una subquery o filtrar por valores literales",
+            )),
+        }
+    }
+
+    /// Bloque E1: evaluador 3VL de `WhereExpr` sobre una fila ya decodificada
+    /// de una tabla single (sin JOIN). Devuelve `Some(true)`/`Some(false)`/
+    /// `None` (NULL/unknown). Se usa cuando el WHERE contiene
+    /// `AND`/`OR`/`NOT` y por lo tanto no podemos usar las fast-paths
+    /// indexadas. Las claves del row son nombres normalizados de columnas
+    /// (lowercase, sin qualifier).
+    fn eval_where_expr_single(
+        &mut self,
+        expr: &WhereExpr,
+        meta: &TableMeta,
+        row: &HashMap<String, Value>,
+    ) -> DbResult<Option<bool>> {
+        match expr {
+            WhereExpr::And(a, b) => {
+                let la = self.eval_where_expr_single(a, meta, row)?;
+                if let Some(false) = la {
+                    return Ok(Some(false));
+                }
+                let lb = self.eval_where_expr_single(b, meta, row)?;
+                Ok(match (la, lb) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+            }
+            WhereExpr::Or(a, b) => {
+                let la = self.eval_where_expr_single(a, meta, row)?;
+                if let Some(true) = la {
+                    return Ok(Some(true));
+                }
+                let lb = self.eval_where_expr_single(b, meta, row)?;
+                Ok(match (la, lb) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+            }
+            WhereExpr::Not(inner) => Ok(match self.eval_where_expr_single(inner, meta, row)? {
+                Some(b) => Some(!b),
+                None => None,
+            }),
+            WhereExpr::Atom(c) => self.eval_atom_single(c, meta, row),
+        }
+    }
+
+    fn eval_atom_single(
+        &mut self,
+        atom: &WhereClause,
+        meta: &TableMeta,
+        row: &HashMap<String, Value>,
+    ) -> DbResult<Option<bool>> {
+        match atom {
+            WhereClause::Eq { column, value } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                match row.get(&key) {
+                    Some(Value::Null) | None => Ok(None),
+                    Some(v) => match value {
+                        Value::Null => Ok(None),
+                        other => Ok(Some(values_equal(v, other))),
+                    },
+                }
+            }
+            WhereClause::Between { column, from, to } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                match row.get(&key) {
+                    Some(Value::Integer(n)) => Ok(Some(*n >= *from && *n <= *to)),
+                    Some(Value::Null) | None => Ok(None),
+                    _ => Ok(Some(false)),
+                }
+            }
+            WhereClause::In { column, subquery } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                // NOTA E1: la subquery se re-ejecuta por cada fila del
+                // outer cuando vive dentro de un AND/OR/NOT. Es correcto
+                // pero no óptimo — un caching pre-loop queda para futuros
+                // bloques (H optimiza subqueries; este bloque prioriza
+                // semántica). La fast-path single-átomo del exec_select
+                // sigue sin pagar este costo.
+                let inner = self.exec_select((**subquery).clone())?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery en IN debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                let set: Vec<Value> = inner
+                    .rows
+                    .into_iter()
+                    .filter_map(|mut r| r.pop())
+                    .filter(|v| !matches!(v, Value::Null))
+                    .collect();
+                match row.get(&key) {
+                    Some(Value::Null) | None => Ok(None),
+                    Some(v) => Ok(Some(set.iter().any(|s| values_equal(v, s)))),
+                }
+            }
+            WhereClause::EqSubquery { column, subquery } => {
+                let key = normalize_ident(column);
+                if meta.column(&key).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en '{}'", column, meta.name),
+                    ));
+                }
+                let inner = self.exec_select((**subquery).clone())?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                if inner.rows.len() > 1 {
+                    return Err(coded(
+                        codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
+                        format!(
+                            "subquery escalar en WHERE devolvió {} filas; debe devolver a lo sumo 1",
+                            inner.rows.len()
+                        ),
+                    ));
+                }
+                let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
+                match (scalar, row.get(&key)) {
+                    (None, _) | (Some(Value::Null), _) | (_, Some(Value::Null)) | (_, None) => {
+                        Ok(None)
+                    }
+                    (Some(expected), Some(v)) => Ok(Some(values_equal(v, &expected))),
+                }
+            }
+            WhereClause::Exists { subquery, negated } => {
+                // EXISTS dentro de combinadores: solo soportamos
+                // no-correlacionado en este release. Correlated EXISTS
+                // dentro de AND/OR/NOT requiere un dispatch más complejo
+                // (push del outer row antes de cada eval) que queda
+                // explícitamente fuera de E1.
+                if subquery_has_outer_refs(subquery) {
+                    return Err(coded(
+                        codes::WHERE_COMBINATOR_CORRELATED_UNSUPPORTED,
+                        "EXISTS correlacionado dentro de AND/OR/NOT no se soporta en \
+                         este release; usalo como único predicado del WHERE",
+                    ));
+                }
+                let inner = self.exec_select((**subquery).clone())?;
+                let has_rows = !inner.rows.is_empty();
+                let pass = if *negated { !has_rows } else { has_rows };
+                Ok(Some(pass))
+            }
+            WhereClause::EqColumnRef { .. } => Err(coded(
+                codes::WHERE_COMBINATOR_CORRELATED_UNSUPPORTED,
+                "referencias a columnas del outer dentro de AND/OR/NOT no se soportan \
+                 en este release; el column-ref correlacionado debe ser el único predicado",
             )),
         }
     }
@@ -3506,11 +3934,29 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 /// a column ref two levels deep still flags the parent as correlated.
 fn subquery_has_outer_refs(stmt: &SelectStmt) -> bool {
     match &stmt.where_clause {
-        Some(WhereClause::EqColumnRef { .. }) => true,
-        Some(WhereClause::Exists { subquery, .. })
-        | Some(WhereClause::In { subquery, .. })
-        | Some(WhereClause::EqSubquery { subquery, .. }) => subquery_has_outer_refs(subquery),
-        _ => false,
+        Some(expr) => where_expr_has_outer_refs(expr),
+        None => false,
+    }
+}
+
+/// Walk de la expresión booleana del WHERE buscando referencias outer
+/// (`EqColumnRef`) en cualquier nivel, incluyendo dentro de subqueries
+/// anidadas. Análogo de `subquery_has_outer_refs` para el árbol `WhereExpr`
+/// — la presencia de un solo `EqColumnRef` en cualquier hoja marca toda la
+/// subquery como correlacionada.
+fn where_expr_has_outer_refs(expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            where_expr_has_outer_refs(a) || where_expr_has_outer_refs(b)
+        }
+        WhereExpr::Not(inner) => where_expr_has_outer_refs(inner),
+        WhereExpr::Atom(c) => match c {
+            WhereClause::EqColumnRef { .. } => true,
+            WhereClause::Exists { subquery, .. }
+            | WhereClause::In { subquery, .. }
+            | WhereClause::EqSubquery { subquery, .. } => subquery_has_outer_refs(subquery),
+            _ => false,
+        },
     }
 }
 
@@ -4128,93 +4574,9 @@ impl Parser {
             });
         }
 
-        let mut where_clause = None;
+        let mut where_clause: Option<WhereExpr> = None;
         if self.match_keyword("WHERE") {
-            // Primero: `[NOT] EXISTS (SELECT ...)` — no consume column.
-            let (is_exists, exists_negated) = if self.match_keyword("NOT") {
-                if !self.match_keyword("EXISTS") {
-                    return Err(coded(
-                        codes::WHERE_OPERATOR_UNSUPPORTED,
-                        "después de NOT se esperaba EXISTS",
-                    ));
-                }
-                (true, true)
-            } else if self.match_keyword("EXISTS") {
-                (true, false)
-            } else {
-                (false, false)
-            };
-            if is_exists {
-                if !(self.peek().kind == TokenKind::Symbol && self.peek().text == "(") {
-                    return Err(coded(
-                        codes::EXISTS_REQUIRES_SUBQUERY,
-                        "EXISTS requiere '(SELECT ...)' a continuación",
-                    ));
-                }
-                self.expect_symbol("(")?;
-                self.expect_keyword("SELECT")?;
-                let subquery = self.parse_select_stmt()?;
-                self.expect_symbol(")")?;
-                where_clause = Some(WhereClause::Exists {
-                    subquery: Box::new(subquery),
-                    negated: exists_negated,
-                });
-            } else {
-                let column = self.expect_ident()?;
-                if self.match_symbol("=") {
-                    // Dispatch tras `=`:
-                    //   `(SELECT ...)` → subquery escalar
-                    //   ident no-keyword (eventualmente `otra.col`) → outer-column ref
-                    //     (solo válido dentro de subquery correlacionada; el engine valida)
-                    //   resto → literal
-                    if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
-                        self.expect_symbol("(")?;
-                        self.expect_keyword("SELECT")?;
-                        let subquery = self.parse_select_stmt()?;
-                        self.expect_symbol(")")?;
-                        where_clause = Some(WhereClause::EqSubquery {
-                            column,
-                            subquery: Box::new(subquery),
-                        });
-                    } else if self.peek().kind == TokenKind::Ident
-                        && !is_value_keyword(&self.peek().text)
-                    {
-                        let raw = self.expect_ident()?;
-                        let (ref_table, ref_column) = split_qualified_ident(&raw);
-                        where_clause = Some(WhereClause::EqColumnRef {
-                            column,
-                            ref_table,
-                            ref_column,
-                        });
-                    } else {
-                        let value = self.expect_value()?;
-                        where_clause = Some(WhereClause::Eq { column, value });
-                    }
-                } else if self.match_keyword("BETWEEN") {
-                    let from = self.expect_integer()?;
-                    self.expect_keyword("AND")?;
-                    let to = self.expect_integer()?;
-                    where_clause = Some(WhereClause::Between { column, from, to });
-                } else if self.match_keyword("IN") {
-                    self.expect_symbol("(")?;
-                    self.expect_keyword("SELECT")?;
-                    let subquery = self.parse_select_stmt()?;
-                    self.expect_symbol(")")?;
-                    where_clause = Some(WhereClause::In {
-                        column,
-                        subquery: Box::new(subquery),
-                    });
-                } else {
-                    return Err(coded(
-                        codes::WHERE_OPERATOR_UNSUPPORTED,
-                        format!(
-                            "WHERE soporta solo '=', BETWEEN, IN (SELECT ...) o [NOT] EXISTS (SELECT ...) \
-                             como operadores; no se reconoció el operador después de la columna '{}'",
-                            column
-                        ),
-                    ));
-                }
-            }
+            where_clause = Some(self.parse_where_expr()?);
         }
 
         // Optional ORDER BY <ident> [ASC|DESC]. Has to come after WHERE
@@ -4290,6 +4652,150 @@ impl Parser {
             limit,
             offset,
         })
+    }
+
+    /// Parsea una expresión de WHERE con soporte completo de `AND`/`OR`/`NOT`
+    /// y paréntesis (Bloque E1). Precedencia estándar SQL:
+    ///   `OR` (más baja) < `AND` < `NOT` < paréntesis / átomo (más alta).
+    /// Asume que el caller ya consumió el keyword `WHERE`.
+    fn parse_where_expr(&mut self) -> DbResult<WhereExpr> {
+        self.parse_where_or()
+    }
+
+    fn parse_where_or(&mut self) -> DbResult<WhereExpr> {
+        let mut left = self.parse_where_and()?;
+        while self.match_keyword("OR") {
+            let right = self.parse_where_and()?;
+            left = WhereExpr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_where_and(&mut self) -> DbResult<WhereExpr> {
+        let mut left = self.parse_where_not()?;
+        while self.match_keyword("AND") {
+            let right = self.parse_where_not()?;
+            left = WhereExpr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_where_not(&mut self) -> DbResult<WhereExpr> {
+        // `NOT NOT x` se permite (cada NOT se apila y se cancela vía 3VL en
+        // el evaluador). `NOT EXISTS (...)` mantiene la forma vieja
+        // (`Atom(Exists { negated: true })`) para preservar el fast-path
+        // del executor — sin esto el `EXISTS` correlacionado tendría que
+        // re-evaluarse vía post-filter genérico.
+        if self.match_keyword("NOT") {
+            if self.peek().kind == TokenKind::Ident
+                && self.peek().text.eq_ignore_ascii_case("EXISTS")
+            {
+                self.pos += 1; // consume EXISTS
+                let subquery = self.parse_exists_subquery_body()?;
+                return Ok(WhereExpr::Atom(WhereClause::Exists {
+                    subquery: Box::new(subquery),
+                    negated: true,
+                }));
+            }
+            let inner = self.parse_where_not()?;
+            return Ok(WhereExpr::Not(Box::new(inner)));
+        }
+        self.parse_where_primary()
+    }
+
+    fn parse_where_primary(&mut self) -> DbResult<WhereExpr> {
+        if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+            // Distinguir `(` de paréntesis de expresión booleana vs `(SELECT ...)`
+            // de un átomo EXISTS/IN/=. Acá venimos del nivel primary: el único
+            // caso donde un `(` arranca un sub-statement es `EXISTS (SELECT)`
+            // — y ése ya lo consumió `parse_where_not`. Cualquier `(` que
+            // llegue acá agrupa una expresión booleana.
+            self.expect_symbol("(")?;
+            let expr = self.parse_where_expr()?;
+            self.expect_symbol(")")?;
+            return Ok(expr);
+        }
+        // EXISTS sin NOT delante — válido como átomo dentro de cualquier
+        // posición (top-level, dentro de paréntesis, lado derecho de AND/OR).
+        if self.match_keyword("EXISTS") {
+            let subquery = self.parse_exists_subquery_body()?;
+            return Ok(WhereExpr::Atom(WhereClause::Exists {
+                subquery: Box::new(subquery),
+                negated: false,
+            }));
+        }
+        let atom = self.parse_where_atom()?;
+        Ok(WhereExpr::Atom(atom))
+    }
+
+    fn parse_exists_subquery_body(&mut self) -> DbResult<SelectStmt> {
+        if !(self.peek().kind == TokenKind::Symbol && self.peek().text == "(") {
+            return Err(coded(
+                codes::EXISTS_REQUIRES_SUBQUERY,
+                "EXISTS requiere '(SELECT ...)' a continuación",
+            ));
+        }
+        self.expect_symbol("(")?;
+        self.expect_keyword("SELECT")?;
+        let subquery = self.parse_select_stmt()?;
+        self.expect_symbol(")")?;
+        Ok(subquery)
+    }
+
+    /// Parsea un único predicado (átomo) del WHERE. Cubre las formas que
+    /// existían antes del bloque E1: `col = val`, `col = (SELECT ...)`,
+    /// `col = otra.col`, `col BETWEEN n AND m`, `col IN (SELECT ...)`.
+    /// Las combinaciones booleanas las arma `parse_where_*` por encima.
+    fn parse_where_atom(&mut self) -> DbResult<WhereClause> {
+        let column = self.expect_ident()?;
+        if self.match_symbol("=") {
+            if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+                self.expect_symbol("(")?;
+                self.expect_keyword("SELECT")?;
+                let subquery = self.parse_select_stmt()?;
+                self.expect_symbol(")")?;
+                Ok(WhereClause::EqSubquery {
+                    column,
+                    subquery: Box::new(subquery),
+                })
+            } else if self.peek().kind == TokenKind::Ident
+                && !is_value_keyword(&self.peek().text)
+            {
+                let raw = self.expect_ident()?;
+                let (ref_table, ref_column) = split_qualified_ident(&raw);
+                Ok(WhereClause::EqColumnRef {
+                    column,
+                    ref_table,
+                    ref_column,
+                })
+            } else {
+                let value = self.expect_value()?;
+                Ok(WhereClause::Eq { column, value })
+            }
+        } else if self.match_keyword("BETWEEN") {
+            let from = self.expect_integer()?;
+            self.expect_keyword("AND")?;
+            let to = self.expect_integer()?;
+            Ok(WhereClause::Between { column, from, to })
+        } else if self.match_keyword("IN") {
+            self.expect_symbol("(")?;
+            self.expect_keyword("SELECT")?;
+            let subquery = self.parse_select_stmt()?;
+            self.expect_symbol(")")?;
+            Ok(WhereClause::In {
+                column,
+                subquery: Box::new(subquery),
+            })
+        } else {
+            Err(coded(
+                codes::WHERE_OPERATOR_UNSUPPORTED,
+                format!(
+                    "WHERE soporta solo '=', BETWEEN, IN (SELECT ...) o [NOT] EXISTS (SELECT ...) \
+                     como operadores; no se reconoció el operador después de la columna '{}'",
+                    column
+                ),
+            ))
+        }
     }
 
     fn parse_ident_list(&mut self) -> DbResult<Vec<String>> {

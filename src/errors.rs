@@ -169,6 +169,12 @@ pub mod codes {
     /// `NATURAL JOIN` cuyas tablas no comparten exactamente una columna por
     /// nombre. 0 columnas en común o >1 → error explícito en este release.
     pub const NATURAL_JOIN_NO_COMMON_COLUMN: u32 = 4023;
+    /// Predicado correlacionado (`EXISTS (… outer.col …)` o `col = outer.col`)
+    /// envuelto en `AND`/`OR`/`NOT` (Bloque E1). El dispatch correlacionado
+    /// solo se aplica cuando el predicado correlacionado es el único átomo
+    /// del WHERE; combinarlo con boolean operators queda para un bloque
+    /// posterior.
+    pub const WHERE_COMBINATOR_CORRELATED_UNSUPPORTED: u32 = 4024;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-05-25 — Bloque E1: `AND` / `OR` / `NOT` + paréntesis en `WHERE`
+
+> **Un push a `main`** que destraba el filtro compuesto en cualquier `SELECT`.
+
+### 🔀 WHERE booleano (bloque E1)
+- AST: `WhereClause` (plano) → `WhereExpr = And | Or | Not | Atom(WhereClause)`. Los átomos siguen siendo los seis predicados pre-existentes (`Eq`, `Between`, `In`, `EqSubquery`, `EqColumnRef`, `Exists`) — el bloque no toca su semántica.
+- Parser: precedencia estándar SQL `OR` < `AND` < `NOT` < paréntesis / átomo. `NOT EXISTS` mantiene la forma vieja (`Atom(Exists{negated:true})`) para preservar el fast-path correlacionado.
+- Executor: cuando el WHERE se reduce a un único átomo, se usan las fast-paths existentes (PK directo, índice secundario, range scan, EXISTS correlacionado post-filter). Cuando hay combinadores se cae a FullScan + evaluador trivaluado (3VL) row-a-row — `defer_window` se activa para que `LIMIT`/`OFFSET` se apliquen DESPUÉS del filtro.
+- 3VL para `NULL`: `NULL AND false = false`, `NULL AND true = NULL`, `NULL OR true = true`, `NOT NULL = NULL`. Solo `Some(true)` mantiene la fila.
+- Soporte completo en `SELECT` con o sin JOINs. `filter_joined_rows` ahora recibe `&WhereExpr` y aplica el mismo evaluador 3VL sobre filas joined.
+
+### ⚠️ Limitación residual
+- `EXISTS` correlacionado y `col = otra.col` (column-ref del outer) **solo se permiten como único átomo del WHERE**. Combinarlos con `AND`/`OR`/`NOT` devuelve `[GBY-4024]`. La generalización queda explícitamente fuera de E1.
+
+### 🧰 Código de error nuevo
+- `4024` `WHERE_COMBINATOR_CORRELATED_UNSUPPORTED`
+
+### 🧪 Validación
+- 11 integration tests nuevos en `tests/integration_test.rs` (sufijo `e1_*`): AND, OR, NOT, paréntesis, precedencia, BETWEEN + AND combinador, 3VL sobre NULL, NOT anidado, combinador con LIMIT+ORDER, doble NOT, combinador con JOIN, error sintáctico.
+- `cargo check --lib --tests` limpio (0 warnings).
+
+### 📚 Documentación
+- `docs/SQL_REFERENCE.md` — EBNF del WHERE reescrita con precedencia + 3VL + ejemplos.
+- `docs/MISSING_COMMANDS.md` — E1 marcado como cerrado; top-5 actualizado.
+- `docs/ERROR_CODES.md` — entry `4024`.
+
+---
+
 ## 2026-05-24 — Subqueries completas + roadmap de JOINs cerrado
 
 > **Siete pushes consecutivos a `main`** que cierran dos features grandes del motor SQL.

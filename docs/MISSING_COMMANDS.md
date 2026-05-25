@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-24 contra `main` post-bloque D de JOINs.
+> Última verificación: 2026-05-25 contra `main` post-bloque **E1** (AND/OR/NOT en WHERE).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -13,7 +13,7 @@ Si vas a ordenar bloques por ROI funcional, este es el orden:
 
 | # | Hueco | Impacto | Bloque sugerido |
 |---|---|---|---|
-| 1 | **`AND` / `OR` / `NOT` en `WHERE`** | Bloquea cualquier filtro compuesto — lo más visible | E1 |
+| 1 | ~~**`AND` / `OR` / `NOT` en `WHERE`**~~ ✅ | Cerrado en E1 (2026-05-25) | E1 ✅ |
 | 2 | **`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`** | Operadores básicos que faltan | E2 |
 | 3 | **`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`** | Sin agregaciones no hay reporting | F |
 | 4 | **`UPDATE` / `DELETE` por columna indexada o subquery** | Hoy solo `WHERE pk = N` | E3 |
@@ -29,7 +29,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 
 | Bloque | Contenido | Esfuerzo | Depende de |
 |---|---|---|---|
-| **E1** | `AND`/`OR`/`NOT` en `WHERE` + paréntesis | Alto (toca AST de WhereClause) | — |
+| **E1** ✅ | `AND`/`OR`/`NOT` en `WHERE` + paréntesis | Alto (toca AST de WhereClause) | — (**cerrado 2026-05-25**) |
 | **E2** | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) |
 | **E3** | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 |
 | **F** | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 |
@@ -56,12 +56,12 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 |---|:---:|:---:|
 | `=` | ✅ | — |
 | `BETWEEN` (PK + INT indexada) | ✅ | — |
-| `AND` | ❌ | P0 |
-| `OR` | ❌ | P0 |
-| `NOT` (fuera de `NOT EXISTS`) | ❌ | P0 |
-| Paréntesis para agrupar | ❌ | P0 |
+| `AND` | ✅ (E1, 2026-05-25) | — |
+| `OR` | ✅ (E1, 2026-05-25) | — |
+| `NOT` (fuera de `NOT EXISTS`) | ✅ (E1, 2026-05-25) | — |
+| Paréntesis para agrupar | ✅ (E1, 2026-05-25) | — |
 
-> **Sin esto, cualquier filtro de más de una condición es imposible**. El AST actual `WhereClause` es plano (un solo predicado); E1 lo refactoriza a un árbol `WhereExpr = And | Or | Not | Atom(WhereClause)`.
+> ✅ **Cerrado en E1**: el AST cambió a `WhereExpr = And | Or | Not | Atom(WhereClause)` con precedencia estándar (`OR` < `AND` < `NOT` < átomo) y lógica trivaluada para NULL. Limitación residual: `EXISTS` correlacionado y `col = otra.col` solo se aceptan como único átomo (combinarlos con AND/OR/NOT devuelve `[GBY-4024]`). Detalles en [SQL_REFERENCE.md](SQL_REFERENCE.md#-ebnf).
 
 ### 1.2 Comparadores
 

@@ -3135,6 +3135,291 @@ fn join_index_loop_secondary_index() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque E1: AND / OR / NOT + paréntesis en WHERE
+// ============================================================
+//
+// Cada test es self-contained: crea la DB, inserta filas conocidas y verifica
+// el set resultante. La fixture común es una tabla `e1` con (id, nombre,
+// edad, ciudad, activo) — pensada para probar combinaciones booleanas sobre
+// columnas de tipos distintos (TEXT, INT, BOOL) con NULLs deliberados para
+// ejercitar la 3VL.
+
+fn e1_fixture(db: &Path) -> Result<(), Box<dyn Error>> {
+    let mut pager = Pager::create(db)?;
+    pager.close()?;
+    run_sql(
+        db,
+        "CREATE TABLE e1 (id INT PRIMARY KEY, nombre TEXT, edad INT, ciudad TEXT, activo BOOL);",
+    )?;
+    run_sql(
+        db,
+        "INSERT INTO e1 (id,nombre,edad,ciudad,activo) VALUES (1,'Ana',30,'BA',TRUE);
+         INSERT INTO e1 (id,nombre,edad,ciudad,activo) VALUES (2,'Beto',25,'MDQ',FALSE);
+         INSERT INTO e1 (id,nombre,edad,ciudad,activo) VALUES (3,'Carla',40,'BA',TRUE);
+         INSERT INTO e1 (id,nombre,edad,ciudad,activo) VALUES (4,'Dario',22,'CBA',TRUE);
+         INSERT INTO e1 (id,nombre,edad,ciudad,activo) VALUES (5,'Eva',50,'MDQ',FALSE);
+         INSERT INTO e1 (id,nombre,activo) VALUES (6,'NullEdad',TRUE);",
+    )?;
+    Ok(())
+}
+
+fn e1_ids(res: &gabysql::sql::ResultSet) -> Vec<i64> {
+    res.rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            other => panic!("se esperaba INT en columna 0, llegó {:?}", other),
+        })
+        .collect()
+}
+
+#[test]
+fn e1_and_two_predicates() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_and");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE ciudad = 'BA' AND activo = TRUE;",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_or_two_predicates() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_or");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE ciudad = 'MDQ' OR ciudad = 'CBA';",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 4, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_not_negates_predicate() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_not");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE NOT ciudad = 'BA';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    // NOT ciudad='BA': filas 2,4,5. La fila 6 tiene ciudad=NULL → NOT (NULL=...) = NULL → descartada.
+    assert_eq!(ids, vec![2, 4, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_parens_force_precedence() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_parens");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // Sin paréntesis AND ata más fuerte que OR:
+    //   ciudad='BA' OR ciudad='MDQ' AND activo=TRUE
+    // = ciudad='BA' OR (ciudad='MDQ' AND activo=TRUE)
+    // → {1,3 (BA)} ∪ {} (MDQ activos no hay) = {1, 3}
+    let res_default = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE ciudad = 'BA' OR ciudad = 'MDQ' AND activo = TRUE;",
+    )?;
+    let mut ids = e1_ids(&res_default[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+
+    // Con paréntesis forzando la otra agrupación:
+    //   (ciudad='BA' OR ciudad='MDQ') AND activo=TRUE
+    // → {1,2,3,5} ∩ {1,3,4,6} = {1, 3}
+    let res_paren = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE (ciudad = 'BA' OR ciudad = 'MDQ') AND activo = TRUE;",
+    )?;
+    let mut ids = e1_ids(&res_paren[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_and_with_between() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_between");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // BETWEEN consume su propio AND; el AND externo es combinador booleano.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE id BETWEEN 1 AND 5 AND ciudad = 'BA';",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_three_valued_logic_null() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_3vl");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // Fila 6 tiene edad=NULL. `edad = 30` → NULL → descartada.
+    // OR con un predicado siempre-true (ciudad nada matchea, ej. 'ZZZ')
+    // mantiene NULL → descartada. Solo Ana (edad=30) sobrevive.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE edad = 30 OR ciudad = 'ZZZ';",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1]);
+
+    // NOT (edad = 30): NULL queda NULL → fila 6 fuera. Filas que matchean
+    // (no son 30 y no son NULL): 2,3,4,5.
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE NOT edad = 30;")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 3, 4, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_nested_not_and_or() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_nested");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    // NOT (ciudad='BA' OR ciudad='CBA') AND activo=FALSE
+    // → NOT({1,3,4}) ∩ {2,5} = {2,5,6} ∩ {2,5} = {2,5}
+    // (la fila 6 tiene ciudad=NULL → NOT(NULL OR NULL)=NULL → descartada;
+    //  pero activo=TRUE para fila 6 igual la descartaba.)
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE NOT (ciudad = 'BA' OR ciudad = 'CBA') AND activo = FALSE;",
+    )?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![2, 5]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_combinator_works_with_limit_and_orderby() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_lim");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(
+        &db,
+        "SELECT id FROM e1 WHERE ciudad = 'BA' OR ciudad = 'MDQ' ORDER BY id DESC LIMIT 2;",
+    )?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![5, 3]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_double_not_cancels() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_dnot");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let res = run_sql(&db, "SELECT id FROM e1 WHERE NOT NOT ciudad = 'BA';")?;
+    let mut ids = e1_ids(&res[0]);
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_works_with_join() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_join");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, tag TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, a_id INT, val INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id,tag) VALUES (1,'x'); INSERT INTO a (id,tag) VALUES (2,'y');
+         INSERT INTO b (id,a_id,val) VALUES (10,1,100);
+         INSERT INTO b (id,a_id,val) VALUES (11,1,200);
+         INSERT INTO b (id,a_id,val) VALUES (12,2,300);",
+    )?;
+
+    let res = run_sql(
+        &db,
+        "SELECT b.id FROM a INNER JOIN b ON a.id = b.a_id WHERE a.tag = 'x' AND b.val = 200;",
+    )?;
+    let ids = e1_ids(&res[0]);
+    assert_eq!(ids, vec![11]);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e1_parser_rejects_dangling_combinator() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e1_bad");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e1_fixture(&db)?;
+
+    let err = run_sql(&db, "SELECT id FROM e1 WHERE ciudad = 'BA' AND;").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[GBY-4001]") || msg.contains("identificador") || msg.contains("ident"),
+        "mensaje inesperado: {}",
+        msg
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
