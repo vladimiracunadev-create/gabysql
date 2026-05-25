@@ -193,6 +193,14 @@ pub mod codes {
     /// reescribir como subquery sobre tabla única o esperar al bloque
     /// posterior que extienda F a multi-tabla.
     pub const AGGREGATE_OVER_JOIN_UNSUPPORTED: u32 = 4028;
+    /// `BEGIN` SQL emitido cuando ya hay una transacción explícita
+    /// abierta (Bloque T). Savepoints no soportados todavía — la única
+    /// forma de salir es `COMMIT` o `ROLLBACK`.
+    pub const TX_BEGIN_DOUBLE: u32 = 4029;
+    /// `COMMIT` o `ROLLBACK` SQL emitido sin `BEGIN` previo (Bloque T).
+    /// Las sentencias fuera de un bloque explícito son auto-commit por
+    /// batch — no hace falta cerrarlas manualmente.
+    pub const TX_END_WITHOUT_BEGIN: u32 = 4030;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

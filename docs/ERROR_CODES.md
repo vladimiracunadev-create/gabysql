@@ -119,6 +119,8 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4026` | `AGGREGATE_ARG_INVALID` | Argumento inválido de función agregada: `SUM(*)`, `AVG(DISTINCT x)`, `MIN(*)`, o tipos no-numéricos en `SUM`/`AVG`. | Solo `COUNT(*)` y `COUNT(DISTINCT col)` son combinaciones especiales aceptadas. Para `SUM`/`AVG` usar columnas INT o FLOAT. |
 | `4027` | `SELECT_COLUMN_NOT_IN_GROUP_BY` | `SELECT` mezcla columnas no-agregadas que no figuran en `GROUP BY`. Cumple la regla ANSI estricta. | Agregar la columna al `GROUP BY` o envolverla en una función agregada (`MIN`/`MAX`). |
 | `4028` | `AGGREGATE_OVER_JOIN_UNSUPPORTED` | Agregados (`COUNT/SUM/AVG/MIN/MAX`) o `GROUP BY`/`HAVING` sobre un `SELECT` con `JOIN`. El executor de JOIN aún no implementa el stage de agregación. | Reescribir como subquery agregada sobre la tabla base (e.g. `SELECT COUNT(*) FROM (SELECT ...)` — pero los derived tables también están en backlog; por ahora separar la query). |
+| `4029` | `TX_BEGIN_DOUBLE` | `BEGIN` SQL emitido con una transacción explícita ya abierta. `SAVEPOINT` no soportado todavía — la única forma de salir es `COMMIT` o `ROLLBACK`. | Cerrar la transacción anterior antes de abrir una nueva. |
+| `4030` | `TX_END_WITHOUT_BEGIN` | `COMMIT` o `ROLLBACK` SQL emitido sin `BEGIN` previo. Las sentencias fuera de un bloque explícito son auto-commit por batch — no hace falta cerrarlas manualmente. | Eliminar el `COMMIT`/`ROLLBACK` redundante, o agregar el `BEGIN` faltante al inicio del bloque. |
 
 ---
 

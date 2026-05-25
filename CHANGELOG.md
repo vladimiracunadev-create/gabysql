@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-05-25 — Bloque T: transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)
+
+> **Un push a `main`** que cierra el último P0 del top-5 del roadmap.
+
+### 🔁 Sentencias nuevas
+- `BEGIN` / `BEGIN TRANSACTION` / `BEGIN WORK` / `START TRANSACTION` — marca el inicio de una transacción explícita.
+- `COMMIT` / `COMMIT TRANSACTION` / `COMMIT WORK` / `END` — persiste lo acumulado y re-abre una tx fresca.
+- `ROLLBACK` / `ROLLBACK TRANSACTION` / `ROLLBACK WORK` — descarta lo acumulado y re-abre una tx fresca.
+
+### 🔧 Cambios
+- `Statement::Begin` / `Commit` / `Rollback` añadidos al AST.
+- `Engine` gana un flag `explicit_tx: bool`. El Pager subyacente SIEMPRE tiene una transacción abierta (la abre el wrap del caller); este flag distingue la implícita del wrap de la explícita pedida por SQL.
+- `exec_begin` / `exec_commit` / `exec_rollback` en el Engine. `COMMIT`/`ROLLBACK` invocan `pager.commit()`/`pager.rollback()` seguido de `pager.begin()` para preservar la invariante del wrap (el caller siempre puede hacer commit al final).
+
+### ⚠️ Limitación documentada
+- El `ROLLBACK` opera sobre el cache de páginas del Pager — descarta TODO lo cacheado, incluidas las sentencias del MISMO batch que ocurrieron ANTES del `BEGIN`. En la práctica esto significa que `BEGIN`/`ROLLBACK` solo aborta limpio cuando el batch entero arranca con `BEGIN` como primera sentencia. Cross-request transactions (mantener una tx abierta entre `/exec` HTTP) requieren session state en el server — fuera de scope para esta primera versión de T.
+- `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` (P1) no soportados. `SET TRANSACTION ISOLATION LEVEL ...` (P2) y `BEGIN READ ONLY` (P2) tampoco.
+
+### 🧰 Códigos de error nuevos
+- `4029` `TX_BEGIN_DOUBLE` — `BEGIN` con transacción explícita ya abierta.
+- `4030` `TX_END_WITHOUT_BEGIN` — `COMMIT`/`ROLLBACK` sin `BEGIN` previo.
+
+### 🧪 Validación
+- 6 integration tests nuevos en `tests/integration_test.rs` (`t_*`): BEGIN+COMMIT persiste, BEGIN+ROLLBACK descarta, doble BEGIN error, COMMIT/ROLLBACK sin BEGIN error, alias START TRANSACTION/END, dos bloques BEGIN/COMMIT consecutivos.
+- `cargo check + cargo fmt --check + cargo clippy --all-targets -- -D warnings` limpios.
+
+### 📚 Documentación
+- (Se actualiza en el mismo push: SQL_REFERENCE, MISSING_COMMANDS, ERROR_CODES.)
+
+---
+
 ## 2026-05-25 — Bloque F: agregaciones (`GROUP BY`, `HAVING`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `DISTINCT`)
 
 > **Un push a `main`** que destraba reporting básico. Cierra el hueco más grande del top-5 del roadmap.

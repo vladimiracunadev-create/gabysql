@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-25 contra `main` post-bloque **F** (agregaciones: `GROUP BY`, `HAVING`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `DISTINCT`).
+> Última verificación: 2026-05-25 contra `main` post-bloque **T** (transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK`).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -17,7 +17,7 @@ Si vas a ordenar bloques por ROI funcional, este es el orden:
 | 2 | ~~**`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`**~~ ✅ | Cerrado en E2 (2026-05-25) | E2 ✅ |
 | 3 | ~~**`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`**~~ ✅ | Cerrado en F (2026-05-25; sin JOINs aún) | F ✅ |
 | 4 | ~~**`UPDATE` / `DELETE` por columna indexada o subquery**~~ ✅ | Cerrado en E3 (2026-05-25) | E3 ✅ |
-| 5 | **Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)** | Necesario para apps que componen mutaciones atómicas | T |
+| 5 | ~~**Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)**~~ ✅ | Cerrado en T (2026-05-25; `SAVEPOINT` y cross-request quedan pendientes) | T ✅ |
 
 Estos 5 bloques cierran >80% de las quejas previsibles de un usuario portando una app SQL clásica.
 
@@ -39,7 +39,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **J** | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `UPSERT`/`ON CONFLICT`, `RETURNING`, `TRUNCATE` | Medio | E3 |
 | **K** | DDL faltante: PK compuesta, `CREATE TABLE AS SELECT`, `DROP/RENAME COLUMN`, `RENAME TABLE`, índices compuestos y partial indexes | Alto | — |
 | **L** | Constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE ...`, multi-column UNIQUE | Medio | K |
-| **T** | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, read-only | Alto (toca server + storage) | — |
+| **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
 | **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
 | **X** | Stored procedures + triggers: `CREATE FUNCTION`, `CREATE TRIGGER`, lenguaje procedural | Muy alto | T, F |
@@ -221,14 +221,15 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Comando | Soportado | Prioridad |
 |---|:---:|:---:|
 | Auto-commit por `exec` | ✅ | — |
-| `BEGIN` / `START TRANSACTION` | ❌ | P0 |
-| `COMMIT` / `END` explícito | ❌ | P0 |
-| `ROLLBACK` | ❌ | P0 |
+| `BEGIN` / `BEGIN TRANSACTION` / `BEGIN WORK` / `START TRANSACTION` | ✅ (T) | — |
+| `COMMIT` / `COMMIT TRANSACTION` / `COMMIT WORK` / `END` | ✅ (T) | — |
+| `ROLLBACK` / `ROLLBACK TRANSACTION` / `ROLLBACK WORK` | ✅ (T) | — |
 | `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT` | ❌ | P1 |
 | `SET TRANSACTION ISOLATION LEVEL ...` | ❌ | P2 |
 | Read-only transactions (`BEGIN READ ONLY`) | ❌ | P2 |
+| **Cross-request transactions** (mantener tx abierta entre `/exec` HTTP) | ❌ | P1 (requiere session state en el server) |
 
-> **Impacto operacional**: hoy cada `/exec` es una transacción atómica. No podés agrupar varias requests del cliente en una sola transacción ni hacer commit/rollback condicional desde el cliente.
+> **Limitación documentada**: `ROLLBACK` opera sobre el cache del Pager y descarta TODO lo cacheado en el batch, incluidas las sentencias previas al `BEGIN`. Funciona limpio cuando `BEGIN` es la primera sentencia del batch. Para abortar selectivo se necesita `SAVEPOINT` (P1).
 
 ---
 

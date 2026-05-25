@@ -4220,6 +4220,170 @@ fn f_empty_input_agg_returns_one_row() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque T: BEGIN / COMMIT / ROLLBACK explícitos
+// ============================================================
+//
+// El wrap de run_sql ya envuelve cada batch en pager.begin()/commit() —
+// los SQL BEGIN/COMMIT/ROLLBACK se anidan dentro y mueven el flag
+// explicit_tx del Engine. Estos tests verifican:
+//  - parsing de los keywords + alias (START TRANSACTION, END).
+//  - BEGIN+COMMIT no rompe nada.
+//  - BEGIN+ROLLBACK descarta las modificaciones del batch.
+//  - BEGIN doble dispara [GBY-4029].
+//  - COMMIT/ROLLBACK sin BEGIN dispara [GBY-4030].
+
+#[test]
+fn t_begin_commit_persists_changes() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("t_bc");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         COMMIT;",
+    )?;
+
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn t_begin_rollback_discards_changes() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("t_br");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    // Insertamos UNA fila en un batch previo (queda persistida).
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10);")?;
+
+    // Ahora un batch que arranca con BEGIN y termina con ROLLBACK:
+    // los INSERTs adicionales deben quedar descartados.
+    run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);
+         ROLLBACK;",
+    )?;
+
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn t_double_begin_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("t_dbl");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "BEGIN; BEGIN;").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-4029]"), "esperaba GBY-4029: {}", msg);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn t_commit_without_begin_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("t_co_no");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+
+    let err = run_sql(&db, "COMMIT;").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[GBY-4030]"),
+        "esperaba GBY-4030 en COMMIT: {}",
+        msg
+    );
+
+    let err = run_sql(&db, "ROLLBACK;").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[GBY-4030]"),
+        "esperaba GBY-4030 en ROLLBACK: {}",
+        msg
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn t_start_transaction_and_end_aliases_work() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("t_alias");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+
+    // START TRANSACTION (alias de BEGIN) + END (alias de COMMIT).
+    run_sql(
+        &db,
+        "START TRANSACTION;
+         INSERT INTO t (id) VALUES (1);
+         END;",
+    )?;
+
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn t_begin_can_be_followed_by_begin_after_commit() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("t_seq");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+
+    // Dos bloques explícitos consecutivos en el mismo batch — el flag
+    // explicit_tx se debe limpiar tras COMMIT y permitir un nuevo BEGIN.
+    run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id) VALUES (1);
+         COMMIT;
+         BEGIN;
+         INSERT INTO t (id) VALUES (2);
+         COMMIT;",
+    )?;
+
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

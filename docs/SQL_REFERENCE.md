@@ -31,6 +31,7 @@
 | `WHERE` con `AND`/`OR`/`NOT` + paréntesis y 3VL para NULL (bloque E1) | DML | 🟢 |
 | `WHERE` con `<`, `>`, `<=`, `>=`, `<>`/`!=`, `[NOT] LIKE` (con `%`/`_`), `IS [NOT] NULL`, `[NOT] IN (lista)` (bloque E2) | DML | 🟢 |
 | Agregaciones: `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`, `DISTINCT` (bloque F) | DML | 🟢 (sin JOINs aún) |
+| Transacciones explícitas: `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, `ROLLBACK` (bloque T) | TCL | 🟢 (batch-local; `SAVEPOINT` y cross-request pendientes) |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
@@ -877,6 +878,58 @@ DELETE FROM tickets WHERE status = 'closed' AND updated_at < '2024-01-01';
 | `violación de FK: 'X.col' referencia 'Y' (ON DELETE RESTRICT, N fila(s) afectadas)` | hay filas hijas y la FK fue declarada `ON DELETE RESTRICT` (default) |
 
 > Antes de borrar la fila, el engine la lee para evictar la entrada correspondiente de cada índice secundario. Si la tabla tiene FKs entrantes, el motor resuelve cascade/restrict iterativamente con un worklist y cycle protection (visited set sobre `(tabla, pk)`). Para tablas grandes con FKs entrantes, **se recomienda crear un índice secundario sobre la columna FK del hijo** — el engine lo usa automáticamente para que el lookup de hijos sea O(log n) en vez de full scan.
+
+---
+
+## Transacciones explícitas (`BEGIN` / `COMMIT` / `ROLLBACK`)
+
+> Bloque T (2026-05-25). Por defecto cada batch enviado a `/exec` (HTTP)
+> o cada invocación de `gabysql exec` (CLI) es una **transacción atómica
+> implícita**: o se commitean todas las sentencias del batch o ninguna.
+> `BEGIN`/`COMMIT`/`ROLLBACK` permiten ademas abortar el batch a mitad
+> de camino y obtener feedback explícito por sentencia.
+
+### 📜 EBNF
+
+```
+tcl ::= "BEGIN" ["TRANSACTION" | "WORK"]
+      | "START" "TRANSACTION"
+      | "COMMIT" ["TRANSACTION" | "WORK"]
+      | "END" ["TRANSACTION" | "WORK"]
+      | "ROLLBACK" ["TRANSACTION" | "WORK"]
+```
+
+Sinónimos ANSI aceptados: `BEGIN` = `START TRANSACTION`. `COMMIT` = `END`.
+Las palabras `TRANSACTION` y `WORK` después de `BEGIN`/`COMMIT`/`END`/`ROLLBACK` son opcionales.
+
+### ✅ Ejemplos
+
+```sql
+BEGIN;
+  INSERT INTO ledger (id, amount) VALUES (1, 100);
+  INSERT INTO ledger (id, amount) VALUES (2, -100);
+COMMIT;
+
+-- Aborto a mitad de batch:
+BEGIN;
+  UPDATE inventory SET stock = stock - 1 WHERE sku = 'ABC';
+  -- ... validación adicional falla ...
+ROLLBACK;
+```
+
+### ⚠️ Limitaciones
+
+- **`ROLLBACK` descarta TODO el cache del Pager**: en un batch que mezcla sentencias antes y después de `BEGIN`, las anteriores también se pierden. `BEGIN`/`ROLLBACK` funciona limpio cuando `BEGIN` es la primera sentencia del batch.
+- **No hay transacciones cross-request en el server HTTP**: cada `/exec` es independiente. Mantener una tx abierta entre requests requiere session state — pendiente para una iteración futura.
+- **`SAVEPOINT` / `ROLLBACK TO SAVEPOINT`** no implementados (P1).
+- **`SET TRANSACTION ISOLATION LEVEL ...`** y `BEGIN READ ONLY` no implementados (P2).
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4029] BEGIN: ya hay una transacción explícita abierta` | dos `BEGIN` consecutivos sin `COMMIT`/`ROLLBACK` intermedio |
+| `[GBY-4030] COMMIT/ROLLBACK: no hay transacción explícita activa` | `COMMIT` o `ROLLBACK` sin `BEGIN` previo |
 
 ---
 

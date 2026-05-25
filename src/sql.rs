@@ -38,6 +38,21 @@ pub enum Statement {
     /// parent. Returns a result set with one row per finding plus a
     /// summary message.
     IntegrityCheck,
+    /// Bloque T: `BEGIN` / `START TRANSACTION` — marca el inicio de una
+    /// transacción explícita dentro del mismo batch. El wrap externo
+    /// (CLI/server) ya garantiza atomicidad de batch; `BEGIN` permite
+    /// además abortar el batch a mitad de camino con `ROLLBACK`.
+    Begin,
+    /// Bloque T: `COMMIT` / `END` — cierra la transacción explícita
+    /// activa: persiste lo acumulado y re-abre una tx fresca para que
+    /// el wrap del caller siga válido.
+    Commit,
+    /// Bloque T: `ROLLBACK` — descarta lo acumulado en la transacción
+    /// explícita actual y re-abre una tx fresca. Las sentencias previas
+    /// del MISMO batch (incluso las que pasaron antes del BEGIN) también
+    /// se pierden, porque el wrap externo es una única transacción
+    /// física; documentado como limitación de la versión inicial de T.
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -499,6 +514,13 @@ pub struct Engine<'a> {
     /// outer y un mapa de columnas (normalizadas) a valores. Push antes de
     /// ejecutar la subquery correlacionada, pop después — siempre balanceado.
     outer_stack: Vec<OuterRow>,
+    /// Bloque T: marca `true` mientras un `BEGIN` SQL está activo y aún
+    /// no se cerró con `COMMIT`/`ROLLBACK`. El Pager subyacente SIEMPRE
+    /// tiene una transacción abierta (la abre el caller en su wrap);
+    /// este flag distingue la tx implícita del wrap de la tx explícita
+    /// pedida por el usuario via SQL. Doble `BEGIN` → `[GBY-4029]`;
+    /// `COMMIT`/`ROLLBACK` sin `BEGIN` → `[GBY-4030]`.
+    explicit_tx: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -512,6 +534,7 @@ impl<'a> Engine<'a> {
         Self {
             pager,
             outer_stack: Vec::new(),
+            explicit_tx: false,
         }
     }
 
@@ -527,6 +550,9 @@ impl<'a> Engine<'a> {
             Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
             Statement::DropIndex(stmt) => self.exec_drop_index(stmt),
             Statement::IntegrityCheck => self.exec_integrity_check(),
+            Statement::Begin => self.exec_begin(),
+            Statement::Commit => self.exec_commit(),
+            Statement::Rollback => self.exec_rollback(),
             Statement::CreateDatabase(_)
             | Statement::DropDatabase(_)
             | Statement::ShowDatabases => Err(DbError::new(
@@ -534,6 +560,74 @@ impl<'a> Engine<'a> {
                  deben ser interceptados por el caller antes de abrir el Pager",
             )),
         }
+    }
+
+    /// Bloque T: marca el inicio de una transacción explícita. No toca el
+    /// Pager (la transacción física ya está abierta por el wrap del
+    /// caller); solo voltea el flag `explicit_tx`. Doble `BEGIN` sin
+    /// `COMMIT`/`ROLLBACK` intermedio devuelve `[GBY-4029]`.
+    fn exec_begin(&mut self) -> DbResult<ResultSet> {
+        if self.explicit_tx {
+            return Err(coded(
+                codes::TX_BEGIN_DOUBLE,
+                "BEGIN: ya hay una transacción explícita abierta — cerrala con COMMIT o ROLLBACK \
+                 antes de empezar otra (savepoints aún no soportados)",
+            ));
+        }
+        self.explicit_tx = true;
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("BEGIN".to_string()),
+        })
+    }
+
+    /// Bloque T: cierra la transacción explícita activa. Persiste lo
+    /// acumulado vía `pager.commit()` y re-abre una tx fresca con
+    /// `pager.begin()` para que el wrap del caller (que también hará
+    /// commit al final) siga válido. Sin `BEGIN` previo → `[GBY-4030]`.
+    fn exec_commit(&mut self) -> DbResult<ResultSet> {
+        if !self.explicit_tx {
+            return Err(coded(
+                codes::TX_END_WITHOUT_BEGIN,
+                "COMMIT: no hay transacción explícita activa; las sentencias fuera de BEGIN/COMMIT \
+                 son auto-commit por batch (no hace falta COMMIT)",
+            ));
+        }
+        self.pager.commit()?;
+        self.pager.begin()?;
+        self.explicit_tx = false;
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("COMMIT".to_string()),
+        })
+    }
+
+    /// Bloque T: descarta la transacción explícita activa vía
+    /// `pager.rollback()` y re-abre una tx fresca. Sin `BEGIN` previo →
+    /// `[GBY-4030]`. ⚠️ El rollback descarta TODO el cache de páginas
+    /// del Pager — incluidas las sentencias anteriores del MISMO batch
+    /// que ocurrieron ANTES del BEGIN (porque el wrap externo abrió una
+    /// única transacción física). En la práctica esto significa que
+    /// `BEGIN`/`ROLLBACK` solo aborta limpio si todo el batch arrancó
+    /// con `BEGIN` como primera sentencia.
+    fn exec_rollback(&mut self) -> DbResult<ResultSet> {
+        if !self.explicit_tx {
+            return Err(coded(
+                codes::TX_END_WITHOUT_BEGIN,
+                "ROLLBACK: no hay transacción explícita activa; un ROLLBACK fuera de BEGIN \
+                 no tiene blanco sobre el que actuar",
+            ));
+        }
+        self.pager.rollback()?;
+        self.pager.begin()?;
+        self.explicit_tx = false;
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some("ROLLBACK".to_string()),
+        })
     }
 
     fn exec_create(&mut self, stmt: CreateTableStmt) -> DbResult<ResultSet> {
@@ -5258,8 +5352,36 @@ impl Parser {
             self.expect_keyword("CHECK")?;
             return Ok(Statement::IntegrityCheck);
         }
+        // Bloque T: transacciones explícitas. `BEGIN` y `START TRANSACTION`
+        // son sinónimos (ANSI); `COMMIT` y `END` son sinónimos (también
+        // ANSI). `ROLLBACK` no tiene alias estándar relevante en este
+        // release (SAVEPOINT queda para un bloque posterior).
+        if self.match_keyword("BEGIN") {
+            let _ = self.match_keyword("TRANSACTION"); // `BEGIN TRANSACTION` opcional
+            let _ = self.match_keyword("WORK"); // `BEGIN WORK` opcional (ANSI)
+            return Ok(Statement::Begin);
+        }
+        if self.match_keyword("START") {
+            self.expect_keyword("TRANSACTION")?;
+            return Ok(Statement::Begin);
+        }
+        if self.match_keyword("COMMIT") {
+            let _ = self.match_keyword("TRANSACTION");
+            let _ = self.match_keyword("WORK");
+            return Ok(Statement::Commit);
+        }
+        if self.match_keyword("END") {
+            let _ = self.match_keyword("TRANSACTION");
+            let _ = self.match_keyword("WORK");
+            return Ok(Statement::Commit);
+        }
+        if self.match_keyword("ROLLBACK") {
+            let _ = self.match_keyword("TRANSACTION");
+            let _ = self.match_keyword("WORK");
+            return Ok(Statement::Rollback);
+        }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW/INTEGRITY)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW/INTEGRITY/BEGIN/COMMIT/ROLLBACK)",
         ))
     }
 
