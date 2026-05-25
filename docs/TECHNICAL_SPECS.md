@@ -242,7 +242,9 @@ Enforcement en runtime:
 - `INTEGRITY CHECK` (sweep operacional de páginas + índices + FKs)
 
 ### No soportado todavía
-- `GROUP BY`, agregaciones (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), `DISTINCT`
+- Agregados sobre `SELECT` con `JOIN` (devuelve `[GBY-4028]`). `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` single-table sí están soportados desde el bloque F (2026-05-25)
+- `GROUP_CONCAT` / `STRING_AGG` / `JSON_AGG` / `ARRAY_AGG`
+- Window functions, CTE (`WITH ... AS`), `WITH RECURSIVE`
 - `ILIKE`, `REGEXP`, `GLOB`, `IS TRUE`/`IS FALSE`
 - `WHERE` por columnas no PK ni indexadas usa FullScan (no es bloqueante — solo perf)
 - Optimización indexada para operadores no-`=`/no-`BETWEEN` (`<`, `>`, `LIKE`, `IN literal`) — hoy cae a FullScan aunque la columna tenga índice

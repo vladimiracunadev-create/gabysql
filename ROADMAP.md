@@ -110,7 +110,7 @@
 `gabysql` sigue apuntando a una base embebida tipo SQLite:
 - storage local
 - archivo único
-- **superficie SQL relacional clásica completa**: DDL, DML, índices, FK, `ORDER BY`, `WHERE` con `IN`/`= (SELECT …)`/`[NOT] EXISTS`, todos los JOINs ANSI (INNER, CROSS, LEFT/RIGHT/FULL, USING, NATURAL, multi-tabla, self-join, index-loop optimization)
-- foco en estabilidad, durabilidad y compatibilidad antes que en amplitud OLAP (sin `GROUP BY`/window/CTE recursivas)
+- **superficie SQL relacional clásica completa**: DDL, DML, índices, FK, `ORDER BY`, `WHERE` con todos los operadores E1+E2 (`=`/`<`/`>`/`<=`/`>=`/`<>`/`!=`/`BETWEEN`/`LIKE`/`IS NULL`/`IN literal`/`IN (SELECT)`/`= (SELECT)`/`[NOT] EXISTS`) combinados con `AND`/`OR`/`NOT` y paréntesis (3VL ANSI), todos los JOINs ANSI (INNER, CROSS, LEFT/RIGHT/FULL, USING, NATURAL, multi-tabla, self-join, index-loop optimization), `UPDATE`/`DELETE` con `WHERE` completo (E3), agregaciones single-table (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)`) — bloque F
+- foco en estabilidad, durabilidad y compatibilidad antes que en amplitud OLAP (sin window functions / CTE recursivas, sin agregados sobre JOIN aún)
 
 > Para el **inventario exhaustivo de comandos SQL que faltan** (con prioridades P0–P3 y la secuencia de bloques `E1 → E2 → E3 → F → G → T → …` para cerrar la línea de comandos completa), ver [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md).

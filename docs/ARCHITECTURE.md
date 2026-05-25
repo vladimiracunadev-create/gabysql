@@ -177,6 +177,6 @@ Las mejoras naturales siguientes son:
 - índices compuestos
 - range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`
 - planner cost-based real (hoy: deterministic dispatch + plan enum cerrado + index-loop join automático para INNER/LEFT con PK/índice)
-- `GROUP BY`, window functions, CTE, vistas
+- window functions, CTE recursivas, vistas materializadas (`GROUP BY`/`HAVING`/agregados single-table cerrados en bloque F el 2026-05-25; agregados sobre `SELECT` con JOIN aún devuelven `[GBY-4028]`)
 - subqueries correlacionadas con múltiples predicados (`AND`/`OR` en `WHERE` interno) y derived tables (`FROM (SELECT ...) t`)
 - política formal de migración entre versiones del formato en disco

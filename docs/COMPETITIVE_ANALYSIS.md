@@ -62,7 +62,8 @@ Leyenda: 🟢 = gana / 🟡 = empate o aceptable / 🔴 = pierde / ⚪ = no apli
 | **JOIN** (INNER/CROSS/LEFT/RIGHT/FULL/USING/NATURAL + index-loop) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Subqueries** (`IN`/`=`/`EXISTS` correlacionado) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **ORDER BY** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **GROUP BY / window** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **GROUP BY / HAVING / agregados (COUNT/SUM/AVG/MIN/MAX/DISTINCT)** | 🟢 (single-table) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Window functions** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Optimizer cost-based** | 🔴 | 🟡 | 🟢 | ⚪ | 🟢 | 🟢 | 🟡 |
 | **MVCC** | 🔴 | 🔴 | 🟢 | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Concurrencia (multi-writer)** | 🔴 (mutex) | 🔴 (single writer) | 🟢 | 🟡 | 🟢 | 🟢 | 🟢 |
@@ -221,7 +222,7 @@ GROUP BY region;
 
 ## 🧠 Resumen ejecutivo: ¿cuándo elegir `gabysql`?
 
-> Hoy, sin caminar A todavía, `gabysql` es razonable si **(1) tu app es Rust nativa**, **(2) rechazas C en el core por compliance o gusto técnico**, **(3) tu workload es OLTP relacional clásico** (lookups por PK/índice, JOINs equi-predicado, subqueries `IN`/`EXISTS`), **(4) valoras supply-chain integrada** y **(5) podés vivir sin `GROUP BY` / window functions / CTE recursivas todavía**.
+> Hoy, sin caminar A todavía, `gabysql` es razonable si **(1) tu app es Rust nativa**, **(2) rechazas C en el core por compliance o gusto técnico**, **(3) tu workload es OLTP relacional clásico** (lookups por PK/índice, JOINs equi-predicado, subqueries `IN`/`EXISTS`, reporting básico con `GROUP BY`/`HAVING`/agregados single-table desde el bloque F), **(4) valoras supply-chain integrada** y **(5) podés vivir sin window functions / CTE recursivas / agregados sobre JOIN todavía**.
 
 Si rompes alguno de esos cinco puntos, hay un competidor mejor: SQLite, DuckDB, Postgres o SurrealDB según el caso.
 

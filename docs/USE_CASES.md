@@ -449,7 +449,8 @@ PY
 
 time gabysql exec bench.db "$(cat /tmp/bulk.sql)"
 
-# Verificar el conteo (cuando GROUP BY exista; por ahora basta con scan)
+# Verificar el conteo (bloque F: COUNT(*) ya disponible)
+gabysql exec bench.db "SELECT COUNT(*) FROM big;"
 gabysql exec bench.db "SELECT id FROM big LIMIT 5;"
 gabysql info bench.db   # mostrará pageCount alto, prueba que hubo splits
 ```

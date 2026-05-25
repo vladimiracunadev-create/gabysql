@@ -51,10 +51,10 @@ Ver el contexto extenso en [RECRUITER.md](../RECRUITER.md) y la postura completa
 
 Antes de invertir tiempo o de adoptarlo:
 
-- ❌ **Reemplazo directo de PostgreSQL/MySQL** — sin MVCC, sin planner cost-based, sin replicación, sin `GROUP BY` ni window functions. Ver [docs/COMMERCIAL_ROADMAP.md](COMMERCIAL_ROADMAP.md) para la diferencia entre los caminos A/B/C.
+- ❌ **Reemplazo directo de PostgreSQL/MySQL** — sin MVCC, sin planner cost-based, sin replicación, sin window functions ni CTE recursivas. Ver [docs/COMMERCIAL_ROADMAP.md](COMMERCIAL_ROADMAP.md) para la diferencia entre los caminos A/B/C.
 - ❌ **Workloads analíticos OLAP** — el motor es row-oriented, sin compresión columnar. Para eso está DuckDB.
 - ❌ **Concurrencia masiva** — un solo mutex de proceso para escrituras; lecturas concurrentes sin MVCC.
-- ❌ **`GROUP BY`, window functions, CTE recursivas, vistas materializadas** — no implementadas (la superficie SQL útil para reporting analítico vive en otros motores).
+- ❌ **Window functions, CTE recursivas, vistas materializadas** — no implementadas. Reporting básico SÍ funciona desde el bloque F (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT` single-table; sobre `JOIN` aún devuelve `[GBY-4028]`).
 - ❌ **Compatibilidad wire-protocol con Postgres/MySQL** — los clientes tienen que hablar HTTP/JSON o usar el crate embebido.
 
 > **Lo que ya entrega hoy en SQL relacional clásico:** `JOIN` completo (INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING, NATURAL, multi-tabla, self-join), `WHERE col IN/= (SELECT ...)`, `WHERE [NOT] EXISTS (SELECT ...)` correlacionada, `ORDER BY ASC/DESC`, `LIMIT/OFFSET`, índices secundarios (hash + INT-ordered con `BETWEEN`), `FOREIGN KEY` con `ON DELETE`, constraints declarativas. Ver [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) para la gramática completa.
