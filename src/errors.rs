@@ -201,6 +201,14 @@ pub mod codes {
     /// Las sentencias fuera de un bloque explícito son auto-commit por
     /// batch — no hace falta cerrarlas manualmente.
     pub const TX_END_WITHOUT_BEGIN: u32 = 4030;
+    /// Cláusula `ON CONFLICT` con acción no soportada o malformada
+    /// (Bloque J2). Acciones aceptadas: `DO NOTHING`, `DO UPDATE SET ...`.
+    /// `REPLACE` solo se obtiene vía `REPLACE INTO ...`.
+    pub const ON_CONFLICT_INVALID: u32 = 4031;
+    /// `ON CONFLICT (col)` cuyo `col` no es PK ni tiene UNIQUE
+    /// (Bloque J2). Sin un constraint indexado el motor no puede
+    /// detectar el conflicto.
+    pub const ON_CONFLICT_TARGET_NOT_UNIQUE: u32 = 4032;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

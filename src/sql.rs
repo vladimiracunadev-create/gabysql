@@ -49,6 +49,11 @@ pub enum Statement {
     /// respeta FKs `ON DELETE` declaradas). Restricciones diferidas no
     /// se soportan.
     Truncate(TruncateStmt),
+    /// Bloque J2: `REPLACE INTO t (cols) VALUES (...)` (SQLite-style).
+    /// Desugar a `INSERT ... ON CONFLICT DO REPLACE`: el parser construye
+    /// un `InsertStmt` con `on_conflict = Some(OnConflict { target: None,
+    /// action: Replace })`.
+    Replace(InsertStmt),
     /// Bloque T: `COMMIT` / `END` — cierra la transacción explícita
     /// activa: persiste lo acumulado y re-abre una tx fresca para que
     /// el wrap del caller siga válido.
@@ -108,6 +113,10 @@ pub struct UpdateStmt {
     /// obligatorio: las mutaciones masivas sin WHERE quedan deshabilitadas
     /// hasta un release explícito.
     pub where_clause: WhereExpr,
+    /// Bloque J2: `RETURNING *` o `RETURNING col1, col2, ...`. Cuando
+    /// es `Some`, el ResultSet trae las filas actualizadas (post-update)
+    /// proyectadas según la lista.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +125,10 @@ pub struct DeleteStmt {
     /// Bloque E3: ver doc de `UpdateStmt::where_clause`. Mismo grammar,
     /// mismas reglas.
     pub where_clause: WhereExpr,
+    /// Bloque J2: `RETURNING *` o `RETURNING col1, col2, ...`. Cuando
+    /// es `Some`, el ResultSet trae las filas borradas (snapshot
+    /// previo a la eliminación) proyectadas según la lista.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +169,36 @@ pub struct InsertStmt {
     /// enum unifica el tratamiento y mantiene el camino single-row como
     /// caso particular de `Values(vec![row])`.
     pub source: InsertSource,
+    /// Bloque J2: cláusula `ON CONFLICT [(col)] DO NOTHING | DO UPDATE`.
+    /// Cuando es `Some`, las violaciones de PK o UNIQUE durante el
+    /// insert se rutean a la acción declarada en vez de abortar.
+    /// `REPLACE INTO` se desazucara como `ON CONFLICT DO REPLACE`.
+    pub on_conflict: Option<OnConflict>,
+    /// Bloque J2: `RETURNING *` o `RETURNING col1, col2, ...`. Cuando
+    /// es `Some`, el ResultSet trae las filas insertadas proyectadas
+    /// según la lista (en vez del `message` con la cuenta).
+    pub returning: Option<Vec<SelectItem>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    /// Columna objetivo del conflicto. `None` = cualquier constraint
+    /// disparable (PK o cualquier UNIQUE).
+    pub target: Option<String>,
+    pub action: OnConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictAction {
+    /// `DO NOTHING`: la fila conflictiva se descarta silenciosamente.
+    DoNothing,
+    /// `DO UPDATE SET col = value, ...`: actualiza la fila existente con
+    /// los assignments. Las RHS son literales (no se soporta `EXCLUDED.col`
+    /// todavía — P2 dentro del backlog de J2).
+    DoUpdate { assignments: Vec<(String, Value)> },
+    /// `REPLACE` (desazucar de SQLite-style `REPLACE INTO`): borra las
+    /// filas conflictivas vía cascade y reinserta con los valores nuevos.
+    Replace,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -579,6 +622,9 @@ impl<'a> Engine<'a> {
             Statement::DropIndex(stmt) => self.exec_drop_index(stmt),
             Statement::IntegrityCheck => self.exec_integrity_check(),
             Statement::Truncate(stmt) => self.exec_truncate(stmt),
+            // Bloque J2: REPLACE INTO se ejecuta vía la misma ruta que
+            // INSERT — el parser ya seteó on_conflict=Replace.
+            Statement::Replace(stmt) => self.exec_insert(stmt),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -1111,6 +1157,9 @@ impl<'a> Engine<'a> {
         // Bloque J: validamos columnas y normalizamos UNA vez para todo
         // el batch (single-row, multi-row o INSERT...SELECT). Después
         // iteramos las filas-fuente delegando en `apply_insert_row`.
+        // Bloque J2: si hay on_conflict (UPSERT / REPLACE) o returning,
+        // las pasamos al loop para que cada fila se procese según el
+        // contrato declarado.
         let meta = {
             let mut catalog = Catalog::open(self.pager);
             catalog.get_table(&stmt.table)?.ok_or_else(|| {
@@ -1185,41 +1234,167 @@ impl<'a> Engine<'a> {
             }
         };
 
-        let mut inserted = 0usize;
-        for row_values in rows_to_insert {
-            self.apply_insert_row(&meta, &normalized_cols, row_values)?;
-            inserted += 1;
+        // Bloque J2: validamos on_conflict target antes del loop (si hay).
+        if let Some(oc) = &stmt.on_conflict {
+            if let Some(target) = &oc.target {
+                let key = normalize_ident(target);
+                let is_pk = normalize_ident(&meta.primary_key) == key;
+                let is_unique = meta
+                    .indexes
+                    .iter()
+                    .any(|i| i.unique && normalize_ident(&i.column) == key);
+                if !is_pk && !is_unique {
+                    return Err(coded(
+                        codes::ON_CONFLICT_TARGET_NOT_UNIQUE,
+                        format!(
+                            "ON CONFLICT ({}): la columna no es PK ni tiene índice UNIQUE — \
+                             el motor no puede detectar el conflicto",
+                            target
+                        ),
+                    ));
+                }
+            }
         }
 
+        let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
+        let mut inserted = 0usize;
+        let mut skipped = 0usize;
+        let mut replaced = 0usize;
+        for row_values in rows_to_insert {
+            let outcome = self.apply_insert_row_with_conflict(
+                &meta,
+                &normalized_cols,
+                row_values,
+                stmt.on_conflict.as_ref(),
+            )?;
+            match outcome {
+                RowOutcome::Inserted(row) => {
+                    inserted += 1;
+                    if stmt.returning.is_some() {
+                        affected_rows.push(row);
+                    }
+                }
+                RowOutcome::Updated(row) => {
+                    replaced += 1;
+                    if stmt.returning.is_some() {
+                        affected_rows.push(row);
+                    }
+                }
+                RowOutcome::Skipped => {
+                    skipped += 1;
+                }
+            }
+        }
+
+        // Bloque J2: con RETURNING devolvemos las filas; el message sigue
+        // siendo informativo. Sin RETURNING devolvemos solo el message.
+        if let Some(returning) = &stmt.returning {
+            let projected = project_returning(&meta, returning, &affected_rows)?;
+            let columns = returning_column_names(&meta, returning);
+            return Ok(ResultSet {
+                columns,
+                rows: projected,
+                message: Some(format_insert_message(inserted, replaced, skipped)),
+            });
+        }
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
-            message: Some(format!(
-                "OK ({} fila{} insertada{})",
-                inserted,
-                if inserted == 1 { "" } else { "s" },
-                if inserted == 1 { "" } else { "s" }
-            )),
+            message: Some(format_insert_message(inserted, replaced, skipped)),
         })
     }
 
-    /// Bloque J: aplica UN row al storage. Encapsula todas las
-    /// validaciones (NOT NULL, UNIQUE, FK), el encode + insert y el
-    /// mantenimiento de índices que pre-J vivían inline en `exec_insert`.
-    /// Se invoca una vez por fila del batch (single-row, multi-row VALUES
-    /// o INSERT...SELECT).
-    fn apply_insert_row(
+    /// Bloque J2: variante de `apply_insert_row` que enrutamiento de
+    /// conflictos PK/UNIQUE según `on_conflict`. Sin on_conflict el
+    /// comportamiento es idéntico al pre-J2 (errorea en violación).
+    /// Devuelve un `RowOutcome` para que el caller actualice los
+    /// contadores y la lista de RETURNING.
+    fn apply_insert_row_with_conflict(
         &mut self,
         meta: &TableMeta,
         normalized_cols: &[String],
         row_values: Vec<Value>,
-    ) -> DbResult<()> {
+        on_conflict: Option<&OnConflict>,
+    ) -> DbResult<RowOutcome> {
         let mut values = HashMap::new();
         for (key, value) in normalized_cols.iter().zip(row_values) {
             values.insert(key.clone(), value);
         }
-
         apply_defaults(meta, &mut values);
+
+        // Detectar conflicto ANTES de validar NOT NULL — el conflicto
+        // PK/UNIQUE permite saltarse las constraints si la acción es
+        // DoNothing (la fila nueva nunca se materializa).
+        if let Some(oc) = on_conflict {
+            let conflict_pks =
+                detect_conflict_pks(self.pager, meta, &values, oc.target.as_deref())?;
+            if !conflict_pks.is_empty() {
+                match &oc.action {
+                    OnConflictAction::DoNothing => return Ok(RowOutcome::Skipped),
+                    OnConflictAction::DoUpdate { assignments } => {
+                        // Aplicamos los assignments a cada fila conflictiva.
+                        // Construimos overrides una vez.
+                        let mut overrides: HashMap<String, Value> = HashMap::new();
+                        for (col, val) in assignments {
+                            let k = normalize_ident(col);
+                            if k == normalize_ident(&meta.primary_key) {
+                                return Err(coded(
+                                    codes::UPDATE_PK_NOT_ALLOWED,
+                                    format!(
+                                        "ON CONFLICT DO UPDATE sobre '{}': no se permite mutar la PRIMARY KEY '{}'",
+                                        meta.name, meta.primary_key
+                                    ),
+                                ));
+                            }
+                            if meta.column(&k).is_none() {
+                                return Err(coded(
+                                    codes::COLUMN_NOT_FOUND,
+                                    format!(
+                                        "ON CONFLICT DO UPDATE: columna '{}' no existe en '{}'",
+                                        col, meta.name
+                                    ),
+                                ));
+                            }
+                            overrides.insert(k, val.clone());
+                        }
+                        // Aplicamos a TODAS las filas conflictivas (en la
+                        // práctica suele ser 1, pero un mismo INSERT puede
+                        // chocar contra más de una constraint).
+                        let mut last_row: Option<HashMap<String, Value>> = None;
+                        for pk in &conflict_pks {
+                            self.apply_update_to_pk(meta, *pk, &overrides)?;
+                            // Leer fila post-update para RETURNING.
+                            let bytes = {
+                                let mut catalog = Catalog::open(self.pager);
+                                catalog.get_row(meta.root_page, *pk)?
+                            };
+                            if let Some(b) = bytes {
+                                last_row = Some(decode_row(meta, &b)?);
+                            }
+                        }
+                        return Ok(match last_row {
+                            Some(r) => RowOutcome::Updated(r),
+                            None => RowOutcome::Skipped,
+                        });
+                    }
+                    OnConflictAction::Replace => {
+                        // Borramos las filas conflictivas vía cascade y
+                        // luego procedemos al insert normal.
+                        for pk in &conflict_pks {
+                            let still_there = {
+                                let mut catalog = Catalog::open(self.pager);
+                                catalog.get_row(meta.root_page, *pk)?.is_some()
+                            };
+                            if still_there {
+                                delete_with_cascade(self.pager, &meta.name, *pk)?;
+                            }
+                        }
+                        // continúa al path de insert normal abajo
+                    }
+                }
+            }
+        }
+
         enforce_not_null_on_insert(meta, &values)?;
 
         for idx in &meta.indexes {
@@ -1262,7 +1437,7 @@ impl<'a> Engine<'a> {
             index_upsert_pk(self.pager, idx.root_page, idx.kind, &value_bytes, pk)?;
         }
 
-        Ok(())
+        Ok(RowOutcome::Inserted(values))
     }
 
     /// Bloque J: `TRUNCATE [TABLE] <name>`. Implementación naive: scan
@@ -2833,9 +3008,35 @@ impl<'a> Engine<'a> {
         }
 
         let mut updated = 0usize;
+        let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
         for pk in &target_pks {
             self.apply_update_to_pk(&meta, *pk, &overrides)?;
             updated += 1;
+            if stmt.returning.is_some() {
+                // Bloque J2: re-leer la fila post-update para RETURNING.
+                let bytes = {
+                    let mut catalog = Catalog::open(self.pager);
+                    catalog.get_row(meta.root_page, *pk)?
+                };
+                if let Some(b) = bytes {
+                    affected_rows.push(decode_row(&meta, &b)?);
+                }
+            }
+        }
+
+        if let Some(returning) = &stmt.returning {
+            let projected = project_returning(&meta, returning, &affected_rows)?;
+            let columns = returning_column_names(&meta, returning);
+            return Ok(ResultSet {
+                columns,
+                rows: projected,
+                message: Some(format!(
+                    "OK ({} fila{} actualizada{})",
+                    updated,
+                    if updated == 1 { "" } else { "s" },
+                    if updated == 1 { "" } else { "s" }
+                )),
+            });
         }
 
         Ok(ResultSet {
@@ -3182,11 +3383,8 @@ impl<'a> Engine<'a> {
         // crítico con FK ON DELETE CASCADE que toca otras tablas pero
         // también con cascadas dentro de la misma vía self-ref).
         let mut deleted = 0usize;
+        let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
         for pk in target_pks {
-            // El cascade walker tolera filas ya borradas (cycles,
-            // multi-path), así que un borrado intermedio no es fatal.
-            // Comprobamos existencia primero para no contar borrados
-            // que ya hizo una cascade previa en este mismo lote.
             let still_there = {
                 let mut catalog = Catalog::open(self.pager);
                 catalog.get_row(meta.root_page, pk)?.is_some()
@@ -3194,8 +3392,33 @@ impl<'a> Engine<'a> {
             if !still_there {
                 continue;
             }
+            // Bloque J2: snapshot de la fila ANTES del delete para RETURNING.
+            if stmt.returning.is_some() {
+                let bytes = {
+                    let mut catalog = Catalog::open(self.pager);
+                    catalog.get_row(meta.root_page, pk)?
+                };
+                if let Some(b) = bytes {
+                    affected_rows.push(decode_row(&meta, &b)?);
+                }
+            }
             delete_with_cascade(self.pager, &meta.name, pk)?;
             deleted += 1;
+        }
+
+        if let Some(returning) = &stmt.returning {
+            let projected = project_returning(&meta, returning, &affected_rows)?;
+            let columns = returning_column_names(&meta, returning);
+            return Ok(ResultSet {
+                columns,
+                rows: projected,
+                message: Some(format!(
+                    "OK ({} fila{} eliminada{})",
+                    deleted,
+                    if deleted == 1 { "" } else { "s" },
+                    if deleted == 1 { "" } else { "s" }
+                )),
+            });
         }
 
         Ok(ResultSet {
@@ -5122,6 +5345,176 @@ fn eval_in_list(lhs: Option<&Value>, values: &[Value], negated: bool) -> Option<
     in_result.map(|b| if negated { !b } else { b })
 }
 
+/// Bloque J2: resultado de aplicar un row del INSERT cuando hay
+/// `ON CONFLICT`. Permite distinguir las 3 trayectorias (insertó nuevo,
+/// reemplazó una existente, o saltó por DO NOTHING) sin volver a
+/// recorrer el storage.
+enum RowOutcome {
+    Inserted(HashMap<String, Value>),
+    Updated(HashMap<String, Value>),
+    Skipped,
+}
+
+/// Bloque J2: encuentra las PKs que conflictúan con el row propuesto.
+/// Si hay `target` explícito (`ON CONFLICT (col)`), busca solo esa
+/// constraint. Sin target, escanea PK + todos los UNIQUE indexes.
+/// Devuelve `Vec<i64>` con las PKs ofendidas (de-duplicadas y ordenadas).
+fn detect_conflict_pks(
+    pager: &mut Pager,
+    meta: &TableMeta,
+    values: &HashMap<String, Value>,
+    target: Option<&str>,
+) -> DbResult<Vec<i64>> {
+    let mut out: Vec<i64> = Vec::new();
+    let pk_key = normalize_ident(&meta.primary_key);
+    let check_pk = match target {
+        Some(t) => normalize_ident(t) == pk_key,
+        None => true,
+    };
+    if check_pk {
+        if let Some(Value::Integer(n)) = values.get(&pk_key) {
+            let exists = {
+                let mut catalog = Catalog::open(pager);
+                catalog.get_row(meta.root_page, *n)?.is_some()
+            };
+            if exists {
+                out.push(*n);
+            }
+        }
+    }
+    for idx in &meta.indexes {
+        if !idx.unique {
+            continue;
+        }
+        let key = normalize_ident(&idx.column);
+        if let Some(t) = target {
+            if normalize_ident(t) != key {
+                continue;
+            }
+        }
+        let column = meta.column(&idx.column).ok_or_else(|| {
+            DbError::new(format!("índice apunta a col inexistente: {}", idx.column))
+        })?;
+        let v = values.get(&key).cloned().unwrap_or(Value::Null);
+        if matches!(v, Value::Null) {
+            // NULLs nunca conflictúan en UNIQUE (ANSI).
+            continue;
+        }
+        let bytes = encode_column_value(column, &v)?;
+        let pks = lookup_pks_via_index(pager, meta, idx, &v)?;
+        // `pks` ya está deduplicado por construcción del index lookup.
+        for p in pks {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        let _ = bytes; // referencia al binding para silenciar el unused
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Bloque J2: formato del `message` del response para INSERT/REPLACE
+/// con on_conflict. Cuenta inserts + reemplazos + skips por separado.
+fn format_insert_message(inserted: usize, replaced: usize, skipped: usize) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "{} fila{} insertada{}",
+        inserted,
+        if inserted == 1 { "" } else { "s" },
+        if inserted == 1 { "" } else { "s" }
+    ));
+    if replaced > 0 {
+        parts.push(format!(
+            "{} actualizada{}/reemplazada{}",
+            replaced,
+            if replaced == 1 { "" } else { "s" },
+            if replaced == 1 { "" } else { "s" }
+        ));
+    }
+    if skipped > 0 {
+        parts.push(format!(
+            "{} omitida{}",
+            skipped,
+            if skipped == 1 { "" } else { "s" }
+        ));
+    }
+    format!("OK ({})", parts.join(", "))
+}
+
+/// Bloque J2: nombres de columnas que el ResultSet expone para
+/// `RETURNING`. Para `*` enumera todas las columnas del meta en orden;
+/// para una lista explícita usa el raw del SelectItem::Column.
+fn returning_column_names(meta: &TableMeta, items: &[SelectItem]) -> Vec<String> {
+    if items.len() == 1 && matches!(items[0], SelectItem::Star) {
+        return meta.columns.iter().map(|c| c.name.clone()).collect();
+    }
+    items
+        .iter()
+        .map(|i| match i {
+            SelectItem::Column(c) => c.clone(),
+            SelectItem::Star => "*".to_string(),
+            _ => i.output_name(),
+        })
+        .collect()
+}
+
+/// Bloque J2: proyecta la lista de filas afectadas según la cláusula
+/// `RETURNING`. Cada `HashMap<String, Value>` debe tener las columnas
+/// del meta como keys (ya normalizadas). Para `*` proyecta en el orden
+/// del schema; para `col1, col2` proyecta en el orden pedido.
+fn project_returning(
+    meta: &TableMeta,
+    items: &[SelectItem],
+    rows: &[HashMap<String, Value>],
+) -> DbResult<Vec<Vec<Value>>> {
+    let keys: Vec<String> = if items.len() == 1 && matches!(items[0], SelectItem::Star) {
+        meta.columns
+            .iter()
+            .map(|c| normalize_ident(&c.name))
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                SelectItem::Column(c) => {
+                    let k = normalize_ident(c);
+                    if meta.column(&k).is_none() {
+                        return Err(coded(
+                            codes::COLUMN_NOT_FOUND,
+                            format!("RETURNING: columna '{}' no existe en '{}'", c, meta.name),
+                        ));
+                    }
+                    out.push(k);
+                }
+                SelectItem::Star => {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        "RETURNING *: no se puede mezclar con columnas explícitas",
+                    ));
+                }
+                SelectItem::Aggregate { .. } => {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        "RETURNING no admite funciones agregadas",
+                    ));
+                }
+            }
+        }
+        out
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let projected: Vec<Value> = keys
+            .iter()
+            .map(|k| row.get(k).cloned().unwrap_or(Value::Null))
+            .collect();
+        out.push(projected);
+    }
+    Ok(out)
+}
+
 /// Bloque F: validación de columna usada por `eval_atom_single`. La
 /// columna está OK si o bien existe en el meta de la tabla, o bien
 /// ya está materializada como clave en la fila — eso último cubre las
@@ -5453,6 +5846,10 @@ impl Parser {
         if self.match_keyword("INSERT") {
             return self.parse_insert();
         }
+        if self.match_keyword("REPLACE") {
+            // Bloque J2: REPLACE INTO ...
+            return self.parse_replace();
+        }
         if self.match_keyword("SELECT") {
             let stmt = self.parse_select_stmt()?;
             return Ok(Statement::Select(stmt));
@@ -5534,10 +5931,12 @@ impl Parser {
         // E1+E2). Si falta, expect_keyword devuelve error.
         self.expect_keyword("WHERE")?;
         let where_clause = self.parse_where_expr()?;
+        let returning = self.parse_returning_clause()?;
         Ok(Statement::Update(UpdateStmt {
             table,
             assignments,
             where_clause,
+            returning,
         }))
     }
 
@@ -5546,9 +5945,11 @@ impl Parser {
         let table = self.expect_ident()?;
         self.expect_keyword("WHERE")?;
         let where_clause = self.parse_where_expr()?;
+        let returning = self.parse_returning_clause()?;
         Ok(Statement::Delete(DeleteStmt {
             table,
             where_clause,
+            returning,
         }))
     }
 
@@ -5745,13 +6146,28 @@ impl Parser {
     }
 
     fn parse_insert(&mut self) -> DbResult<Statement> {
+        let stmt = self.parse_insert_body(false)?;
+        Ok(Statement::Insert(stmt))
+    }
+
+    /// Bloque J2: `REPLACE INTO ...` reusa el cuerpo del INSERT y le
+    /// asigna `on_conflict = Replace` automáticamente. Equivale a un
+    /// `INSERT ... ON CONFLICT DO REPLACE`.
+    fn parse_replace(&mut self) -> DbResult<Statement> {
+        let stmt = self.parse_insert_body(true)?;
+        Ok(Statement::Replace(stmt))
+    }
+
+    /// Bloque J + J2: parsea el cuerpo común de INSERT/REPLACE. Cuando
+    /// `force_replace` es true ignoramos el `ON CONFLICT` que pudiera
+    /// venir en SQL (REPLACE INTO ya define la acción) y construimos
+    /// `OnConflictAction::Replace`.
+    fn parse_insert_body(&mut self, force_replace: bool) -> DbResult<InsertStmt> {
         self.expect_keyword("INTO")?;
         let table = self.expect_ident()?;
         self.expect_symbol("(")?;
         let columns = self.parse_ident_list()?;
         self.expect_symbol(")")?;
-        // Bloque J: dos fuentes posibles tras el header del INSERT —
-        // `VALUES (...), (...), ...` (multi-row) o `SELECT ...`.
         let source = if self.match_keyword("VALUES") {
             let mut rows = Vec::new();
             self.expect_symbol("(")?;
@@ -5770,16 +6186,77 @@ impl Parser {
             return Err(coded(
                 codes::INSERT_COLS_VS_VALUES_MISMATCH,
                 format!(
-                    "INSERT INTO '{}': se esperaba VALUES (…) o SELECT … después de la lista de columnas",
+                    "INSERT/REPLACE INTO '{}': se esperaba VALUES (…) o SELECT … después de la lista de columnas",
                     table
                 ),
             ));
         };
-        Ok(Statement::Insert(InsertStmt {
+        let on_conflict = if force_replace {
+            Some(OnConflict {
+                target: None,
+                action: OnConflictAction::Replace,
+            })
+        } else if self.match_keyword("ON") {
+            self.expect_keyword("CONFLICT")?;
+            // Target opcional: `(col)` — solo se acepta un nombre por ahora.
+            let target = if self.match_symbol("(") {
+                let c = self.expect_ident()?;
+                self.expect_symbol(")")?;
+                Some(c)
+            } else {
+                None
+            };
+            self.expect_keyword("DO")?;
+            let action = if self.match_keyword("NOTHING") {
+                OnConflictAction::DoNothing
+            } else if self.match_keyword("UPDATE") {
+                self.expect_keyword("SET")?;
+                let mut assignments = Vec::new();
+                loop {
+                    let col = self.expect_ident()?;
+                    self.expect_symbol("=")?;
+                    let value = self.expect_value()?;
+                    assignments.push((col, value));
+                    if !self.match_symbol(",") {
+                        break;
+                    }
+                }
+                OnConflictAction::DoUpdate { assignments }
+            } else {
+                return Err(coded(
+                    codes::ON_CONFLICT_INVALID,
+                    "ON CONFLICT: se esperaba DO NOTHING o DO UPDATE SET ...",
+                ));
+            };
+            Some(OnConflict { target, action })
+        } else {
+            None
+        };
+        let returning = self.parse_returning_clause()?;
+        Ok(InsertStmt {
             table,
             columns,
             source,
-        }))
+            on_conflict,
+            returning,
+        })
+    }
+
+    /// Bloque J2: cláusula `RETURNING` opcional al final de
+    /// INSERT/UPDATE/DELETE. Acepta `RETURNING *` o `RETURNING col1, col2`.
+    fn parse_returning_clause(&mut self) -> DbResult<Option<Vec<SelectItem>>> {
+        if !self.match_keyword("RETURNING") {
+            return Ok(None);
+        }
+        if self.match_symbol("*") {
+            return Ok(Some(vec![SelectItem::Star]));
+        }
+        let mut items = Vec::new();
+        items.push(SelectItem::Column(self.expect_ident()?));
+        while self.match_symbol(",") {
+            items.push(SelectItem::Column(self.expect_ident()?));
+        }
+        Ok(Some(items))
     }
 
     /// Parsea `[AS] <ident>` como alias opcional. Devuelve `None` si el

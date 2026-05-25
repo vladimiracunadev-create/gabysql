@@ -121,6 +121,8 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4028` | `AGGREGATE_OVER_JOIN_UNSUPPORTED` | Agregados (`COUNT/SUM/AVG/MIN/MAX`) o `GROUP BY`/`HAVING` sobre un `SELECT` con `JOIN`. El executor de JOIN aún no implementa el stage de agregación. | Reescribir como subquery agregada sobre la tabla base (e.g. `SELECT COUNT(*) FROM (SELECT ...)` — pero los derived tables también están en backlog; por ahora separar la query). |
 | `4029` | `TX_BEGIN_DOUBLE` | `BEGIN` SQL emitido con una transacción explícita ya abierta. `SAVEPOINT` no soportado todavía — la única forma de salir es `COMMIT` o `ROLLBACK`. | Cerrar la transacción anterior antes de abrir una nueva. |
 | `4030` | `TX_END_WITHOUT_BEGIN` | `COMMIT` o `ROLLBACK` SQL emitido sin `BEGIN` previo. Las sentencias fuera de un bloque explícito son auto-commit por batch — no hace falta cerrarlas manualmente. | Eliminar el `COMMIT`/`ROLLBACK` redundante, o agregar el `BEGIN` faltante al inicio del bloque. |
+| `4031` | `ON_CONFLICT_INVALID` | `ON CONFLICT` con acción no soportada o malformada (acciones aceptadas: `DO NOTHING`, `DO UPDATE SET ...`). `REPLACE` solo se obtiene vía `REPLACE INTO ...`. | Reescribir la cláusula con una acción soportada o usar `REPLACE INTO`. |
+| `4032` | `ON_CONFLICT_TARGET_NOT_UNIQUE` | `ON CONFLICT (col)` cuyo `col` no es PK ni tiene índice UNIQUE — sin un constraint indexado no se puede detectar el conflicto. | Crear `CREATE UNIQUE INDEX` sobre la columna, usar la PK como target, u omitir `(col)` para que la cláusula aplique a cualquier constraint. |
 
 ---
 

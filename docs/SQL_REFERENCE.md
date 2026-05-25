@@ -32,7 +32,8 @@
 | `WHERE` con `<`, `>`, `<=`, `>=`, `<>`/`!=`, `[NOT] LIKE` (con `%`/`_`), `IS [NOT] NULL`, `[NOT] IN (lista)` (bloque E2) | DML | 🟢 |
 | Agregaciones: `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`, `DISTINCT` (bloque F) | DML | 🟢 (sin JOINs aún) |
 | Transacciones explícitas: `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, `ROLLBACK` (bloque T) | TCL | 🟢 (batch-local; `SAVEPOINT` y cross-request pendientes) |
-| Multi-row `INSERT` `VALUES (...), (...)`, `INSERT INTO t SELECT ...`, `TRUNCATE [TABLE]` (bloque J) | DML | 🟢 (UPSERT/RETURNING pendientes) |
+| Multi-row `INSERT` `VALUES (...), (...)`, `INSERT INTO t SELECT ...`, `TRUNCATE [TABLE]` (bloque J) | DML | 🟢 |
+| `UPSERT` (`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE SET ...`), `REPLACE INTO`, `RETURNING` (bloque J2) | DML | 🟢 (sin `EXCLUDED.col`) |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
@@ -496,6 +497,22 @@ SELECT id, name, active FROM users WHERE active = TRUE;
 -- Con agregados del bloque F
 INSERT INTO sales_summary (region, total)
 SELECT region, SUM(monto) FROM ventas GROUP BY region;
+
+-- UPSERT (bloque J2): ON CONFLICT DO NOTHING
+INSERT INTO users (id, email) VALUES (1, 'a@x')
+  ON CONFLICT DO NOTHING;
+
+-- UPSERT: ON CONFLICT DO UPDATE (sin EXCLUDED.col por ahora — RHS literal)
+INSERT INTO users (id, name) VALUES (1, 'Ana M')
+  ON CONFLICT (id) DO UPDATE SET name = 'Ana M';
+
+-- REPLACE INTO (SQLite-style): borra la fila conflictiva + inserta
+REPLACE INTO users (id, name) VALUES (1, 'Anna');
+
+-- RETURNING (bloque J2): la respuesta trae las filas afectadas
+INSERT INTO orders (id, total) VALUES (10, 199.50) RETURNING id;
+UPDATE products SET on_sale = TRUE WHERE stock > 0 AND price < 50 RETURNING id, price;
+DELETE FROM sessions WHERE last_seen < '2024-01-01' RETURNING user_id;
 ```
 
 ### ❌ Errores típicos

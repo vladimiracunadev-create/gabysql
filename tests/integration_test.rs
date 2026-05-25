@@ -4568,6 +4568,229 @@ fn j_multi_row_with_unique_conflict_aborts() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque J2: RETURNING + UPSERT + REPLACE INTO
+// ============================================================
+
+#[test]
+fn j2_insert_returning_star() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_ret_star");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    let res = run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20) RETURNING *;",
+    )?;
+    assert_eq!(res[0].columns, vec!["id", "v"]);
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::Integer(10));
+    assert_eq!(res[0].rows[1][0], Value::Integer(2));
+    assert_eq!(res[0].rows[1][1], Value::Integer(20));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_insert_returning_specific_cols() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_ret_cols");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, v INT);",
+    )?;
+    let res = run_sql(
+        &db,
+        "INSERT INTO t (id, name, v) VALUES (1, 'a', 10) RETURNING id, name;",
+    )?;
+    assert_eq!(res[0].columns, vec!["id", "name"]);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::String("a".into()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_update_returning() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_upd_ret");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "UPDATE t SET v = 99 WHERE v > 15 AND id > 0 RETURNING id, v;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    // Ambas filas actualizadas tienen v=99.
+    assert_eq!(res[0].rows[0][1], Value::Integer(99));
+    assert_eq!(res[0].rows[1][1], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_delete_returning() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_del_ret");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);",
+    )?;
+    let res = run_sql(&db, "DELETE FROM t WHERE v >= 20 AND id > 0 RETURNING *;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Integer(n) = r[0] {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_upsert_on_conflict_do_nothing() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_dn");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10);")?;
+    // INSERT con conflict en PK → ON CONFLICT DO NOTHING evita el error.
+    let res = run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 99), (2, 20) ON CONFLICT DO NOTHING;",
+    )?;
+    let msg = res[0].message.as_deref().unwrap_or("");
+    assert!(msg.contains("1 fila insertada"), "msg: {}", msg);
+    assert!(msg.contains("1 omitida"), "msg: {}", msg);
+    // Fila 1 conserva v=10 (no se sobrescribió).
+    let res = run_sql(&db, "SELECT v FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(10));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_upsert_on_conflict_do_update() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_du");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10);")?;
+    // INSERT con conflict → DO UPDATE SET v = 999.
+    run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 50) ON CONFLICT (id) DO UPDATE SET v = 999;",
+    )?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_upsert_target_not_unique_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_bad_tgt");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    // `v` no es PK ni UNIQUE → target inválido.
+    let err = run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 10) ON CONFLICT (v) DO NOTHING;",
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-4032]"), "esperaba GBY-4032: {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_replace_into_replaces_existing() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_rep");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10);")?;
+    // REPLACE INTO con PK conflict → borra la vieja, inserta nueva.
+    run_sql(&db, "REPLACE INTO t (id, v) VALUES (1, 999);")?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(999));
+    // Sigue habiendo 1 sola fila.
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_replace_into_inserts_when_no_conflict() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_rep2");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(&db, "REPLACE INTO t (id, v) VALUES (1, 10);")?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(10));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn j2_insert_returning_skipped_not_in_output() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("j2_skipret");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10);")?;
+    // 2 filas en el INSERT: (1, 99) que choca con DO NOTHING (skipped)
+    // + (2, 20) que sí entra. RETURNING solo trae la fila insertada.
+    let res = run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 99), (2, 20) ON CONFLICT DO NOTHING RETURNING id;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

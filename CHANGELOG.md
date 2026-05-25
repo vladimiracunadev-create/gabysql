@@ -4,6 +4,47 @@
 
 ---
 
+## 2026-05-25 — Bloque J2: UPSERT, REPLACE INTO, RETURNING
+
+> **Un push a `main`** que completa los pendientes del bloque J (excepto `UPDATE ... FROM`, deferido).
+
+### 🆕 Sentencias / cláusulas nuevas
+- `INSERT ... ON CONFLICT [(col)] DO NOTHING` — UPSERT pasivo (skip silencioso).
+- `INSERT ... ON CONFLICT [(col)] DO UPDATE SET col = value, ...` — UPSERT activo (actualiza filas conflictivas con literales; sin `EXCLUDED.col` por ahora).
+- `REPLACE INTO t (cols) VALUES (...)` — alias SQLite-style; desugar a `INSERT ... ON CONFLICT DO REPLACE` (borra fila conflictiva vía cascade FK + inserta nueva).
+- `INSERT|UPDATE|DELETE ... RETURNING *` y `... RETURNING col1, col2` — devuelve las filas afectadas en el ResultSet (INSERT: post-insert; UPDATE: post-update; DELETE: pre-delete snapshot).
+
+### 🔧 AST
+- `InsertStmt` gana `on_conflict: Option<OnConflict>` y `returning: Option<Vec<SelectItem>>`.
+- `UpdateStmt` y `DeleteStmt` ganan `returning: Option<Vec<SelectItem>>`.
+- Nuevo enum `OnConflictAction { DoNothing | DoUpdate { assignments } | Replace }`.
+- Nuevo `Statement::Replace(InsertStmt)` (desugar via parser).
+
+### 🚦 Executor
+- `apply_insert_row_with_conflict` reemplaza `apply_insert_row` y orquesta la trayectoria por fila: detecta conflictos PK + UNIQUE vía `detect_conflict_pks` y dispatcha a la acción. `RowOutcome { Inserted | Updated | Skipped }` mantiene los contadores y la lista de RETURNING.
+- `DoUpdate` reusa `apply_update_to_pk` (E3) sobre las PKs conflictivas.
+- `Replace` borra las PKs conflictivas con `delete_with_cascade` (J) y luego sigue el path normal de insert.
+- `exec_update` y `exec_delete` recolectan filas post-update / pre-delete cuando hay RETURNING y proyectan vía `project_returning` + `returning_column_names`.
+- `format_insert_message` cuenta inserted + replaced + skipped en el `message` del response.
+
+### ⚠️ Limitaciones residuales
+- `EXCLUDED.col` en `DO UPDATE SET col = EXCLUDED.col` no se soporta — los RHS deben ser literales por ahora. Workaround: precomputar el valor en cliente.
+- `UPDATE ... FROM otra_tabla` (P2) — pendiente; requiere refactor del RHS de SET para aceptar column refs cualificados.
+- `ON CONFLICT (col)` solo acepta una columna; multi-column unique constraints no se soportan todavía (los índices compuestos están en backlog del bloque K).
+
+### 🧰 Códigos de error nuevos
+- `4031` `ON_CONFLICT_INVALID` — `ON CONFLICT` malformada.
+- `4032` `ON_CONFLICT_TARGET_NOT_UNIQUE` — `ON CONFLICT (col)` sobre columna sin PK/UNIQUE.
+
+### 🧪 Validación
+- 10 integration tests nuevos en `tests/integration_test.rs` (`j2_*`): INSERT RETURNING * / cols, UPDATE RETURNING, DELETE RETURNING, UPSERT DO NOTHING, UPSERT DO UPDATE, target no-único error, REPLACE INTO reemplaza / inserta, RETURNING con filas omitidas.
+- `cargo check + cargo fmt --check + cargo clippy --all-targets -- -D warnings` limpios.
+
+### 📚 Documentación
+- (Se actualiza en el mismo push: SQL_REFERENCE, MISSING_COMMANDS, ERROR_CODES.)
+
+---
+
 ## 2026-05-25 — Bloque J: DML masivo (multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`)
 
 > **Un push a `main`** que destraba inserts en bloque y limpieza de tabla.
