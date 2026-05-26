@@ -38,7 +38,7 @@
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
 | Index-loop join optimization (transparente: aplica auto cuando hay índice/PK) | DML | 🟢 |
-| `ALTER TABLE DROP/RENAME COLUMN`, `GROUP BY`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate | — | 🔴 (ver [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| `ALTER TABLE DROP/RENAME COLUMN`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -452,23 +452,51 @@ ALTER TABLE users ADD score FLOAT DEFAULT 0;     -- COLUMN es opcional
 
 ```mermaid
 flowchart LR
-    S([▶]) --> I[INSERT] --> INTO[INTO] --> T[/table/]
-    T --> P1["("] --> COLS[col_list] --> P2[")"]
-    P2 --> V[VALUES] --> P3["("] --> VALS[value_list] --> P4[")"]
-    P4 --> SEMI[";"] --> E([■])
+    S([▶]) --> I["INSERT (o REPLACE)"] --> INTO[INTO] --> T[/table/]
+    T --> COLS["( col_list )"]
+    COLS --> SRC{insert_source}
+    SRC -- "VALUES" --> ROWS["(vals), (vals), ..."]
+    SRC -- "SELECT" --> SEL[SELECT body]
+    ROWS --> OC{ON CONFLICT?}
+    SEL --> OC
+    OC -- "DO NOTHING" --> RET
+    OC -- "DO UPDATE SET ..." --> RET
+    OC -- "(REPLACE)" --> RET
+    OC --> RET{RETURNING?}
+    RET -- "*  /  cols" --> SEMI[";"]
+    RET --> SEMI
+    SEMI --> E([■])
 ```
 
 ### 📜 EBNF
 
 ```
-insert      ::= "INSERT" "INTO" identifier "(" col_list ")" insert_source
+insert        ::= ("INSERT" | "REPLACE") "INTO" identifier "(" col_list ")"
+                  insert_source
+                  on_conflict_clause?
+                  returning_clause?
 insert_source ::= "VALUES" "(" value_list ")" ("," "(" value_list ")")*
                 | "SELECT" select_body
-col_list    ::= identifier ("," identifier)*
-value_list  ::= value ("," value)*
-value       ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
-string      ::= "'" ([^'] | "''")* "'"
+on_conflict_clause
+              ::= "ON" "CONFLICT" ( "(" identifier ")" )? "DO" conflict_action
+conflict_action
+              ::= "NOTHING"
+                | "UPDATE" "SET" assignment ("," assignment)*
+assignment    ::= identifier "=" value
+returning_clause
+              ::= "RETURNING" ( "*" | identifier ("," identifier)* )
+col_list      ::= identifier ("," identifier)*
+value_list    ::= value ("," value)*
+value         ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
+string        ::= "'" ([^'] | "''")* "'"
 ```
+
+`REPLACE INTO ... VALUES (...)` se desugara internamente a
+`INSERT ... ON CONFLICT DO REPLACE` — la cláusula `ON CONFLICT` explícita
+no se acepta si la sentencia empezó con `REPLACE`. El target opcional
+`(col)` solo se admite si `col` es PK o tiene índice UNIQUE (`[GBY-4032]`).
+En `DO UPDATE SET`, los valores de la derecha son literales — `EXCLUDED.col`
+no se soporta en este release.
 
 Desde el bloque **J** (2026-05-25) el `INSERT` admite tres formas:
 - Single-row: `INSERT INTO t (cols) VALUES (a, b, c);`
@@ -537,23 +565,39 @@ DELETE FROM sessions WHERE last_seen < '2024-01-01' RETURNING user_id;
 ```mermaid
 flowchart LR
     S([▶]) --> SEL[SELECT]
-    SEL --> COLS{Columnas}
+    SEL --> DIST{DISTINCT?}
+    DIST --> COLS{select_list}
     COLS -- "*" --> FROM
-    COLS -- "lista" --> CL[col_list] --> FROM[FROM]
+    COLS -- "items" --> ITEMS[col, agg AS alias, ...] --> FROM[FROM]
     FROM --> T[/table/]
-    T --> WH{WHERE?}
-    WH -- "no" --> LO
-    WH -- "sí" --> WHERE[WHERE clause] --> LO[LIMIT/OFFSET?]
-    LO -- "opcional" --> SEMI[";"] --> E([■])
+    T --> JOIN{JOINs?}
+    JOIN --> WH{WHERE?}
+    WH --> GB{GROUP BY?}
+    GB --> HAV{HAVING?}
+    HAV --> OB{ORDER BY?}
+    OB --> LIM{LIMIT?}
+    LIM --> OFF{OFFSET?}
+    OFF --> SEMI[";"] --> E([■])
 ```
 
 ```mermaid
 flowchart LR
-    A([WHERE clause]) --> COL[/column/]
-    COL --> EQ{operador}
-    EQ -- "=" --> V1[value | "(" SELECT subquery ")"]
-    EQ -- "BETWEEN" --> V2[int] --> AND[AND] --> V3[int]
-    EQ -- "IN" --> LP["("] --> SUB[SELECT subquery] --> RP[")"]
+    A([where_clause]) --> OR{OR}
+    OR --> AND{AND}
+    AND --> NOT{NOT?}
+    NOT -- "NOT" --> NOT
+    NOT --> PRIM{primary}
+    PRIM -- "(...)" --> A
+    PRIM -- "EXISTS (SELECT)" --> EX([EXISTS])
+    PRIM --> ATOM[atom]
+    ATOM --> COL[/column/]
+    COL --> OP{operador}
+    OP -- "=" --> VEQ["value, (SELECT), o ref outer"]
+    OP -- "&lt; &gt; &lt;= &gt;= &lt;&gt; !=" --> VCMP["value"]
+    OP -- "BETWEEN" --> VBT["int AND int"]
+    OP -- "IS [NOT] NULL" --> VNULL([NULL])
+    OP -- "[NOT] LIKE" --> VLIKE["'patron' (con % _ y \\)"]
+    OP -- "[NOT] IN" --> VIN["lista o (SELECT)"]
 ```
 
 ### 📜 EBNF
@@ -626,7 +670,7 @@ join_clause ::= ( "," | "CROSS" "JOIN" ) table_ref
 ```
 
 **Reglas:**
-- `INNER JOIN` (o `JOIN` solo, equivalente ANSI) requiere `ON l = r` con un único equi-predicado (`AND`/`OR` y operadores no-equi quedan para el bloque D).
+- `INNER JOIN` (o `JOIN` solo, equivalente ANSI) requiere `ON l = r` con un único equi-predicado. `AND`/`OR` y operadores no-equi (`<`, `>`, `BETWEEN`, etc.) en el `ON` siguen pendientes — workaround: filtrarlos en el `WHERE` post-JOIN.
 - `CROSS JOIN` (y la comma-syntax `FROM a, b`) NO admite `ON`. Producto cartesiano completo.
 - `LEFT [OUTER] JOIN`: preserva todas las filas del lado izquierdo. Cuando no hay match, las columnas del lado derecho aparecen como `NULL`.
 - `RIGHT [OUTER] JOIN`: simétrico — preserva todas las del derecho, NULL-fill en el izquierdo.
@@ -640,7 +684,7 @@ join_clause ::= ( "," | "CROSS" "JOIN" ) table_ref
 
 **Complejidad:**
 - **Nested-loop puro** (fallback): `O(N1 × N2 × … × Nk)`. Se usa cuando el `ON` no apunta contra PK ni índice del right, o cuando el JOIN es CROSS/RIGHT/FULL.
-- **Index-loop** (optimización transparente): `O(N1 × log N2)` por JOIN. Se activa automáticamente cuando se cumplen las 3 condiciones: (a) el `ON` (o el USING/NATURAL derivado) referencia la PK o una columna indexada del right; (b) el `JoinKind` es `INNER` o `LEFT`; (c) hay un predicate (no aplica a `CROSS`). El engine elige el path por sí mismo — no hace falta cambiar el SQL.
+- **Index-loop** (optimización transparente): `O(N1 × log N2)` por JOIN. Se activa automáticamente cuando se cumplen las 3 condiciones: (a) el `ON` (o el USING/NATURAL derivado) referencia la PK o una columna indexada del right; (b) el tipo de JOIN es `INNER` o `LEFT`; (c) hay un predicate (no aplica a `CROSS`). El engine elige el path por sí mismo — no hace falta cambiar el SQL.
 
 > **Sobre `qualified_ident` en el RHS del `=`:** solo es válido **dentro de una subquery correlacionada** dentro de `EXISTS (...)`. Permite expresar `WHERE inner_col = outer_table.outer_col`, donde `outer_table` es la tabla del SELECT padre. Usarlo fuera de ese contexto devuelve `[GBY-4016]`.
 >
@@ -799,7 +843,7 @@ SELECT ciudad.nombre, pais.nombre_pais
 | `subquery en IN debe devolver exactamente 1 columna; devolvió N` | la subquery proyectó más de una columna — reescribila con una sola |
 | `subquery escalar debe devolver exactamente 1 columna; devolvió N` | igual que el anterior pero en `= (SELECT ...)` |
 | `subquery escalar en WHERE devolvió N filas; debe devolver a lo sumo 1` | la subquery escalar matcheó más de una fila — agregar `WHERE`/`LIMIT 1` o usar `IN (SELECT ...)` |
-| `WHERE IN solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` | la columna del outer en `IN (...)` o `= (SELECT ...)` no es PK ni tiene `CREATE INDEX` |
+| `WHERE IN solo soporta PK (X) o columnas con índice secundario; 'Y' no está indexada` `[GBY-4013]` | aplica solo cuando el WHERE es `col IN (SELECT)` como **único átomo** (fast-path). El WHERE compuesto (`col IN (SELECT) AND ...`) cae a FullScan + 3VL y no exige índice. |
 | `EXISTS requiere '(SELECT ...)' a continuación` `[GBY-4015]` | `EXISTS` no seguido por un paréntesis abriendo un `SELECT` |
 | `outer column 'X.Y' fuera de alcance` `[GBY-4016]` | `col = outer.col` usado fuera de un `EXISTS (...)` correlacionado, o la tabla outer no coincide con la del outer-stack |
 | `PRIMARY KEY 'X' es INT; valor incompatible en WHERE` | pasaste un string a una PK INT |
@@ -813,16 +857,14 @@ SELECT ciudad.nombre, pais.nombre_pais
 ```mermaid
 flowchart LR
     S([▶]) --> U[UPDATE] --> T[/table/]
-    T --> SET[SET] --> A[assignment]
+    T --> SET[SET] --> A[col = value]
     A --> COMMA{","}
     COMMA -- "sí" --> A
     COMMA -- "no" --> WH[WHERE]
-    WH --> PK[/pk_column/] --> EQ["="] --> N[/integer/] --> SEMI[";"] --> E([■])
-```
-
-```mermaid
-flowchart LR
-    A([assignment]) --> C[/column/] --> EQ["="] --> V[value]
+    WH --> WC[where_clause] --> RET{RETURNING?}
+    RET -- "*  /  cols" --> SEMI[";"]
+    RET --> SEMI
+    SEMI --> E([■])
 ```
 
 ### 📜 EBNF
@@ -830,8 +872,12 @@ flowchart LR
 ```
 update       ::= "UPDATE" identifier "SET" assignment ("," assignment)*
                   "WHERE" where_clause
+                  returning_clause?
 assignment   ::= identifier "=" value
 ```
+
+`where_clause` y `returning_clause` son los mismos definidos en `SELECT`
+y `INSERT` respectivamente — ver esas secciones.
 
 Desde el bloque **E3** el `WHERE` de `UPDATE` acepta exactamente la misma
 gramática que `SELECT`: combinadores `AND`/`OR`/`NOT`, paréntesis, todos los
@@ -882,14 +928,22 @@ UPDATE users SET status = 'banned'
 ```mermaid
 flowchart LR
     S([▶]) --> D[DELETE] --> F[FROM] --> T[/table/]
-    T --> WH[WHERE] --> PK[/pk_column/] --> EQ["="] --> N[/integer/] --> SEMI[";"] --> E([■])
+    T --> WH[WHERE] --> WC[where_clause]
+    WC --> RET{RETURNING?}
+    RET -- "*  /  cols" --> SEMI[";"]
+    RET --> SEMI
+    SEMI --> E([■])
 ```
 
 ### 📜 EBNF
 
 ```
 delete  ::= "DELETE" "FROM" identifier "WHERE" where_clause
+            returning_clause?
 ```
+
+`where_clause` y `returning_clause` son los mismos definidos en `SELECT`
+e `INSERT` respectivamente.
 
 Mismo `where_clause` que `SELECT` y `UPDATE` (bloque E3). Borra todas las
 filas matcheadas en orden de PK ascendente; las FK con `ON DELETE CASCADE`

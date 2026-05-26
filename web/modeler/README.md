@@ -2,7 +2,7 @@
 
 > **Modelador ER → DDL** para `gabysql`, layout PowerDesigner-style.
 > Single-page HTML+CSS+JS vanilla, sin frameworks, sin servidor obligatorio.
-> Persistencia local en `localStorage`. Espejo del motor `gabysql VERSION 6`.
+> Persistencia local en `localStorage`. Espejo del motor `gabysql VERSION 7`.
 
 ---
 
@@ -36,7 +36,7 @@
 |        | [Check Model] [SQL Preview]      |
 |        | severidad | objeto | detalle ...  |
 +--------+-----------------------------------+
-| Status: VERSION 6 · N tablas · 0 errores  |
+| Status: VERSION 7 · N tablas · 0 errores  |
 +-------------------------------------------+
 ```
 
@@ -71,7 +71,7 @@ python3 -m http.server 8000 --directory web
 # http://localhost:8000/modeler/
 ```
 
-> Para usar **↘ Importar de gabysql**, levantá también el server: `gabysql-server -dir ./data -addr :8080`. Desde gabysql VERSION 6 el server emite headers CORS, por lo que el modeler en `:8000` puede leer el API en `:8080` sin proxy.
+> Para usar **↘ Importar de gabysql**, levantá también el server: `gabysql-server -dir ./data -addr :8080`. Desde gabysql VERSION 7 el server emite headers CORS, por lo que el modeler en `:8000` puede leer el API en `:8080` sin proxy.
 
 ---
 

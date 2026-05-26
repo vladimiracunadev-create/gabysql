@@ -1,6 +1,6 @@
 # 📖 Manual de usuario · gabymodeler v2
 
-> **Modelador ER → DDL** para `gabysql`. Layout PowerDesigner-style. Single-page HTML+CSS+JS vanilla, sin frameworks ni servidor obligatorio. Espejo del motor `gabysql VERSION 6`.
+> **Modelador ER → DDL** para `gabysql`. Layout PowerDesigner-style. Single-page HTML+CSS+JS vanilla, sin frameworks ni servidor obligatorio. Espejo del motor `gabysql VERSION 7`.
 >
 > Este manual te lleva de cero a un schema completo (con constraints, índices y FOREIGN KEYs) listo para ejecutar en `gabysql`. Cada paso tiene su captura.
 
@@ -48,7 +48,7 @@ python3 -m http.server 8000 --directory web
 > ```bash
 > gabysql-server -dir ./data -addr :8080
 > ```
-> Desde `gabysql VERSION 6` el server ya emite headers CORS, así que el modeler en `:8000` puede hablarle al API en `:8080` sin proxy.
+> Desde `gabysql VERSION 7` el server ya emite headers CORS, así que el modeler en `:8000` puede hablarle al API en `:8080` sin proxy.
 
 ---
 
@@ -228,7 +228,7 @@ Tres campos:
 
 | Campo | Default | Comentario |
 | :--- | :--- | :--- |
-| **API base URL** | `http://localhost:8080` | El endpoint del `gabysql-server`. Desde gabysql VERSION 6 ya tiene CORS habilitado. |
+| **API base URL** | `http://localhost:8080` | El endpoint del `gabysql-server`. Desde gabysql VERSION 7 ya tiene CORS habilitado. |
 | **Token** | (vacío) | Solo si el server fue iniciado con `-token <secret>`. Va como `Authorization: Bearer <token>`. |
 | **Database (.db)** | `<dbName actual>.db` | Nombre exacto del archivo DB. |
 
