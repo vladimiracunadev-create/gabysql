@@ -33,7 +33,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **E2** ✅ | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) (**cerrado 2026-05-25**) |
 | **E3** ✅ | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 (**cerrado 2026-05-25**) |
 | **F** ✅ | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 (**cerrado 2026-05-25**; limitación: sin JOINs aún) |
-| **G1+G2** ✅ | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` en SELECT list **y** WHERE/HAVING/UPDATE SET/DELETE WHERE | Medio-Alto | E1 (**cerrado 2026-05-26**; G3 sumará `\|\|`, aritméticos, P2/P3, IS NULL/LIKE/IN/BETWEEN sobre Expr, y `EXCLUDED.col`) |
+| **G1+G2+G3** ✅ | Funciones escalares (string + numéricas + fecha, incluyendo P2/P3) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` + operadores aritméticos `+/-/*///%` + concat `\|\|` + postfix `IS NULL`/`LIKE`/`IN`/`BETWEEN` sobre cualquier `Expr`, en SELECT list / WHERE / HAVING / UPDATE SET / DELETE WHERE | Medio-Alto | E1 (**cerrado 2026-05-26**; pendiente sólo `EXCLUDED.col` en UPSERT — sub-pendiente J2-P2) |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
 | **I** | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual | Medio | — |
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
@@ -118,29 +118,30 @@ Hoy sin ninguna función built-in. Lista mínima útil:
 | `LENGTH(s)` | ✅ (G1, 2026-05-26) |
 | `UPPER(s)` / `LOWER(s)` | ✅ (G1, 2026-05-26) |
 | `SUBSTR(s, from, len)` / `SUBSTRING` | ✅ (G1, 2026-05-26) |
-| `TRIM(s)` / `LTRIM` / `RTRIM` | P2 |
-| `CONCAT(a, b, ...)` | ✅ (G1, 2026-05-26; operador `||` aún no) |
-| `REPLACE(s, from, to)` | P2 |
-| `SPLIT_PART(s, sep, idx)` | P3 |
+| `TRIM(s)` / `LTRIM` / `RTRIM` | ✅ (G3, 2026-05-26) |
+| `CONCAT(a, b, ...)` | ✅ (G1, 2026-05-26) — operador `\|\|` ✅ (G3, 2026-05-26) |
+| `REPLACE(s, from, to)` | ✅ (G3, 2026-05-26) |
+| `SPLIT_PART(s, sep, idx)` | ✅ (G3, 2026-05-26) |
 
 ### Numéricas
 | Función | Prioridad |
 |---|:---:|
 | `ABS(x)` | ✅ (G1, 2026-05-26) |
 | `ROUND(x, n)` | ✅ (G1, 2026-05-26) |
-| `CEIL(x)` / `FLOOR(x)` | P2 |
-| `MOD(a, b)` u operador `%` | P2 |
-| `POWER(x, y)` / `SQRT(x)` | P3 |
+| `CEIL(x)` / `FLOOR(x)` | ✅ (G3, 2026-05-26) |
+| `MOD(a, b)` u operador `%` | ✅ (G3, 2026-05-26) |
+| `POWER(x, y)` / `SQRT(x)` | ✅ (G3, 2026-05-26) |
+| Operadores aritméticos `+`/`-`/`*`/`/` | ✅ (G3, 2026-05-26) |
 
 ### Fecha / hora
 | Función | Prioridad |
 |---|:---:|
 | `NOW()` / `CURRENT_TIMESTAMP` | ✅ (G1, 2026-05-26) |
 | `CURRENT_DATE` | ✅ (G1, 2026-05-26) |
-| `DATE_ADD(d, n_days)` / `DATE_SUB` | P2 |
-| `DATEDIFF(d1, d2)` | P2 |
-| `EXTRACT(YEAR FROM d)` | P2 |
-| `STRFTIME(format, d)` | P3 |
+| `DATE_ADD(d, n_days)` / `DATE_SUB` | ✅ (G3, 2026-05-26) |
+| `DATEDIFF(d1, d2)` | ✅ (G3, 2026-05-26) |
+| `EXTRACT(YEAR FROM d)` | ✅ (G3, 2026-05-26) |
+| `STRFTIME(format, d)` | ✅ (G3, 2026-05-26) |
 
 ### Conversión y condicional
 | Construcción | Prioridad |

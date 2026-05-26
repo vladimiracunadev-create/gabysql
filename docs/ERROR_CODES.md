@@ -129,9 +129,15 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4036` | `CAST_INVALID` | `CAST(x AS TYPE)` cuyo valor no se puede convertir al tipo destino (e.g. `CAST('abc' AS INT)`). | Pre-validar el valor; usar `COALESCE`/`CASE` para descartar valores inválidos antes del `CAST`. |
 | `4037` | `SCALAR_FN_UNKNOWN` | Invocación a una función escalar que el motor no reconoce (e.g. `FOO(1)`). | Ver la lista de funciones soportadas en `SQL_REFERENCE.md` (sección "Funciones escalares"); algunas todavía no están implementadas. |
 | `4038` | `CASE_BRANCH_TYPE_MISMATCH` | Condición de un `CASE WHEN` searched que no evalúa a BOOL. | Reescribir la condición como una comparación (`x > 10`, `x IS NULL`, etc.). |
-| `4039` | `EXPR_IN_PREDICATE_NOT_SUPPORTED` | G2: operador postfix (`IS NULL`/`LIKE`/`IN`/`BETWEEN`) con LHS expresional, e.g. `WHERE LENGTH(x) IS NULL`. | Reescribir como comparación directa (`WHERE LENGTH(x) = 0`, `WHERE COALESCE(x, '') = ''`, etc.) o esperar al bloque G3. |
+| `4039` | `EXPR_IN_PREDICATE_NOT_SUPPORTED` | G2 (cerrado por G3): operador postfix (`IS NULL`/`LIKE`/`IN`/`BETWEEN`) con LHS expresional. Desde G3 la query funciona; el código queda reservado y sin emisión activa para preservar el contrato de estabilidad. | — |
 | `4040` | `WHERE_EXPR_NOT_BOOLEAN` | G2: expresión usada como predicado completo del WHERE/HAVING que no rinde BOOL/NULL, e.g. `WHERE LENGTH(x)` sin comparador. | Agregar el operador de comparación faltante (`= 0`, `> 3`, etc.). |
 | `4041` | `UPDATE_SET_TYPE_MISMATCH` | G2: la RHS de `UPDATE ... SET col = <expr>` rinde un tipo incompatible con la columna (e.g. TEXT en INT). | Envolver con `CAST(... AS TIPO)` explícito si la conversión es intencional. |
+| `4042` | `ARITH_OVERFLOW` | G3: operación entera con overflow (e.g. `i64::MAX + 1`). | Promover a FLOAT con `CAST(... AS FLOAT)` antes de la operación si el rango es necesario. |
+| `4043` | `DIVISION_BY_ZERO` | G3: divisor cero en `/` o `%` (entero o flotante). | Pre-filtrar con `WHERE divisor <> 0` o usar `NULLIF(divisor, 0)` para devolver NULL. |
+| `4044` | `ARITH_TYPE_MISMATCH` | G3: operador aritmético sobre tipos incompatibles (e.g. `'abc' + 1`). | Reescribir con `CAST` explícito o usar `\|\|` si la intención era concatenar. |
+| `4045` | `MATH_DOMAIN` | G3: función matemática fuera del dominio real (e.g. `SQRT(-1)`, `POWER(0, -1)`). | Pre-filtrar el dominio del argumento o devolver NULL con `CASE WHEN ... THEN ... ELSE NULL END`. |
+| `4046` | `DATE_PARSE_ERROR` | G3: TEXT no parseable como DATE/DATETIME en `DATE_ADD`/`DATEDIFF`/`EXTRACT`/`STRFTIME`. | Asegurar el formato `YYYY-MM-DD` o `YYYY-MM-DD HH:MM:SS`. |
+| `4047` | `EXTRACT_FIELD_INVALID` | G3: `EXTRACT(<campo> FROM ...)` con un campo desconocido. | Usar uno de `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`. |
 
 ---
 

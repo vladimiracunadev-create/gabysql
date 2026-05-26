@@ -245,6 +245,30 @@ pub mod codes {
     /// una columna INT). Lo dispara el encoder al rechazar el cast
     /// implícito; con `SET col = CAST(... AS T)` se evita.
     pub const UPDATE_SET_TYPE_MISMATCH: u32 = 4041;
+    /// Bloque G3 (2026-05-26): aritmético entero produjo overflow en
+    /// `checked_add` / `_sub` / `_mul` / `_div` (e.g. `i64::MAX + 1`).
+    /// Antes de G3 no había operadores binarios; ahora `+`, `-`, `*`,
+    /// `/`, `%` sobre INT pueden disparar este código.
+    pub const ARITH_OVERFLOW: u32 = 4042;
+    /// Bloque G3: división o módulo cuyo divisor evaluó a cero
+    /// (entero o flotante). gabysql elige error explícito en vez de
+    /// devolver `±Inf`/`NaN` para no contaminar resultados aguas abajo.
+    pub const DIVISION_BY_ZERO: u32 = 4043;
+    /// Bloque G3: operador aritmético o `||` aplicado a tipos que no
+    /// admiten esa combinación (e.g. `'abc' + 1`, `true * 2`,
+    /// `BOOL || INT`). NULL en cualquiera de los lados NO dispara esto
+    /// — propaga NULL via 3VL.
+    pub const ARITH_TYPE_MISMATCH: u32 = 4044;
+    /// Bloque G3: función matemática llamada con un argumento fuera
+    /// del dominio (e.g. `SQRT(-1)`, `POWER(0, -1)`).
+    pub const MATH_DOMAIN: u32 = 4045;
+    /// Bloque G3: función de fecha (`DATE_ADD`, `DATEDIFF`, `EXTRACT`,
+    /// `STRFTIME`, ...) recibió un string que no parsea como
+    /// `YYYY-MM-DD` ni `YYYY-MM-DD HH:MM:SS`.
+    pub const DATE_PARSE_ERROR: u32 = 4046;
+    /// Bloque G3: `EXTRACT(<field> FROM ...)` con un campo que no es
+    /// `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`.
+    pub const EXTRACT_FIELD_INVALID: u32 = 4047;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

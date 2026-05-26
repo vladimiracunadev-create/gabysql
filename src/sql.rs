@@ -400,6 +400,46 @@ pub enum Expr {
     /// searched. NUNCA propaga NULL: es la forma explícita de preguntar
     /// por ausencia, igual que el `IS NULL` del WHERE.
     IsNull(Box<Expr>, bool /* negated */),
+    /// Bloque G3: operador binario aritmético / concatenación.
+    /// `+`, `-`, `*`, `/`, `%` y `||` con precedencia clásica armada
+    /// por el parser (`*` `/` `%` antes que `+` `-` `||`).
+    Arith(Box<Expr>, ArithOp, Box<Expr>),
+    /// Bloque G3: `lhs [NOT] LIKE 'patron'` como expresión. Igual
+    /// semántica que `WhereClause::Like` (3VL, escape con `\`).
+    Like(Box<Expr>, String, bool /* negated */),
+    /// Bloque G3: `lhs [NOT] IN (lit1, lit2, ...)` como expresión. Solo
+    /// listas literales — subqueries en IN sobre Expr quedan para H.
+    InList(Box<Expr>, Vec<Value>, bool /* negated */),
+    /// Bloque G3: `lhs [NOT] BETWEEN low AND high` como expresión. Los
+    /// tres operandos son `Expr`; promoción de tipos igual que
+    /// `Compare`.
+    Between(Box<Expr>, Box<Expr>, Box<Expr>, bool /* negated */),
+}
+
+/// Bloque G3: operadores binarios soportados por [`Expr::Arith`].
+/// `Concat` agrupa al operador `||` y comparte precedencia con `+`/`-`
+/// (regla PostgreSQL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Concat,
+}
+
+impl ArithOp {
+    pub fn lexeme(&self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+            ArithOp::Concat => "||",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,13 +464,31 @@ pub enum ScalarFunc {
     Lower,
     Substr,
     Concat,
+    // string (G3 P2/P3)
+    Trim,
+    Ltrim,
+    Rtrim,
+    Replace,
+    SplitPart,
     // numeric
     Abs,
     Round,
+    // numeric (G3 P2/P3)
+    Ceil,
+    Floor,
+    Mod,
+    Power,
+    Sqrt,
     // datetime
     Now,
     CurrentDate,
     CurrentTimestamp,
+    // datetime (G3 P2/P3)
+    DateAdd,
+    DateSub,
+    Datediff,
+    Extract,
+    Strftime,
     // conditional
     Coalesce,
     Nullif,
@@ -446,11 +504,26 @@ impl ScalarFunc {
             ScalarFunc::Lower => "LOWER",
             ScalarFunc::Substr => "SUBSTR",
             ScalarFunc::Concat => "CONCAT",
+            ScalarFunc::Trim => "TRIM",
+            ScalarFunc::Ltrim => "LTRIM",
+            ScalarFunc::Rtrim => "RTRIM",
+            ScalarFunc::Replace => "REPLACE",
+            ScalarFunc::SplitPart => "SPLIT_PART",
             ScalarFunc::Abs => "ABS",
             ScalarFunc::Round => "ROUND",
+            ScalarFunc::Ceil => "CEIL",
+            ScalarFunc::Floor => "FLOOR",
+            ScalarFunc::Mod => "MOD",
+            ScalarFunc::Power => "POWER",
+            ScalarFunc::Sqrt => "SQRT",
             ScalarFunc::Now => "NOW",
             ScalarFunc::CurrentDate => "CURRENT_DATE",
             ScalarFunc::CurrentTimestamp => "CURRENT_TIMESTAMP",
+            ScalarFunc::DateAdd => "DATE_ADD",
+            ScalarFunc::DateSub => "DATE_SUB",
+            ScalarFunc::Datediff => "DATEDIFF",
+            ScalarFunc::Extract => "EXTRACT",
+            ScalarFunc::Strftime => "STRFTIME",
             ScalarFunc::Coalesce => "COALESCE",
             ScalarFunc::Nullif => "NULLIF",
             ScalarFunc::Ifnull => "IFNULL",
@@ -468,11 +541,26 @@ impl ScalarFunc {
             "LOWER" => Some(ScalarFunc::Lower),
             "SUBSTR" | "SUBSTRING" => Some(ScalarFunc::Substr),
             "CONCAT" => Some(ScalarFunc::Concat),
+            "TRIM" => Some(ScalarFunc::Trim),
+            "LTRIM" => Some(ScalarFunc::Ltrim),
+            "RTRIM" => Some(ScalarFunc::Rtrim),
+            "REPLACE" => Some(ScalarFunc::Replace),
+            "SPLIT_PART" => Some(ScalarFunc::SplitPart),
             "ABS" => Some(ScalarFunc::Abs),
             "ROUND" => Some(ScalarFunc::Round),
+            "CEIL" | "CEILING" => Some(ScalarFunc::Ceil),
+            "FLOOR" => Some(ScalarFunc::Floor),
+            "MOD" => Some(ScalarFunc::Mod),
+            "POWER" | "POW" => Some(ScalarFunc::Power),
+            "SQRT" => Some(ScalarFunc::Sqrt),
             "NOW" => Some(ScalarFunc::Now),
             "CURRENT_DATE" | "CURDATE" => Some(ScalarFunc::CurrentDate),
             "CURRENT_TIMESTAMP" => Some(ScalarFunc::CurrentTimestamp),
+            "DATE_ADD" => Some(ScalarFunc::DateAdd),
+            "DATE_SUB" => Some(ScalarFunc::DateSub),
+            "DATEDIFF" => Some(ScalarFunc::Datediff),
+            "EXTRACT" => Some(ScalarFunc::Extract),
+            "STRFTIME" => Some(ScalarFunc::Strftime),
             "COALESCE" => Some(ScalarFunc::Coalesce),
             "NULLIF" => Some(ScalarFunc::Nullif),
             "IFNULL" => Some(ScalarFunc::Ifnull),
@@ -583,6 +671,35 @@ fn expr_default_label(expr: &Expr) -> String {
             } else {
                 "is_null".to_string()
             }
+        }
+        Expr::Arith(l, op, r) => {
+            format!(
+                "({}{}{})",
+                expr_default_label(l),
+                op.lexeme(),
+                expr_default_label(r)
+            )
+        }
+        Expr::Like(l, _, negated) => {
+            format!(
+                "{}{}_like",
+                expr_default_label(l),
+                if *negated { "_not" } else { "" }
+            )
+        }
+        Expr::InList(l, _, negated) => {
+            format!(
+                "{}{}_in",
+                expr_default_label(l),
+                if *negated { "_not" } else { "" }
+            )
+        }
+        Expr::Between(l, _, _, negated) => {
+            format!(
+                "{}{}_between",
+                expr_default_label(l),
+                if *negated { "_not" } else { "" }
+            )
         }
     }
 }
@@ -4551,6 +4668,18 @@ fn validate_expr_columns(expr: &Expr, meta: &TableMeta) -> DbResult<()> {
             Ok(())
         }
         Expr::IsNull(inner, _) => validate_expr_columns(inner, meta),
+        Expr::Arith(a, _, b) => {
+            validate_expr_columns(a, meta)?;
+            validate_expr_columns(b, meta)?;
+            Ok(())
+        }
+        Expr::Like(inner, _, _) | Expr::InList(inner, _, _) => validate_expr_columns(inner, meta),
+        Expr::Between(a, lo, hi, _) => {
+            validate_expr_columns(a, meta)?;
+            validate_expr_columns(lo, meta)?;
+            validate_expr_columns(hi, meta)?;
+            Ok(())
+        }
     }
 }
 
@@ -5550,6 +5679,27 @@ fn rewrite_expr_columns_for_join(expr: Expr, scope: &JoinScope) -> DbResult<Expr
             Box::new(rewrite_expr_columns_for_join(*inner, scope)?),
             neg,
         )),
+        Expr::Arith(a, op, b) => Ok(Expr::Arith(
+            Box::new(rewrite_expr_columns_for_join(*a, scope)?),
+            op,
+            Box::new(rewrite_expr_columns_for_join(*b, scope)?),
+        )),
+        Expr::Like(inner, pat, neg) => Ok(Expr::Like(
+            Box::new(rewrite_expr_columns_for_join(*inner, scope)?),
+            pat,
+            neg,
+        )),
+        Expr::InList(inner, vs, neg) => Ok(Expr::InList(
+            Box::new(rewrite_expr_columns_for_join(*inner, scope)?),
+            vs,
+            neg,
+        )),
+        Expr::Between(a, lo, hi, neg) => Ok(Expr::Between(
+            Box::new(rewrite_expr_columns_for_join(*a, scope)?),
+            Box::new(rewrite_expr_columns_for_join(*lo, scope)?),
+            Box::new(rewrite_expr_columns_for_join(*hi, scope)?),
+            neg,
+        )),
     }
 }
 
@@ -6023,12 +6173,29 @@ fn where_expr_has_outer_refs(expr: &WhereExpr) -> bool {
 /// al parsearla. Devuelve `[GBY-4034]` si la aridad no calza.
 fn validate_scalar_arity(f: ScalarFunc, n: usize) -> DbResult<()> {
     let ok = match f {
-        ScalarFunc::Length | ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Abs => n == 1,
+        ScalarFunc::Length
+        | ScalarFunc::Upper
+        | ScalarFunc::Lower
+        | ScalarFunc::Abs
+        | ScalarFunc::Trim
+        | ScalarFunc::Ltrim
+        | ScalarFunc::Rtrim
+        | ScalarFunc::Ceil
+        | ScalarFunc::Floor
+        | ScalarFunc::Sqrt => n == 1,
         ScalarFunc::Round => n == 1 || n == 2,
         ScalarFunc::Substr => n == 2 || n == 3,
         ScalarFunc::Concat | ScalarFunc::Coalesce => n >= 1,
-        ScalarFunc::Nullif | ScalarFunc::Ifnull => n == 2,
-        ScalarFunc::If => n == 3,
+        ScalarFunc::Nullif
+        | ScalarFunc::Ifnull
+        | ScalarFunc::Mod
+        | ScalarFunc::Power
+        | ScalarFunc::DateAdd
+        | ScalarFunc::DateSub
+        | ScalarFunc::Datediff
+        | ScalarFunc::Extract
+        | ScalarFunc::Strftime => n == 2,
+        ScalarFunc::Replace | ScalarFunc::SplitPart | ScalarFunc::If => n == 3,
         ScalarFunc::Now | ScalarFunc::CurrentDate | ScalarFunc::CurrentTimestamp => n == 0,
     };
     if ok {
@@ -6205,7 +6372,134 @@ fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
             let is_null = matches!(v, Value::Null);
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
+        Expr::Arith(lhs, op, rhs) => {
+            let a = eval_expr(lhs, row)?;
+            let b = eval_expr(rhs, row)?;
+            eval_arith(a, *op, b)
+        }
+        Expr::Like(lhs, pattern, negated) => {
+            let v = eval_expr(lhs, row)?;
+            match eval_like(Some(&v), pattern, *negated) {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::InList(lhs, values, negated) => {
+            let v = eval_expr(lhs, row)?;
+            match eval_in_list(Some(&v), values, *negated) {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::Between(lhs, lo, hi, negated) => {
+            let v = eval_expr(lhs, row)?;
+            let lv = eval_expr(lo, row)?;
+            let hv = eval_expr(hi, row)?;
+            if matches!(v, Value::Null) || matches!(lv, Value::Null) || matches!(hv, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let ge_lo = eval_compare(Some(&v), CompareOp::Ge, &lv);
+            let le_hi = eval_compare(Some(&v), CompareOp::Le, &hv);
+            match (ge_lo, le_hi) {
+                (Some(a), Some(b)) => {
+                    let between = a && b;
+                    Ok(Value::Bool(if *negated { !between } else { between }))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
     }
+}
+
+/// Bloque G3: evaluador del operador binario aritmético / concat.
+/// Reglas:
+/// - NULL en cualquiera de los operandos → NULL (3VL).
+/// - INT op INT → INT con `checked_*`; overflow → `[GBY-4042]`.
+/// - INT/FLOAT mixto → promueve a FLOAT.
+/// - División o módulo con divisor cero → `[GBY-4043]`.
+/// - `Concat` (`||`): adopta la regla ANSI estricta (NULL → NULL).
+///   Cualquier tipo se imprime via `value_to_text`.
+/// - Cualquier otra combinación (`TEXT + INT`, `BOOL * 2`, ...) → `[GBY-4044]`.
+fn eval_arith(a: Value, op: ArithOp, b: Value) -> DbResult<Value> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if matches!(op, ArithOp::Concat) {
+        return Ok(Value::String(format!(
+            "{}{}",
+            value_to_text(&a),
+            value_to_text(&b)
+        )));
+    }
+    // Promoción numérica.
+    let (af, bf, both_int) = match (&a, &b) {
+        (Value::Integer(x), Value::Integer(y)) => (*x as f64, *y as f64, Some((*x, *y))),
+        (Value::Integer(x), Value::Float(y)) => (*x as f64, *y, None),
+        (Value::Float(x), Value::Integer(y)) => (*x, *y as f64, None),
+        (Value::Float(x), Value::Float(y)) => (*x, *y, None),
+        _ => {
+            return Err(coded(
+                codes::ARITH_TYPE_MISMATCH,
+                format!(
+                    "operador '{}' no acepta operandos {} y {}",
+                    op.lexeme(),
+                    value_type_name(&a),
+                    value_type_name(&b)
+                ),
+            ));
+        }
+    };
+    if let Some((x, y)) = both_int {
+        // Camino entero puro: checked_* + cero check.
+        let r = match op {
+            ArithOp::Add => x.checked_add(y),
+            ArithOp::Sub => x.checked_sub(y),
+            ArithOp::Mul => x.checked_mul(y),
+            ArithOp::Div => {
+                if y == 0 {
+                    return Err(coded(codes::DIVISION_BY_ZERO, "división entera por cero"));
+                }
+                x.checked_div(y)
+            }
+            ArithOp::Mod => {
+                if y == 0 {
+                    return Err(coded(codes::DIVISION_BY_ZERO, "módulo por cero"));
+                }
+                x.checked_rem(y)
+            }
+            ArithOp::Concat => unreachable!(),
+        };
+        return match r {
+            Some(v) => Ok(Value::Integer(v)),
+            None => Err(coded(
+                codes::ARITH_OVERFLOW,
+                format!("overflow aritmético en INT: {} {} {}", x, op.lexeme(), y),
+            )),
+        };
+    }
+    // Camino flotante (al menos un operando FLOAT).
+    let r = match op {
+        ArithOp::Add => af + bf,
+        ArithOp::Sub => af - bf,
+        ArithOp::Mul => af * bf,
+        ArithOp::Div => {
+            if bf == 0.0 {
+                return Err(coded(
+                    codes::DIVISION_BY_ZERO,
+                    "división por cero (flotante)",
+                ));
+            }
+            af / bf
+        }
+        ArithOp::Mod => {
+            if bf == 0.0 {
+                return Err(coded(codes::DIVISION_BY_ZERO, "módulo por cero (flotante)"));
+            }
+            af % bf
+        }
+        ArithOp::Concat => unreachable!(),
+    };
+    Ok(Value::Float(r))
 }
 
 /// Bloque G2: evalúa una `Expr` como predicado booleano para
@@ -6377,12 +6671,439 @@ fn eval_scalar_fn(f: ScalarFunc, args: Vec<Value>) -> DbResult<Value> {
             // primeros 10 chars son YYYY-MM-DD.
             Ok(Value::String(dt[..10].to_string()))
         }
+        // -------- Bloque G3: string P2/P3 --------
+        ScalarFunc::Trim => match &args[0] {
+            Value::String(s) => Ok(Value::String(s.trim().to_string())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!("TRIM requiere TEXT, recibí {}", value_type_name(other)),
+            )),
+        },
+        ScalarFunc::Ltrim => match &args[0] {
+            Value::String(s) => Ok(Value::String(s.trim_start().to_string())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!("LTRIM requiere TEXT, recibí {}", value_type_name(other)),
+            )),
+        },
+        ScalarFunc::Rtrim => match &args[0] {
+            Value::String(s) => Ok(Value::String(s.trim_end().to_string())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!("RTRIM requiere TEXT, recibí {}", value_type_name(other)),
+            )),
+        },
+        ScalarFunc::Replace => {
+            let s = expect_text(&args[0], "REPLACE", "s")?;
+            let from = expect_text(&args[1], "REPLACE", "from")?;
+            let to = expect_text(&args[2], "REPLACE", "to")?;
+            if from.is_empty() {
+                // Evitar bucle infinito en `String::replace` con patrón
+                // vacío — devolver el string sin cambios es la opción
+                // segura y la que toma SQLite.
+                return Ok(Value::String(s.to_string()));
+            }
+            Ok(Value::String(s.replace(from, to)))
+        }
+        ScalarFunc::SplitPart => {
+            let s = expect_text(&args[0], "SPLIT_PART", "s")?;
+            let sep = expect_text(&args[1], "SPLIT_PART", "sep")?;
+            let idx = match &args[2] {
+                Value::Integer(n) => *n,
+                other => {
+                    return Err(coded(
+                        codes::SCALAR_FN_TYPE_MISMATCH,
+                        format!(
+                            "SPLIT_PART(s, sep, idx): 'idx' debe ser INT, recibí {}",
+                            value_type_name(other)
+                        ),
+                    ));
+                }
+            };
+            if idx <= 0 {
+                return Err(coded(
+                    codes::SCALAR_FN_TYPE_MISMATCH,
+                    "SPLIT_PART: 'idx' debe ser >= 1 (1-based)",
+                ));
+            }
+            if sep.is_empty() {
+                return Ok(Value::String(if idx == 1 {
+                    s.to_string()
+                } else {
+                    String::new()
+                }));
+            }
+            let parts: Vec<&str> = s.split(sep).collect();
+            let i = (idx as usize) - 1;
+            Ok(Value::String(
+                parts.get(i).copied().unwrap_or("").to_string(),
+            ))
+        }
+        // -------- Bloque G3: numéricas P2/P3 --------
+        ScalarFunc::Ceil => match &args[0] {
+            Value::Integer(n) => Ok(Value::Integer(*n)),
+            Value::Float(f) => Ok(Value::Float(f.ceil())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!(
+                    "CEIL requiere INT o FLOAT, recibí {}",
+                    value_type_name(other)
+                ),
+            )),
+        },
+        ScalarFunc::Floor => match &args[0] {
+            Value::Integer(n) => Ok(Value::Integer(*n)),
+            Value::Float(f) => Ok(Value::Float(f.floor())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!(
+                    "FLOOR requiere INT o FLOAT, recibí {}",
+                    value_type_name(other)
+                ),
+            )),
+        },
+        ScalarFunc::Mod => {
+            // Reusa el operador binario; mismas reglas de tipo y de cero.
+            eval_arith(args[0].clone(), ArithOp::Mod, args[1].clone())
+        }
+        ScalarFunc::Power => {
+            let x = value_as_f64(&args[0], "POWER", "x")?;
+            let y = value_as_f64(&args[1], "POWER", "y")?;
+            // x^y con base 0 y exponente negativo es ±Inf → tratamos como
+            // dominio inválido.
+            if x == 0.0 && y < 0.0 {
+                return Err(coded(codes::MATH_DOMAIN, "POWER(0, y) con y<0 indefinido"));
+            }
+            Ok(Value::Float(x.powf(y)))
+        }
+        ScalarFunc::Sqrt => {
+            let x = value_as_f64(&args[0], "SQRT", "x")?;
+            if x < 0.0 {
+                return Err(coded(
+                    codes::MATH_DOMAIN,
+                    format!("SQRT({}) indefinido en reales (argumento negativo)", x),
+                ));
+            }
+            Ok(Value::Float(x.sqrt()))
+        }
+        // -------- Bloque G3: fechas P2/P3 --------
+        ScalarFunc::DateAdd => date_add_days(&args[0], expect_int(&args[1], "DATE_ADD", "n")?),
+        ScalarFunc::DateSub => date_add_days(&args[0], -expect_int(&args[1], "DATE_SUB", "n")?),
+        ScalarFunc::Datediff => {
+            let d1 = parse_date_part_to_days(&args[0], "DATEDIFF")?;
+            let d2 = parse_date_part_to_days(&args[1], "DATEDIFF")?;
+            Ok(Value::Integer(d1 - d2))
+        }
+        ScalarFunc::Extract => {
+            let field = match &args[0] {
+                Value::String(s) => s.to_ascii_uppercase(),
+                other => {
+                    return Err(coded(
+                        codes::EXTRACT_FIELD_INVALID,
+                        format!(
+                            "EXTRACT: campo debe ser un keyword (YEAR/MONTH/DAY/HOUR/MINUTE/SECOND), recibí {}",
+                            value_type_name(other)
+                        ),
+                    ));
+                }
+            };
+            let s = match &args[1] {
+                Value::String(s) => s.as_str(),
+                other => {
+                    return Err(coded(
+                        codes::DATE_PARSE_ERROR,
+                        format!(
+                            "EXTRACT: argumento de fecha debe ser TEXT, recibí {}",
+                            value_type_name(other)
+                        ),
+                    ));
+                }
+            };
+            extract_date_field(&field, s)
+        }
+        ScalarFunc::Strftime => {
+            let fmt = expect_text(&args[0], "STRFTIME", "format")?;
+            let s = expect_text(&args[1], "STRFTIME", "fecha")?;
+            strftime_format(fmt, s)
+        }
         // Casos con short-circuit: ya tratados en `eval_expr`. Si llegamos
         // acá es bug del caller.
         ScalarFunc::Coalesce | ScalarFunc::Ifnull | ScalarFunc::If | ScalarFunc::Nullif => Err(
             DbError::new("interno: short-circuit fn dispatcheada por eval_scalar_fn"),
         ),
     }
+}
+
+/// Bloque G3: helper para funciones que esperan TEXT.
+fn expect_text<'a>(v: &'a Value, func: &str, slot: &str) -> DbResult<&'a str> {
+    match v {
+        Value::String(s) => Ok(s.as_str()),
+        other => Err(coded(
+            codes::SCALAR_FN_TYPE_MISMATCH,
+            format!(
+                "{}({}): se esperaba TEXT, recibí {}",
+                func,
+                slot,
+                value_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// Bloque G3: helper para funciones que esperan INT.
+fn expect_int(v: &Value, func: &str, slot: &str) -> DbResult<i64> {
+    match v {
+        Value::Integer(n) => Ok(*n),
+        other => Err(coded(
+            codes::SCALAR_FN_TYPE_MISMATCH,
+            format!(
+                "{}({}): se esperaba INT, recibí {}",
+                func,
+                slot,
+                value_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// Bloque G3: promueve INT/FLOAT a f64 para funciones matemáticas.
+fn value_as_f64(v: &Value, func: &str, slot: &str) -> DbResult<f64> {
+    match v {
+        Value::Integer(n) => Ok(*n as f64),
+        Value::Float(f) => Ok(*f),
+        other => Err(coded(
+            codes::SCALAR_FN_TYPE_MISMATCH,
+            format!(
+                "{}({}): se esperaba INT o FLOAT, recibí {}",
+                func,
+                slot,
+                value_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// Bloque G3: parsea la parte `YYYY-MM-DD` de un string DATE o
+/// DATETIME, devuelve días desde la epoch (1970-01-01).
+fn parse_date_part_to_days(v: &Value, func: &str) -> DbResult<i64> {
+    let s = match v {
+        Value::String(s) => s.as_str(),
+        other => {
+            return Err(coded(
+                codes::DATE_PARSE_ERROR,
+                format!(
+                    "{}: se esperaba TEXT (DATE/DATETIME), recibí {}",
+                    func,
+                    value_type_name(other)
+                ),
+            ));
+        }
+    };
+    let date_part = if looks_like_datetime(s) {
+        &s[..10]
+    } else if looks_like_date(s) {
+        s
+    } else {
+        return Err(coded(
+            codes::DATE_PARSE_ERROR,
+            format!(
+                "{}: '{}' no es DATE 'YYYY-MM-DD' ni DATETIME 'YYYY-MM-DD HH:MM:SS'",
+                func, s
+            ),
+        ));
+    };
+    let y: i64 = date_part[..4].parse().map_err(|_| {
+        coded(
+            codes::DATE_PARSE_ERROR,
+            format!("{}: año inválido en '{}'", func, s),
+        )
+    })?;
+    let m: u32 = date_part[5..7].parse().map_err(|_| {
+        coded(
+            codes::DATE_PARSE_ERROR,
+            format!("{}: mes inválido en '{}'", func, s),
+        )
+    })?;
+    let d: u32 = date_part[8..10].parse().map_err(|_| {
+        coded(
+            codes::DATE_PARSE_ERROR,
+            format!("{}: día inválido en '{}'", func, s),
+        )
+    })?;
+    Ok(days_from_civil(y, m, d))
+}
+
+/// Bloque G3: suma `n` días al date-part de un DATE o DATETIME. Para
+/// DATETIME preserva el time-part. Para DATE devuelve un DATE.
+fn date_add_days(v: &Value, n: i64) -> DbResult<Value> {
+    let s = match v {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(coded(
+                codes::DATE_PARSE_ERROR,
+                format!(
+                    "DATE_ADD/DATE_SUB: se esperaba TEXT, recibí {}",
+                    value_type_name(other)
+                ),
+            ));
+        }
+    };
+    let (date_part, time_suffix) = if looks_like_datetime(&s) {
+        (&s[..10], Some(&s[10..]))
+    } else if looks_like_date(&s) {
+        (s.as_str(), None)
+    } else {
+        return Err(coded(
+            codes::DATE_PARSE_ERROR,
+            format!("DATE_ADD/DATE_SUB: '{}' no es DATE ni DATETIME válido", s),
+        ));
+    };
+    let y: i64 = date_part[..4]
+        .parse()
+        .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("año inválido: '{}'", s)))?;
+    let m: u32 = date_part[5..7]
+        .parse()
+        .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("mes inválido: '{}'", s)))?;
+    let d: u32 = date_part[8..10]
+        .parse()
+        .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("día inválido: '{}'", s)))?;
+    let days = days_from_civil(y, m, d).saturating_add(n);
+    let (yy, mm, dd) = civil_from_days(days);
+    let new_date = format!("{:04}-{:02}-{:02}", yy, mm, dd);
+    match time_suffix {
+        Some(suffix) => Ok(Value::String(format!("{}{}", new_date, suffix))),
+        None => Ok(Value::String(new_date)),
+    }
+}
+
+/// Bloque G3: EXTRACT(<field> FROM expr) sobre DATE/DATETIME en TEXT.
+fn extract_date_field(field: &str, s: &str) -> DbResult<Value> {
+    let (date_part, time_part): (&str, Option<&str>) = if looks_like_datetime(s) {
+        (&s[..10], Some(&s[11..]))
+    } else if looks_like_date(s) {
+        (s, None)
+    } else {
+        return Err(coded(
+            codes::DATE_PARSE_ERROR,
+            format!("EXTRACT: '{}' no es DATE/DATETIME válido", s),
+        ));
+    };
+    let yy: i64 = date_part[..4]
+        .parse()
+        .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("año inválido: '{}'", s)))?;
+    let mm: i64 = date_part[5..7]
+        .parse()
+        .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("mes inválido: '{}'", s)))?;
+    let dd: i64 = date_part[8..10]
+        .parse()
+        .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("día inválido: '{}'", s)))?;
+    match field {
+        "YEAR" => Ok(Value::Integer(yy)),
+        "MONTH" => Ok(Value::Integer(mm)),
+        "DAY" => Ok(Value::Integer(dd)),
+        "HOUR" | "MINUTE" | "SECOND" => {
+            let tp = match time_part {
+                Some(t) => t,
+                None => {
+                    return Err(coded(
+                        codes::DATE_PARSE_ERROR,
+                        format!(
+                            "EXTRACT({} FROM ...): '{}' es DATE sin componente de hora",
+                            field, s
+                        ),
+                    ));
+                }
+            };
+            // tp = "HH:MM:SS"
+            let hh: i64 = tp[..2]
+                .parse()
+                .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("hora inválida: '{}'", s)))?;
+            let mi: i64 = tp[3..5]
+                .parse()
+                .map_err(|_| coded(codes::DATE_PARSE_ERROR, format!("minuto inválido: '{}'", s)))?;
+            let ss: i64 = tp[6..8].parse().map_err(|_| {
+                coded(
+                    codes::DATE_PARSE_ERROR,
+                    format!("segundo inválido: '{}'", s),
+                )
+            })?;
+            Ok(Value::Integer(match field {
+                "HOUR" => hh,
+                "MINUTE" => mi,
+                "SECOND" => ss,
+                _ => unreachable!(),
+            }))
+        }
+        other => Err(coded(
+            codes::EXTRACT_FIELD_INVALID,
+            format!(
+                "EXTRACT: campo '{}' no soportado; usar YEAR/MONTH/DAY/HOUR/MINUTE/SECOND",
+                other
+            ),
+        )),
+    }
+}
+
+/// Bloque G3: formateo mínimo de fechas estilo `strftime`. Soporta
+/// `%Y`, `%m`, `%d`, `%H`, `%M`, `%S` y `%%`. Otros placeholders
+/// `%X` se emiten tal cual (permisivo).
+fn strftime_format(fmt: &str, s: &str) -> DbResult<Value> {
+    let (date_part, time_part): (&str, Option<&str>) = if looks_like_datetime(s) {
+        (&s[..10], Some(&s[11..]))
+    } else if looks_like_date(s) {
+        (s, None)
+    } else {
+        return Err(coded(
+            codes::DATE_PARSE_ERROR,
+            format!("STRFTIME: '{}' no es DATE/DATETIME válido", s),
+        ));
+    };
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&date_part[..4]),
+            Some('m') => out.push_str(&date_part[5..7]),
+            Some('d') => out.push_str(&date_part[8..10]),
+            Some('H') => match time_part {
+                Some(t) => out.push_str(&t[..2]),
+                None => out.push_str("00"),
+            },
+            Some('M') => match time_part {
+                Some(t) => out.push_str(&t[3..5]),
+                None => out.push_str("00"),
+            },
+            Some('S') => match time_part {
+                Some(t) => out.push_str(&t[6..8]),
+                None => out.push_str("00"),
+            },
+            Some('%') => out.push('%'),
+            Some(other) => {
+                // Permisivo: lo emitimos literal con su `%`.
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    Ok(Value::String(out))
+}
+
+/// Bloque G3: inverso de `civil_from_days`. Algoritmo de Howard
+/// Hinnant: convierte (year, month, day) gregoriano a días desde
+/// 1970-01-01.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mu = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mu + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
 }
 
 /// Bloque G2: ¿el `Value` calculado encaja en la columna destino para
@@ -6703,8 +7424,60 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
             });
             continue;
         }
+        // Bloque G3: `-N` solo se trata como literal negativo cuando el
+        // token anterior NO termina un operando. Reglas:
+        // - Número, String, `)` cierran un operando → `-` siguiente es operador.
+        // - Ident: es operando SOLO si NO es un keyword que introduce un valor
+        //   (LIMIT, OFFSET, VALUES, WHERE, AND, OR, IN, BETWEEN, RETURNING, ...).
+        //   En esos casos `-N` es literal negativo. Para idents "comunes"
+        //   (column refs) un `-` siguiente es resta.
+        // Sin esta guarda `5-3` se tokenizaba como `5`, `-3` rompiendo la resta.
+        let prev_is_operand = match tokens.last() {
+            Some(t) => match (&t.kind, t.text.as_str()) {
+                (TokenKind::Number, _) | (TokenKind::String, _) => true,
+                (TokenKind::Symbol, ")") => true,
+                (TokenKind::Ident, txt) => {
+                    let upper = txt.to_ascii_uppercase();
+                    // Lista de keywords que introducen un valor (NO son operandos).
+                    !matches!(
+                        upper.as_str(),
+                        "LIMIT"
+                            | "OFFSET"
+                            | "VALUES"
+                            | "WHERE"
+                            | "AND"
+                            | "OR"
+                            | "NOT"
+                            | "IN"
+                            | "BETWEEN"
+                            | "RETURNING"
+                            | "BY"
+                            | "ON"
+                            | "USING"
+                            | "SET"
+                            | "SELECT"
+                            | "HAVING"
+                            | "WHEN"
+                            | "THEN"
+                            | "ELSE"
+                            | "CASE"
+                            | "LIKE"
+                            | "AS"
+                            | "FROM"
+                            | "INTO"
+                            | "DEFAULT"
+                            | "IS"
+                    )
+                }
+                _ => false,
+            },
+            None => false,
+        };
         if ch.is_ascii_digit()
-            || (ch == '-' && index + 1 < chars.len() && chars[index + 1].is_ascii_digit())
+            || (ch == '-'
+                && !prev_is_operand
+                && index + 1 < chars.len()
+                && chars[index + 1].is_ascii_digit())
         {
             let start = index;
             index += 1;
@@ -6760,12 +7533,41 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
             continue;
         }
         match ch {
-            '(' | ')' | ',' | '*' | '=' => {
+            '(' | ')' | ',' | '*' | '=' | '+' | '/' | '%' => {
                 tokens.push(Token {
                     kind: TokenKind::Symbol,
                     text: ch.to_string(),
                 });
                 index += 1;
+            }
+            // Bloque G3: '-' suelto como operador binario. El caso de
+            // literal negativo ya lo capturó la rama de `is_ascii_digit`
+            // arriba (que también detecta `-NN` cuando viene precedido
+            // por algo que no es número/ident). Acá emitimos un símbolo
+            // que el parser combinará en la precedencia aritmética.
+            '-' => {
+                tokens.push(Token {
+                    kind: TokenKind::Symbol,
+                    text: "-".to_string(),
+                });
+                index += 1;
+            }
+            // Bloque G3: `||` = concat. Dos pipes pegados forman un
+            // único Symbol "||" para consistencia con `<=`, `>=`, etc.
+            // Un único `|` suelto NO se soporta — error explícito.
+            '|' => {
+                if index + 1 < chars.len() && chars[index + 1] == '|' {
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol,
+                        text: "||".to_string(),
+                    });
+                    index += 2;
+                } else {
+                    return Err(DbError::new(
+                        "símbolo no soportado: '|' suelto; ¿quisiste decir '||' (concat)?"
+                            .to_string(),
+                    ));
+                }
             }
             // Bloque E2: operadores de comparación. Reconocemos primero los
             // bi-carácter (`<=`, `>=`, `<>`, `!=`) y luego los mono (`<`, `>`).
@@ -7599,7 +8401,12 @@ impl Parser {
                 head.text.to_ascii_uppercase().as_str(),
                 "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURDATE"
             );
-            if !next_is_lparen && !is_expr_keyword && !is_zero_arg_fn {
+            // Bloque G3: si el siguiente token es un operador aritmético
+            // o el concat `||`, no es columna bare — es una expresión.
+            // Cae a `parse_expr` para que la precedencia se aplique.
+            let next_is_arith = next.kind == TokenKind::Symbol
+                && matches!(next.text.as_str(), "+" | "-" | "*" | "/" | "%" | "||");
+            if !next_is_lparen && !is_expr_keyword && !is_zero_arg_fn && !next_is_arith {
                 self.pos += 1;
                 let column = head.text.clone();
                 // ¿hay alias? `col AS x` o `col x`.
@@ -7643,19 +8450,158 @@ impl Parser {
     /// No hay operadores aritméticos ni `AND`/`OR`: ese subset se
     /// agregará junto con G2 (uso en WHERE/HAVING).
     fn parse_expr(&mut self) -> DbResult<Expr> {
-        let lhs = self.parse_expr_primary()?;
+        // Capa más alta del árbol: comparadores y postfix predicates
+        // (LIKE / IN / BETWEEN / IS NULL) — precedencia más baja que
+        // los operadores aritméticos.
+        let lhs = self.parse_arith()?;
         if let Some(op) = self.peek_expr_cmp_op() {
             self.pos += 1;
-            let rhs = self.parse_expr_primary()?;
+            let rhs = self.parse_arith()?;
             return Ok(Expr::Compare(Box::new(lhs), op, Box::new(rhs)));
         }
+        // Postfix predicates sobre Expr — habilitado por G3.
+        self.parse_predicate_postfix(lhs)
+    }
+
+    /// Bloque G3: nivel `+`, `-`, `||` (left-assoc, mismo nivel que en
+    /// PostgreSQL).
+    fn parse_arith(&mut self) -> DbResult<Expr> {
+        let mut left = self.parse_arith_term()?;
+        loop {
+            let t = self.peek();
+            if t.kind != TokenKind::Symbol {
+                break;
+            }
+            let op = match t.text.as_str() {
+                "+" => ArithOp::Add,
+                "-" => ArithOp::Sub,
+                "||" => ArithOp::Concat,
+                _ => break,
+            };
+            self.pos += 1;
+            let right = self.parse_arith_term()?;
+            left = Expr::Arith(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// Bloque G3: nivel `*`, `/`, `%` (más alta precedencia que `+`/`-`).
+    fn parse_arith_term(&mut self) -> DbResult<Expr> {
+        let mut left = self.parse_arith_factor()?;
+        loop {
+            let t = self.peek();
+            if t.kind != TokenKind::Symbol {
+                break;
+            }
+            let op = match t.text.as_str() {
+                "*" => ArithOp::Mul,
+                "/" => ArithOp::Div,
+                "%" => ArithOp::Mod,
+                _ => break,
+            };
+            self.pos += 1;
+            let right = self.parse_arith_factor()?;
+            left = Expr::Arith(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// Bloque G3: atom-level. Wrapper sobre `parse_expr_primary` para
+    /// dejar puerta abierta a unary +/- en el futuro.
+    fn parse_arith_factor(&mut self) -> DbResult<Expr> {
+        self.parse_expr_primary()
+    }
+
+    /// Bloque G3: después de parsear una `Expr` LHS en `parse_expr`,
+    /// chequea los postfix predicates SQL: `IS [NOT] NULL`,
+    /// `[NOT] LIKE 'patron'`, `[NOT] IN (lit, ...)`,
+    /// `[NOT] BETWEEN low AND high`. Devuelve la `Expr` envuelta en la
+    /// variante correspondiente, o la propia LHS si no había postfix.
+    fn parse_predicate_postfix(&mut self, lhs: Expr) -> DbResult<Expr> {
+        // `IS [NOT] NULL`
         if self.peek().kind == TokenKind::Ident && self.peek().text.eq_ignore_ascii_case("IS") {
             self.pos += 1;
             let negated = self.match_keyword("NOT");
             self.expect_keyword("NULL")?;
             return Ok(Expr::IsNull(Box::new(lhs), negated));
         }
+        // `LIKE 'patron'`
+        if self.match_keyword("LIKE") {
+            let pattern = self.expect_string_literal("LIKE")?;
+            return Ok(Expr::Like(Box::new(lhs), pattern, false));
+        }
+        // `IN (lit, ...)`
+        if self.match_keyword("IN") {
+            let values = self.parse_in_literal_list_for_expr()?;
+            return Ok(Expr::InList(Box::new(lhs), values, false));
+        }
+        // `BETWEEN low AND high`
+        if self.match_keyword("BETWEEN") {
+            let lo = self.parse_arith()?;
+            self.expect_keyword("AND")?;
+            let hi = self.parse_arith()?;
+            return Ok(Expr::Between(
+                Box::new(lhs),
+                Box::new(lo),
+                Box::new(hi),
+                false,
+            ));
+        }
+        // `NOT LIKE | NOT IN | NOT BETWEEN`
+        if self.peek().kind == TokenKind::Ident && self.peek().text.eq_ignore_ascii_case("NOT") {
+            let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                kind: TokenKind::Eof,
+                text: String::new(),
+            });
+            if next.kind == TokenKind::Ident {
+                let upper = next.text.to_ascii_uppercase();
+                match upper.as_str() {
+                    "LIKE" => {
+                        self.pos += 2;
+                        let pattern = self.expect_string_literal("NOT LIKE")?;
+                        return Ok(Expr::Like(Box::new(lhs), pattern, true));
+                    }
+                    "IN" => {
+                        self.pos += 2;
+                        let values = self.parse_in_literal_list_for_expr()?;
+                        return Ok(Expr::InList(Box::new(lhs), values, true));
+                    }
+                    "BETWEEN" => {
+                        self.pos += 2;
+                        let lo = self.parse_arith()?;
+                        self.expect_keyword("AND")?;
+                        let hi = self.parse_arith()?;
+                        return Ok(Expr::Between(
+                            Box::new(lhs),
+                            Box::new(lo),
+                            Box::new(hi),
+                            true,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(lhs)
+    }
+
+    /// Bloque G3: parsea `(lit, lit, ...)` para postfix `IN` sobre
+    /// `Expr`. Solo literales (no subqueries — eso queda para H).
+    fn parse_in_literal_list_for_expr(&mut self) -> DbResult<Vec<Value>> {
+        self.expect_symbol("(")?;
+        if self.peek().kind == TokenKind::Ident && self.peek().text.eq_ignore_ascii_case("SELECT") {
+            return Err(coded(
+                codes::WHERE_OPERATOR_UNSUPPORTED,
+                "IN (SELECT ...) sobre expresión escalar no se soporta en este release — \
+                 esperar al bloque H del roadmap",
+            ));
+        }
+        let mut values = vec![self.expect_value()?];
+        while self.match_symbol(",") {
+            values.push(self.expect_value()?);
+        }
+        self.expect_symbol(")")?;
+        Ok(values)
     }
 
     fn parse_expr_primary(&mut self) -> DbResult<Expr> {
@@ -7736,6 +8682,42 @@ impl Parser {
                 })?;
                 self.pos += 1; // ident
                 self.expect_symbol("(")?;
+                // Bloque G3: `EXTRACT(field FROM expr)` tiene sintaxis
+                // especial — el primer "argumento" es un keyword. Lo
+                // empaquetamos como `Literal(String("YEAR"))` y la fecha
+                // como segundo arg para encajar en la firma genérica.
+                if matches!(func, ScalarFunc::Extract) {
+                    let field_tok = self.peek().clone();
+                    if field_tok.kind != TokenKind::Ident {
+                        return Err(coded(
+                            codes::EXTRACT_FIELD_INVALID,
+                            format!(
+                                "EXTRACT: se esperaba un keyword YEAR/MONTH/DAY/HOUR/MINUTE/SECOND, recibí '{}'",
+                                field_tok.text
+                            ),
+                        ));
+                    }
+                    let upper = field_tok.text.to_ascii_uppercase();
+                    if !matches!(
+                        upper.as_str(),
+                        "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND"
+                    ) {
+                        return Err(coded(
+                            codes::EXTRACT_FIELD_INVALID,
+                            format!(
+                                "EXTRACT: campo '{}' no soportado; usar YEAR/MONTH/DAY/HOUR/MINUTE/SECOND",
+                                field_tok.text
+                            ),
+                        ));
+                    }
+                    self.pos += 1;
+                    self.expect_keyword("FROM")?;
+                    let date_expr = self.parse_expr()?;
+                    self.expect_symbol(")")?;
+                    let args = vec![Expr::Literal(Value::String(upper)), date_expr];
+                    validate_scalar_arity(func, args.len())?;
+                    return Ok(Expr::Func(func, args));
+                }
                 let mut args = Vec::new();
                 if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
                     args.push(self.parse_expr()?);
@@ -8205,6 +9187,17 @@ impl Parser {
                 if matches!(upper.as_str(), "CASE" | "CAST" | "NULL" | "TRUE" | "FALSE") {
                     return false;
                 }
+                // Bloque G3: si el siguiente token es un operador
+                // aritmético o el concat `||`, el átomo es
+                // expresional (la forma estructural `col OP literal`
+                // no aplica).
+                if let Some(next) = self.tokens.get(self.pos + 1) {
+                    if next.kind == TokenKind::Symbol
+                        && matches!(next.text.as_str(), "+" | "-" | "*" | "/" | "%" | "||")
+                    {
+                        return false;
+                    }
+                }
                 // Funciones zero-arg sin parens — son expresiones.
                 if matches!(
                     upper.as_str(),
@@ -8259,30 +9252,12 @@ impl Parser {
     /// `[NOT] IN`, `BETWEEN`) sobre una expresión escalar todavía NO
     /// se soportan — devolvemos `[GBY-4039]` con guía.
     fn parse_where_atom_as_expr(&mut self) -> DbResult<WhereClause> {
-        let lhs = self.parse_expr_primary()?;
-        // Operador postfix sobre Expr: rechazamos explícitamente.
-        if self.peek().kind == TokenKind::Ident {
-            let upper = self.peek().text.to_ascii_uppercase();
-            if matches!(upper.as_str(), "IS" | "LIKE" | "IN" | "BETWEEN" | "NOT") {
-                return Err(coded(
-                    codes::EXPR_IN_PREDICATE_NOT_SUPPORTED,
-                    format!(
-                        "operador '{}' sobre expresión escalar aún no se soporta en este release; \
-                         usar comparación directa (=, <>, <, >, <=, >=) o esperar al bloque G3",
-                        upper
-                    ),
-                ));
-            }
-        }
-        if let Some(op) = self.peek_expr_cmp_op() {
-            self.pos += 1;
-            let rhs = self.parse_expr_primary()?;
-            return Ok(WhereClause::ExprPredicate {
-                expr: Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
-            });
-        }
-        // Sin comparador: la expr se evalúa tal cual y debe ser BOOL/NULL.
-        Ok(WhereClause::ExprPredicate { expr: lhs })
+        // Bloque G3: el path expresional usa la misma cadena de
+        // precedencia del SELECT — aritmética, comparador, postfix
+        // predicates (IS NULL / LIKE / IN / BETWEEN). `parse_expr`
+        // ya devuelve la `Expr` envuelta con el postfix si aparece.
+        let expr = self.parse_expr()?;
+        Ok(WhereClause::ExprPredicate { expr })
     }
 
     /// Bloque F: parsea el LHS de un átomo del WHERE/HAVING. En HAVING

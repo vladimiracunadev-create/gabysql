@@ -6,6 +6,58 @@
 
 ---
 
+## 2026-05-26 — Bloque G3: aritméticos + concat + postfix Expr + funciones P2/P3
+
+> **Un push a `main`** que cierra la familia G: operadores binarios `+`/`-`/`*`/`/`/`%`, concatenación `||`, postfix predicates (`IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN`, `[NOT] BETWEEN`) sobre cualquier `Expr`, y las funciones escalares P2/P3 que quedaban abiertas en G1 — string (`TRIM`/`LTRIM`/`RTRIM`/`REPLACE`/`SPLIT_PART`), numéricas (`CEIL`/`FLOOR`/`MOD`/`POWER`/`SQRT`) y fecha (`DATE_ADD`/`DATE_SUB`/`DATEDIFF`/`EXTRACT`/`STRFTIME`).
+
+### 🆕 Operadores
+- Aritméticos binarios `+`, `-`, `*`, `/`, `%` sobre INT/FLOAT con promoción implícita (INT+FLOAT → FLOAT), `checked_*` para detectar overflow en INT, y error explícito en división/módulo por cero (entero o flotante).
+- Concatenación `||` (regla PostgreSQL: misma precedencia que `+`/`-`). Cualquier tipo se reduce a TEXT con `value_to_text`; NULL propaga (ANSI estricta, igual que `CONCAT`).
+- Postfix predicates sobre `Expr`: `LENGTH(x) IS NULL`, `UPPER(x) LIKE 'A%'`, `LENGTH(x) IN (3, 4, 5)`, `LENGTH(x) BETWEEN 3 AND 10` (más sus formas `NOT ...`). El path estructural pre-G3 (columna directa) se preserva intacto para no perder fast-paths.
+
+### 🆕 Funciones escalares P2/P3
+- **String:** `TRIM`, `LTRIM`, `RTRIM`, `REPLACE(s, from, to)`, `SPLIT_PART(s, sep, idx)` (1-based, fuera de rango → `''`).
+- **Numéricas:** `CEIL` / `CEILING`, `FLOOR`, `MOD(a, b)` (alias del operador `%`), `POWER(x, y)` / `POW`, `SQRT(x)` (negativo → `[GBY-4045]`).
+- **Fecha:** `DATE_ADD(d, n)`, `DATE_SUB(d, n)`, `DATEDIFF(d1, d2)` (días), `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM expr)`, `STRFTIME(fmt, d)` con placeholders `%Y %m %d %H %M %S %%`.
+
+### 🔧 AST + Parser
+- `Expr` suma `Arith(Box<Expr>, ArithOp, Box<Expr>)`, `Like(...)`, `InList(...)`, `Between(...)`. Nuevo enum `ArithOp { Add, Sub, Mul, Div, Mod, Concat }`.
+- Cadena de precedencia explícita en el parser: `parse_expr` → `parse_arith` (+/-/||) → `parse_arith_term` (*///%) → `parse_arith_factor` → `parse_expr_primary`. Comparadores y postfix predicates viven al tope (precedencia más baja, como en SQL estándar).
+- Tokenizer: emite `||` como un único `Symbol`. `-N` literal solo se forma cuando el token previo NO termina un operando (heurística que respeta `LIMIT -1` / `VALUES (-3)` y a la vez deja funcionar `5 - 3`).
+- `EXTRACT(field FROM expr)` se parsea con branch dedicado en `parse_func_call`; internamente se guarda como `Func(Extract, [Literal(String("YEAR")), expr])` para encajar en la firma genérica.
+- `parse_where_atom_as_expr` ya no rechaza postfix sobre Expr — delega en `parse_expr` que aplica todo postfix uniformemente.
+
+### 🚦 Executor
+- `eval_expr` gana ramas para las nuevas variantes. `eval_arith` centraliza promoción de tipos, `checked_*` y división/módulo por cero. `Like`/`InList`/`Between` reusan los helpers existentes `eval_like` / `eval_in_list` / `eval_compare` con la misma 3VL que las variantes equivalentes de `WhereClause`.
+- Helpers `days_from_civil` (inverso del existente `civil_from_days`) y formateadores `extract_date_field` / `strftime_format` / `parse_date_part_to_days` para las funciones de fecha.
+
+### ⚠️ Limitaciones residuales (futuros bloques)
+- `EXCLUDED.col` dentro de `ON CONFLICT DO UPDATE SET` (J2-P2 explícito).
+- Unary `+` / `-` como operador prefix sobre expresión (el tokenizer captura literales negativos; expresiones tipo `-LENGTH(x)` quedan para una iteración futura — se puede escribir `0 - LENGTH(x)`).
+- Subqueries dentro de `IN (...)` sobre LHS expresional (bloque H).
+- Operadores aritméticos sobre tipos no numéricos (TEXT + INT, etc.) → `[GBY-4044]` explícito.
+
+### 🧰 Códigos de error nuevos
+- `4042` `ARITH_OVERFLOW` — overflow entero en `+/-/*//`.
+- `4043` `DIVISION_BY_ZERO` — divisor cero en `/` o `%`.
+- `4044` `ARITH_TYPE_MISMATCH` — operador aritmético sobre tipos no compatibles.
+- `4045` `MATH_DOMAIN` — `SQRT(-x)`, `POWER(0, neg)`.
+- `4046` `DATE_PARSE_ERROR` — TEXT no parseable como DATE/DATETIME en funciones de fecha.
+- `4047` `EXTRACT_FIELD_INVALID` — campo no soportado por `EXTRACT`.
+
+### 🧪 Validación
+- ~30 integration tests nuevos `g3_*` cubriendo aritméticos (precedencia, paréntesis, overflow, division by zero, mezcla INT/FLOAT, NULL propagation, type mismatch), concat (`||`), postfix sobre Expr (IS NULL / LIKE / IN / BETWEEN), y todas las funciones P2/P3.
+- `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` limpios.
+
+### 📚 Documentación
+- [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md): subsección "Operadores aritméticos" + tabla de funciones P2/P3 + tabla de errores `4042`-`4047`.
+- [`docs/MISSING_COMMANDS.md`](docs/MISSING_COMMANDS.md): los items P2/P3 cerrados se marcan `✅ (G3, 2026-05-26)`; el `||` y los aritméticos pasan a `✅`.
+- [`docs/STATUS.md`](docs/STATUS.md): nota de cierre G3 en la fila "Funciones escalares".
+- [`docs/ERROR_CODES.md`](docs/ERROR_CODES.md): seis filas nuevas (`4042`–`4047`).
+- [`ROADMAP.md`](ROADMAP.md): bullet de cierre G3.
+
+---
+
 ## 2026-05-26 — Bloque G2: expresiones escalares en WHERE / HAVING / UPDATE SET
 
 > **Un push a `main`** que completa el bloque G iniciado por G1: las mismas funciones escalares / `CAST` / `CASE` / condicionales ahora se aceptan en las superficies de filtrado y mutación. Cierra la mayor limitación residual documentada en el changelog de G1.

@@ -1058,7 +1058,7 @@ ROLLBACK;
 
 ---
 
-## Funciones escalares (bloques G1 + G2)
+## Funciones escalares (bloques G1 + G2 + G3)
 
 > Desde el **bloque G1 (2026-05-26)**, el `SELECT` list acepta expresiones escalares además de columnas crudas y agregadas: funciones built-in (`LENGTH`, `UPPER`, `CONCAT`, …), `CAST(x AS TYPE)`, `CASE … END`, literales, y los conditionals `COALESCE`/`NULLIF`/`IFNULL`/`IF`. Cada expresión puede recibir `AS alias` para nombrar la columna del `ResultSet`.
 >
@@ -1067,7 +1067,13 @@ ROLLBACK;
 > - **`HAVING`**: igual que WHERE, con la libertad ya existente de referir agregados. Ej: `HAVING UPPER(grupo) = 'X'`.
 > - **`UPDATE SET col = <expr>`** y **`ON CONFLICT DO UPDATE SET col = <expr>`**: la RHS puede ser cualquier `Expr`. Se evalúa contra la fila **pre-update**, así que `SET a = b, b = a` deja ambos con los valores intercambiados (las dos RHS ven el snapshot original).
 >
-> **Limitaciones residuales (vienen en G3)**: operadores postfix sobre expresión escalar (`LENGTH(x) IS NULL`, `UPPER(x) LIKE 'A%'`, `LENGTH(x) IN (...)`, `LENGTH(x) BETWEEN ... AND ...`) → `[GBY-4039]`. Operador `||` y aritméticos binarios (`+`/`-`/`*`/`/`). Funciones P2/P3 (TRIM, REPLACE, CEIL/FLOOR, MOD, DATE_ADD/SUB, EXTRACT, …). `EXCLUDED.col` dentro de `ON CONFLICT DO UPDATE SET`.
+> El **bloque G3 (2026-05-26)** cierra la familia:
+> - **Operadores aritméticos binarios `+`, `-`, `*`, `/`, `%`** sobre INT/FLOAT con promoción implícita (INT+FLOAT → FLOAT). Overflow → `[GBY-4042]`; división/módulo por cero → `[GBY-4043]`; tipos inválidos → `[GBY-4044]`.
+> - **Operador `||` (concat)** con misma precedencia que `+`/`-` (regla PostgreSQL). Cualquier tipo se reduce a TEXT; NULL propaga (ANSI estricta).
+> - **Postfix predicates sobre `Expr`**: `LENGTH(x) IS NULL`, `UPPER(x) LIKE 'A%'`, `LENGTH(x) IN (3,4,5)`, `LENGTH(x) BETWEEN 3 AND 10` (más sus formas `NOT ...`).
+> - **Funciones escalares P2/P3**: `TRIM`/`LTRIM`/`RTRIM`, `REPLACE`, `SPLIT_PART`, `CEIL`/`FLOOR`, `MOD`, `POWER`/`SQRT`, `DATE_ADD`/`DATE_SUB`, `DATEDIFF`, `EXTRACT`, `STRFTIME`.
+>
+> **Pendientes residuales menores**: `EXCLUDED.col` dentro de `ON CONFLICT DO UPDATE SET` y unary `-` prefix sobre expresión (se puede escribir `0 - LENGTH(x)`).
 >
 > **NULL propagation**: por defecto cualquier argumento `NULL` hace que la función devuelva `NULL`. Las excepciones son `COALESCE`/`NULLIF`/`IFNULL`/`IF`/`Now`/`CurrentDate`/`CurrentTimestamp` (la primera tiene su propio short-circuit, las últimas no tienen args).
 
@@ -1075,7 +1081,14 @@ ROLLBACK;
 
 ```
 select_item    = expression [ "AS" ident | ident ] ;
-expression     = primary [ cmp_op primary | "IS" [ "NOT" ] "NULL" ] ;
+expression     = arith [ cmp_op arith | postfix ] ;
+postfix        = "IS" [ "NOT" ] "NULL"
+               | [ "NOT" ] "LIKE" string_literal
+               | [ "NOT" ] "IN" "(" value { "," value } ")"
+               | [ "NOT" ] "BETWEEN" arith "AND" arith ;
+arith          = arith_term { ( "+" | "-" | "||" ) arith_term } ;
+arith_term     = arith_factor { ( "*" | "/" | "%" ) arith_factor } ;
+arith_factor   = primary ;
 primary        = literal
                | qualified_ident
                | func_call
@@ -1084,12 +1097,25 @@ primary        = literal
                  [ "ELSE" expression ] "END"
                | "(" expression ")" ;
 func_call      = ident "(" [ expression { "," expression } ] ")"
+               | "EXTRACT" "(" extract_field "FROM" expression ")"
                | "CURRENT_DATE" | "CURRENT_TIMESTAMP" ;
+extract_field  = "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" ;
 cmp_op         = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
 type_name      = "INT" | "FLOAT" | "TEXT" | "BOOL" | "DATE" | "DATETIME" | "JSON" ;
 ```
 
-### 🧰 Funciones soportadas en G1
+### 🧮 Operadores aritméticos (bloque G3)
+
+| Operador | Precedencia | Notas |
+| :---: | :---: | :--- |
+| `*` `/` `%` | Alta | Multiplicación, división, módulo. INT×INT con `checked_*` → overflow `[GBY-4042]`. División o módulo por cero → `[GBY-4043]`. |
+| `+` `-` `\|\|` | Baja | Suma, resta y concat. `\|\|` reduce ambos lados a TEXT con la misma regla que `CONCAT` (NULL propaga). Promoción INT+FLOAT → FLOAT en `+`/`-`. |
+
+- NULL en cualquier lado → NULL (3VL).
+- Tipos incompatibles (`'abc' + 1`, `true * 2`, …) → `[GBY-4044]`.
+- Para forzar precedencia distinta, usar paréntesis.
+
+### 🧰 Funciones soportadas (G1 + G3)
 
 | Familia | Función | Notas |
 | :--- | :--- | :--- |
@@ -1097,10 +1123,21 @@ type_name      = "INT" | "FLOAT" | "TEXT" | "BOOL" | "DATE" | "DATETIME" | "JSON
 | String | `UPPER(s)` / `LOWER(s)` | Solo TEXT. |
 | String | `SUBSTR(s, from [, len])` | `from` es 1-based; `from <= 0` se trata como 1. Alias: `SUBSTRING`. |
 | String | `CONCAT(a, b, …)` | Convierte cada arg a texto. NULL propaga (ANSI). |
+| String (G3) | `TRIM(s)` / `LTRIM(s)` / `RTRIM(s)` | Solo TEXT. Strip de whitespace ambos lados / izq / der. |
+| String (G3) | `REPLACE(s, from, to)` | Solo TEXT. Reemplazo no-overlap. `from = ''` deja `s` sin cambios. |
+| String (G3) | `SPLIT_PART(s, sep, idx)` | 1-based; `idx <= 0` → `[GBY-4035]`; fuera de rango → `''`. |
 | Numéricas | `ABS(x)` | INT o FLOAT. |
 | Numéricas | `ROUND(x)` / `ROUND(x, n)` | INT pasa tal cual; FLOAT redondea al entero o a `n` decimales. |
+| Numéricas (G3) | `CEIL(x)` / `CEILING(x)` / `FLOOR(x)` | INT pasa tal cual; FLOAT aplica `.ceil()` / `.floor()`. |
+| Numéricas (G3) | `MOD(a, b)` | Mismo semántica que el operador `%`. Cero → `[GBY-4043]`. |
+| Numéricas (G3) | `POWER(x, y)` / `POW(x, y)` | Devuelve FLOAT. `POWER(0, y<0)` → `[GBY-4045]`. |
+| Numéricas (G3) | `SQRT(x)` | Devuelve FLOAT. Negativo → `[GBY-4045]`. |
 | Fecha / hora | `NOW()` / `CURRENT_TIMESTAMP` | UTC, formato `YYYY-MM-DD HH:MM:SS` como TEXT. |
 | Fecha / hora | `CURRENT_DATE` | UTC, formato `YYYY-MM-DD` como TEXT. Alias: `CURDATE`. |
+| Fecha / hora (G3) | `DATE_ADD(d, n)` / `DATE_SUB(d, n)` | `d` es DATE o DATETIME; suma/resta `n` días al date-part, preservando time-part en DATETIME. |
+| Fecha / hora (G3) | `DATEDIFF(d1, d2)` | Días entre `d1` y `d2` (`d1 - d2`), usando solo date-part. |
+| Fecha / hora (G3) | `EXTRACT(field FROM d)` | `field`: `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`. Sintaxis especial (no es coma). |
+| Fecha / hora (G3) | `STRFTIME(fmt, d)` | Placeholders mínimos: `%Y %m %d %H %M %S %%`. Otros `%X` pasan literal. |
 | Conversión | `CAST(x AS TYPE)` | Tipos: INT, FLOAT, TEXT, BOOL, DATE, DATETIME, JSON. Errores → `[GBY-4036]`. |
 | Condicional | `COALESCE(a, b, …)` | Primer argumento no-NULL. Todos NULL → NULL. |
 | Condicional | `NULLIF(a, b)` | NULL si `a = b`, sino `a`. |
@@ -1122,8 +1159,8 @@ FROM exams;
 
 SELECT COALESCE(nickname, name, 'anónimo') FROM users;
 
-SELECT CAST(price AS TEXT) || '?' FROM products; -- error: `||` aún no soportado
-SELECT CONCAT(CAST(price AS TEXT), '?') FROM products; -- forma soportada
+SELECT CAST(price AS TEXT) || '?' FROM products; -- G3: `||` soportado
+SELECT CONCAT(CAST(price AS TEXT), '?') FROM products; -- forma equivalente
 
 -- G2: expresiones en WHERE, HAVING, UPDATE SET
 SELECT id FROM users WHERE LENGTH(name) > 3;
@@ -1137,6 +1174,20 @@ UPDATE users SET name = UPPER(name) WHERE id = 1;
 UPDATE users SET descr = COALESCE(descr, 'sin descr') WHERE id = 2;
 UPDATE users SET tier = CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END;
 DELETE FROM users WHERE LENGTH(name) = 0;
+
+-- G3: aritméticos, concat, postfix Expr y funciones P2/P3
+SELECT precio * cantidad AS total FROM ventas;
+SELECT id FROM ventas WHERE precio * 1.21 > 1000;
+UPDATE ventas SET contador = contador + 1 WHERE id = 1;
+SELECT nombre || ' ' || apellido AS fullname FROM users;
+SELECT id FROM users WHERE LENGTH(name) IS NULL;
+SELECT id FROM users WHERE UPPER(name) LIKE 'A%';
+SELECT id FROM users WHERE LENGTH(name) IN (3, 4, 5);
+SELECT id FROM users WHERE LENGTH(name) BETWEEN 3 AND 10;
+SELECT TRIM('  hola  '), REPLACE('a-b-c', '-', '_'), SPLIT_PART('a-b-c', '-', 2);
+SELECT CEIL(1.2), FLOOR(1.8), MOD(10, 3), POWER(2, 10), SQRT(16);
+SELECT DATE_ADD('2026-01-01', 31), DATEDIFF('2026-12-31', '2026-01-01');
+SELECT EXTRACT(YEAR FROM '2026-05-26'), STRFTIME('%Y-%m', '2026-05-26');
 ```
 
 ### ❌ Errores típicos
@@ -1148,9 +1199,15 @@ DELETE FROM users WHERE LENGTH(name) = 0;
 | `[GBY-4036] CAST('xyz' AS INT): no es un entero válido` | conversión imposible al tipo destino. |
 | `[GBY-4037] función escalar desconocida: 'FOO'` | nombre no presente en la lista soportada. |
 | `[GBY-4038] CASE WHEN: la condición debe ser BOOL, recibí INT` | `CASE WHEN x THEN …` con `x` no booleano. |
-| `[GBY-4039] operador 'IS' sobre expresión escalar aún no se soporta` | G2: postfix (`IS NULL`/`LIKE`/`IN`/`BETWEEN`) con LHS expresional (`LENGTH(x) IS NULL`) — usar comparación directa o esperar G3. |
+| `[GBY-4039] EXPR_IN_PREDICATE_NOT_SUPPORTED` | G2 (cerrado por G3): postfix sobre Expr ahora funciona; el código queda reservado y sin emisión activa. |
 | `[GBY-4040] expresión en WHERE/HAVING debe evaluar a BOOL (o NULL)` | G2: predicado expresional sin comparador (`WHERE LENGTH(x)`) — falta `>`/`=`/etc. |
 | `[GBY-4041] UPDATE sobre 't': el valor calculado para 'col' es TEXT y la columna es INT` | G2: la RHS de un `SET col = <expr>` rinde un tipo incompatible — envolver con `CAST(... AS T)`. |
+| `[GBY-4042] overflow aritmético en INT: 9223372036854775807 + 1` | G3: operación entera con overflow — promover a FLOAT con `CAST`. |
+| `[GBY-4043] división entera por cero` | G3: divisor cero en `/` o `%`. Usar `NULLIF(div, 0)` o pre-filtrar. |
+| `[GBY-4044] operador '+' no acepta operandos TEXT y INT` | G3: operador aritmético sobre tipos incompatibles. ¿Quisiste decir `\|\|`? |
+| `[GBY-4045] SQRT(-1) indefinido en reales (argumento negativo)` | G3: función matemática fuera del dominio real. |
+| `[GBY-4046] DATE_ADD: '2026-13-01' no es DATE ni DATETIME válido` | G3: TEXT no parseable como fecha en una función de fecha. |
+| `[GBY-4047] EXTRACT: campo 'CENTURY' no soportado` | G3: `EXTRACT(<campo> FROM ...)` con campo no permitido. |
 
 ---
 

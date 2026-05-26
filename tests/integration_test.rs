@@ -5281,14 +5281,14 @@ fn g2_where_expr_not_boolean_error() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn g2_where_is_null_on_expr_error() -> Result<(), Box<dyn Error>> {
+fn g2_where_is_null_on_expr_now_supported() -> Result<(), Box<dyn Error>> {
+    // Pre-G3 esto devolvía GBY-4039; G3 cierra el caso y la query
+    // funciona — el predicado IS NULL sobre Expr es legal.
     let (db, wal) = setup_g2_table("g2_where_isnull_expr")?;
-    let err = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) IS NULL;").unwrap_err();
-    assert!(
-        err.to_string().contains("[GBY-4039]"),
-        "esperaba GBY-4039: {}",
-        err
-    );
+    // LENGTH(nombre) nunca es NULL (todos los textos están presentes
+    // o son cadena vacía), así que el WHERE no debería matchear nada.
+    let res = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) IS NULL;")?;
+    assert_eq!(res[0].rows.len(), 0);
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -5455,6 +5455,460 @@ fn g2_update_where_upper() -> Result<(), Box<dyn Error>> {
     )?;
     let res = run_sql(&db, "SELECT activo FROM t WHERE id = 1;")?;
     assert_eq!(res[0].rows[0][0], Value::Bool(false));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque G3 (2026-05-26): operadores aritméticos + || + postfix
+// sobre Expr + funciones P2/P3.
+// ============================================================
+
+fn setup_g3_table(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, nombre TEXT, apellido TEXT, precio FLOAT, cantidad INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, nombre, apellido, precio, cantidad) VALUES (1, 'pepe', 'lopez', 10.0, 3);
+         INSERT INTO t (id, nombre, apellido, precio, cantidad) VALUES (2, 'ana', 'ruiz', 20.5, 5);
+         INSERT INTO t (id, nombre, apellido, precio, cantidad) VALUES (3, 'bob', 'gomez', 1000.0, 2);",
+    )?;
+    Ok((db, wal))
+}
+
+#[test]
+fn g3_arith_add_int_int() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_add")?;
+    let res = run_sql(&db, "SELECT cantidad + 10 FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(13));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_sub_int_float_promotion() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_sub_promo")?;
+    let res = run_sql(&db, "SELECT cantidad - 0.5 FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Float(2.5));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_mul_mixed() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_mul_mixed")?;
+    let res = run_sql(&db, "SELECT precio * cantidad FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Float(30.0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_div_int_int_truncates() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_div_trunc")?;
+    let res = run_sql(&db, "SELECT 7 / 2 FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_div_by_zero_int() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_div_zero")?;
+    let err = run_sql(&db, "SELECT 1 / 0 FROM t WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4043]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_mod_operator() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_mod_op")?;
+    let res = run_sql(&db, "SELECT 10 % 3 FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_overflow() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_overflow")?;
+    let err = run_sql(&db, "SELECT 9223372036854775807 + 1 FROM t WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4042]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_precedence() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_prec")?;
+    let res = run_sql(&db, "SELECT 2 + 3 * 4 FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(14));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_paren() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_paren")?;
+    let res = run_sql(&db, "SELECT (2 + 3) * 4 FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(20));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_with_column() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_arith_col")?;
+    let res = run_sql(
+        &db,
+        "SELECT precio * cantidad AS total FROM t WHERE id = 2;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Float(102.5));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_in_where() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_arith_where")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE precio * 1.21 > 100;")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    // 10*1.21=12.1 no, 20.5*1.21=24.8 no, 1000*1.21=1210 sí.
+    assert_eq!(ids, vec![3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_in_update() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_arith_update")?;
+    run_sql(&db, "UPDATE t SET cantidad = cantidad + 1 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT cantidad FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(4));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_null_propagation() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_arith_null")?;
+    let res = run_sql(&db, "SELECT 1 + NULL FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    // Y vía postfix IS NULL sobre una expresión aritmética con un
+    // literal a la izquierda — sin paréntesis envolventes (los `()` a
+    // nivel WHERE arrancan un sub-WhereExpr y no una sub-Expr).
+    let res = run_sql(&db, "SELECT id FROM t WHERE 1 + NULL IS NULL;")?;
+    // Todas las filas pasan (la expresión es NULL para todas).
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_arith_type_mismatch() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_arith_type")?;
+    let err = run_sql(&db, "SELECT 'abc' + 1 FROM t WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4044]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_concat_op_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_concat_basic")?;
+    let res = run_sql(&db, "SELECT 'hola' || ' ' || 'mundo' FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("hola mundo".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_concat_op_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_concat_null")?;
+    let res = run_sql(&db, "SELECT 'x' || NULL FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_concat_in_where() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_concat_where")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE nombre || apellido = 'pepelopez';",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_postfix_is_null_on_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_postfix_isnull")?;
+    // LENGTH('texto') siempre devuelve INT no-null → ninguna fila.
+    let res = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) IS NULL;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_postfix_is_not_null_on_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_postfix_isnotnull")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) IS NOT NULL;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_postfix_like_on_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_postfix_like")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE UPPER(nombre) LIKE 'A%';")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2)); // 'ana'
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_postfix_in_on_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_postfix_in")?;
+    // LENGTH('pepe')=4, LENGTH('ana')=3, LENGTH('bob')=3 → IN (3) → ids 2,3.
+    let res = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) IN (3, 5);")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_postfix_between_on_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_postfix_between")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE LENGTH(nombre) BETWEEN 3 AND 4;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_postfix_not_in_on_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_postfix_notin")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE UPPER(nombre) NOT IN ('PEPE', 'ANA');",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3)); // 'bob'
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_trim() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_trim")?;
+    let res = run_sql(&db, "SELECT TRIM('  hola  ') FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("hola".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_ltrim_rtrim() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_ltrim_rtrim")?;
+    let res = run_sql(
+        &db,
+        "SELECT LTRIM('  x  '), RTRIM('  x  ') FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("x  ".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::String("  x".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_replace() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_replace")?;
+    let res = run_sql(
+        &db,
+        "SELECT REPLACE('a-b-c', '-', '_') FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("a_b_c".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_split_part_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_split_basic")?;
+    let res = run_sql(
+        &db,
+        "SELECT SPLIT_PART('a-b-c', '-', 2) FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("b".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_split_part_out_of_range_empty() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_split_oor")?;
+    let res = run_sql(
+        &db,
+        "SELECT SPLIT_PART('a-b-c', '-', 10) FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String(String::new()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_ceil_floor() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_ceil_floor")?;
+    let res = run_sql(&db, "SELECT CEIL(1.2), FLOOR(1.8) FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Float(2.0));
+    assert_eq!(res[0].rows[0][1], Value::Float(1.0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_mod_fn() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_mod_fn")?;
+    let res = run_sql(&db, "SELECT MOD(10, 3) FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_power_sqrt() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_pow_sqrt")?;
+    let res = run_sql(&db, "SELECT POWER(2, 10), SQRT(16) FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Float(1024.0));
+    assert_eq!(res[0].rows[0][1], Value::Float(4.0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_sqrt_negative_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_sqrt_neg")?;
+    let err = run_sql(&db, "SELECT SQRT(0 - 1) FROM t WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4045]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_date_add() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_date_add")?;
+    let res = run_sql(
+        &db,
+        "SELECT DATE_ADD('2026-01-01', 31) FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("2026-02-01".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_date_sub() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_date_sub")?;
+    let res = run_sql(
+        &db,
+        "SELECT DATE_SUB('2026-02-01', 31) FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("2026-01-01".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_datediff() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_datediff")?;
+    let res = run_sql(
+        &db,
+        "SELECT DATEDIFF('2026-12-31', '2026-01-01') FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(364));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_extract_year_month_day() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_extract_ymd")?;
+    let res = run_sql(
+        &db,
+        "SELECT EXTRACT(YEAR FROM '2026-05-26'), EXTRACT(MONTH FROM '2026-05-26'), EXTRACT(DAY FROM '2026-05-26') FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(2026));
+    assert_eq!(res[0].rows[0][1], Value::Integer(5));
+    assert_eq!(res[0].rows[0][2], Value::Integer(26));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_extract_invalid_field() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_extract_bad")?;
+    let err = run_sql(
+        &db,
+        "SELECT EXTRACT(CENTURY FROM '2026-05-26') FROM t WHERE id = 1;",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("[GBY-4047]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_strftime() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_strftime")?;
+    let res = run_sql(
+        &db,
+        "SELECT STRFTIME('%Y-%m', '2026-05-26') FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("2026-05".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g3_fn_date_parse_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g3_table("g3_date_parse")?;
+    let err = run_sql(&db, "SELECT DATE_ADD('not-a-date', 1) FROM t WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4046]"), "{}", err);
     cleanup(&[&db, &wal]);
     Ok(())
 }
