@@ -33,7 +33,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **E2** ✅ | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) (**cerrado 2026-05-25**) |
 | **E3** ✅ | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 (**cerrado 2026-05-25**) |
 | **F** ✅ | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 (**cerrado 2026-05-25**; limitación: sin JOINs aún) |
-| **G** | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` | Medio-Alto | E1 |
+| **G1** ✅ | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` — solo en SELECT list | Medio-Alto | E1 (**cerrado 2026-05-26**; G2 extiende a WHERE/HAVING/UPDATE SET) |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
 | **I** | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual | Medio | — |
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
@@ -108,22 +108,24 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 
 Hoy sin ninguna función built-in. Lista mínima útil:
 
+> ✅ **Cerrado en G1 (2026-05-26)** para SELECT list: parser + evaluator + 12 integration tests. Limitación residual documentada: estas funciones todavía NO se pueden usar en `WHERE` / `HAVING` / `UPDATE SET` (eso es el bloque G2). El operador `||` para concatenación tampoco se soporta — usar `CONCAT(a, b, ...)`. Detalles en [SQL_REFERENCE.md](SQL_REFERENCE.md).
+
 ### String
 | Función | Prioridad |
 |---|:---:|
-| `LENGTH(s)` | P1 |
-| `UPPER(s)` / `LOWER(s)` | P1 |
-| `SUBSTR(s, from, len)` / `SUBSTRING` | P1 |
+| `LENGTH(s)` | ✅ (G1, 2026-05-26) |
+| `UPPER(s)` / `LOWER(s)` | ✅ (G1, 2026-05-26) |
+| `SUBSTR(s, from, len)` / `SUBSTRING` | ✅ (G1, 2026-05-26) |
 | `TRIM(s)` / `LTRIM` / `RTRIM` | P2 |
-| `CONCAT(a, b, ...)` y operador `||` | P1 |
+| `CONCAT(a, b, ...)` | ✅ (G1, 2026-05-26; operador `||` aún no) |
 | `REPLACE(s, from, to)` | P2 |
 | `SPLIT_PART(s, sep, idx)` | P3 |
 
 ### Numéricas
 | Función | Prioridad |
 |---|:---:|
-| `ABS(x)` | P1 |
-| `ROUND(x, n)` | P1 |
+| `ABS(x)` | ✅ (G1, 2026-05-26) |
+| `ROUND(x, n)` | ✅ (G1, 2026-05-26) |
 | `CEIL(x)` / `FLOOR(x)` | P2 |
 | `MOD(a, b)` u operador `%` | P2 |
 | `POWER(x, y)` / `SQRT(x)` | P3 |
@@ -131,8 +133,8 @@ Hoy sin ninguna función built-in. Lista mínima útil:
 ### Fecha / hora
 | Función | Prioridad |
 |---|:---:|
-| `NOW()` / `CURRENT_TIMESTAMP` | P1 |
-| `CURRENT_DATE` | P1 |
+| `NOW()` / `CURRENT_TIMESTAMP` | ✅ (G1, 2026-05-26) |
+| `CURRENT_DATE` | ✅ (G1, 2026-05-26) |
 | `DATE_ADD(d, n_days)` / `DATE_SUB` | P2 |
 | `DATEDIFF(d1, d2)` | P2 |
 | `EXTRACT(YEAR FROM d)` | P2 |
@@ -141,12 +143,12 @@ Hoy sin ninguna función built-in. Lista mínima útil:
 ### Conversión y condicional
 | Construcción | Prioridad |
 |---|:---:|
-| `CAST(x AS TYPE)` | P0 |
-| `COALESCE(a, b, ...)` | P0 |
-| `NULLIF(a, b)` | P1 |
-| `IFNULL(a, b)` / `IF(cond, a, b)` | P1 |
-| `CASE WHEN ... THEN ... ELSE ... END` | P0 |
-| `CASE col WHEN x THEN ... END` (simple form) | P1 |
+| `CAST(x AS TYPE)` | ✅ (G1, 2026-05-26) |
+| `COALESCE(a, b, ...)` | ✅ (G1, 2026-05-26) |
+| `NULLIF(a, b)` | ✅ (G1, 2026-05-26) |
+| `IFNULL(a, b)` / `IF(cond, a, b)` | ✅ (G1, 2026-05-26; alias `IIF` aceptado) |
+| `CASE WHEN ... THEN ... ELSE ... END` | ✅ (G1, 2026-05-26) |
+| `CASE col WHEN x THEN ... END` (simple form) | ✅ (G1, 2026-05-26) |
 
 ---
 

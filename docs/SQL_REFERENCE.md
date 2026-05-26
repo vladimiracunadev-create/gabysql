@@ -1058,6 +1058,81 @@ ROLLBACK;
 
 ---
 
+## Funciones escalares (bloque G1)
+
+> Desde el **bloque G1 (2026-05-26)**, el `SELECT` list acepta expresiones escalares además de columnas crudas y agregadas: funciones built-in (`LENGTH`, `UPPER`, `CONCAT`, …), `CAST(x AS TYPE)`, `CASE … END`, literales, y los conditionals `COALESCE`/`NULLIF`/`IFNULL`/`IF`. Cada expresión puede recibir `AS alias` para nombrar la columna del `ResultSet`.
+>
+> **Limitación de G1**: las expresiones escalares solo se aceptan en el `SELECT` list. `WHERE`, `HAVING` y `UPDATE SET` no las aceptan todavía (bloque **G2**). Tampoco hay operadores aritméticos binarios (`+`/`-`/`*`/`/`) ni el operador `||` para concatenar texto — usar `CONCAT`.
+>
+> **NULL propagation**: por defecto cualquier argumento `NULL` hace que la función devuelva `NULL`. Las excepciones son `COALESCE`/`NULLIF`/`IFNULL`/`IF`/`Now`/`CurrentDate`/`CurrentTimestamp` (la primera tiene su propio short-circuit, las últimas no tienen args).
+
+### 📜 EBNF mínima
+
+```
+select_item    = expression [ "AS" ident | ident ] ;
+expression     = primary [ cmp_op primary | "IS" [ "NOT" ] "NULL" ] ;
+primary        = literal
+               | qualified_ident
+               | func_call
+               | "CAST" "(" expression "AS" type_name ")"
+               | "CASE" [ expression ] ( "WHEN" expression "THEN" expression )+
+                 [ "ELSE" expression ] "END"
+               | "(" expression ")" ;
+func_call      = ident "(" [ expression { "," expression } ] ")"
+               | "CURRENT_DATE" | "CURRENT_TIMESTAMP" ;
+cmp_op         = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
+type_name      = "INT" | "FLOAT" | "TEXT" | "BOOL" | "DATE" | "DATETIME" | "JSON" ;
+```
+
+### 🧰 Funciones soportadas en G1
+
+| Familia | Función | Notas |
+| :--- | :--- | :--- |
+| String | `LENGTH(s)` | Largo en caracteres (no bytes). Solo TEXT. Aliases: `LEN`, `CHAR_LENGTH`. |
+| String | `UPPER(s)` / `LOWER(s)` | Solo TEXT. |
+| String | `SUBSTR(s, from [, len])` | `from` es 1-based; `from <= 0` se trata como 1. Alias: `SUBSTRING`. |
+| String | `CONCAT(a, b, …)` | Convierte cada arg a texto. NULL propaga (ANSI). |
+| Numéricas | `ABS(x)` | INT o FLOAT. |
+| Numéricas | `ROUND(x)` / `ROUND(x, n)` | INT pasa tal cual; FLOAT redondea al entero o a `n` decimales. |
+| Fecha / hora | `NOW()` / `CURRENT_TIMESTAMP` | UTC, formato `YYYY-MM-DD HH:MM:SS` como TEXT. |
+| Fecha / hora | `CURRENT_DATE` | UTC, formato `YYYY-MM-DD` como TEXT. Alias: `CURDATE`. |
+| Conversión | `CAST(x AS TYPE)` | Tipos: INT, FLOAT, TEXT, BOOL, DATE, DATETIME, JSON. Errores → `[GBY-4036]`. |
+| Condicional | `COALESCE(a, b, …)` | Primer argumento no-NULL. Todos NULL → NULL. |
+| Condicional | `NULLIF(a, b)` | NULL si `a = b`, sino `a`. |
+| Condicional | `IFNULL(a, b)` | `a` si no-NULL, sino `b`. |
+| Condicional | `IF(cond, a, b)` | `cond` debe ser BOOL. Alias: `IIF`. |
+| Condicional | `CASE WHEN cond THEN val [...] [ELSE val] END` | Searched form: `cond` debe evaluar a BOOL (NULL = no-match). |
+| Condicional | `CASE expr WHEN x THEN val [...] [ELSE val] END` | Simple form: matchea `x` contra `expr` por igualdad ANSI (NULL ≠ NULL). |
+
+### ✅ Ejemplos
+
+```sql
+SELECT id, UPPER(name) AS n FROM users WHERE id = 1;
+
+SELECT
+  CASE WHEN score >= 90 THEN 'A'
+       WHEN score >= 75 THEN 'B'
+       ELSE 'C' END AS grade
+FROM exams;
+
+SELECT COALESCE(nickname, name, 'anónimo') FROM users;
+
+SELECT CAST(price AS TEXT) || '?' FROM products; -- error: `||` aún no soportado
+SELECT CONCAT(CAST(price AS TEXT), '?') FROM products; -- forma soportada
+```
+
+### ❌ Errores típicos
+
+| Error | Causa |
+| :--- | :--- |
+| `[GBY-4034] LENGTH: cantidad incorrecta de argumentos` | función llamada con la aridad equivocada (e.g. `LENGTH()`). |
+| `[GBY-4035] LENGTH requiere TEXT, recibí INT` | argumento de un tipo no aceptado por la función. |
+| `[GBY-4036] CAST('xyz' AS INT): no es un entero válido` | conversión imposible al tipo destino. |
+| `[GBY-4037] función escalar desconocida: 'FOO'` | nombre no presente en la lista soportada. |
+| `[GBY-4038] CASE WHEN: la condición debe ser BOOL, recibí INT` | `CASE WHEN x THEN …` con `x` no booleano. |
+
+---
+
 ## INTEGRITY CHECK
 
 > Recorre la DB abierta y reporta toda inconsistencia detectable: páginas con CRC inválido, filas no decodificables, entradas de índice secundario huérfanas (apuntan a PKs que ya no existen) y FKs huérfanas (valor no NULL sin parent). De solo lectura — no modifica nada.

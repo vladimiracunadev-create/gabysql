@@ -4834,6 +4834,259 @@ fn sec_parser_accepts_reasonable_depth() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque G1 (2026-05-26): funciones escalares en SELECT list
+// ============================================================
+
+fn setup_g1_table(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, monto INT, nota FLOAT, estado INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, name, monto, nota, estado) VALUES (1, 'Ana', 100, 9.456, 1);
+         INSERT INTO t (id, name, monto, nota, estado) VALUES (2, 'Beto', 200, 7.25, 2);
+         INSERT INTO t (id, name, monto, nota, estado) VALUES (3, 'Carlos', -50, 8.0, 1);",
+    )?;
+    Ok((db, wal))
+}
+
+#[test]
+fn g1_string_functions() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_str")?;
+    let res = run_sql(
+        &db,
+        "SELECT LENGTH(name), UPPER(name), LOWER(name) FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    assert_eq!(res[0].rows[0][1], Value::String("ANA".to_string()));
+    assert_eq!(res[0].rows[0][2], Value::String("ana".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_substr_two_and_three_args() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_substr")?;
+    let res = run_sql(
+        &db,
+        "SELECT SUBSTR(name, 2), SUBSTR(name, 1, 2) FROM t WHERE id = 3;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("arlos".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::String("Ca".to_string()));
+    // from <= 0 se ajusta a 1
+    let res = run_sql(&db, "SELECT SUBSTR(name, 0, 2) FROM t WHERE id = 3;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("Ca".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_concat_mixed_types() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_concat")?;
+    let res = run_sql(&db, "SELECT CONCAT(name, '=', monto) FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("Ana=100".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_abs_round() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_num")?;
+    let res = run_sql(
+        &db,
+        "SELECT ABS(monto), ROUND(nota), ROUND(nota, 2) FROM t WHERE id = 3;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(50));
+    assert_eq!(res[0].rows[0][1], Value::Float(8.0));
+    assert_eq!(res[0].rows[0][2], Value::Float(8.0));
+    let res = run_sql(&db, "SELECT ROUND(nota, 2) FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Float(9.46));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_now_current_date_timestamp() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_time")?;
+    let res = run_sql(
+        &db,
+        "SELECT NOW(), CURRENT_DATE, CURRENT_TIMESTAMP FROM t WHERE id = 1;",
+    )?;
+    let now = match &res[0].rows[0][0] {
+        Value::String(s) => s.clone(),
+        other => panic!("NOW() debe ser STRING, fue {:?}", other),
+    };
+    assert_eq!(now.len(), 19, "NOW() len debe ser 19: {}", now);
+    assert_eq!(&now[4..5], "-");
+    assert_eq!(&now[7..8], "-");
+    assert_eq!(&now[10..11], " ");
+    let cd = match &res[0].rows[0][1] {
+        Value::String(s) => s.clone(),
+        other => panic!("CURRENT_DATE debe ser STRING, fue {:?}", other),
+    };
+    assert_eq!(cd.len(), 10);
+    let cts = match &res[0].rows[0][2] {
+        Value::String(s) => s.clone(),
+        other => panic!("CURRENT_TIMESTAMP debe ser STRING, fue {:?}", other),
+    };
+    assert_eq!(cts.len(), 19);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_coalesce_nullif_ifnull_if() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_cond")?;
+    let res = run_sql(
+        &db,
+        "SELECT COALESCE(NULL, NULL, name), NULLIF(monto, 100), IFNULL(NULL, 'x'), IF(estado = 1, 'a', 'b') FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("Ana".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Null);
+    assert_eq!(res[0].rows[0][2], Value::String("x".to_string()));
+    assert_eq!(res[0].rows[0][3], Value::String("a".to_string()));
+    let res = run_sql(&db, "SELECT NULLIF(monto, 200) FROM t WHERE id = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_cast_int_text_bool() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_cast")?;
+    let res = run_sql(
+        &db,
+        "SELECT CAST(monto AS TEXT), CAST('42' AS INT), CAST(1 AS BOOL) FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("100".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(42));
+    assert_eq!(res[0].rows[0][2], Value::Bool(true));
+    // CAST inválido
+    let err = run_sql(&db, "SELECT CAST('xyz' AS INT) FROM t WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4036]"),
+        "esperaba GBY-4036: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_case_searched_and_simple() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_case")?;
+    // Searched
+    let res = run_sql(
+        &db,
+        "SELECT CASE WHEN monto > 150 THEN 'big' ELSE 'small' END FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("small".to_string()));
+    let res = run_sql(
+        &db,
+        "SELECT CASE WHEN monto > 150 THEN 'big' ELSE 'small' END FROM t WHERE id = 2;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("big".to_string()));
+    // Simple form
+    let res = run_sql(
+        &db,
+        "SELECT CASE estado WHEN 1 THEN 'activo' WHEN 2 THEN 'pausa' ELSE 'baja' END FROM t WHERE id = 2;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("pausa".to_string()));
+    // Sin ELSE y sin match → NULL
+    let res = run_sql(
+        &db,
+        "SELECT CASE estado WHEN 9 THEN 'x' END FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_alias_in_expression() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_alias")?;
+    let res = run_sql(&db, "SELECT UPPER(name) AS n FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].columns, vec!["n"]);
+    assert_eq!(res[0].rows[0][0], Value::String("ANA".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_errors_arity_type_unknown() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_err")?;
+    // arity: LENGTH() sin args
+    let err = run_sql(&db, "SELECT LENGTH() FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4034]"),
+        "esperaba GBY-4034 por arity: {}",
+        err
+    );
+    // tipo: LENGTH sobre INT
+    let err = run_sql(&db, "SELECT LENGTH(monto) FROM t WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4035]"),
+        "esperaba GBY-4035 por tipo: {}",
+        err
+    );
+    // función desconocida
+    let err = run_sql(&db, "SELECT FOO(1) FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4037]"),
+        "esperaba GBY-4037 por función desconocida: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_null_3vl_in_scalars() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g1_table("g1_null")?;
+    // LENGTH(NULL) → NULL; IS NULL evaluado en CASE
+    let res = run_sql(
+        &db,
+        "SELECT CASE WHEN LENGTH(NULL) IS NULL THEN 'yes' ELSE 'no' END FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("yes".to_string()));
+    // COALESCE(NULL, 'x') = 'x'
+    let res = run_sql(&db, "SELECT COALESCE(NULL, 'x') FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("x".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g1_expression_on_join() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("g1_join");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE o (id INT PRIMARY KEY, uid INT, amount INT);",
+    )?;
+    run_sql(&db, "INSERT INTO u (id, name) VALUES (1, 'Ana');")?;
+    run_sql(&db, "INSERT INTO o (id, uid, amount) VALUES (10, 1, 99);")?;
+    let res = run_sql(
+        &db,
+        "SELECT UPPER(u.name), o.amount FROM u INNER JOIN o ON u.id = o.uid;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::String("ANA".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

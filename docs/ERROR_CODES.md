@@ -123,6 +123,12 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4030` | `TX_END_WITHOUT_BEGIN` | `COMMIT` o `ROLLBACK` SQL emitido sin `BEGIN` previo. Las sentencias fuera de un bloque explícito son auto-commit por batch — no hace falta cerrarlas manualmente. | Eliminar el `COMMIT`/`ROLLBACK` redundante, o agregar el `BEGIN` faltante al inicio del bloque. |
 | `4031` | `ON_CONFLICT_INVALID` | `ON CONFLICT` con acción no soportada o malformada (acciones aceptadas: `DO NOTHING`, `DO UPDATE SET ...`). `REPLACE` solo se obtiene vía `REPLACE INTO ...`. | Reescribir la cláusula con una acción soportada o usar `REPLACE INTO`. |
 | `4032` | `ON_CONFLICT_TARGET_NOT_UNIQUE` | `ON CONFLICT (col)` cuyo `col` no es PK ni tiene índice UNIQUE — sin un constraint indexado no se puede detectar el conflicto. | Crear `CREATE UNIQUE INDEX` sobre la columna, usar la PK como target, u omitir `(col)` para que la cláusula aplique a cualquier constraint. |
+| `4033` | `PARSE_DEPTH_EXCEEDED` | Expresión SQL con anidamiento mayor al permitido por el parser (defensa contra stack exhaustion via paréntesis o `NOT` encadenados). | Simplificar la expresión o partirla en varias consultas. |
+| `4034` | `SCALAR_FN_ARITY` | Función escalar invocada con la cantidad equivocada de argumentos (e.g. `LENGTH()` o `SUBSTR(s)`). | Pasar la cantidad correcta de argumentos según la signatura de la función. |
+| `4035` | `SCALAR_FN_TYPE_MISMATCH` | Argumento de una función escalar con un tipo no aceptado (e.g. `LENGTH(123)` o `ABS('x')`). | Usar el tipo correcto, o envolver con `CAST(... AS TYPE)`. |
+| `4036` | `CAST_INVALID` | `CAST(x AS TYPE)` cuyo valor no se puede convertir al tipo destino (e.g. `CAST('abc' AS INT)`). | Pre-validar el valor; usar `COALESCE`/`CASE` para descartar valores inválidos antes del `CAST`. |
+| `4037` | `SCALAR_FN_UNKNOWN` | Invocación a una función escalar que el motor no reconoce (e.g. `FOO(1)`). | Ver la lista de funciones soportadas en `SQL_REFERENCE.md` (sección "Funciones escalares"); algunas todavía no están implementadas. |
+| `4038` | `CASE_BRANCH_TYPE_MISMATCH` | Condición de un `CASE WHEN` searched que no evalúa a BOOL. | Reescribir la condición como una comparación (`x > 10`, `x IS NULL`, etc.). |
 
 ---
 

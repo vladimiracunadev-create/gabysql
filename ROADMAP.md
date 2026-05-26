@@ -55,6 +55,7 @@
 - ~~locking simple entre procesos~~ ✅ entregado (ADR-0013, `File::try_lock` advisory exclusivo en `Pager::create/open`)
 - ~~backup / restore verificado~~ ✅ entregado (ADR-0015, `gabysql backup/restore/verify` con CRC end-to-end)
 - ~~logs estructurados y primeras métricas del server~~ ✅ entregado (ADR-0014, endpoint `/metrics` + flag `-log-json`)
+- ~~funciones escalares en SELECT list (`LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `CONCAT`, `ABS`, `ROUND`, `NOW`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `COALESCE`, `NULLIF`, `IFNULL`, `IF`, `CAST`, `CASE`)~~ ✅ entregado (bloque **G1**, 2026-05-26). Extensión a `WHERE`/`HAVING`/`UPDATE SET` queda para G2.
 
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats

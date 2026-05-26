@@ -215,6 +215,21 @@ pub mod codes {
     /// (CWE-674). El límite duro está en `MAX_PARSE_DEPTH` dentro
     /// de `sql.rs`.
     pub const PARSE_DEPTH_EXCEEDED: u32 = 4033;
+    /// Bloque G1 (2026-05-26): función escalar invocada con la cantidad
+    /// equivocada de argumentos (e.g. `LENGTH()` o `SUBSTR(s)`).
+    pub const SCALAR_FN_ARITY: u32 = 4034;
+    /// Bloque G1: argumento de una función escalar con un tipo que la
+    /// función no acepta (e.g. `LENGTH(123)` o `ABS('x')`).
+    pub const SCALAR_FN_TYPE_MISMATCH: u32 = 4035;
+    /// Bloque G1: `CAST(x AS TYPE)` cuyo valor no se puede convertir al
+    /// tipo destino (e.g. `CAST('abc' AS INT)`).
+    pub const CAST_INVALID: u32 = 4036;
+    /// Bloque G1: invocación a una función escalar que el motor no
+    /// reconoce (e.g. `FOO(1)`).
+    pub const SCALAR_FN_UNKNOWN: u32 = 4037;
+    /// Bloque G1: condición de un `CASE` searched (`CASE WHEN cond …`)
+    /// que no evalúa a BOOL.
+    pub const CASE_BRANCH_TYPE_MISMATCH: u32 = 4038;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

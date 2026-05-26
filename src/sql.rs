@@ -347,6 +347,132 @@ pub enum SelectItem {
         /// como referencia válida en `HAVING` y `ORDER BY`.
         alias: Option<String>,
     },
+    /// Bloque G1 (2026-05-26): expresión escalar arbitraria proyectada en
+    /// el SELECT list — funciones (`LENGTH(name)`), CAST, CASE, literales,
+    /// `COALESCE`, etc. Mantiene `Column` y `Aggregate` separados para no
+    /// romper los fast-paths existentes (bare column lookup + agregación).
+    Expression {
+        expr: Expr,
+        alias: Option<String>,
+    },
+}
+
+/// Bloque G1: árbol mínimo de expresiones escalares. Vive solo dentro del
+/// SELECT list por ahora (G2 lo extenderá a WHERE/HAVING/UPDATE SET).
+///
+/// El subset es voluntariamente chico: no hay operadores aritméticos
+/// binarios (`+`, `-`, `*`, `/`) ni booleanos a tope (`AND`/`OR`) en el
+/// árbol general — `Compare`/`IsNull` solo se materializan dentro de
+/// `Case` searched. Esto evita interferir con el parser actual de WHERE
+/// (que es donde viven los booleans) y deja el alcance acotado a "la
+/// función + el CASE + el CAST".
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// Literal directo: número, string, NULL, TRUE/FALSE.
+    Literal(Value),
+    /// Referencia a una columna; puede venir cualificada (`tabla.col`),
+    /// se resuelve igual que `SelectItem::Column`.
+    Column(String),
+    /// Función escalar `NAME(arg, arg, ...)`.
+    Func(ScalarFunc, Vec<Expr>),
+    /// `CAST(expr AS TYPE)`.
+    Cast(Box<Expr>, ColumnType),
+    /// `CASE [operand] WHEN cond THEN val [WHEN ...] [ELSE val] END`.
+    /// `operand = None` → searched form (cond es Expr booleana).
+    /// `operand = Some(x)` → simple form (cond se compara por igualdad
+    /// contra x con la misma semántica que `NULLIF`).
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_branch: Option<Box<Expr>>,
+    },
+    /// Comparación binaria `lhs <op> rhs`. En G1 solo se construye dentro
+    /// de un `CASE WHEN` searched.
+    Compare(Box<Expr>, ExprCmpOp, Box<Expr>),
+    /// `expr IS [NOT] NULL`. En G1 solo aparece dentro de `CASE WHEN`
+    /// searched. NUNCA propaga NULL: es la forma explícita de preguntar
+    /// por ausencia, igual que el `IS NULL` del WHERE.
+    IsNull(Box<Expr>, bool /* negated */),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExprCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Bloque G1: funciones escalares built-in que reconoce el parser y
+/// evalúa el motor. La lista cubre los items P0/P1 del bloque G en
+/// `docs/MISSING_COMMANDS.md`; el resto (TRIM, REPLACE, CEIL/FLOOR,
+/// DATE_ADD, etc.) queda para iteraciones posteriores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunc {
+    // string
+    Length,
+    Upper,
+    Lower,
+    Substr,
+    Concat,
+    // numeric
+    Abs,
+    Round,
+    // datetime
+    Now,
+    CurrentDate,
+    CurrentTimestamp,
+    // conditional
+    Coalesce,
+    Nullif,
+    Ifnull,
+    If,
+}
+
+impl ScalarFunc {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            ScalarFunc::Length => "LENGTH",
+            ScalarFunc::Upper => "UPPER",
+            ScalarFunc::Lower => "LOWER",
+            ScalarFunc::Substr => "SUBSTR",
+            ScalarFunc::Concat => "CONCAT",
+            ScalarFunc::Abs => "ABS",
+            ScalarFunc::Round => "ROUND",
+            ScalarFunc::Now => "NOW",
+            ScalarFunc::CurrentDate => "CURRENT_DATE",
+            ScalarFunc::CurrentTimestamp => "CURRENT_TIMESTAMP",
+            ScalarFunc::Coalesce => "COALESCE",
+            ScalarFunc::Nullif => "NULLIF",
+            ScalarFunc::Ifnull => "IFNULL",
+            ScalarFunc::If => "IF",
+        }
+    }
+
+    /// Devuelve el `ScalarFunc` asociado al ident (case-insensitive).
+    /// Acepta también aliases comunes: `SUBSTRING` → `Substr`, `IIF` →
+    /// `If`. Devuelve `None` si el ident no es un built-in conocido.
+    pub fn from_ident(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "LENGTH" | "LEN" | "CHAR_LENGTH" => Some(ScalarFunc::Length),
+            "UPPER" => Some(ScalarFunc::Upper),
+            "LOWER" => Some(ScalarFunc::Lower),
+            "SUBSTR" | "SUBSTRING" => Some(ScalarFunc::Substr),
+            "CONCAT" => Some(ScalarFunc::Concat),
+            "ABS" => Some(ScalarFunc::Abs),
+            "ROUND" => Some(ScalarFunc::Round),
+            "NOW" => Some(ScalarFunc::Now),
+            "CURRENT_DATE" | "CURDATE" => Some(ScalarFunc::CurrentDate),
+            "CURRENT_TIMESTAMP" => Some(ScalarFunc::CurrentTimestamp),
+            "COALESCE" => Some(ScalarFunc::Coalesce),
+            "NULLIF" => Some(ScalarFunc::Nullif),
+            "IFNULL" => Some(ScalarFunc::Ifnull),
+            "IF" | "IIF" => Some(ScalarFunc::If),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +537,44 @@ impl SelectItem {
                         format!("{}_distinct_{}", func_lower, normalize_ident(c))
                     }
                 }
+            }
+            SelectItem::Expression { expr, alias } => {
+                if let Some(a) = alias {
+                    return a.clone();
+                }
+                expr_default_label(expr)
+            }
+        }
+    }
+}
+
+/// Bloque G1: nombre por defecto para una `SelectItem::Expression` sin
+/// alias. La intención es que sea estable y "razonable" para que el
+/// caller pueda referirla — no es necesario que sea SQL parseable. Para
+/// funciones tipo `LENGTH(name)` devuelve `"length(name)"`; para CASE
+/// devuelve `"case"`; para literales el repr canónico; etc.
+fn expr_default_label(expr: &Expr) -> String {
+    match expr {
+        Expr::Literal(v) => match v {
+            Value::Null => "NULL".to_string(),
+            Value::Integer(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::String(s) => format!("'{}'", s),
+        },
+        Expr::Column(name) => name.clone(),
+        Expr::Func(f, args) => {
+            let inside: Vec<String> = args.iter().map(expr_default_label).collect();
+            format!("{}({})", f.keyword().to_ascii_lowercase(), inside.join(","))
+        }
+        Expr::Cast(inner, ty) => format!("cast({} as {})", expr_default_label(inner), ty.as_sql()),
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Compare(_, _, _) => "compare".to_string(),
+        Expr::IsNull(_, negated) => {
+            if *negated {
+                "is_not_null".to_string()
+            } else {
+                "is_null".to_string()
             }
         }
     }
@@ -1567,7 +1731,7 @@ impl<'a> Engine<'a> {
         } else {
             selected_columns
                 .iter()
-                .map(|(name, _)| name.clone())
+                .map(|p| p.display().to_string())
                 .collect()
         };
 
@@ -2246,17 +2410,20 @@ impl<'a> Engine<'a> {
 
         // --- 7. Proyectar + OFFSET/LIMIT ---
         let take = stmt.limit.unwrap_or(usize::MAX);
-        let rows: Vec<Vec<Value>> = current
-            .into_iter()
-            .skip(stmt.offset)
-            .take(take)
-            .map(|row| {
-                projected_keys
-                    .iter()
-                    .map(|k| row.get(k).cloned().unwrap_or(Value::Null))
-                    .collect()
-            })
-            .collect();
+        let windowed: Vec<HashMap<String, Value>> =
+            current.into_iter().skip(stmt.offset).take(take).collect();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(windowed.len());
+        for row in windowed {
+            let mut out = Vec::with_capacity(projected_keys.len());
+            for p in &projected_keys {
+                let v = match p {
+                    JoinedProjection::Key(k) => row.get(k).cloned().unwrap_or(Value::Null),
+                    JoinedProjection::Expr(e) => eval_expr(e, &row)?,
+                };
+                out.push(v);
+            }
+            rows.push(out);
+        }
 
         Ok(ResultSet {
             columns: output_columns,
@@ -3699,6 +3866,18 @@ fn validate_aggregate_select(stmt: &SelectStmt, meta: &TableMeta) -> DbResult<()
                     }
                 }
             },
+            SelectItem::Expression { .. } => {
+                // Bloque G1: expresiones escalares en SELECT con
+                // GROUP BY/HAVING/agregados todavía no se soportan.
+                // El bloque G2 las trata (requiere que las columnas
+                // referenciadas estén en el GROUP BY o envueltas en
+                // una agregada).
+                return Err(coded(
+                    codes::SELECT_COLUMN_NOT_IN_GROUP_BY,
+                    "expresiones escalares en SELECT con GROUP BY / agregados aún no se soportan \
+                     (bloque G1: solo SELECT plano); reescribir como subquery o esperar G2",
+                ));
+            }
         }
     }
     Ok(())
@@ -4159,15 +4338,36 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
     Ok(out)
 }
 
-fn project_row(
-    selected_columns: &[(String, String)],
-    row: &HashMap<String, Value>,
-) -> DbResult<Vec<Value>> {
-    let mut out = Vec::with_capacity(selected_columns.len());
-    for (_, normalized) in selected_columns {
-        let value = row.get(normalized).cloned().ok_or_else(|| {
-            DbError::new(format!("columna no encontrada en fila: {}", normalized))
-        })?;
+/// Bloque G1: una "proyección resuelta" del SELECT list. Para columnas
+/// bare seguimos el lookup directo por clave normalizada (preserva el
+/// fast-path pre-G1); para expresiones llevamos el `Expr` y lo evaluamos
+/// per-row con `eval_expr`. El campo `display` es el header que ve el
+/// caller en `ResultSet.columns`.
+#[derive(Debug, Clone)]
+enum Projection {
+    BareColumn { display: String, key: String },
+    Expression { display: String, expr: Expr },
+}
+
+impl Projection {
+    fn display(&self) -> &str {
+        match self {
+            Projection::BareColumn { display, .. } => display,
+            Projection::Expression { display, .. } => display,
+        }
+    }
+}
+
+fn project_row(projections: &[Projection], row: &HashMap<String, Value>) -> DbResult<Vec<Value>> {
+    let mut out = Vec::with_capacity(projections.len());
+    for p in projections {
+        let value = match p {
+            Projection::BareColumn { key, .. } => row
+                .get(key)
+                .cloned()
+                .ok_or_else(|| DbError::new(format!("columna no encontrada en fila: {}", key)))?,
+            Projection::Expression { expr, .. } => eval_expr(expr, row)?,
+        };
         out.push(value);
     }
     Ok(out)
@@ -4176,7 +4376,7 @@ fn project_row(
 fn resolve_selected_columns(
     meta: &TableMeta,
     requested: &[SelectItem],
-) -> DbResult<Vec<(String, String)>> {
+) -> DbResult<Vec<Projection>> {
     // Bloque F: el path no-agregado solo acepta columnas crudas o `*`.
     // Si llegan `SelectItem::Aggregate` acá es bug del caller — el
     // dispatcher (`needs_aggregation`) debería haber desviado al
@@ -4185,14 +4385,29 @@ fn resolve_selected_columns(
         return Ok(meta
             .columns
             .iter()
-            .map(|column| (column.name.clone(), normalize_ident(&column.name)))
+            .map(|column| Projection::BareColumn {
+                display: column.name.clone(),
+                key: normalize_ident(&column.name),
+            })
             .collect());
     }
 
     let mut out = Vec::with_capacity(requested.len());
     for item in requested {
-        let name = match item {
-            SelectItem::Column(n) => n.clone(),
+        match item {
+            SelectItem::Column(n) => {
+                let normalized = normalize_ident(n);
+                let column = meta.column(&normalized).ok_or_else(|| {
+                    coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("columna '{}' no existe en tabla '{}'", n, meta.name),
+                    )
+                })?;
+                out.push(Projection::BareColumn {
+                    display: column.name.clone(),
+                    key: normalize_ident(&column.name),
+                });
+            }
             SelectItem::Star => {
                 return Err(coded(
                     codes::COLUMN_NOT_FOUND,
@@ -4204,17 +4419,69 @@ fn resolve_selected_columns(
                     "interno: resolve_selected_columns no debe recibir agregados".to_string(),
                 ));
             }
-        };
-        let normalized = normalize_ident(&name);
-        let column = meta.column(&normalized).ok_or_else(|| {
-            coded(
-                codes::COLUMN_NOT_FOUND,
-                format!("columna '{}' no existe en tabla '{}'", name, meta.name),
-            )
-        })?;
-        out.push((column.name.clone(), normalize_ident(&column.name)));
+            SelectItem::Expression { expr, .. } => {
+                // Bloque G1: validamos que las columnas referenciadas
+                // existan en el schema. Esto da error temprano (en
+                // tiempo de planeo) en lugar de explotar a mitad de
+                // proyección con un mensaje menos claro.
+                validate_expr_columns(expr, meta)?;
+                out.push(Projection::Expression {
+                    display: item.output_name(),
+                    expr: expr.clone(),
+                });
+            }
+        }
     }
     Ok(out)
+}
+
+/// Bloque G1: walk recursivo del `Expr` para confirmar que cada
+/// `Column(name)` referida existe en el meta. Para JOINs hay una versión
+/// específica que mira el `JoinScope` (con qualifier + ambigüedad).
+fn validate_expr_columns(expr: &Expr, meta: &TableMeta) -> DbResult<()> {
+    match expr {
+        Expr::Literal(_) => Ok(()),
+        Expr::Column(name) => {
+            let key = normalize_ident(name);
+            if meta.column(&key).is_none() {
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!("columna '{}' no existe en tabla '{}'", name, meta.name),
+                ));
+            }
+            Ok(())
+        }
+        Expr::Func(_, args) => {
+            for a in args {
+                validate_expr_columns(a, meta)?;
+            }
+            Ok(())
+        }
+        Expr::Cast(inner, _) => validate_expr_columns(inner, meta),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                validate_expr_columns(op, meta)?;
+            }
+            for (c, v) in branches {
+                validate_expr_columns(c, meta)?;
+                validate_expr_columns(v, meta)?;
+            }
+            if let Some(e) = else_branch {
+                validate_expr_columns(e, meta)?;
+            }
+            Ok(())
+        }
+        Expr::Compare(a, _, b) => {
+            validate_expr_columns(a, meta)?;
+            validate_expr_columns(b, meta)?;
+            Ok(())
+        }
+        Expr::IsNull(inner, _) => validate_expr_columns(inner, meta),
+    }
 }
 
 fn window_rows<T: Clone>(rows: Vec<T>, offset: usize, limit: Option<usize>) -> Vec<T> {
@@ -5088,19 +5355,19 @@ fn derive_join_predicate(
     })
 }
 
-/// Convierte una columna del SELECT (`*`, `col` o `tabla.col`) en el par
-/// `(output_label, lookup_key)` que necesitamos para proyectar. `*` se
-/// expande a TODAS las columnas de TODAS las tablas, en orden.
+/// Convierte una columna del SELECT (`*`, `col` o `tabla.col`) en una
+/// lista de `JoinedProjection`. `*` se expande a TODAS las columnas de
+/// TODAS las tablas, en orden. Bloque G1: ahora también acepta
+/// expresiones escalares (`SelectItem::Expression`); las columnas que la
+/// expresión referencia se resuelven contra el `JoinScope` (qualifier
+/// si lo trae, sino busca en todas las tablas con check de ambigüedad).
 fn resolve_joined_projection(
     scope: &JoinScope,
     requested: &[SelectItem],
-) -> DbResult<(Vec<String>, Vec<String>)> {
+) -> DbResult<(Vec<String>, Vec<JoinedProjection>)> {
     let mut output = Vec::new();
-    let mut keys = Vec::new();
+    let mut projs = Vec::new();
     if requested.is_empty() || (requested.len() == 1 && matches!(requested[0], SelectItem::Star)) {
-        // `SELECT *` → todas las columnas de todas las tablas, prefijadas
-        // por qualifier. Omite las que quedaron "hidden" por USING/NATURAL
-        // (ANSI: la columna común aparece una sola vez).
         for t in &scope.tables {
             for col in &t.meta.columns {
                 let key = format!("{}.{}", t.qualifier, normalize_ident(&col.name));
@@ -5108,16 +5375,18 @@ fn resolve_joined_projection(
                     continue;
                 }
                 output.push(format!("{}.{}", t.qualifier, col.name));
-                keys.push(key);
+                projs.push(JoinedProjection::Key(key));
             }
         }
-        return Ok((output, keys));
+        return Ok((output, projs));
     }
     for item in requested {
         match item {
             SelectItem::Column(raw) => {
                 output.push(raw.clone());
-                keys.push(resolve_joined_column_key(scope, raw)?);
+                projs.push(JoinedProjection::Key(resolve_joined_column_key(
+                    scope, raw,
+                )?));
             }
             SelectItem::Star => {
                 return Err(coded(
@@ -5132,9 +5401,86 @@ fn resolve_joined_projection(
                      reescribir como subquery agregada sobre la tabla base",
                 ));
             }
+            SelectItem::Expression { expr, .. } => {
+                // Bloque G1: re-escribimos cada `Expr::Column` para que
+                // apunte a la clave cualificada que vive en la fila
+                // joineada (`alias.col`). Si el ident es ambiguo o no
+                // existe en ninguna tabla, `resolve_joined_column_key`
+                // devuelve `[GBY-4018]` / `[GBY-4019]`.
+                let rewritten = rewrite_expr_columns_for_join(expr.clone(), scope)?;
+                output.push(item.output_name());
+                projs.push(JoinedProjection::Expr(rewritten));
+            }
         }
     }
-    Ok((output, keys))
+    Ok((output, projs))
+}
+
+/// Bloque G1: una proyección dentro de un SELECT con JOIN. `Key` es el
+/// camino rápido pre-G1 (lookup directo en la HashMap joineada);
+/// `Expr` evalúa la expresión contra la fila joineada con
+/// `eval_expr` — los `Expr::Column` ya fueron reescritos a la forma
+/// cualificada por `rewrite_expr_columns_for_join`.
+#[derive(Debug, Clone)]
+enum JoinedProjection {
+    Key(String),
+    Expr(Expr),
+}
+
+/// Bloque G1: reescribe cada `Expr::Column(name)` para que su nombre sea
+/// la clave cualificada usada en la fila joineada (`alias.col`). Esto
+/// permite reutilizar `eval_expr` sin enseñarle a navegar el `JoinScope`.
+fn rewrite_expr_columns_for_join(expr: Expr, scope: &JoinScope) -> DbResult<Expr> {
+    match expr {
+        Expr::Literal(v) => Ok(Expr::Literal(v)),
+        Expr::Column(raw) => Ok(Expr::Column(resolve_joined_column_key(scope, &raw)?)),
+        Expr::Func(f, args) => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                out.push(rewrite_expr_columns_for_join(a, scope)?);
+            }
+            Ok(Expr::Func(f, out))
+        }
+        Expr::Cast(inner, ty) => Ok(Expr::Cast(
+            Box::new(rewrite_expr_columns_for_join(*inner, scope)?),
+            ty,
+        )),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            let operand = match operand {
+                Some(op) => Some(Box::new(rewrite_expr_columns_for_join(*op, scope)?)),
+                None => None,
+            };
+            let mut new_branches = Vec::with_capacity(branches.len());
+            for (c, v) in branches {
+                new_branches.push((
+                    rewrite_expr_columns_for_join(c, scope)?,
+                    rewrite_expr_columns_for_join(v, scope)?,
+                ));
+            }
+            let else_branch = match else_branch {
+                Some(e) => Some(Box::new(rewrite_expr_columns_for_join(*e, scope)?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                operand,
+                branches: new_branches,
+                else_branch,
+            })
+        }
+        Expr::Compare(a, op, b) => Ok(Expr::Compare(
+            Box::new(rewrite_expr_columns_for_join(*a, scope)?),
+            op,
+            Box::new(rewrite_expr_columns_for_join(*b, scope)?),
+        )),
+        Expr::IsNull(inner, neg) => Ok(Expr::IsNull(
+            Box::new(rewrite_expr_columns_for_join(*inner, scope)?),
+            neg,
+        )),
+    }
 }
 
 /// Toma una referencia de columna como string raw (`col` o `tabla.col`)
@@ -5501,6 +5847,13 @@ fn project_returning(
                         "RETURNING no admite funciones agregadas",
                     ));
                 }
+                SelectItem::Expression { .. } => {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        "RETURNING no admite expresiones escalares en este release (G1: solo \
+                         columnas crudas o `*`)",
+                    ));
+                }
             }
         }
         out
@@ -5590,6 +5943,538 @@ fn where_expr_has_outer_refs(expr: &WhereExpr) -> bool {
             | WhereClause::InList { .. } => false,
         },
     }
+}
+
+/// Bloque G1: valida la cantidad de argumentos de una función escalar
+/// al parsearla. Devuelve `[GBY-4034]` si la aridad no calza.
+fn validate_scalar_arity(f: ScalarFunc, n: usize) -> DbResult<()> {
+    let ok = match f {
+        ScalarFunc::Length | ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Abs => n == 1,
+        ScalarFunc::Round => n == 1 || n == 2,
+        ScalarFunc::Substr => n == 2 || n == 3,
+        ScalarFunc::Concat | ScalarFunc::Coalesce => n >= 1,
+        ScalarFunc::Nullif | ScalarFunc::Ifnull => n == 2,
+        ScalarFunc::If => n == 3,
+        ScalarFunc::Now | ScalarFunc::CurrentDate | ScalarFunc::CurrentTimestamp => n == 0,
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(coded(
+        codes::SCALAR_FN_ARITY,
+        format!(
+            "{}: cantidad incorrecta de argumentos ({} recibido{})",
+            f.keyword(),
+            n,
+            if n == 1 { "" } else { "s" }
+        ),
+    ))
+}
+
+/// Bloque G1: evaluador de `Expr` sobre una fila ya decodificada. Las
+/// claves de `row` son ident normalizado (`normalize_ident`) o, en el
+/// caso de JOINs, `alias.ident` — `Expr::Column` resuelve igual que la
+/// proyección bare: busca primero la key exacta normalizada y, si no
+/// está, intenta el sufijo después del último `.`.
+fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
+    match expr {
+        Expr::Literal(v) => Ok(v.clone()),
+        Expr::Column(name) => {
+            let key = normalize_ident(name);
+            if let Some(v) = row.get(&key) {
+                return Ok(v.clone());
+            }
+            // Match suffix para filas joineadas (`alias.col` en la map).
+            for (k, v) in row {
+                if k.rsplit('.').next().unwrap_or(k) == key {
+                    return Ok(v.clone());
+                }
+            }
+            Err(coded(
+                codes::COLUMN_NOT_FOUND,
+                format!("columna '{}' no encontrada al evaluar expresión", name),
+            ))
+        }
+        Expr::Func(f, args) => {
+            // Funciones que NO evalúan todos los args antes (short-circuit):
+            // Coalesce/Ifnull/If/Nullif requieren control de NULL propio.
+            match f {
+                ScalarFunc::Coalesce => {
+                    for a in args {
+                        let v = eval_expr(a, row)?;
+                        if !matches!(v, Value::Null) {
+                            return Ok(v);
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                ScalarFunc::Ifnull => {
+                    let a = eval_expr(&args[0], row)?;
+                    if matches!(a, Value::Null) {
+                        eval_expr(&args[1], row)
+                    } else {
+                        Ok(a)
+                    }
+                }
+                ScalarFunc::If => {
+                    let cond = eval_expr(&args[0], row)?;
+                    let truthy = match cond {
+                        Value::Bool(b) => b,
+                        Value::Null => false,
+                        other => {
+                            return Err(coded(
+                                codes::SCALAR_FN_TYPE_MISMATCH,
+                                format!(
+                                    "IF(cond,...): cond debe ser BOOL, recibí {}",
+                                    value_type_name(&other)
+                                ),
+                            ));
+                        }
+                    };
+                    if truthy {
+                        eval_expr(&args[1], row)
+                    } else {
+                        eval_expr(&args[2], row)
+                    }
+                }
+                ScalarFunc::Nullif => {
+                    let a = eval_expr(&args[0], row)?;
+                    let b = eval_expr(&args[1], row)?;
+                    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                        return Ok(a);
+                    }
+                    if values_equal(&a, &b) {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(a)
+                    }
+                }
+                _ => {
+                    let mut evaluated = Vec::with_capacity(args.len());
+                    for a in args {
+                        evaluated.push(eval_expr(a, row)?);
+                    }
+                    eval_scalar_fn(*f, evaluated)
+                }
+            }
+        }
+        Expr::Cast(inner, ty) => {
+            let v = eval_expr(inner, row)?;
+            cast_value(v, *ty)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => match operand {
+            None => {
+                // Searched: cada cond debe evaluar a BOOL.
+                for (cond, val) in branches {
+                    let c = eval_expr(cond, row)?;
+                    match c {
+                        Value::Bool(true) => return eval_expr(val, row),
+                        Value::Bool(false) | Value::Null => continue,
+                        other => {
+                            return Err(coded(
+                                codes::CASE_BRANCH_TYPE_MISMATCH,
+                                format!(
+                                    "CASE WHEN: la condición debe ser BOOL, recibí {}",
+                                    value_type_name(&other)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                match else_branch {
+                    Some(e) => eval_expr(e, row),
+                    None => Ok(Value::Null),
+                }
+            }
+            Some(op_expr) => {
+                let op_val = eval_expr(op_expr, row)?;
+                for (when_val, then_val) in branches {
+                    let wv = eval_expr(when_val, row)?;
+                    // ANSI: NULL nunca matchea NULL en CASE simple — para
+                    // eso está IS NULL. `values_equal` ya implementa ese
+                    // contract.
+                    if values_equal(&op_val, &wv) {
+                        return eval_expr(then_val, row);
+                    }
+                }
+                match else_branch {
+                    Some(e) => eval_expr(e, row),
+                    None => Ok(Value::Null),
+                }
+            }
+        },
+        Expr::Compare(lhs, op, rhs) => {
+            let a = eval_expr(lhs, row)?;
+            let b = eval_expr(rhs, row)?;
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let cmp_op = match op {
+                ExprCmpOp::Eq => return Ok(Value::Bool(values_equal(&a, &b))),
+                ExprCmpOp::Ne => return Ok(Value::Bool(!values_equal(&a, &b))),
+                ExprCmpOp::Lt => CompareOp::Lt,
+                ExprCmpOp::Le => CompareOp::Le,
+                ExprCmpOp::Gt => CompareOp::Gt,
+                ExprCmpOp::Ge => CompareOp::Ge,
+            };
+            match eval_compare(Some(&a), cmp_op, &b) {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::IsNull(inner, negated) => {
+            let v = eval_expr(inner, row)?;
+            let is_null = matches!(v, Value::Null);
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
+    }
+}
+
+/// Bloque G1: dispatcher para las funciones escalares "puras" (sin
+/// short-circuit). Los args ya vienen evaluados. NULL propagation:
+/// salvo `Concat` (que adopta la regla ANSI estricta y propaga), si
+/// cualquier arg es NULL devolvemos NULL sin invocar al cuerpo de la
+/// función. `Now` / `CurrentDate` / `CurrentTimestamp` no tienen args.
+fn eval_scalar_fn(f: ScalarFunc, args: Vec<Value>) -> DbResult<Value> {
+    // NULL propagation por defecto. Excepciones tratadas arriba o abajo.
+    if !matches!(
+        f,
+        ScalarFunc::Now | ScalarFunc::CurrentDate | ScalarFunc::CurrentTimestamp
+    ) && args.iter().any(|v| matches!(v, Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    match f {
+        ScalarFunc::Length => match &args[0] {
+            Value::String(s) => Ok(Value::Integer(s.chars().count() as i64)),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!("LENGTH requiere TEXT, recibí {}", value_type_name(other)),
+            )),
+        },
+        ScalarFunc::Upper => match &args[0] {
+            Value::String(s) => Ok(Value::String(s.to_uppercase())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!("UPPER requiere TEXT, recibí {}", value_type_name(other)),
+            )),
+        },
+        ScalarFunc::Lower => match &args[0] {
+            Value::String(s) => Ok(Value::String(s.to_lowercase())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!("LOWER requiere TEXT, recibí {}", value_type_name(other)),
+            )),
+        },
+        ScalarFunc::Substr => {
+            let s = match &args[0] {
+                Value::String(s) => s,
+                other => {
+                    return Err(coded(
+                        codes::SCALAR_FN_TYPE_MISMATCH,
+                        format!("SUBSTR requiere TEXT, recibí {}", value_type_name(other)),
+                    ));
+                }
+            };
+            let from = match &args[1] {
+                Value::Integer(n) => *n,
+                other => {
+                    return Err(coded(
+                        codes::SCALAR_FN_TYPE_MISMATCH,
+                        format!(
+                            "SUBSTR(s, from): 'from' debe ser INT, recibí {}",
+                            value_type_name(other)
+                        ),
+                    ));
+                }
+            };
+            let chars: Vec<char> = s.chars().collect();
+            // SQL standard: from es 1-based. from <= 0 → tratar como 1.
+            let start = if from <= 1 { 0 } else { (from - 1) as usize };
+            let end = if args.len() == 3 {
+                let len = match &args[2] {
+                    Value::Integer(n) => *n,
+                    other => {
+                        return Err(coded(
+                            codes::SCALAR_FN_TYPE_MISMATCH,
+                            format!(
+                                "SUBSTR(s, from, len): 'len' debe ser INT, recibí {}",
+                                value_type_name(other)
+                            ),
+                        ));
+                    }
+                };
+                if len <= 0 {
+                    start
+                } else {
+                    (start + len as usize).min(chars.len())
+                }
+            } else {
+                chars.len()
+            };
+            let start = start.min(chars.len());
+            Ok(Value::String(chars[start..end].iter().collect()))
+        }
+        ScalarFunc::Concat => {
+            // NULL propagation ya fue chequeada arriba.
+            let mut out = String::new();
+            for v in &args {
+                out.push_str(&value_to_text(v));
+            }
+            Ok(Value::String(out))
+        }
+        ScalarFunc::Abs => match &args[0] {
+            Value::Integer(n) => Ok(Value::Integer(n.wrapping_abs())),
+            Value::Float(f) => Ok(Value::Float(f.abs())),
+            other => Err(coded(
+                codes::SCALAR_FN_TYPE_MISMATCH,
+                format!(
+                    "ABS requiere INT o FLOAT, recibí {}",
+                    value_type_name(other)
+                ),
+            )),
+        },
+        ScalarFunc::Round => {
+            let value = &args[0];
+            let n_decimals: i64 = if args.len() == 2 {
+                match &args[1] {
+                    Value::Integer(n) => *n,
+                    other => {
+                        return Err(coded(
+                            codes::SCALAR_FN_TYPE_MISMATCH,
+                            format!(
+                                "ROUND(x, n): 'n' debe ser INT, recibí {}",
+                                value_type_name(other)
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                0
+            };
+            match value {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => {
+                    if n_decimals <= 0 {
+                        Ok(Value::Float(f.round()))
+                    } else {
+                        let factor = 10f64.powi(n_decimals as i32);
+                        Ok(Value::Float((f * factor).round() / factor))
+                    }
+                }
+                other => Err(coded(
+                    codes::SCALAR_FN_TYPE_MISMATCH,
+                    format!(
+                        "ROUND requiere INT o FLOAT, recibí {}",
+                        value_type_name(other)
+                    ),
+                )),
+            }
+        }
+        ScalarFunc::Now | ScalarFunc::CurrentTimestamp => Ok(Value::String(now_datetime_utc())),
+        ScalarFunc::CurrentDate => {
+            let dt = now_datetime_utc();
+            // primeros 10 chars son YYYY-MM-DD.
+            Ok(Value::String(dt[..10].to_string()))
+        }
+        // Casos con short-circuit: ya tratados en `eval_expr`. Si llegamos
+        // acá es bug del caller.
+        ScalarFunc::Coalesce | ScalarFunc::Ifnull | ScalarFunc::If | ScalarFunc::Nullif => Err(
+            DbError::new("interno: short-circuit fn dispatcheada por eval_scalar_fn"),
+        ),
+    }
+}
+
+/// Bloque G1: nombre legible del tipo de un `Value` para mensajes de
+/// error de tipo.
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NULL",
+        Value::Integer(_) => "INT",
+        Value::Float(_) => "FLOAT",
+        Value::Bool(_) => "BOOL",
+        Value::String(_) => "TEXT",
+    }
+}
+
+/// Bloque G1: representación canónica de un `Value` como texto (usada
+/// por `CONCAT`, `value_default_label`, y la rama TEXT de `cast_value`).
+fn value_to_text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(), // CONCAT propaga NULL antes de llegar acá
+        Value::Integer(n) => n.to_string(),
+        Value::Float(f) => format!("{}", f),
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::String(s) => s.clone(),
+    }
+}
+
+/// Bloque G1: implementación de `CAST(expr AS TYPE)`. Devuelve
+/// `[GBY-4036]` si la conversión es imposible (texto no-numérico a INT,
+/// fechas malformadas, etc.). NULL siempre se propaga.
+fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match ty {
+        ColumnType::Int => match v {
+            Value::Integer(n) => Ok(Value::Integer(n)),
+            Value::Float(f) => Ok(Value::Integer(f.trunc() as i64)),
+            Value::Bool(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
+            Value::String(s) => s.trim().parse::<i64>().map(Value::Integer).map_err(|_| {
+                coded(
+                    codes::CAST_INVALID,
+                    format!("CAST('{}' AS INT): no es un entero válido", s),
+                )
+            }),
+            Value::Null => unreachable!(),
+        },
+        ColumnType::Float => match v {
+            Value::Integer(n) => Ok(Value::Float(n as f64)),
+            Value::Float(f) => Ok(Value::Float(f)),
+            Value::Bool(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
+            Value::String(s) => s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
+                coded(
+                    codes::CAST_INVALID,
+                    format!("CAST('{}' AS FLOAT): no es un número válido", s),
+                )
+            }),
+            Value::Null => unreachable!(),
+        },
+        ColumnType::Text => Ok(Value::String(value_to_text(&v))),
+        ColumnType::Bool => match v {
+            Value::Bool(b) => Ok(Value::Bool(b)),
+            Value::Integer(n) => Ok(Value::Bool(n != 0)),
+            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => Ok(Value::Bool(true)),
+                "false" | "f" | "0" => Ok(Value::Bool(false)),
+                _ => Err(coded(
+                    codes::CAST_INVALID,
+                    format!("CAST('{}' AS BOOL): valor no reconocido", s),
+                )),
+            },
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS BOOL desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
+        ColumnType::Date => match v {
+            Value::String(s) => {
+                if looks_like_date(&s) {
+                    Ok(Value::String(s))
+                } else {
+                    Err(coded(
+                        codes::CAST_INVALID,
+                        format!("CAST('{}' AS DATE): formato esperado YYYY-MM-DD", s),
+                    ))
+                }
+            }
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS DATE desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
+        ColumnType::DateTime => match v {
+            Value::String(s) => {
+                if looks_like_datetime(&s) || looks_like_date(&s) {
+                    Ok(Value::String(s))
+                } else {
+                    Err(coded(
+                        codes::CAST_INVALID,
+                        format!(
+                            "CAST('{}' AS DATETIME): formato esperado YYYY-MM-DD HH:MM:SS",
+                            s
+                        ),
+                    ))
+                }
+            }
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS DATETIME desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
+        ColumnType::Json => match v {
+            Value::String(s) => Ok(Value::String(s)),
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS JSON desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
+    }
+}
+
+fn looks_like_date(s: &str) -> bool {
+    // YYYY-MM-DD
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn looks_like_datetime(s: &str) -> bool {
+    // YYYY-MM-DD HH:MM:SS  (longitud 19)
+    let b = s.as_bytes();
+    b.len() == 19
+        && looks_like_date(&s[..10])
+        && (b[10] == b' ' || b[10] == b'T')
+        && b[11..13].iter().all(u8::is_ascii_digit)
+        && b[13] == b':'
+        && b[14..16].iter().all(u8::is_ascii_digit)
+        && b[16] == b':'
+        && b[17..19].iter().all(u8::is_ascii_digit)
+}
+
+/// Bloque G1: formatea el instante actual como `YYYY-MM-DD HH:MM:SS` en
+/// UTC, sin chrono. Convierte los segundos desde UNIX_EPOCH a la fecha
+/// civil con el algoritmo de Howard Hinnant (`days_from_civil` inverso).
+fn now_datetime_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
+}
+
+/// Howard Hinnant, "civil_from_days": convierte días-desde-epoch
+/// (1970-01-01) a (year, month, day) en el calendario gregoriano
+/// proléptico. Sirve para evitar la dependencia en chrono.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn normalize_ident(value: &str) -> String {
@@ -6548,8 +7433,8 @@ impl Parser {
     /// `[AS] alias` siempre que no choque con keywords del statement.
     fn parse_select_item(&mut self) -> DbResult<SelectItem> {
         // Lookahead: si el token actual es uno de los nombres de agregada
-        // y el siguiente es `(`, parseamos como agregado. Caso contrario
-        // es columna bare (que puede ir cualificada vía split_qualified_ident).
+        // y el siguiente es `(`, parseamos como agregado (sin tocar — se
+        // preserva fast-path del bloque F).
         let head = self.peek().clone();
         if head.kind == TokenKind::Ident {
             if let Some(func) = AggFunc::from_ident(&head.text) {
@@ -6567,8 +7452,249 @@ impl Parser {
                 }
             }
         }
-        let column = self.expect_ident()?;
-        Ok(SelectItem::Column(column))
+        // Bloque G1: fast-path bare column. Si es Ident NO seguido de `(`
+        // y NO es un keyword reservado de expresión (CASE/CAST/funcion
+        // built-in), preservamos la representación clásica
+        // `SelectItem::Column(name)`. Esto mantiene el comportamiento
+        // pre-G para el caso abrumadoramente más común (`SELECT a, b, c
+        // FROM t`) y evita que el resolver de proyección tenga que
+        // distinguir "expresión-que-es-solo-una-columna" de "columna
+        // bare" — preserva todos los call-sites de bloques anteriores.
+        if head.kind == TokenKind::Ident {
+            let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                kind: TokenKind::Eof,
+                text: String::new(),
+            });
+            let next_is_lparen = next.kind == TokenKind::Symbol && next.text == "(";
+            let is_expr_keyword = head.text.eq_ignore_ascii_case("CASE")
+                || head.text.eq_ignore_ascii_case("CAST")
+                || head.text.eq_ignore_ascii_case("NULL")
+                || head.text.eq_ignore_ascii_case("TRUE")
+                || head.text.eq_ignore_ascii_case("FALSE");
+            let is_zero_arg_fn = matches!(
+                head.text.to_ascii_uppercase().as_str(),
+                "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURDATE"
+            );
+            if !next_is_lparen && !is_expr_keyword && !is_zero_arg_fn {
+                self.pos += 1;
+                let column = head.text.clone();
+                // ¿hay alias? `col AS x` o `col x`.
+                let _ = self.try_parse_select_alias_for_column(&mut |_| {});
+                // Para preservar back-compat, descartamos el alias de la
+                // forma `Column` (los blocs E2/F/J2 ya tenían UX sin
+                // alias bare; lo dejamos para la rama Expression). El
+                // helper de abajo NO consume tokens cuando es bare.
+                return Ok(SelectItem::Column(column));
+            }
+        }
+        // Caso general: expresión.
+        let expr = self.parse_expr()?;
+        let alias = self.try_parse_select_alias()?;
+        // Si la expresión es solo `Expr::Column(x)` sin alias y sin nada
+        // raro, devolvemos `SelectItem::Column(x)` por compatibilidad
+        // con todos los path pre-G1 (incluído needs_aggregation /
+        // GROUP BY validation que sólo conoce Column).
+        if alias.is_none() {
+            if let Expr::Column(name) = &expr {
+                return Ok(SelectItem::Column(name.clone()));
+            }
+        }
+        Ok(SelectItem::Expression { expr, alias })
+    }
+
+    /// Helper neutral: no consume tokens. Existe solo para mantener una
+    /// signatura simétrica al resto del parser; la forma `Column` no
+    /// admitía alias en pre-G1 (no estaba en `parse_select_item`).
+    fn try_parse_select_alias_for_column(&mut self, _: &mut dyn FnMut(&str)) -> Option<String> {
+        None
+    }
+
+    /// Bloque G1: entry-point del parser de expresiones escalares.
+    ///
+    /// El árbol G1 es deliberadamente plano:
+    ///   - primary (literal | col | func | CASE | CAST | `(`expr`)`)
+    ///   - opcionalmente seguido de comparación o `IS [NOT] NULL` —
+    ///     solo útil dentro de un `CASE WHEN searched`.
+    ///
+    /// No hay operadores aritméticos ni `AND`/`OR`: ese subset se
+    /// agregará junto con G2 (uso en WHERE/HAVING).
+    fn parse_expr(&mut self) -> DbResult<Expr> {
+        let lhs = self.parse_expr_primary()?;
+        if let Some(op) = self.peek_expr_cmp_op() {
+            self.pos += 1;
+            let rhs = self.parse_expr_primary()?;
+            return Ok(Expr::Compare(Box::new(lhs), op, Box::new(rhs)));
+        }
+        if self.peek().kind == TokenKind::Ident && self.peek().text.eq_ignore_ascii_case("IS") {
+            self.pos += 1;
+            let negated = self.match_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            return Ok(Expr::IsNull(Box::new(lhs), negated));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_expr_primary(&mut self) -> DbResult<Expr> {
+        let head = self.peek().clone();
+        // Literal numérico.
+        if head.kind == TokenKind::Number {
+            self.pos += 1;
+            if head.text.contains('.') {
+                return Ok(Expr::Literal(Value::Float(head.text.parse()?)));
+            }
+            return Ok(Expr::Literal(Value::Integer(head.text.parse()?)));
+        }
+        // Literal string.
+        if head.kind == TokenKind::String {
+            self.pos += 1;
+            return Ok(Expr::Literal(Value::String(head.text)));
+        }
+        // Paréntesis: expresión anidada.
+        if head.kind == TokenKind::Symbol && head.text == "(" {
+            self.pos += 1;
+            let inner = self.parse_expr()?;
+            self.expect_symbol(")")?;
+            return Ok(inner);
+        }
+        if head.kind == TokenKind::Ident {
+            // NULL / TRUE / FALSE.
+            if head.text.eq_ignore_ascii_case("NULL") {
+                self.pos += 1;
+                return Ok(Expr::Literal(Value::Null));
+            }
+            if head.text.eq_ignore_ascii_case("TRUE") {
+                self.pos += 1;
+                return Ok(Expr::Literal(Value::Bool(true)));
+            }
+            if head.text.eq_ignore_ascii_case("FALSE") {
+                self.pos += 1;
+                return Ok(Expr::Literal(Value::Bool(false)));
+            }
+            // CASE … END.
+            if head.text.eq_ignore_ascii_case("CASE") {
+                self.pos += 1;
+                return self.parse_case_expr();
+            }
+            // CAST(expr AS TYPE).
+            if head.text.eq_ignore_ascii_case("CAST") {
+                self.pos += 1;
+                return self.parse_cast_expr();
+            }
+            // Funciones zero-arg sin parens: CURRENT_DATE / CURRENT_TIMESTAMP.
+            let upper = head.text.to_ascii_uppercase();
+            let next_is_lparen = self
+                .tokens
+                .get(self.pos + 1)
+                .map(|t| t.kind == TokenKind::Symbol && t.text == "(")
+                .unwrap_or(false);
+            if (upper == "CURRENT_DATE" || upper == "CURRENT_TIMESTAMP" || upper == "CURDATE")
+                && !next_is_lparen
+            {
+                self.pos += 1;
+                let f = if upper == "CURRENT_TIMESTAMP" {
+                    ScalarFunc::CurrentTimestamp
+                } else {
+                    ScalarFunc::CurrentDate
+                };
+                return Ok(Expr::Func(f, Vec::new()));
+            }
+            // Llamada a función `IDENT(...)`.
+            let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                kind: TokenKind::Eof,
+                text: String::new(),
+            });
+            if next.kind == TokenKind::Symbol && next.text == "(" {
+                let func = ScalarFunc::from_ident(&head.text).ok_or_else(|| {
+                    coded(
+                        codes::SCALAR_FN_UNKNOWN,
+                        format!("función escalar desconocida: '{}'", head.text),
+                    )
+                })?;
+                self.pos += 1; // ident
+                self.expect_symbol("(")?;
+                let mut args = Vec::new();
+                if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
+                    args.push(self.parse_expr()?);
+                    while self.match_symbol(",") {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect_symbol(")")?;
+                validate_scalar_arity(func, args.len())?;
+                return Ok(Expr::Func(func, args));
+            }
+            // Ident bare → column reference.
+            self.pos += 1;
+            return Ok(Expr::Column(head.text));
+        }
+        Err(coded(
+            codes::WHERE_OPERATOR_UNSUPPORTED,
+            format!("expresión inválida: token inesperado '{}'", head.text),
+        ))
+    }
+
+    fn parse_case_expr(&mut self) -> DbResult<Expr> {
+        // CASE [operand] (WHEN cond THEN val)+ [ELSE val] END
+        let operand = if self.peek().kind == TokenKind::Ident
+            && self.peek().text.eq_ignore_ascii_case("WHEN")
+        {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        let mut branches = Vec::new();
+        while self.match_keyword("WHEN") {
+            let cond = self.parse_expr()?;
+            self.expect_keyword("THEN")?;
+            let val = self.parse_expr()?;
+            branches.push((cond, val));
+        }
+        if branches.is_empty() {
+            return Err(coded(
+                codes::WHERE_OPERATOR_UNSUPPORTED,
+                "CASE requiere al menos una rama WHEN ... THEN ...",
+            ));
+        }
+        let else_branch = if self.match_keyword("ELSE") {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword("END")?;
+        Ok(Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        })
+    }
+
+    fn parse_cast_expr(&mut self) -> DbResult<Expr> {
+        self.expect_symbol("(")?;
+        let inner = self.parse_expr()?;
+        self.expect_keyword("AS")?;
+        let type_ident = self.expect_ident()?;
+        let ty = ColumnType::from_sql(&type_ident)?;
+        self.expect_symbol(")")?;
+        Ok(Expr::Cast(Box::new(inner), ty))
+    }
+
+    /// Operadores de comparación válidos dentro de un `Expr`. Mismos
+    /// símbolos que el WHERE pero el set incluye `=` (el WHERE lo trata
+    /// separado por sus fast-paths).
+    fn peek_expr_cmp_op(&self) -> Option<ExprCmpOp> {
+        let t = self.peek();
+        if t.kind != TokenKind::Symbol {
+            return None;
+        }
+        match t.text.as_str() {
+            "=" => Some(ExprCmpOp::Eq),
+            "<>" | "!=" => Some(ExprCmpOp::Ne),
+            "<" => Some(ExprCmpOp::Lt),
+            "<=" => Some(ExprCmpOp::Le),
+            ">" => Some(ExprCmpOp::Gt),
+            ">=" => Some(ExprCmpOp::Ge),
+            _ => None,
+        }
     }
 
     fn parse_agg_arg(&mut self, func: AggFunc) -> DbResult<AggArg> {

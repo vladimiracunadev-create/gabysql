@@ -6,6 +6,53 @@
 
 ---
 
+## 2026-05-26 — Bloque G1: funciones escalares en SELECT list
+
+> **Un push a `main`** que abre el subsistema de funciones escalares: built-ins de string / numéricas / fecha + `CAST` + `CASE` + condicionales (`COALESCE`/`NULLIF`/`IFNULL`/`IF`). Cierra los P0/P1 del bloque G en [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md) **dentro del SELECT list** — la extensión a `WHERE`/`HAVING`/`UPDATE SET` queda para G2.
+
+### 🆕 Sentencias / cláusulas nuevas
+- `SELECT` ahora acepta expresiones escalares como ítems del SELECT list, además de columnas crudas y agregados. `AS alias` opcional por ítem.
+- Funciones built-in: `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`/`SUBSTRING`, `CONCAT`, `ABS`, `ROUND`, `NOW`, `CURRENT_DATE`/`CURDATE`, `CURRENT_TIMESTAMP`, `COALESCE`, `NULLIF`, `IFNULL`, `IF`/`IIF`.
+- `CAST(expr AS TYPE)` para INT / FLOAT / TEXT / BOOL / DATE / DATETIME / JSON.
+- `CASE [operand] WHEN cond THEN val [...] [ELSE val] END` en sus dos formas (searched y simple).
+
+### 🔧 AST
+- Nuevo enum `Expr { Literal | Column | Func | Cast | Case | Compare | IsNull }` y enum auxiliar `ExprCmpOp` con los seis comparadores estándar.
+- Nuevo enum `ScalarFunc` con las 14 built-ins soportadas + helper `from_ident` que acepta los aliases comunes.
+- `SelectItem` gana la variante `Expression { expr, alias }`. `Star`/`Column`/`Aggregate` se preservan para no romper fast-paths.
+
+### 🚦 Executor
+- `resolve_selected_columns` ahora devuelve `Vec<Projection>` donde cada `Projection` es `BareColumn` (lookup directo, fast-path pre-G1) o `Expression` (evaluada per-row con `eval_expr`).
+- `resolve_joined_projection` análogo: las columnas referenciadas dentro de `Expr::Column` se re-escriben a la forma cualificada `alias.col` con `rewrite_expr_columns_for_join` antes de la proyección — soporta JOIN + expresión escalar end-to-end (con detección de ambigüedad vía `[GBY-4018]`).
+- Validación: NULL propagation por defecto (excepto `COALESCE`/`NULLIF`/`IFNULL`/`IF` con su propio control de NULL, y las funciones zero-arg de tiempo). `CASE` searched exige cond BOOL; `CASE` simple matchea por igualdad ANSI (NULL nunca matchea NULL).
+- `NOW()` / `CURRENT_TIMESTAMP` / `CURRENT_DATE` formatean UTC como TEXT sin chrono — implementación inline con `civil_from_days` de Howard Hinnant.
+
+### ⚠️ Limitaciones residuales (G2)
+- Las expresiones escalares **solo** se aceptan en `SELECT` list. En `WHERE` / `HAVING` / `UPDATE SET` siguen aplicando las restricciones pre-G1 (literales o referencias a columna).
+- En queries con `GROUP BY`/`HAVING`/agregados, `SelectItem::Expression` no se acepta todavía (devuelve `[GBY-4027]`). Lo mismo para `RETURNING` (devuelve `[GBY-2002]` con mensaje claro).
+- No hay operador `||` para concatenar texto — usar `CONCAT(a, b, ...)`. Tampoco hay operadores aritméticos binarios (`+`/`-`/`*`/`/`).
+- Funciones P2/P3 (`TRIM`, `REPLACE`, `CEIL`/`FLOOR`, `MOD`, `POWER`/`SQRT`, `DATE_ADD`/`DATE_SUB`, `DATEDIFF`, `EXTRACT`, `STRFTIME`, `SPLIT_PART`) siguen en backlog del mismo bloque G.
+
+### 🧰 Códigos de error nuevos
+- `4034` `SCALAR_FN_ARITY` — función escalar con cantidad equivocada de argumentos.
+- `4035` `SCALAR_FN_TYPE_MISMATCH` — argumento de un tipo no aceptado por la función.
+- `4036` `CAST_INVALID` — `CAST` cuyo valor no se puede convertir al tipo destino.
+- `4037` `SCALAR_FN_UNKNOWN` — función escalar invocada que el motor no conoce.
+- `4038` `CASE_BRANCH_TYPE_MISMATCH` — condición de `CASE WHEN` searched que no evalúa a BOOL.
+
+### 🧪 Validación
+- 12 integration tests nuevos en `tests/integration_test.rs` (`g1_*`): string funcs, SUBSTR edge cases, CONCAT mixto, ABS/ROUND, NOW/CURRENT_DATE/CURRENT_TIMESTAMP shape, COALESCE/NULLIF/IFNULL/IF, CAST válido + inválido, CASE searched + simple, alias, errores (arity/tipo/desconocido), 3VL con NULL, expresión sobre JOIN.
+- `cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test --all-targets` limpios.
+
+### 📚 Documentación
+- Sección nueva en [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) ("Funciones escalares (bloque G1)") con EBNF + tabla de funciones + ejemplos + errores típicos.
+- [`docs/MISSING_COMMANDS.md`](docs/MISSING_COMMANDS.md): marcado `✅ (G1, 2026-05-26)` en los items P0/P1 cerrados.
+- [`docs/STATUS.md`](docs/STATUS.md): nueva fila en la matriz de madurez por subsistema.
+- [`docs/ERROR_CODES.md`](docs/ERROR_CODES.md): seis filas nuevas (`4033`-`4038`).
+- [`ROADMAP.md`](ROADMAP.md): bullet de cierre en Fase 2.
+
+---
+
 ## 2026-05-25 — Bloque J2: UPSERT, REPLACE INTO, RETURNING
 
 > **Un push a `main`** que completa los pendientes del bloque J (excepto `UPDATE ... FROM`, deferido).
