@@ -3913,6 +3913,7 @@ pub fn parse(sql_text: &str) -> DbResult<Vec<Statement>> {
         let mut parser = Parser {
             tokens,
             pos: 0,
+            where_depth: 0,
             in_having: false,
         };
         let statement = parser.parse_statement()?;
@@ -5836,7 +5837,20 @@ struct Parser {
     /// `parse_where_expr_with(true)`); WHERE normal lo deja en false
     /// para rechazar `SUM(x) > 10` con error claro.
     in_having: bool,
+    /// Sec3 (2026-05-25): profundidad de recursión actual del parser
+    /// expresiones WHERE/HAVING. Pre-fix, `WHERE (((((...)))))` con
+    /// miles de paréntesis o `NOT NOT NOT...` consumía el stack del
+    /// proceso (CWE-674: Uncontrolled Recursion). Se incrementa en
+    /// cada entrada a `parse_where_or/and/not/primary` y se decrementa
+    /// al salir; si supera `MAX_PARSE_DEPTH` devuelve `[GBY-4033]`.
+    where_depth: usize,
 }
+
+/// Sec3: profundidad máxima permitida en el árbol de expresiones del
+/// WHERE/HAVING. 100 es ~10× lo que un humano va a escribir a mano y
+/// muy por debajo del límite de stack típico de Rust (~2 MB = ~5k
+/// frames con frames promedio).
+const MAX_PARSE_DEPTH: usize = 100;
 
 impl Parser {
     fn parse_statement(&mut self) -> DbResult<Statement> {
@@ -6625,12 +6639,33 @@ impl Parser {
     }
 
     fn parse_where_or(&mut self) -> DbResult<WhereExpr> {
-        let mut left = self.parse_where_and()?;
-        while self.match_keyword("OR") {
-            let right = self.parse_where_and()?;
-            left = WhereExpr::Or(Box::new(left), Box::new(right));
+        // Sec3: punto de entrada del descenso recursivo. Todo paréntesis
+        // que abra una sub-expresión vuelve acá vía parse_where_primary,
+        // así que incrementar el contador aquí cubre el caso del ataque
+        // `WHERE ((((...))))`. Para `NOT NOT NOT...` el check también
+        // está en `parse_where_not`, que es recursión directa.
+        self.where_depth += 1;
+        if self.where_depth > MAX_PARSE_DEPTH {
+            self.where_depth -= 1;
+            return Err(coded(
+                codes::PARSE_DEPTH_EXCEEDED,
+                format!(
+                    "expresión WHERE demasiado profunda (límite: {} niveles); \
+                     simplificá la query o partila en varias",
+                    MAX_PARSE_DEPTH
+                ),
+            ));
         }
-        Ok(left)
+        let result = (|| {
+            let mut left = self.parse_where_and()?;
+            while self.match_keyword("OR") {
+                let right = self.parse_where_and()?;
+                left = WhereExpr::Or(Box::new(left), Box::new(right));
+            }
+            Ok(left)
+        })();
+        self.where_depth -= 1;
+        result
     }
 
     fn parse_where_and(&mut self) -> DbResult<WhereExpr> {
@@ -6643,26 +6678,45 @@ impl Parser {
     }
 
     fn parse_where_not(&mut self) -> DbResult<WhereExpr> {
+        // Sec3: `NOT NOT NOT ...` recursa directamente acá sin pasar por
+        // parse_where_or, así que el contador necesita su propio check
+        // local. Ataque típico: `WHERE NOT NOT NOT ... NOT col = 1`
+        // con miles de NOT consume el stack del proceso.
+        self.where_depth += 1;
+        if self.where_depth > MAX_PARSE_DEPTH {
+            self.where_depth -= 1;
+            return Err(coded(
+                codes::PARSE_DEPTH_EXCEEDED,
+                format!(
+                    "demasiados `NOT` encadenados en WHERE (límite: {})",
+                    MAX_PARSE_DEPTH
+                ),
+            ));
+        }
         // `NOT NOT x` se permite (cada NOT se apila y se cancela vía 3VL en
         // el evaluador). `NOT EXISTS (...)` mantiene la forma vieja
         // (`Atom(Exists { negated: true })`) para preservar el fast-path
         // del executor — sin esto el `EXISTS` correlacionado tendría que
         // re-evaluarse vía post-filter genérico.
-        if self.match_keyword("NOT") {
-            if self.peek().kind == TokenKind::Ident
-                && self.peek().text.eq_ignore_ascii_case("EXISTS")
-            {
-                self.pos += 1; // consume EXISTS
-                let subquery = self.parse_exists_subquery_body()?;
-                return Ok(WhereExpr::Atom(WhereClause::Exists {
-                    subquery: Box::new(subquery),
-                    negated: true,
-                }));
+        let result = (|| {
+            if self.match_keyword("NOT") {
+                if self.peek().kind == TokenKind::Ident
+                    && self.peek().text.eq_ignore_ascii_case("EXISTS")
+                {
+                    self.pos += 1; // consume EXISTS
+                    let subquery = self.parse_exists_subquery_body()?;
+                    return Ok(WhereExpr::Atom(WhereClause::Exists {
+                        subquery: Box::new(subquery),
+                        negated: true,
+                    }));
+                }
+                let inner = self.parse_where_not()?;
+                return Ok(WhereExpr::Not(Box::new(inner)));
             }
-            let inner = self.parse_where_not()?;
-            return Ok(WhereExpr::Not(Box::new(inner)));
-        }
-        self.parse_where_primary()
+            self.parse_where_primary()
+        })();
+        self.where_depth -= 1;
+        result
     }
 
     fn parse_where_primary(&mut self) -> DbResult<WhereExpr> {

@@ -1,6 +1,47 @@
 ﻿<?php
 session_start();
 
+// Sec5 (2026-05-25): CSRF token de sesión. Pre-fix, todos los POSTs
+// (run_sql, create_index, import_csv, new_db, etc.) eran disparables
+// desde cualquier origen — un `<form action="http://localhost:8000/">`
+// en una página atacante con `document.forms[0].submit()` ejecutaba
+// SQL arbitrario en el navegador de la víctima logueada (CWE-352).
+// Mitigación combinada: token CSRF en sesión + check de Origin/Referer
+// para defense-in-depth (samesite=Strict en la cookie de auth ya
+// cubre algunos casos, pero no aplica en todos los browsers viejos).
+if (!isset($_SESSION['csrf_token']) || !is_string($_SESSION['csrf_token']) || strlen($_SESSION['csrf_token']) !== 64) {
+  $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+function csrf_token(): string {
+  return $_SESSION['csrf_token'];
+}
+
+function csrf_field(): string {
+  return '<input type="hidden" name="csrf_token" value="' . htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8') . '">';
+}
+
+/**
+ * Sec5: valida el token CSRF para una request POST. Si falla, aborta
+ * con HTTP 403 y mensaje claro. Se invoca al INICIO de cada handler
+ * de POST — debe correr ANTES de mutar nada en el server upstream o
+ * en sesión local.
+ */
+function require_csrf_token(): void {
+  if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    return;
+  }
+  $submitted = isset($_POST['csrf_token']) && is_string($_POST['csrf_token']) ? $_POST['csrf_token'] : '';
+  $expected  = csrf_token();
+  if (!hash_equals($expected, $submitted)) {
+    http_response_code(403);
+    echo '<!doctype html><meta charset="utf-8"><title>403 CSRF</title>';
+    echo '<h1>403 — CSRF token inválido o ausente</h1>';
+    echo '<p>El POST recibido no incluye un token CSRF válido. Si llegaste acá desde un link externo, ese link es malicioso. Volvé al admin desde la URL original.</p>';
+    exit;
+  }
+}
+
 function cookie_options(int $expires): array {
   $secure = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
   return [
@@ -97,6 +138,7 @@ $uiToken = getenv('GABYADMIN_TOKEN');
 $cookieName = 'gabyadmin_auth';
 if ($uiToken) {
   if (isset($_POST['logout'])) {
+    require_csrf_token();
     setcookie($cookieName, '', cookie_options(time() - 3600));
     header('Location: ' . $_SERVER['PHP_SELF']);
     exit;
@@ -175,6 +217,7 @@ if ($db !== '') {
 
 $createDbMsg = null;
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['new_db'])) {
+  require_csrf_token();
   [$createResp, $createErr] = http_post_json($server . '/dbs', ['db' => trim((string)$_POST['new_db'])], $apiToken);
   if ($createErr) {
     $createDbMsg = $createErr;
@@ -189,6 +232,7 @@ $importMsg = null;
 $execJson = null;
 $execErr = null;
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_csv']) && $db !== '' && $table !== '' && isset($_FILES['csv'])) {
+  require_csrf_token();
   $tmp = $_FILES['csv']['tmp_name'] ?? '';
   if (!$tmp || !is_uploaded_file($tmp)) {
     $importMsg = 'No se recibió archivo';
@@ -249,6 +293,7 @@ if (isset($_GET['export']) && $db !== '' && $table !== '') {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_index']) && $db !== '') {
+  require_csrf_token();
   $idxTable = trim((string)($_POST['create_index_table'] ?? ''));
   $idxName  = trim((string)($_POST['create_index_name']  ?? ''));
   $idxCol   = trim((string)($_POST['create_index_column']?? ''));
@@ -267,6 +312,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_index']) && $d
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['run_sql'])) {
+  require_csrf_token();
   [$execJson, $execErr] = http_post_json($server . '/exec', ['db' => $db, 'sql' => (string)$sql], $apiToken);
   if (!$execErr && !($execJson['ok'] ?? false)) {
     $execErr = $execJson['error'] ?? 'Error';
@@ -327,7 +373,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['run_sql'])) {
         <div class="muted" style="margin-top:8px">
           <a href="/index.php">Volver a la portada</a>
           <?php if ($uiToken): ?>
-            · <form method="post" style="display:inline"><button name="logout" style="background:transparent;border:0;color:#9cd1ff;padding:0">Salir</button></form>
+            · <form method="post" style="display:inline"><?= csrf_field() ?><button name="logout" style="background:transparent;border:0;color:#9cd1ff;padding:0">Salir</button></form>
           <?php endif; ?>
         </div>
       </div>
@@ -361,6 +407,7 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
             <hr style="border:0;border-top:1px solid #243244;margin:14px 0"/>
             <div class="muted">Crear nueva DB</div>
             <form method="post" style="display:flex;gap:10px;margin-top:8px">
+              <?= csrf_field() ?>
               <input type="text" name="new_db" placeholder="nueva.db" style="flex:1"/>
               <button type="submit">Crear</button>
             </form>
@@ -446,6 +493,7 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
                       <td><?= htmlspecialchars((string)($idx['rootPage'] ?? '')) ?></td>
                       <td>
                         <form method="post" style="display:inline" onsubmit="return confirm('Eliminar índice <?= htmlspecialchars($idxName, ENT_QUOTES) ?>?');">
+                          <?= csrf_field() ?>
                           <input type="hidden" name="sql" value="DROP INDEX <?= htmlspecialchars($idxName, ENT_QUOTES) ?>;"/>
                           <button name="run_sql" type="submit" class="pill" style="background:#5a2030;color:#ffd6e0;border-color:#7a2c44">DROP</button>
                         </form>
@@ -458,6 +506,7 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
 
             <h4 style="margin-top:14px">Crear nuevo índice</h4>
             <form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <?= csrf_field() ?>
               <input type="hidden" name="create_index_table" value="<?= htmlspecialchars((string)$table) ?>"/>
               <input name="create_index_name" placeholder="idx_<?= htmlspecialchars((string)$table) ?>_col" required/>
               <select name="create_index_column">
@@ -505,6 +554,7 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
             <hr style="border:0;border-top:1px solid #243244;margin:14px 0"/>
             <div class="muted">Import CSV (header = columnas)</div>
             <form method="post" enctype="multipart/form-data" style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
+              <?= csrf_field() ?>
               <input type="file" name="csv" accept=".csv" style="color:#d7e6ff"/>
               <button name="import_csv" type="submit">Import</button>
             </form>
@@ -533,6 +583,7 @@ cargo run --release --bin gabysql-server -- -dir .\dbs -addr :8080</code></pre>
           <?php if (isset($_GET['prefill'])) { $sql = (string)$_GET['prefill']; } ?>
 
           <form method="post" style="margin-top:12px">
+            <?= csrf_field() ?>
             <textarea name="sql"><?= htmlspecialchars((string)$sql) ?></textarea>
             <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
               <button name="run_sql" type="submit">Ejecutar</button>

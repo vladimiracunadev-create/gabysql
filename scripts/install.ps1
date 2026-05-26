@@ -84,19 +84,34 @@ function Download-Release([string]$tag, [string]$destDir) {
         throw "No pude descargar $zipUrl . ¿Existe ese tag en Releases? Detalles: $($_.Exception.Message)"
     }
 
-    # Verificación opcional del SHA256. Si el .sha256 no existe en el
-    # release, simplemente no verificamos (warning, no fatal).
+    # Sec4 (2026-05-25): verificación de SHA256 OBLIGATORIA.
+    #
+    # Pre-fix, el `catch [System.Net.WebException]` saltaba el chequeo si
+    # la descarga del `.sha256` fallaba. Un MITM activo podía interceptar
+    # AMBOS el zip y la solicitud del `.sha256` (devolver 404), forzando
+    # al script a continuar sin verificación e instalando un binario
+    # malicioso (CWE-347: Improper Verification of Cryptographic
+    # Signature). Ahora cualquier error en la descarga o verificación es
+    # fatal — la instalación se aborta limpia, sin escribir nada al
+    # destino.
+    Write-Step "Descargando hash de verificación SHA256 ..."
     try {
-        Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -UseBasicParsing
-        $expected = ((Get-Content $shaPath -Raw) -split '\s+')[0].ToLower()
-        $actual   = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
-        if ($expected -ne $actual) {
-            throw "SHA256 no coincide. Esperado $expected, obtuve $actual. Abortando."
-        }
-        Write-Step "SHA256 verificado: $actual"
-    } catch [System.Net.WebException] {
-        Write-Warning "No hay .sha256 publicado para este release — sigo sin verificación de hash."
+        Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        throw "No pude descargar el SHA256 desde $shaUrl. La instalación se aborta — sin verificación de integridad NO se ejecuta el binario. Detalles: $($_.Exception.Message)"
     }
+    if (-not (Test-Path $shaPath) -or ((Get-Item $shaPath).Length -eq 0)) {
+        throw "El archivo .sha256 descargado está vacío o no existe. Abortando."
+    }
+    $expected = ((Get-Content $shaPath -Raw) -split '\s+')[0].ToLower()
+    if ($expected.Length -ne 64) {
+        throw "El SHA256 publicado tiene formato inválido ('$expected'). Abortando."
+    }
+    $actual = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+    if ($expected -ne $actual) {
+        throw "SHA256 no coincide. Esperado $expected, obtuve $actual. Posible MITM o release corrupto. Abortando."
+    }
+    Write-Step "SHA256 verificado: $actual"
 
     Write-Step "Extrayendo a $destDir ..."
     if (Test-Path $destDir) {

@@ -209,6 +209,12 @@ pub mod codes {
     /// (Bloque J2). Sin un constraint indexado el motor no puede
     /// detectar el conflicto.
     pub const ON_CONFLICT_TARGET_NOT_UNIQUE: u32 = 4032;
+    /// Sec3 (2026-05-25): expresión SQL con anidamiento mayor al
+    /// permitido por el parser. Defensa contra ataques de stack
+    /// exhaustion con paréntesis o `NOT` encadenados sin fin
+    /// (CWE-674). El límite duro está en `MAX_PARSE_DEPTH` dentro
+    /// de `sql.rs`.
+    pub const PARSE_DEPTH_EXCEEDED: u32 = 4033;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.
@@ -223,6 +229,10 @@ pub mod codes {
     pub const SERVER_BUSY: u32 = 5005;
     /// El server arrancó en modo single-DB; la operación requería `-dir`.
     pub const SERVER_NOT_MULTI_DB: u32 = 5006;
+    /// Sec1 (2026-05-25): HTTP request con `Content-Length` mayor al
+    /// permitido (`MAX_REQUEST_BODY_BYTES`). Defensa contra DoS por
+    /// memory exhaustion (CWE-400).
+    pub const REQUEST_BODY_TOO_LARGE: u32 = 5007;
 }
 
 /// Build a `DbError` with the `[GBY-NNNN]` prefix. See module docs for

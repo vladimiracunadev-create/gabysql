@@ -4791,6 +4791,49 @@ fn j2_insert_returning_skipped_not_in_output() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Security audit fixes (2026-05-25): tests de regresión
+// ============================================================
+
+#[test]
+fn sec_parser_rejects_deep_paren_nesting() -> Result<(), Box<dyn Error>> {
+    use gabysql::sql::parse;
+    let opens = "(".repeat(200);
+    let closes = ")".repeat(200);
+    let sql = format!("SELECT * FROM t WHERE {}x = 1{};", opens, closes);
+    let err = parse(&sql).unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4033]"),
+        "esperaba GBY-4033 sobre 200 paréntesis anidados: {}",
+        err
+    );
+    Ok(())
+}
+
+#[test]
+fn sec_parser_rejects_deep_not_chain() -> Result<(), Box<dyn Error>> {
+    use gabysql::sql::parse;
+    let nots = "NOT ".repeat(200);
+    let sql = format!("SELECT * FROM t WHERE {}x = 1;", nots);
+    let err = parse(&sql).unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4033]"),
+        "esperaba GBY-4033 sobre 200 NOT encadenados: {}",
+        err
+    );
+    Ok(())
+}
+
+#[test]
+fn sec_parser_accepts_reasonable_depth() -> Result<(), Box<dyn Error>> {
+    use gabysql::sql::parse;
+    let opens = "(".repeat(20);
+    let closes = ")".repeat(20);
+    let sql = format!("SELECT * FROM t WHERE {}x = 1{};", opens, closes);
+    parse(&sql)?;
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

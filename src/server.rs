@@ -15,6 +15,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
+/// Sec1 (2026-05-25): tope al `Content-Length` aceptado en `/exec`.
+/// Pre-fix el server confiaba en el header del cliente y rellenaba el
+/// buffer de body indefinidamente — un solo request con
+/// `Content-Length: 999999999999` agotaba la RAM (CWE-400). 100 MiB
+/// cubre los casos legítimos (SQL scripts y exports CSV grandes) y
+/// rechaza el abuso temprano, antes de la primera lectura post-headers.
+pub const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
+
 /// Bounded ring of recent latency samples used for the p50/p95 in
 /// `/metrics`. Keeping it fixed-size means the metrics endpoint runs in
 /// O(N log N) on a small slice (a few thousand entries at most) and the
@@ -307,17 +315,23 @@ fn handle_request(
         return Ok(Response::text(204, ""));
     }
     if let Some(token) = &config.token {
-        let auth_ok = request
+        // Sec2: comparación en tiempo constante para evitar el timing
+        // attack sobre el token. Pre-fix usábamos `value == token` que
+        // hace short-circuit byte-a-byte: midiendo la latencia de
+        // requests con tokens "aaa..", "baa..", ... un atacante puede
+        // recuperar el token byte por byte (CWE-208).
+        let bearer_ok = request
             .headers
             .get("authorization")
             .and_then(|value| value.strip_prefix("Bearer "))
-            .map(|value| value.trim() == token)
-            .unwrap_or(false)
-            || request
-                .headers
-                .get("x-gabysql-token")
-                .map(|value| value == token)
-                .unwrap_or(false);
+            .map(|value| constant_time_eq_str(value.trim(), token))
+            .unwrap_or(false);
+        let header_ok = request
+            .headers
+            .get("x-gabysql-token")
+            .map(|value| constant_time_eq_str(value, token))
+            .unwrap_or(false);
+        let auth_ok = bearer_ok || header_ok;
         if !auth_ok {
             return Ok(Response::json(
                 401,
@@ -1048,13 +1062,39 @@ fn read_request(stream: &mut TcpStream) -> DbResult<Request> {
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    // Sec1: rechazar requests con Content-Length excesivo ANTES de
+    // empezar a leer del socket. Sin este check el while loop de abajo
+    // crecía `body` hasta `content_length` (que el cliente declaraba) →
+    // RAM exhaustion + thread-worker stuck por el read timeout (CWE-400).
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return Err(coded(
+            codes::REQUEST_BODY_TOO_LARGE,
+            format!(
+                "Content-Length {} excede el máximo permitido ({} bytes); rechazado antes de leer",
+                content_length, MAX_REQUEST_BODY_BYTES
+            ),
+        ));
+    }
     let mut body = buffer[header_end..].to_vec();
-    while body.len() < content_length {
+    // Defense-in-depth: aunque ya validamos content_length, también
+    // cortamos el while si el body crece más allá del cap (por si el
+    // cliente miente sobre Content-Length o el header está ausente).
+    while body.len() < content_length && body.len() < MAX_REQUEST_BODY_BYTES {
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             break;
         }
         body.extend_from_slice(&chunk[..read]);
+    }
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        return Err(coded(
+            codes::REQUEST_BODY_TOO_LARGE,
+            format!(
+                "body recibido ({} bytes) excede el máximo permitido ({} bytes)",
+                body.len(),
+                MAX_REQUEST_BODY_BYTES
+            ),
+        ));
     }
     body.truncate(content_length);
 
@@ -1105,6 +1145,39 @@ fn write_response(stream: &mut TcpStream, response: Response) -> DbResult<()> {
     stream.write_all(&response.body)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Sec2 (2026-05-25): comparación de strings en tiempo constante.
+/// Idéntica latencia ante cualquier input de la misma longitud — la
+/// duración NO depende del primer byte que difiere. Imprescindible
+/// para comparar secrets (tokens, MACs) que un atacante puede
+/// manipular request-a-request midiendo el tiempo de respuesta.
+///
+/// Implementación: XOR byte-a-byte sin short-circuit, fold con OR.
+/// No usamos crates externos (`subtle`/`constant_time_eq`) para no
+/// agregar dependencias al core — el algoritmo es trivial.
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    constant_time_eq(a.as_bytes(), b.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // Length mismatch siempre es false, pero seguimos consumiendo
+        // los bytes para que el atacante no pueda inferir |a| vs |b|
+        // por timing. Un atacante que sabe la longitud del token no
+        // gana nada — solo recibe `false` después del mismo trabajo.
+        let n = a.len().min(b.len());
+        let mut acc = 1u8; // != 0 → forzamos false
+        for i in 0..n {
+            acc |= a[i] ^ b[i];
+        }
+        return acc == 0; // siempre false porque acc partió en 1
+    }
+    let mut acc = 0u8;
+    for i in 0..a.len() {
+        acc |= a[i] ^ b[i];
+    }
+    acc == 0
 }
 
 fn split_target(target: &str) -> DbResult<(String, HashMap<String, String>)> {
