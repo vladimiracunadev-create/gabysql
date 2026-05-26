@@ -1,6 +1,8 @@
 ﻿# 📝 Changelog
 
 > **Historial de cambios relevantes aplicados al producto y a su base documental.**
+>
+> Para registro detallado de **bugs e incidentes operativos resueltos en sesión** (regresiones de CI, fixes intermedios, errores de configuración), ver [`docs/INCIDENTS_2026-05-25.md`](docs/INCIDENTS_2026-05-25.md). Para el detalle de los hallazgos del audit interno de seguridad ver [`SECURITY_AUDIT_2026-05-25.md`](SECURITY_AUDIT_2026-05-25.md).
 
 ---
 
