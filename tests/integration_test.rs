@@ -5913,6 +5913,364 @@ fn g3_fn_date_parse_error() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ───────────────────────── Bloque H (2026-05-26) ─────────────────────────
+//
+// Tests del bloque H: derived tables (FROM (SELECT ...)), NOT IN (SELECT),
+// subqueries escalares en SELECT list, y multi-predicate correlated EXISTS.
+
+fn setup_h_table(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+fn setup_h_two_tables(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let (db, wal) = setup_h_table(label)?;
+    run_sql(
+        &db,
+        "CREATE TABLE cursos (id INT PRIMARY KEY, nivel TEXT NOT NULL);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE alumnos (id INT PRIMARY KEY, nombre TEXT NOT NULL, curso_id INT, edad INT);",
+    )?;
+    // Índices necesarios para que WHERE col = lit y EXISTS correlated
+    // disparen las fast-paths del executor (sino → [GBY-4001]/[GBY-4013]).
+    run_sql(&db, "CREATE INDEX idx_cursos_nivel ON cursos (nivel);")?;
+    run_sql(&db, "CREATE INDEX idx_alumnos_curso ON alumnos (curso_id);")?;
+    run_sql(&db, "CREATE INDEX idx_alumnos_edad ON alumnos (edad);")?;
+    run_sql(
+        &db,
+        "INSERT INTO cursos (id,nivel) VALUES (1,'A'); \
+         INSERT INTO cursos (id,nivel) VALUES (2,'B'); \
+         INSERT INTO cursos (id,nivel) VALUES (3,'A');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id,edad) VALUES (10,'Ana',1,17); \
+         INSERT INTO alumnos (id,nombre,curso_id,edad) VALUES (11,'Beto',2,18); \
+         INSERT INTO alumnos (id,nombre,curso_id,edad) VALUES (12,'Carla',3,17); \
+         INSERT INTO alumnos (id,nombre,curso_id,edad) VALUES (13,'Dani',1,19);",
+    )?;
+    Ok((db, wal))
+}
+
+#[test]
+fn h_derived_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_basic")?;
+    let res = run_sql(
+        &db,
+        "SELECT sub.nombre FROM (SELECT id, nombre FROM alumnos) AS sub ORDER BY nombre ASC;",
+    )?;
+    let names: Vec<&str> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.as_str(),
+            _ => panic!("expected string"),
+        })
+        .collect();
+    assert_eq!(names, vec!["Ana", "Beto", "Carla", "Dani"]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_derived_with_alias_required() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_alias_required")?;
+    let err = run_sql(&db, "SELECT * FROM (SELECT id FROM alumnos);").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4048]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_derived_join_persistent() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_join_persistent")?;
+    // Inner: cuenta de alumnos por curso. Outer: join contra cursos.
+    let res = run_sql(
+        &db,
+        "SELECT cursos.nivel, sub.total \
+         FROM cursos \
+         INNER JOIN (SELECT curso_id, COUNT(*) AS total FROM alumnos GROUP BY curso_id) AS sub \
+           ON cursos.id = sub.curso_id \
+         ORDER BY nivel ASC;",
+    )?;
+    // Esperamos 3 filas: curso 1 (A) → 2, curso 2 (B) → 1, curso 3 (A) → 1.
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_derived_nested() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_nested")?;
+    let res = run_sql(
+        &db,
+        "SELECT y.id FROM (SELECT * FROM (SELECT id FROM alumnos) AS x) AS y \
+         ORDER BY id ASC;",
+    )?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("expected int"),
+        })
+        .collect();
+    assert_eq!(ids, vec![10, 11, 12, 13]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_derived_with_where_outer() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_where_outer")?;
+    let res = run_sql(
+        &db,
+        "SELECT sub.nombre FROM (SELECT id, nombre, edad FROM alumnos) AS sub \
+         WHERE edad = 17 ORDER BY nombre ASC;",
+    )?;
+    let names: Vec<&str> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.as_str(),
+            _ => panic!("expected string"),
+        })
+        .collect();
+    assert_eq!(names, vec!["Ana", "Carla"]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_derived_with_aggregate_subquery() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_aggregate_subquery")?;
+    let res = run_sql(
+        &db,
+        "SELECT sub.curso_id, sub.total \
+         FROM (SELECT curso_id, COUNT(*) AS total FROM alumnos GROUP BY curso_id) AS sub \
+         ORDER BY curso_id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_derived_duplicate_column_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_derived_dup_col")?;
+    let err = run_sql(&db, "SELECT * FROM (SELECT id, id FROM alumnos) AS d;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4049]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_not_in_subquery_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_not_in_basic")?;
+    // Cursos cuyos ids NO aparecen en alumnos.curso_id (todos los cursos
+    // tienen al menos un alumno, así que el resultado es vacío). Para
+    // un test más interesante: NOT IN sobre ids de alumnos.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM cursos \
+         WHERE id NOT IN (SELECT curso_id FROM alumnos WHERE edad = 19);",
+    )?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("expected int"),
+        })
+        .collect();
+    ids.sort();
+    // alumnos con edad=19: id=13 (Dani), curso_id=1. NOT IN → cursos 2 y 3.
+    assert_eq!(ids, vec![2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_not_in_subquery_with_null_returns_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_not_in_null")?;
+    // Insertamos un alumno con curso_id NULL para que la subquery
+    // contenga NULL. ANSI estricta: outer cursos NOT IN (set con NULL)
+    // → NULL para todos → 0 filas.
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id,edad) VALUES (99,'Zoe',NULL,20);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM cursos \
+         WHERE id NOT IN (SELECT curso_id FROM alumnos);",
+    )?;
+    assert_eq!(res[0].rows.len(), 0);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_not_in_subquery_outer_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_not_in_outer_null")?;
+    // alumno con curso_id NULL. NOT IN sobre cursos.id (no NULL en
+    // subquery acá) → la fila con NULL outer descarta (3VL).
+    run_sql(
+        &db,
+        "INSERT INTO alumnos (id,nombre,curso_id,edad) VALUES (50,'Yago',NULL,16);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM alumnos \
+         WHERE curso_id NOT IN (SELECT id FROM cursos WHERE nivel = 'B') \
+         ORDER BY id ASC;",
+    )?;
+    // Filas con curso_id distinto de 2 (curso B): 10,12,13 (NO 50 — NULL outer).
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("expected int"),
+        })
+        .collect();
+    assert_eq!(ids, vec![10, 12, 13]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_select_scalar_subquery_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_scalar_basic")?;
+    let res = run_sql(
+        &db,
+        "SELECT id, (SELECT COUNT(*) FROM alumnos) AS cnt FROM cursos ORDER BY id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    // Cada fila debe tener cnt=4 (4 alumnos en la tabla base).
+    for row in &res[0].rows {
+        assert_eq!(row[1], Value::Integer(4));
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_select_scalar_subquery_correlated() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_scalar_correlated")?;
+    let res = run_sql(
+        &db,
+        "SELECT id, (SELECT COUNT(*) FROM alumnos WHERE alumnos.curso_id = cursos.id) AS cnt \
+         FROM cursos ORDER BY id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    // Curso 1 → 2 alumnos, curso 2 → 1, curso 3 → 1.
+    assert_eq!(res[0].rows[0][1], Value::Integer(2));
+    assert_eq!(res[0].rows[1][1], Value::Integer(1));
+    assert_eq!(res[0].rows[2][1], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_select_scalar_subquery_too_many_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_scalar_too_many")?;
+    let err = run_sql(&db, "SELECT id, (SELECT id FROM alumnos) FROM cursos;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4014]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_select_scalar_subquery_two_columns() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_scalar_two_cols")?;
+    let err = run_sql(
+        &db,
+        "SELECT id, (SELECT id, nombre FROM alumnos WHERE id = 10) FROM cursos;",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("[GBY-4011]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_select_scalar_subquery_no_rows_returns_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_scalar_no_rows")?;
+    let res = run_sql(
+        &db,
+        "SELECT id, (SELECT id FROM alumnos WHERE id = 999) AS x FROM cursos ORDER BY id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    for row in &res[0].rows {
+        assert_eq!(row[1], Value::Null);
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_correlated_exists_and_other_pred() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_corr_exists_and")?;
+    // Cursos con al menos un alumno Y cuyo id sea 1.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM cursos \
+         WHERE EXISTS (SELECT 1 FROM alumnos WHERE alumnos.curso_id = cursos.id) AND id = 1;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_correlated_exists_or_other_pred() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_corr_exists_or")?;
+    // NOT EXISTS (no hay alumnos en este curso) OR id = 1.
+    // Todos los cursos tienen alumnos → solo id=1 matchea.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM cursos \
+         WHERE NOT EXISTS (SELECT 1 FROM alumnos WHERE alumnos.curso_id = cursos.id) OR id = 1;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn h_correlated_two_exists_and() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_h_two_tables("h_corr_two_exists")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM cursos \
+         WHERE EXISTS (SELECT 1 FROM alumnos WHERE alumnos.curso_id = cursos.id) \
+           AND EXISTS (SELECT 1 FROM alumnos WHERE alumnos.curso_id = cursos.id AND alumnos.edad = 17) \
+         ORDER BY id ASC;",
+    )?;
+    // Cursos con alumnos Y al menos un alumno de 17 años:
+    // curso 1 (Ana=17), curso 3 (Carla=17). Curso 2 (Beto=18) — no.
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("expected int"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

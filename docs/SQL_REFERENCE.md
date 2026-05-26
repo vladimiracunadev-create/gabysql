@@ -1211,6 +1211,79 @@ SELECT EXTRACT(YEAR FROM '2026-05-26'), STRFTIME('%Y-%m', '2026-05-26');
 
 ---
 
+## Subqueries y derived tables (bloque H)
+
+> Bloque H (2026-05-26) cierra los P0+P1 de subqueries: derived tables, `NOT IN (SELECT)`, subquery escalar en SELECT list, y multi-predicate correlated EXISTS dentro de `AND`/`OR`/`NOT`.
+
+### 📜 EBNF
+
+```ebnf
+from_source   := tabla_ident [ alias ]
+               | "(" subquery ")" alias       (* derived table — alias OBLIGATORIO *)
+
+subquery      := "SELECT" select_stmt
+
+scalar_subq   := "(" subquery ")"             (* dentro de Expr *)
+
+where_atom    := … (formas pre-H) …
+               | columna [ "NOT" ] "IN" "(" subquery ")"   (* H *)
+               | "EXISTS" "(" subquery ")"                  (* puede ir dentro de AND/OR/NOT — H *)
+               | "NOT" "EXISTS" "(" subquery ")"            (* idem *)
+
+expr_primary  := … (formas pre-H) …
+               | scalar_subq                  (* H *)
+```
+
+### ✅ Ejemplos
+
+```sql
+-- Derived table: lista de cursos con cantidad de alumnos.
+SELECT sub.curso_id, sub.total
+FROM (SELECT curso_id, COUNT(*) AS total FROM alumnos GROUP BY curso_id) AS sub
+ORDER BY sub.total DESC;
+
+-- Derived table joineada con una tabla persistente.
+SELECT cursos.nivel, sub.total
+FROM cursos
+INNER JOIN (SELECT curso_id, COUNT(*) AS total FROM alumnos GROUP BY curso_id) AS sub
+  ON cursos.id = sub.curso_id;
+
+-- NOT IN con 3VL ANSI estricta.
+SELECT id FROM cursos
+WHERE id NOT IN (SELECT curso_id FROM alumnos WHERE edad = 19);
+
+-- Subquery escalar en SELECT list (correlated).
+SELECT cursos.id,
+       (SELECT COUNT(*) FROM alumnos WHERE alumnos.curso_id = cursos.id) AS cnt
+FROM cursos;
+
+-- EXISTS correlacionado combinado con otro predicado.
+SELECT id FROM cursos
+WHERE EXISTS (SELECT 1 FROM alumnos WHERE alumnos.curso_id = cursos.id)
+  AND id = 1;
+```
+
+### ⚠️ Reglas y limitaciones
+
+- **Alias obligatorio** en derived tables (ANSI estricto, `[GBY-4048]`). Sin él el parser rechaza.
+- **Sin nombres duplicados** en el output de una derived table (`[GBY-4049]`). Usar alias internos para des-ambiguar.
+- **Inferencia de tipo** por columna del derived: si todos los valores no-NULL son de la misma variante (INT/FLOAT/BOOL/TEXT), el schema virtual usa ese tipo; mezcla → fallback a TEXT.
+- **Sin índices** sobre derived (always full-scan en el outer). Sin UPDATE/DELETE/INSERT sobre una derived table.
+- **NOT IN + NULL**: si la subquery proyecta algún NULL, `col NOT IN (...)` devuelve NULL para todos los outer rows que no matcheen exactamente. Es la regla ANSI estricta — distinta de `NOT (col IN ...)` cuando hay match.
+- **Subquery escalar**: exactamente 1 columna y a lo sumo 1 fila. 0 filas → NULL. más de 1 → `[GBY-4014]`. más de 1 columna → `[GBY-4011]`.
+- **Correlated multi-predicado**: `EXISTS` y `col = outer.col` correlacionados ahora funcionan dentro de `AND`/`OR`/`NOT` (el código histórico `[GBY-4024]` queda deprecado).
+
+### ❌ Errores típicos
+
+| Mensaje | Por qué |
+|---|---|
+| `[GBY-4048] derived table (SELECT ...) requiere un alias obligatorio` | El parser vio `FROM (SELECT ...)` sin alias. |
+| `[GBY-4049] derived table 'x' proyecta dos columnas con el mismo nombre 'id'` | La subquery devuelve nombres duplicados. Aliasear: `SELECT a AS x, b AS y`. |
+| `[GBY-4014] subquery escalar … devolvió 5 filas` | Subquery en SELECT list o en `WHERE = (SELECT ...)` con más de una fila. |
+| `[GBY-4011] subquery … debe devolver exactamente 1 columna` | La subquery escalar/IN devuelve múltiples columnas. |
+
+---
+
 ## INTEGRITY CHECK
 
 > Recorre la DB abierta y reporta toda inconsistencia detectable: páginas con CRC inválido, filas no decodificables, entradas de índice secundario huérfanas (apuntan a PKs que ya no existen) y FKs huérfanas (valor no NULL sin parent). De solo lectura — no modifica nada.

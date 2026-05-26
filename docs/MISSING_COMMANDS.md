@@ -76,7 +76,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | `IS TRUE` / `IS FALSE` | ❌ | P3 |
 | `IN (lista_literales)` — `id IN (1,2,3)` | ✅ (E2) | — |
 | `NOT IN (lista_literales)` | ✅ (E2; 3VL ANSI con NULLs en la lista) | — |
-| `NOT IN (SELECT ...)` | ❌ (esperar bloque H) | P1 |
+| `NOT IN (SELECT ...)` | ✅ (H, 2026-05-26; 3VL ANSI estricta — NULL en subquery propaga NULL) | — |
 | `REGEXP` / `~` (regex) | ❌ | P3 |
 | `GLOB` (estilo SQLite) | ❌ | P3 |
 
@@ -162,13 +162,14 @@ Hoy sin ninguna función built-in. Lista mínima útil:
 | `WHERE col IN (SELECT ...)` no-correl | ✅ | — |
 | `WHERE col = (SELECT ...)` escalar | ✅ | — |
 | `WHERE [NOT] EXISTS (...)` correl single-eq | ✅ | — |
-| `WHERE col NOT IN (SELECT ...)` | ❌ | P1 |
-| Subquery con `AND`/`OR` multi-predicado correlated | ❌ | P1 (depende de E1) |
-| `FROM (SELECT ...) AS t` (derived tables) | ❌ | P0 |
-| `SELECT (SELECT MAX(x) FROM t) FROM s` (subquery en SELECT) | ❌ | P1 (depende de F) |
+| `WHERE col NOT IN (SELECT ...)` | ✅ (H, 2026-05-26; 3VL ANSI estricta) | — |
+| Subquery con `AND`/`OR` multi-predicado correlated | ✅ (H, 2026-05-26; `EXISTS`/`EqColumnRef` en combinadores) | — |
+| `FROM (SELECT ...) AS t` (derived tables) | ✅ (H, 2026-05-26; alias obligatorio, derived en JOINs OK) | — |
+| `SELECT (SELECT MAX(x) FROM t) FROM s` (subquery en SELECT) | ✅ (H, 2026-05-26; correlated OK) | — |
 | `WHERE col > ALL (SELECT ...)` / `ANY` / `SOME` | ❌ | P2 |
-| Correlated en `=` o `IN` (no solo `EXISTS`) | ❌ | P2 |
+| Correlated `col = outer.col` puro fuera de `EXISTS` con JOIN | ❌ | P2 |
 | `LATERAL (SELECT ...)` | ❌ | P3 |
+| Derived dentro de UPDATE/DELETE/INSERT | ❌ | P3 |
 
 ---
 

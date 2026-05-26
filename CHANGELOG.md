@@ -6,6 +6,50 @@
 
 ---
 
+## 2026-05-26 — Bloque H: derived tables + NOT IN + scalar subquery in SELECT + multi-predicate correlated
+
+> **Un push a `main`** que cierra los P0 + P1 del bloque H del roadmap (`docs/MISSING_COMMANDS.md` §4): derived tables `FROM (SELECT ...) AS alias`, `WHERE col NOT IN (SELECT ...)` con semántica ANSI 3VL, subqueries escalares en SELECT list (`SELECT id, (SELECT COUNT(*) FROM other) FROM t`), y `EXISTS` correlacionado dentro de combinadores `AND`/`OR`/`NOT` (levanta el bloqueo histórico `[GBY-4024]`).
+
+### 🆕 Sintaxis
+- `FROM (SELECT ...) AS sub` — derived tables (inline views) en el FROM o en el RHS de un JOIN; alias obligatorio (ANSI estricto, `[GBY-4048]`).
+- `WHERE col NOT IN (SELECT ...)` — first-class. Con NULL en la subquery devuelve NULL (3VL ANSI estricta: `5 NOT IN (1, NULL)` → NULL).
+- `SELECT id, (SELECT MAX(x) FROM t WHERE t.fk = outer.id) AS m FROM outer` — subquery escalar correlacionada en el SELECT list.
+- `WHERE EXISTS (...) AND otra_col = N`, `WHERE NOT EXISTS (...) OR ...`, `WHERE EXISTS (...) AND EXISTS (...)` — combinaciones correlated multi-predicado.
+
+### 🔧 AST + Parser
+- `SelectStmt` suma `derived_source: Option<Box<SelectStmt>>`; cuando es `Some`, `table` lleva el alias y la subquery se materializa antes del scan.
+- `TableRef` suma `derived: Option<Box<SelectStmt>>` para soportar derived en JOINs.
+- `WhereClause::In` suma `negated: bool` — el parser construye `negated=true` cuando ve `NOT IN (SELECT ...)`.
+- `Expr` suma `ScalarSubquery(Box<SelectStmt>)`. `parse_expr_primary` detecta `(` seguido de `SELECT` y la consume como subquery escalar.
+- Helpers `expr_contains_subquery` (walker) y `Engine::eval_expr_full` (evaluator engine-aware) — el caller usa fast-path `eval_expr` cuando el árbol no contiene subqueries (zero overhead) y delega al engine cuando sí.
+
+### 🚦 Executor
+- `Engine::materialize_derived_table` ejecuta la subquery del derived, infiere tipo por columna (mismo variant en todos los no-NULL → ese tipo; mezcla → TEXT fallback) y construye un `TableMeta` virtual + filas decodificadas. Nombres duplicados → `[GBY-4049]`.
+- `JoinTable` suma `virtual_rows: Option<Vec<HashMap<String, Value>>>`; `scan_qualified` las devuelve directamente sin hit al pager. `plan_index_loop` rechaza derived (no hay PK/índice real).
+- `exec_select` despacha al JOIN path cuando hay `derived_source` (aunque no haya JOINs explícitos) — reusa todo el pipeline materializado.
+- `eval_atom_single` ahora pushea el outer row al `outer_stack` al evaluar `Exists`/`EqColumnRef`/`In` correlados dentro de combinadores (antes solo el dispatch top-level lo hacía). Eso destraba `EXISTS` correlacionado en `AND`/`OR`/`NOT`.
+- `collect_in_set` + `eval_in_subquery` centralizan la lógica 3VL ANSI de `[NOT] IN (SELECT)` con tracking explícito de NULL.
+
+### ⚠️ Limitaciones residuales (futuros bloques)
+- `ALL`/`ANY`/`SOME` (`col > ALL (SELECT ...)`) — P2.
+- Correlated `col = outer.col` puro fuera de `EXISTS` combinado con JOINs — P2.
+- `LATERAL` joins — P3.
+- `WITH` / CTE — bloque W (planificado aparte).
+- Derived dentro de UPDATE/DELETE/INSERT — fuera de scope en H.
+
+### 🧰 Códigos de error nuevos
+- `4048` `DERIVED_TABLE_REQUIRES_ALIAS` — `FROM (SELECT ...)` sin alias.
+- `4049` `DERIVED_DUPLICATE_COLUMN` — derived table con dos columnas del mismo nombre.
+- `4050` `DERIVED_COLUMN_TYPE_AMBIGUOUS` — reservado para futura inferencia estricta de tipos en derived.
+- `4051` `SCALAR_SUBQUERY_IN_EXPR_REQUIRES_PARENS` — reservado para validaciones futuras.
+- `4024` `WHERE_COMBINATOR_CORRELATED_UNSUPPORTED` — DEPRECADO: el motor ya no lo genera (H levantó el bloqueo). Se conserva el slot por estabilidad del catálogo.
+
+### 🧪 Validación
+- 18 tests nuevos `h_*` cubriendo: derived basic / nested / con WHERE outer / con aggregate inside / join con persistente / alias requerido / duplicate column; NOT IN basic / NULL en subquery / NULL en outer; scalar subquery basic / correlated / too-many-rows / two-columns / no-rows-returns-null; correlated EXISTS AND/OR/two-EXISTS.
+- 233 tests integración total (215 pre-H + 18 H), `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` limpios.
+
+---
+
 ## 2026-05-26 — Bloque G3: aritméticos + concat + postfix Expr + funciones P2/P3
 
 > **Un push a `main`** que cierra la familia G: operadores binarios `+`/`-`/`*`/`/`/`%`, concatenación `||`, postfix predicates (`IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN`, `[NOT] BETWEEN`) sobre cualquier `Expr`, y las funciones escalares P2/P3 que quedaban abiertas en G1 — string (`TRIM`/`LTRIM`/`RTRIM`/`REPLACE`/`SPLIT_PART`), numéricas (`CEIL`/`FLOOR`/`MOD`/`POWER`/`SQRT`) y fecha (`DATE_ADD`/`DATE_SUB`/`DATEDIFF`/`EXTRACT`/`STRFTIME`).

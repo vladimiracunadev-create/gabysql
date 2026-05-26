@@ -169,11 +169,12 @@ pub mod codes {
     /// `NATURAL JOIN` cuyas tablas no comparten exactamente una columna por
     /// nombre. 0 columnas en común o >1 → error explícito en este release.
     pub const NATURAL_JOIN_NO_COMMON_COLUMN: u32 = 4023;
-    /// Predicado correlacionado (`EXISTS (… outer.col …)` o `col = outer.col`)
-    /// envuelto en `AND`/`OR`/`NOT` (Bloque E1). El dispatch correlacionado
-    /// solo se aplica cuando el predicado correlacionado es el único átomo
-    /// del WHERE; combinarlo con boolean operators queda para un bloque
-    /// posterior.
+    /// Reservado histórico. Hasta el bloque H (2026-05-26) este código
+    /// se emitía cuando un predicado correlacionado (`EXISTS (… outer.col …)`
+    /// o `col = outer.col`) aparecía envuelto en `AND`/`OR`/`NOT`. H1
+    /// habilita `EXISTS` correlacionado dentro de combinadores; el
+    /// código se conserva por estabilidad del catálogo (ADR de la sec. ##
+    /// Stability contract) pero el motor ya no lo genera.
     pub const WHERE_COMBINATOR_CORRELATED_UNSUPPORTED: u32 = 4024;
     /// Función agregada usada fuera del SELECT list o HAVING (Bloque F).
     /// `SUM(x) > 10` en `WHERE` o en `ORDER BY` no se acepta; debe ir en
@@ -269,6 +270,25 @@ pub mod codes {
     /// Bloque G3: `EXTRACT(<field> FROM ...)` con un campo que no es
     /// `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`.
     pub const EXTRACT_FIELD_INVALID: u32 = 4047;
+    /// Bloque H (2026-05-26): `FROM (SELECT ...)` sin alias. ANSI exige
+    /// que toda derived table tenga un nombre para poder referenciar sus
+    /// columnas; gabysql lo aplica estrictamente para que el resolver de
+    /// columnas no tenga ambigüedades.
+    pub const DERIVED_TABLE_REQUIRES_ALIAS: u32 = 4048;
+    /// Bloque H: `FROM (SELECT a, a FROM t) AS d` — la subquery de una
+    /// derived table proyecta dos columnas con el mismo nombre/alias.
+    /// Sin nombres únicos, el outer no puede referenciar las columnas
+    /// sin colisión.
+    pub const DERIVED_DUPLICATE_COLUMN: u32 = 4049;
+    /// Bloque H: una columna de una derived table mezcla valores de
+    /// tipos incompatibles (e.g. INT + TEXT en un UNION simulado). El
+    /// schema virtual cae a TEXT como compromiso pero deja este código
+    /// reservado para validaciones futuras más estrictas.
+    pub const DERIVED_COLUMN_TYPE_AMBIGUOUS: u32 = 4050;
+    /// Bloque H: subquery escalar en el SELECT list / Expr sin
+    /// paréntesis envolventes. `SELECT SELECT x FROM t` no se acepta;
+    /// debe ir `(SELECT x FROM t)`.
+    pub const SCALAR_SUBQUERY_IN_EXPR_REQUIRES_PARENS: u32 = 4051;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

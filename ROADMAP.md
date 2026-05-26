@@ -58,6 +58,7 @@
 - ~~funciones escalares en SELECT list (`LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `CONCAT`, `ABS`, `ROUND`, `NOW`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `COALESCE`, `NULLIF`, `IFNULL`, `IF`, `CAST`, `CASE`)~~ ✅ entregado (bloque **G1**, 2026-05-26). Extensión a `WHERE`/`HAVING`/`UPDATE SET` queda para G2.
 - ~~funciones escalares también en `WHERE` / `HAVING` / `UPDATE SET` / `DELETE WHERE` / `ON CONFLICT DO UPDATE SET`~~ ✅ entregado (bloque **G2**, 2026-05-26).
 - ~~aritméticos binarios (`+`/`-`/`*`/`/`/`%`), operador `||`, postfix `IS [NOT] NULL`/`[NOT] LIKE`/`[NOT] IN`/`[NOT] BETWEEN` sobre cualquier `Expr`, y funciones escalares P2/P3 (`TRIM`/`LTRIM`/`RTRIM`, `REPLACE`, `SPLIT_PART`, `CEIL`/`FLOOR`, `MOD`, `POWER`/`SQRT`, `DATE_ADD`/`DATE_SUB`, `DATEDIFF`, `EXTRACT`, `STRFTIME`)~~ ✅ entregado (bloque **G3**, 2026-05-26). Pendientes residuales menores: `EXCLUDED.col` en UPSERT (sub-pendiente J2-P2) y unary `-` prefix sobre expresión.
+- ~~subqueries restantes (P0+P1): derived tables `FROM (SELECT ...) AS sub`, `WHERE col NOT IN (SELECT ...)` con 3VL ANSI, subquery escalar en SELECT list (con correlated), y multi-predicate correlated EXISTS dentro de `AND`/`OR`/`NOT`~~ ✅ entregado (bloque **H**, 2026-05-26). Sub-pendientes para futuros bloques: `ALL`/`ANY`/`SOME` (P2), correlated `col = outer.col` puro fuera de `EXISTS` (P2), `LATERAL` (P3), `WITH` / CTE (bloque W aparte).
 
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats

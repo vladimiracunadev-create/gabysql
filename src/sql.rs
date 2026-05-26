@@ -230,7 +230,19 @@ pub struct SelectStmt {
     /// Base table del FROM. En SELECTs con JOIN sigue siendo "la primera"
     /// tabla declarada (las demás viven en `joins`). Se mantiene como
     /// `String` plano para no romper la API pública preexistente.
+    ///
+    /// Bloque H (2026-05-26): cuando `derived_source` es `Some`, este
+    /// campo contiene el **alias obligatorio** de la derived table en
+    /// vez del nombre de una tabla persistente. El executor consulta
+    /// `derived_source` primero — si está, materializa la subquery; si
+    /// no, abre `table` contra el catálogo como hasta ahora.
     pub table: String,
+    /// Bloque H: cuando es `Some(stmt)`, el FROM es una derived table
+    /// `(SELECT ...) AS <table>`. La subquery se materializa una sola
+    /// vez (no admite correlación con su propio outer) y se expone como
+    /// una tabla virtual cuyo nombre es `table`. ANSI exige el alias —
+    /// el parser devuelve `[GBY-4048]` si lo omite.
+    pub derived_source: Option<Box<SelectStmt>>,
     /// Alias opcional de la base table (`FROM alumnos a`). Aplica también
     /// cuando hay JOINs — es la forma estándar de des-ambiguar columnas.
     pub table_alias: Option<String>,
@@ -265,6 +277,11 @@ pub struct SelectStmt {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// Bloque H (2026-05-26): cuando es `Some`, el operand del JOIN es
+    /// una derived table `(SELECT ...) AS alias`. `name` lleva el alias,
+    /// `alias` es siempre `None` (la sintaxis pone el alias dentro del
+    /// constructor). El executor materializa antes de joinear.
+    pub derived: Option<Box<SelectStmt>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,6 +431,18 @@ pub enum Expr {
     /// tres operandos son `Expr`; promoción de tipos igual que
     /// `Compare`.
     Between(Box<Expr>, Box<Expr>, Box<Expr>, bool /* negated */),
+    /// Bloque H (2026-05-26): subquery escalar embebida en una expresión
+    /// del SELECT list / WHERE / HAVING / SET.
+    ///
+    /// La subquery debe devolver exactamente 1 columna y, en runtime, a
+    /// lo sumo 1 fila (0 → NULL, más de 1 → `[GBY-4014]`). Puede
+    /// referenciar columnas del outer scope vía el `outer_stack` del
+    /// engine (correlated). El parser solo la construye dentro de
+    /// paréntesis: `(SELECT MAX(x) FROM t)`. La evaluación requiere
+    /// acceso al engine, por lo que `eval_expr` puro devuelve error si
+    /// encuentra esta variante — el caller debe usar
+    /// `Engine::eval_expr_full`.
+    ScalarSubquery(Box<SelectStmt>),
 }
 
 /// Bloque G3: operadores binarios soportados por [`Expr::Arith`].
@@ -701,6 +730,7 @@ fn expr_default_label(expr: &Expr) -> String {
                 if *negated { "_not" } else { "" }
             )
         }
+        Expr::ScalarSubquery(_) => "scalar_subquery".to_string(),
     }
 }
 
@@ -764,6 +794,11 @@ pub enum WhereClause {
     In {
         column: String,
         subquery: Box<SelectStmt>,
+        /// Bloque H (2026-05-26): `NOT IN (SELECT ...)`. Semántica ANSI
+        /// estricta — si la subquery contiene algún NULL en su columna
+        /// proyectada, `col NOT IN (...)` devuelve NULL (3VL), no false.
+        /// Esto es importante: `5 NOT IN (1, 2, NULL)` ⇒ NULL.
+        negated: bool,
     },
     EqSubquery {
         column: String,
@@ -1793,6 +1828,368 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Bloque H (2026-05-26): evaluador de `Expr` con acceso al engine,
+    /// necesario para resolver `Expr::ScalarSubquery`. Para árboles sin
+    /// subqueries dispara la fast-path `eval_expr` (sin overhead) y solo
+    /// recursa per-variant cuando hay alguna subquery escondida en el
+    /// árbol.
+    ///
+    /// `outer_table_name` (cuando es `Some`) se usa como nombre de la
+    /// frame que se pushea en `outer_stack` antes de ejecutar cada
+    /// subquery — así una subquery correlacionada puede resolver
+    /// `outer.col` aunque la outer query haya proyectado columnas bare
+    /// sin qualifier.
+    fn eval_expr_full(
+        &mut self,
+        expr: &Expr,
+        row: &HashMap<String, Value>,
+        outer_table_name: Option<&str>,
+    ) -> DbResult<Value> {
+        if !expr_contains_subquery(expr) {
+            return eval_expr(expr, row);
+        }
+        match expr {
+            Expr::ScalarSubquery(sub) => {
+                let pushed = if let Some(name) = outer_table_name {
+                    self.outer_stack.push(OuterRow {
+                        table: name.to_string(),
+                        values: row.clone(),
+                    });
+                    true
+                } else {
+                    false
+                };
+                let inner_res = self.exec_select((**sub).clone());
+                if pushed {
+                    self.outer_stack.pop();
+                }
+                let inner = inner_res?;
+                if inner.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                            inner.columns.len()
+                        ),
+                    ));
+                }
+                if inner.rows.len() > 1 {
+                    return Err(coded(
+                        codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
+                        format!(
+                            "subquery escalar en SELECT/expr devolvió {} filas; debe devolver a lo sumo 1",
+                            inner.rows.len()
+                        ),
+                    ));
+                }
+                let scalar = inner.rows.into_iter().next().and_then(|mut r| r.pop());
+                Ok(scalar.unwrap_or(Value::Null))
+            }
+            Expr::Literal(_) | Expr::Column(_) => eval_expr(expr, row),
+            Expr::Func(f, args) => {
+                // Reusamos la dispatch logic de eval_expr para
+                // short-circuit (COALESCE/IF/IFNULL/NULLIF) — solo
+                // que evaluamos cada arg con eval_expr_full.
+                match f {
+                    ScalarFunc::Coalesce => {
+                        for a in args {
+                            let v = self.eval_expr_full(a, row, outer_table_name)?;
+                            if !matches!(v, Value::Null) {
+                                return Ok(v);
+                            }
+                        }
+                        Ok(Value::Null)
+                    }
+                    ScalarFunc::Ifnull => {
+                        let a = self.eval_expr_full(&args[0], row, outer_table_name)?;
+                        if matches!(a, Value::Null) {
+                            self.eval_expr_full(&args[1], row, outer_table_name)
+                        } else {
+                            Ok(a)
+                        }
+                    }
+                    ScalarFunc::If => {
+                        let cond = self.eval_expr_full(&args[0], row, outer_table_name)?;
+                        let truthy = match cond {
+                            Value::Bool(b) => b,
+                            Value::Null => false,
+                            other => {
+                                return Err(coded(
+                                    codes::SCALAR_FN_TYPE_MISMATCH,
+                                    format!(
+                                        "IF(cond,...): cond debe ser BOOL, recibí {}",
+                                        value_type_name(&other)
+                                    ),
+                                ));
+                            }
+                        };
+                        if truthy {
+                            self.eval_expr_full(&args[1], row, outer_table_name)
+                        } else {
+                            self.eval_expr_full(&args[2], row, outer_table_name)
+                        }
+                    }
+                    ScalarFunc::Nullif => {
+                        let a = self.eval_expr_full(&args[0], row, outer_table_name)?;
+                        let b = self.eval_expr_full(&args[1], row, outer_table_name)?;
+                        if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                            return Ok(a);
+                        }
+                        if values_equal(&a, &b) {
+                            Ok(Value::Null)
+                        } else {
+                            Ok(a)
+                        }
+                    }
+                    _ => {
+                        let mut evaluated = Vec::with_capacity(args.len());
+                        for a in args {
+                            evaluated.push(self.eval_expr_full(a, row, outer_table_name)?);
+                        }
+                        eval_scalar_fn(*f, evaluated)
+                    }
+                }
+            }
+            Expr::Cast(inner, ty) => {
+                let v = self.eval_expr_full(inner, row, outer_table_name)?;
+                cast_value(v, *ty)
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => match operand {
+                None => {
+                    for (cond, val) in branches {
+                        let c = self.eval_expr_full(cond, row, outer_table_name)?;
+                        match c {
+                            Value::Bool(true) => {
+                                return self.eval_expr_full(val, row, outer_table_name);
+                            }
+                            Value::Bool(false) | Value::Null => continue,
+                            other => {
+                                return Err(coded(
+                                    codes::CASE_BRANCH_TYPE_MISMATCH,
+                                    format!(
+                                        "CASE WHEN: la condición debe ser BOOL, recibí {}",
+                                        value_type_name(&other)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    match else_branch {
+                        Some(e) => self.eval_expr_full(e, row, outer_table_name),
+                        None => Ok(Value::Null),
+                    }
+                }
+                Some(op_expr) => {
+                    let op_val = self.eval_expr_full(op_expr, row, outer_table_name)?;
+                    for (when_val, then_val) in branches {
+                        let wv = self.eval_expr_full(when_val, row, outer_table_name)?;
+                        if values_equal(&op_val, &wv) {
+                            return self.eval_expr_full(then_val, row, outer_table_name);
+                        }
+                    }
+                    match else_branch {
+                        Some(e) => self.eval_expr_full(e, row, outer_table_name),
+                        None => Ok(Value::Null),
+                    }
+                }
+            },
+            Expr::Compare(lhs, op, rhs) => {
+                let a = self.eval_expr_full(lhs, row, outer_table_name)?;
+                let b = self.eval_expr_full(rhs, row, outer_table_name)?;
+                if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let cmp_op = match op {
+                    ExprCmpOp::Eq => return Ok(Value::Bool(values_equal(&a, &b))),
+                    ExprCmpOp::Ne => return Ok(Value::Bool(!values_equal(&a, &b))),
+                    ExprCmpOp::Lt => CompareOp::Lt,
+                    ExprCmpOp::Le => CompareOp::Le,
+                    ExprCmpOp::Gt => CompareOp::Gt,
+                    ExprCmpOp::Ge => CompareOp::Ge,
+                };
+                match eval_compare(Some(&a), cmp_op, &b) {
+                    Some(b) => Ok(Value::Bool(b)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Expr::IsNull(inner, negated) => {
+                let v = self.eval_expr_full(inner, row, outer_table_name)?;
+                let is_null = matches!(v, Value::Null);
+                Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+            }
+            Expr::Arith(lhs, op, rhs) => {
+                let a = self.eval_expr_full(lhs, row, outer_table_name)?;
+                let b = self.eval_expr_full(rhs, row, outer_table_name)?;
+                eval_arith(a, *op, b)
+            }
+            Expr::Like(lhs, pattern, negated) => {
+                let v = self.eval_expr_full(lhs, row, outer_table_name)?;
+                match eval_like(Some(&v), pattern, *negated) {
+                    Some(b) => Ok(Value::Bool(b)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Expr::InList(lhs, values, negated) => {
+                let v = self.eval_expr_full(lhs, row, outer_table_name)?;
+                match eval_in_list(Some(&v), values, *negated) {
+                    Some(b) => Ok(Value::Bool(b)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Expr::Between(lhs, lo, hi, negated) => {
+                let v = self.eval_expr_full(lhs, row, outer_table_name)?;
+                let lv = self.eval_expr_full(lo, row, outer_table_name)?;
+                let hv = self.eval_expr_full(hi, row, outer_table_name)?;
+                if matches!(v, Value::Null)
+                    || matches!(lv, Value::Null)
+                    || matches!(hv, Value::Null)
+                {
+                    return Ok(Value::Null);
+                }
+                let ge_lo = eval_compare(Some(&v), CompareOp::Ge, &lv);
+                let le_hi = eval_compare(Some(&v), CompareOp::Le, &hv);
+                match (ge_lo, le_hi) {
+                    (Some(a), Some(b)) => {
+                        let between = a && b;
+                        Ok(Value::Bool(if *negated { !between } else { between }))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+        }
+    }
+
+    /// Bloque H (2026-05-26): ejecuta la subquery de una derived table
+    /// y devuelve un schema virtual + filas decodificadas listas para
+    /// usar como JoinTable. La inferencia de tipo va columna-a-columna
+    /// sobre los valores observados: si todos los no-NULL comparten
+    /// variante → ese tipo; mezcla → TEXT como fallback documentado.
+    /// Columnas con nombres duplicados en el output de la subquery
+    /// disparan `[GBY-4049]`.
+    fn materialize_derived_table(
+        &mut self,
+        sub: &SelectStmt,
+        alias: &str,
+    ) -> DbResult<MaterializedDerived> {
+        let raw = self.exec_select((*sub).clone())?;
+        // Bloque H: cuando la subquery se ejecuta a través del JOIN
+        // path (`exec_select_joined`), las columnas vienen prefijadas
+        // con `qualifier.` para des-ambiguar. Para la derived table
+        // de un solo "scope interno" lo que quiere el outer es la
+        // columna sin prefijo (`id`, no `sub.id`) — eso le permite
+        // al outer referirla bare o con su propio alias. Quedan
+        // expuestas las dos formas: el output normalizado del schema
+        // virtual usa solo el sufijo después del último `.`.
+        let result = ResultSet {
+            columns: raw
+                .columns
+                .iter()
+                .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+                .collect(),
+            rows: raw.rows,
+            message: raw.message,
+        };
+        // Validar columnas únicas (case-insensitive sobre el ident).
+        let mut seen: HashSet<String> = HashSet::new();
+        for col in &result.columns {
+            let key = normalize_ident(col);
+            if !seen.insert(key) {
+                return Err(coded(
+                    codes::DERIVED_DUPLICATE_COLUMN,
+                    format!(
+                        "derived table '{}' proyecta dos columnas con el mismo nombre '{}' — \
+                         usá alias para des-ambiguar (`SELECT a AS x, b AS y`)",
+                        alias, col
+                    ),
+                ));
+            }
+        }
+        // Inferir tipo por columna: si todos los valores no-NULL son
+        // del mismo variant, ese tipo gana; mezcla → TEXT.
+        let n_cols = result.columns.len();
+        let mut inferred_types: Vec<Option<ColumnType>> = vec![None; n_cols];
+        let mut conflicting: Vec<bool> = vec![false; n_cols];
+        for row in &result.rows {
+            for (i, v) in row.iter().enumerate() {
+                let t = match v {
+                    Value::Null => continue,
+                    Value::Integer(_) => ColumnType::Int,
+                    Value::Float(_) => ColumnType::Float,
+                    Value::Bool(_) => ColumnType::Bool,
+                    Value::String(_) => ColumnType::Text,
+                };
+                match inferred_types[i] {
+                    None => inferred_types[i] = Some(t),
+                    Some(prev) if prev == t => {}
+                    Some(_) => conflicting[i] = true,
+                }
+            }
+        }
+        let columns: Vec<Column> = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let ty = if conflicting[i] {
+                    ColumnType::Text
+                } else {
+                    inferred_types[i].unwrap_or(ColumnType::Text)
+                };
+                Column::plain(name.clone(), ty)
+            })
+            .collect();
+        let primary_key = columns.first().map(|c| c.name.clone()).unwrap_or_default();
+        let meta = TableMeta {
+            name: alias.to_string(),
+            primary_key,
+            columns,
+            root_page: 0,
+            indexes: Vec::new(),
+        };
+        // Decodificar filas a HashMap<colname-normalizado, Value>.
+        let rows: Vec<HashMap<String, Value>> = result
+            .rows
+            .into_iter()
+            .map(|r| {
+                result
+                    .columns
+                    .iter()
+                    .zip(r)
+                    .map(|(name, val)| (normalize_ident(name), val))
+                    .collect()
+            })
+            .collect();
+        Ok(MaterializedDerived { meta, rows })
+    }
+
+    /// Bloque H: proyecta una fila contra una lista de `Projection`,
+    /// delegando expresiones a `eval_expr_full` (que puede ejecutar
+    /// subqueries escalares). Las `BareColumn` siguen el lookup directo.
+    fn project_row_with_engine(
+        &mut self,
+        projections: &[Projection],
+        row: &HashMap<String, Value>,
+        outer_table_name: Option<&str>,
+    ) -> DbResult<Vec<Value>> {
+        let mut out = Vec::with_capacity(projections.len());
+        for p in projections {
+            let value = match p {
+                Projection::BareColumn { key, .. } => row.get(key).cloned().ok_or_else(|| {
+                    DbError::new(format!("columna no encontrada en fila: {}", key))
+                })?,
+                Projection::Expression { expr, .. } => {
+                    self.eval_expr_full(expr, row, outer_table_name)?
+                }
+            };
+            out.push(value);
+        }
+        Ok(out)
+    }
+
     /// Look up `ref_table.ref_column` against the current `outer_stack`.
     /// With an explicit `ref_table`, returns the value from the most-recent
     /// frame whose table name matches (case-insensitive). Without one,
@@ -1844,7 +2241,12 @@ impl<'a> Engine<'a> {
         // combinado, WHERE como post-filter). El single-table path queda
         // exactamente como estaba — sin regresión en performance ni
         // semántica para queries que no usan JOIN.
-        if !stmt.joins.is_empty() {
+        //
+        // Bloque H (2026-05-26): si el FROM es una derived table (con o
+        // sin JOINs), también delegamos al pipeline del JOIN — opera
+        // sobre filas materializadas en HashMap que es exactamente lo
+        // que necesitamos para una virtual table sin pager.
+        if !stmt.joins.is_empty() || stmt.derived_source.is_some() {
             return self.exec_select_joined(stmt);
         }
         let meta = {
@@ -1907,14 +2309,24 @@ impl<'a> Engine<'a> {
             Some(expr) => {
                 let force = match expr.as_atom() {
                     None => true,
-                    Some(atom) => matches!(
-                        atom,
-                        WhereClause::Compare { .. }
-                            | WhereClause::Like { .. }
-                            | WhereClause::IsNull { .. }
-                            | WhereClause::InList { .. }
-                            | WhereClause::ExprPredicate { .. }
-                    ),
+                    Some(atom) => {
+                        matches!(
+                            atom,
+                            WhereClause::Compare { .. }
+                                | WhereClause::Like { .. }
+                                | WhereClause::IsNull { .. }
+                                | WhereClause::InList { .. }
+                                | WhereClause::ExprPredicate { .. }
+                        ) || matches!(
+                            atom,
+                            // Bloque H: `NOT IN (SELECT ...)` cae al
+                            // post-filter genérico — la fast-path indexada
+                            // solo cubre `IN` afirmativo (devuelve PKs
+                            // matched); negar matched-PKs no es trivial
+                            // sobre el cursor.
+                            WhereClause::In { negated: true, .. }
+                        )
+                    }
                 };
                 if force {
                     Some(expr.clone())
@@ -2009,8 +2421,12 @@ impl<'a> Engine<'a> {
                         ));
                     }
                 }
-                Some(WhereClause::In { column, subquery }) => {
-                    // Non-correlated IN: execute the subquery once, materialize
+                Some(WhereClause::In {
+                    column,
+                    subquery,
+                    negated: false,
+                }) => {
+                    // Non-correlated IN (afirmativo): execute the subquery once, materialize
                     // its single-column result, then turn each value into a PK
                     // (direct or via secondary index lookup). The Plan stays
                     // `ByPks`, so the existing row-fetch path handles ORDER BY,
@@ -2200,7 +2616,9 @@ impl<'a> Engine<'a> {
                 | Some(WhereClause::Like { .. })
                 | Some(WhereClause::IsNull { .. })
                 | Some(WhereClause::InList { .. })
-                | Some(WhereClause::ExprPredicate { .. }) => Plan::FullScan,
+                | Some(WhereClause::ExprPredicate { .. })
+                // Bloque H: NOT IN (SELECT) cae al generic_post_filter.
+                | Some(WhereClause::In { negated: true, .. }) => Plan::FullScan,
             }
         };
 
@@ -2353,9 +2771,19 @@ impl<'a> Engine<'a> {
 
         let mut rows: Vec<(HashMap<String, Value>, Vec<Value>)> =
             Vec::with_capacity(rows_bytes.len());
+        let outer_name = meta.name.clone();
         for kv in rows_bytes {
             let decoded = decode_row(&meta, &kv.value)?;
-            let projected = project_row(&selected_columns, &decoded)?;
+            // Bloque H: la proyección puede contener subqueries escalares
+            // (`SELECT (SELECT ... FROM other) FROM t`); cuando es el
+            // caso, evaluamos cada Expr con el engine para que la
+            // subquery se ejecute. Para árboles sin subquery se preserva
+            // el fast-path pre-H (`project_row`) sin overhead.
+            let projected = self.project_row_with_engine(
+                &selected_columns,
+                &decoded,
+                Some(outer_name.as_str()),
+            )?;
             rows.push((decoded, projected));
         }
 
@@ -2557,12 +2985,18 @@ impl<'a> Engine<'a> {
         let windowed: Vec<HashMap<String, Value>> =
             current.into_iter().skip(stmt.offset).take(take).collect();
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(windowed.len());
+        // Bloque H: para JOINs no tenemos un solo "outer table name"
+        // — la subquery escalar correlacionada en SELECT sobre un JOIN
+        // queda fuera del alcance de este release; pasamos `None` y
+        // delegamos a `eval_expr_full` que evaluará la subquery sin
+        // pushear frame. Una subquery sin outer refs funciona; una con
+        // outer refs caería en `[GBY-4016]`.
         for row in windowed {
             let mut out = Vec::with_capacity(projected_keys.len());
             for p in &projected_keys {
                 let v = match p {
                     JoinedProjection::Key(k) => row.get(k).cloned().unwrap_or(Value::Null),
-                    JoinedProjection::Expr(e) => eval_expr(e, &row)?,
+                    JoinedProjection::Expr(e) => self.eval_expr_full(e, &row, None)?,
                 };
                 out.push(v);
             }
@@ -2695,6 +3129,18 @@ impl<'a> Engine<'a> {
     }
 
     fn scan_qualified(&mut self, entry: &JoinTable) -> DbResult<Vec<HashMap<String, Value>>> {
+        // Bloque H: derived table — las filas ya están materializadas.
+        if let Some(rows) = entry.virtual_rows.as_ref() {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut qualified = HashMap::with_capacity(row.len());
+                for (col, val) in row {
+                    qualified.insert(format!("{}.{}", entry.qualifier, col), val.clone());
+                }
+                out.push(qualified);
+            }
+            return Ok(out);
+        }
         let raw = {
             let mut catalog = Catalog::open(self.pager);
             catalog.scan_rows(entry.meta.root_page, 0, None)?
@@ -2716,11 +3162,21 @@ impl<'a> Engine<'a> {
     /// (alias preferido; nombre real si no hay alias).
     fn build_join_scope(&mut self, stmt: &SelectStmt) -> DbResult<JoinScope> {
         let mut tables: Vec<JoinTable> = Vec::with_capacity(1 + stmt.joins.len());
-        let base = {
-            let mut catalog = Catalog::open(self.pager);
-            catalog
-                .get_table(&stmt.table)?
-                .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+        // Bloque H: la base table puede ser una derived table. La
+        // materializamos primero (ejecutando la subquery) y construimos
+        // un `TableMeta` virtual cuyas columnas vienen de la headers
+        // del ResultSet.
+        let (base_meta, base_virtual_rows) = if let Some(sub) = stmt.derived_source.as_ref() {
+            let materialized = self.materialize_derived_table(sub, &stmt.table)?;
+            (materialized.meta, Some(materialized.rows))
+        } else {
+            let m = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog
+                    .get_table(&stmt.table)?
+                    .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
+            };
+            (m, None)
         };
         let base_qualifier = stmt
             .table_alias
@@ -2728,17 +3184,25 @@ impl<'a> Engine<'a> {
             .unwrap_or_else(|| stmt.table.clone())
             .to_ascii_lowercase();
         tables.push(JoinTable {
-            meta: base,
+            meta: base_meta,
             qualifier: base_qualifier.clone(),
             raw_name: stmt.table.clone(),
             alias: stmt.table_alias.clone(),
+            virtual_rows: base_virtual_rows,
         });
         for join in &stmt.joins {
-            let meta = {
-                let mut catalog = Catalog::open(self.pager);
-                catalog
-                    .get_table(&join.right.name)?
-                    .ok_or_else(|| DbError::new(format!("tabla no existe: {}", join.right.name)))?
+            // Bloque H: el RHS de un JOIN también puede ser derived.
+            let (meta, virtual_rows) = if let Some(sub) = join.right.derived.as_ref() {
+                let materialized = self.materialize_derived_table(sub, &join.right.name)?;
+                (materialized.meta, Some(materialized.rows))
+            } else {
+                let m = {
+                    let mut catalog = Catalog::open(self.pager);
+                    catalog.get_table(&join.right.name)?.ok_or_else(|| {
+                        DbError::new(format!("tabla no existe: {}", join.right.name))
+                    })?
+                };
+                (m, None)
             };
             let qualifier = join
                 .right
@@ -2761,6 +3225,7 @@ impl<'a> Engine<'a> {
                 qualifier,
                 raw_name: join.right.name.clone(),
                 alias: join.right.alias.clone(),
+                virtual_rows,
             });
         }
         Ok(JoinScope {
@@ -2870,7 +3335,11 @@ impl<'a> Engine<'a> {
                     _ => Ok(Some(false)),
                 }
             }
-            WhereClause::In { column, subquery } => {
+            WhereClause::In {
+                column,
+                subquery,
+                negated,
+            } => {
                 let key = resolve_joined_column_key(scope, column)?;
                 let inner = self.exec_select((**subquery).clone())?;
                 if inner.columns.len() != 1 {
@@ -2882,16 +3351,8 @@ impl<'a> Engine<'a> {
                         ),
                     ));
                 }
-                let set: Vec<Value> = inner
-                    .rows
-                    .into_iter()
-                    .filter_map(|mut r| r.pop())
-                    .filter(|v| !matches!(v, Value::Null))
-                    .collect();
-                match row.get(&key) {
-                    Some(Value::Null) | None => Ok(None),
-                    Some(v) => Ok(Some(set.iter().any(|s| values_equal(v, s)))),
-                }
+                let (set, had_null) = collect_in_set(inner.rows);
+                Ok(eval_in_subquery(row.get(&key), &set, had_null, *negated))
             }
             WhereClause::EqSubquery { column, subquery } => {
                 let key = resolve_joined_column_key(scope, column)?;
@@ -2987,7 +3448,11 @@ impl<'a> Engine<'a> {
                     })
                     .collect())
             }
-            WhereClause::In { column, subquery } => {
+            WhereClause::In {
+                column,
+                subquery,
+                negated,
+            } => {
                 let key = resolve_joined_column_key(scope, column)?;
                 let inner = self.exec_select((**subquery).clone())?;
                 if inner.columns.len() != 1 {
@@ -2999,18 +3464,15 @@ impl<'a> Engine<'a> {
                         ),
                     ));
                 }
-                let set: Vec<Value> = inner
-                    .rows
-                    .into_iter()
-                    .filter_map(|mut r| r.pop())
-                    .filter(|v| !matches!(v, Value::Null))
-                    .collect();
+                let (set, had_null) = collect_in_set(inner.rows);
+                let neg = *negated;
                 Ok(rows
                     .into_iter()
                     .filter(|r| {
-                        r.get(&key)
-                            .map(|v| set.iter().any(|s| values_equal(v, s)))
-                            .unwrap_or(false)
+                        matches!(
+                            eval_in_subquery(r.get(&key), &set, had_null, neg),
+                            Some(true)
+                        )
                     })
                     .collect())
             }
@@ -3145,16 +3607,31 @@ impl<'a> Engine<'a> {
                     _ => Ok(Some(false)),
                 }
             }
-            WhereClause::In { column, subquery } => {
+            WhereClause::In {
+                column,
+                subquery,
+                negated,
+            } => {
                 let key = normalize_ident(column);
                 ensure_column_visible(meta, &key, column, row)?;
-                // NOTA E1: la subquery se re-ejecuta por cada fila del
-                // outer cuando vive dentro de un AND/OR/NOT. Es correcto
-                // pero no óptimo — un caching pre-loop queda para futuros
-                // bloques (H optimiza subqueries; este bloque prioriza
-                // semántica). La fast-path single-átomo del exec_select
-                // sigue sin pagar este costo.
-                let inner = self.exec_select((**subquery).clone())?;
+                // Bloque H: si la subquery es correlacionada, pusheamos
+                // el outer row para que `outer.col` resuelva. Cuando es
+                // afirmativo, NULL en la subquery se descarta y la
+                // membresía se evalúa por presencia; cuando es NOT IN,
+                // la semántica ANSI exige propagar NULL si la subquery
+                // contiene algún NULL (3VL estricta).
+                let is_correlated = subquery_has_outer_refs(subquery);
+                if is_correlated {
+                    self.outer_stack.push(OuterRow {
+                        table: meta.name.clone(),
+                        values: row.clone(),
+                    });
+                }
+                let inner_res = self.exec_select((**subquery).clone());
+                if is_correlated {
+                    self.outer_stack.pop();
+                }
+                let inner = inner_res?;
                 if inner.columns.len() != 1 {
                     return Err(coded(
                         codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
@@ -3164,16 +3641,8 @@ impl<'a> Engine<'a> {
                         ),
                     ));
                 }
-                let set: Vec<Value> = inner
-                    .rows
-                    .into_iter()
-                    .filter_map(|mut r| r.pop())
-                    .filter(|v| !matches!(v, Value::Null))
-                    .collect();
-                match row.get(&key) {
-                    Some(Value::Null) | None => Ok(None),
-                    Some(v) => Ok(Some(set.iter().any(|s| values_equal(v, s)))),
-                }
+                let (set, had_null) = collect_in_set(inner.rows);
+                Ok(eval_in_subquery(row.get(&key), &set, had_null, *negated))
             }
             WhereClause::EqSubquery { column, subquery } => {
                 let key = normalize_ident(column);
@@ -3206,28 +3675,45 @@ impl<'a> Engine<'a> {
                 }
             }
             WhereClause::Exists { subquery, negated } => {
-                // EXISTS dentro de combinadores: solo soportamos
-                // no-correlacionado en este release. Correlated EXISTS
-                // dentro de AND/OR/NOT requiere un dispatch más complejo
-                // (push del outer row antes de cada eval) que queda
-                // explícitamente fuera de E1.
-                if subquery_has_outer_refs(subquery) {
-                    return Err(coded(
-                        codes::WHERE_COMBINATOR_CORRELATED_UNSUPPORTED,
-                        "EXISTS correlacionado dentro de AND/OR/NOT no se soporta en \
-                         este release; usalo como único predicado del WHERE",
-                    ));
+                // Bloque H (2026-05-26): EXISTS dentro de combinadores
+                // soporta tanto no-correlacionado como correlacionado.
+                // Para el correlacionado pusheamos el outer row en
+                // `outer_stack` antes de re-ejecutar la subquery y
+                // popeamos al terminar (siempre balanceado, incluso si
+                // la subquery falla).
+                let is_correlated = subquery_has_outer_refs(subquery);
+                if is_correlated {
+                    self.outer_stack.push(OuterRow {
+                        table: meta.name.clone(),
+                        values: row.clone(),
+                    });
                 }
-                let inner = self.exec_select((**subquery).clone())?;
+                let inner_res = self.exec_select((**subquery).clone());
+                if is_correlated {
+                    self.outer_stack.pop();
+                }
+                let inner = inner_res?;
                 let has_rows = !inner.rows.is_empty();
                 let pass = if *negated { !has_rows } else { has_rows };
                 Ok(Some(pass))
             }
-            WhereClause::EqColumnRef { .. } => Err(coded(
-                codes::WHERE_COMBINATOR_CORRELATED_UNSUPPORTED,
-                "referencias a columnas del outer dentro de AND/OR/NOT no se soportan \
-                 en este release; el column-ref correlacionado debe ser el único predicado",
-            )),
+            WhereClause::EqColumnRef {
+                column,
+                ref_table,
+                ref_column,
+            } => {
+                // Bloque H: dentro de un combinador (AND/OR/NOT) la
+                // forma `inner_col = outer.col` se resuelve contra el
+                // outer_stack y se compara con el valor presente en la
+                // fila inner actual.
+                let key = normalize_ident(column);
+                ensure_column_visible(meta, &key, column, row)?;
+                let outer_val = self.resolve_outer_ref(ref_table.as_deref(), ref_column)?;
+                match (row.get(&key), &outer_val) {
+                    (Some(Value::Null), _) | (None, _) | (_, Value::Null) => Ok(None),
+                    (Some(v), other) => Ok(Some(values_equal(v, other))),
+                }
+            }
             WhereClause::Compare { column, op, value } => {
                 let key = normalize_ident(column);
                 ensure_column_visible(meta, &key, column, row)?;
@@ -3257,7 +3743,26 @@ impl<'a> Engine<'a> {
                 ensure_column_visible(meta, &key, column, row)?;
                 Ok(eval_in_list(row.get(&key), values, *negated))
             }
-            WhereClause::ExprPredicate { expr } => eval_expr_as_predicate(expr, row),
+            WhereClause::ExprPredicate { expr } => {
+                // Bloque H: si el árbol contiene subqueries escalares,
+                // dispatch al evaluador con engine; sino, fast-path.
+                if expr_contains_subquery(expr) {
+                    let v = self.eval_expr_full(expr, row, Some(meta.name.as_str()))?;
+                    match v {
+                        Value::Bool(b) => Ok(Some(b)),
+                        Value::Null => Ok(None),
+                        other => Err(coded(
+                            codes::WHERE_EXPR_NOT_BOOLEAN,
+                            format!(
+                                "expresión en WHERE/HAVING debe evaluar a BOOL (o NULL), recibí {}",
+                                value_type_name(&other)
+                            ),
+                        )),
+                    }
+                } else {
+                    eval_expr_as_predicate(expr, row)
+                }
+            }
         }
     }
 
@@ -4545,20 +5050,10 @@ impl Projection {
     }
 }
 
-fn project_row(projections: &[Projection], row: &HashMap<String, Value>) -> DbResult<Vec<Value>> {
-    let mut out = Vec::with_capacity(projections.len());
-    for p in projections {
-        let value = match p {
-            Projection::BareColumn { key, .. } => row
-                .get(key)
-                .cloned()
-                .ok_or_else(|| DbError::new(format!("columna no encontrada en fila: {}", key)))?,
-            Projection::Expression { expr, .. } => eval_expr(expr, row)?,
-        };
-        out.push(value);
-    }
-    Ok(out)
-}
+// Bloque H (2026-05-26): la antigua `project_row` libre fue reemplazada
+// por `Engine::project_row_with_engine`, que puede ejecutar
+// `Expr::ScalarSubquery`. Conservar la firma libre causaba código
+// muerto — el dispatch ahora siempre pasa por el engine.
 
 fn resolve_selected_columns(
     meta: &TableMeta,
@@ -4680,6 +5175,11 @@ fn validate_expr_columns(expr: &Expr, meta: &TableMeta) -> DbResult<()> {
             validate_expr_columns(hi, meta)?;
             Ok(())
         }
+        // Bloque H: la validación temprana no entra a la subquery
+        // (su propio executor valida sus columnas contra su propio
+        // schema en runtime, y además puede referenciar `outer.col`
+        // que aún no está resuelto acá).
+        Expr::ScalarSubquery(_) => Ok(()),
     }
 }
 
@@ -5348,6 +5848,19 @@ struct JoinTable {
     /// solo si la tabla NO tiene alias declarado (regla SQL standard).
     raw_name: String,
     alias: Option<String>,
+    /// Bloque H (2026-05-26): cuando este JoinTable proviene de una
+    /// derived table `(SELECT ...) AS alias`, aquí viven las filas ya
+    /// materializadas (decoded). `scan_qualified` las devuelve en lugar
+    /// de hacer FullScan contra el pager. El index-loop plan no aplica
+    /// — el `meta` virtual no tiene ni PK ni índices.
+    virtual_rows: Option<Vec<HashMap<String, Value>>>,
+}
+
+/// Bloque H (2026-05-26): salida de `materialize_derived_table` —
+/// schema virtual + filas decodificadas listas para usar.
+struct MaterializedDerived {
+    meta: TableMeta,
+    rows: Vec<HashMap<String, Value>>,
 }
 
 /// Plan de ejecución index-loop para un JOIN específico. Solo se construye
@@ -5377,6 +5890,13 @@ fn plan_index_loop(
     pred: &JoinPredicate,
 ) -> DbResult<Option<IndexLoopPlan>> {
     let right = &scope.tables[join_idx + 1];
+    // Bloque H: las derived tables no tienen pager-backed storage —
+    // el index-loop fast-path no aplica. Caemos al nested-loop con
+    // las filas virtuales ya materializadas (scan_qualified las
+    // devuelve directamente).
+    if right.virtual_rows.is_some() {
+        return Ok(None);
+    }
     let left_candidate = column_ref_to_raw(&pred.left);
     let right_candidate = column_ref_to_raw(&pred.right);
     // Tratamos las dos orientaciones del predicate: `left.col = right.col`
@@ -5415,6 +5935,7 @@ fn plan_index_loop(
                     qualifier: t.qualifier.clone(),
                     raw_name: t.raw_name.clone(),
                     alias: t.alias.clone(),
+                    virtual_rows: t.virtual_rows.clone(),
                 })
                 .collect(),
             hidden_in_star: HashSet::new(),
@@ -5700,6 +6221,10 @@ fn rewrite_expr_columns_for_join(expr: Expr, scope: &JoinScope) -> DbResult<Expr
             Box::new(rewrite_expr_columns_for_join(*hi, scope)?),
             neg,
         )),
+        // Bloque H: la subquery vive en su propio scope; el rewriting
+        // de qualifiers no debe descender dentro de ella. El engine la
+        // ejecuta con su propio `parse_select_stmt`/`build_join_scope`.
+        Expr::ScalarSubquery(sub) => Ok(Expr::ScalarSubquery(sub)),
     }
 }
 
@@ -5910,6 +6435,57 @@ fn eval_in_list(lhs: Option<&Value>, values: &[Value], negated: bool) -> Option<
         Some(false)
     };
     in_result.map(|b| if negated { !b } else { b })
+}
+
+/// Bloque H (2026-05-26): materializa el set proyectado por una subquery
+/// en `IN (SELECT ...)`. Devuelve los valores no-NULL como `Vec<Value>`
+/// y, separadamente, si la subquery contenía algún NULL. El flag lo
+/// usa `eval_in_subquery` para aplicar la 3VL ANSI en `NOT IN`:
+/// `5 NOT IN (1, NULL)` → NULL, no true.
+fn collect_in_set(rows: Vec<Vec<Value>>) -> (Vec<Value>, bool) {
+    let mut set = Vec::with_capacity(rows.len());
+    let mut had_null = false;
+    for mut r in rows {
+        if let Some(v) = r.pop() {
+            if matches!(v, Value::Null) {
+                had_null = true;
+            } else {
+                set.push(v);
+            }
+        }
+    }
+    (set, had_null)
+}
+
+/// Bloque H: evalúa `lhs [NOT] IN (subquery_set)` con semántica ANSI
+/// trivaluada. Reglas:
+/// - `lhs` NULL → NULL (3VL clásica).
+/// - Afirmativo `IN`: true si está en el set; false si no (los NULL de
+///   la subquery se ignoran por completo).
+/// - `NOT IN`: si el set tiene match → false; si no hay match y la
+///   subquery contenía algún NULL → NULL (estricta ANSI); si no hay
+///   match y no había NULL → true.
+fn eval_in_subquery(
+    lhs: Option<&Value>,
+    set: &[Value],
+    had_null: bool,
+    negated: bool,
+) -> Option<bool> {
+    let lhs = lhs?;
+    if matches!(lhs, Value::Null) {
+        return None;
+    }
+    let matched = set.iter().any(|v| values_equal(lhs, v));
+    if !negated {
+        return Some(matched);
+    }
+    if matched {
+        Some(false)
+    } else if had_null {
+        None
+    } else {
+        Some(true)
+    }
 }
 
 /// Bloque J2: resultado de aplicar un row del INSERT cuando hay
@@ -6407,6 +6983,48 @@ fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
                 }
                 _ => Ok(Value::Null),
             }
+        }
+        Expr::ScalarSubquery(_) => Err(coded(
+            codes::WHERE_OPERATOR_UNSUPPORTED,
+            "subquery escalar dentro de Expr requiere el path con engine \
+             (`Engine::eval_expr_full`); este caller la invocó con la firma pura",
+        )),
+    }
+}
+
+/// Bloque H: walker que detecta si un árbol `Expr` contiene alguna
+/// `ScalarSubquery` en cualquier nivel. Lo usa el dispatcher de
+/// proyección y de WHERE/HAVING para decidir si vale el fast-path
+/// `eval_expr` (sin engine) o si hay que ir por `eval_expr_full`.
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarSubquery(_) => true,
+        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Func(_, args) => args.iter().any(expr_contains_subquery),
+        Expr::Cast(inner, _) | Expr::IsNull(inner, _) => expr_contains_subquery(inner),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand
+                .as_deref()
+                .map(expr_contains_subquery)
+                .unwrap_or(false)
+                || branches
+                    .iter()
+                    .any(|(c, v)| expr_contains_subquery(c) || expr_contains_subquery(v))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_subquery)
+                    .unwrap_or(false)
+        }
+        Expr::Compare(a, _, b) | Expr::Arith(a, _, b) => {
+            expr_contains_subquery(a) || expr_contains_subquery(b)
+        }
+        Expr::Like(inner, _, _) | Expr::InList(inner, _, _) => expr_contains_subquery(inner),
+        Expr::Between(a, b, c, _) => {
+            expr_contains_subquery(a) || expr_contains_subquery(b) || expr_contains_subquery(c)
         }
     }
 }
@@ -8124,8 +8742,47 @@ impl Parser {
         let columns = self.parse_select_list()?;
         self.expect_keyword("FROM")?;
         // Base table + alias opcional (`AS` aceptado pero opcional).
-        let table = self.expect_ident()?;
-        let table_alias = self.try_parse_alias()?;
+        // Bloque H: el FROM puede arrancar con una derived table
+        // `(SELECT ...) [AS] alias`. En ese caso el "table" es solo el
+        // alias y `derived_source` lleva la subquery. El alias es
+        // obligatorio (ANSI estricto, `[GBY-4048]`).
+        let (table, table_alias, derived_source) = if self.peek().kind == TokenKind::Symbol
+            && self.peek().text == "("
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .map(|t| t.kind == TokenKind::Ident && t.text.eq_ignore_ascii_case("SELECT"))
+                .unwrap_or(false)
+        {
+            self.expect_symbol("(")?;
+            self.expect_keyword("SELECT")?;
+            let sub = self.parse_select_stmt()?;
+            self.expect_symbol(")")?;
+            // Alias OBLIGATORIO. Acepta `AS alias` o `alias` bare.
+            let alias = if self.match_keyword("AS") {
+                Some(self.expect_ident()?)
+            } else if self.peek().kind == TokenKind::Ident
+                && !is_select_terminator_keyword(&self.peek().text)
+            {
+                let a = self.peek().text.clone();
+                self.pos += 1;
+                Some(a)
+            } else {
+                None
+            };
+            let alias = alias.ok_or_else(|| {
+                coded(
+                    codes::DERIVED_TABLE_REQUIRES_ALIAS,
+                    "derived table `(SELECT ...)` requiere un alias obligatorio \
+                     (`(SELECT ...) AS sub`); ANSI no permite omitirlo",
+                )
+            })?;
+            (alias, None, Some(Box::new(sub)))
+        } else {
+            let t = self.expect_ident()?;
+            let a = self.try_parse_alias()?;
+            (t, a, None)
+        };
 
         // Cero o más JOINs en cadena. Aceptamos tres formas:
         //   - `, b` (comma-syntax) → CROSS JOIN sin ON
@@ -8169,11 +8826,50 @@ impl Parser {
             if !parsed {
                 break;
             }
-            let right_name = self.expect_ident()?;
-            let right_alias = self.try_parse_alias()?;
-            let right = TableRef {
-                name: right_name,
-                alias: right_alias,
+            // Bloque H: el RHS de un JOIN también puede ser una derived
+            // table. Alias obligatorio.
+            let right = if self.peek().kind == TokenKind::Symbol
+                && self.peek().text == "("
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|t| t.kind == TokenKind::Ident && t.text.eq_ignore_ascii_case("SELECT"))
+                    .unwrap_or(false)
+            {
+                self.expect_symbol("(")?;
+                self.expect_keyword("SELECT")?;
+                let sub = self.parse_select_stmt()?;
+                self.expect_symbol(")")?;
+                let alias = if self.match_keyword("AS") {
+                    Some(self.expect_ident()?)
+                } else if self.peek().kind == TokenKind::Ident
+                    && !is_select_terminator_keyword(&self.peek().text)
+                {
+                    let a = self.peek().text.clone();
+                    self.pos += 1;
+                    Some(a)
+                } else {
+                    None
+                };
+                let alias = alias.ok_or_else(|| {
+                    coded(
+                        codes::DERIVED_TABLE_REQUIRES_ALIAS,
+                        "derived table en JOIN requiere alias obligatorio",
+                    )
+                })?;
+                TableRef {
+                    name: alias,
+                    alias: None,
+                    derived: Some(Box::new(sub)),
+                }
+            } else {
+                let right_name = self.expect_ident()?;
+                let right_alias = self.try_parse_alias()?;
+                TableRef {
+                    name: right_name,
+                    alias: right_alias,
+                    derived: None,
+                }
             };
             // Resolución de la cláusula del JOIN — pueden venir ON, USING
             // o nada (CROSS o NATURAL). Mutuamente excluyentes.
@@ -8324,6 +9020,7 @@ impl Parser {
 
         Ok(SelectStmt {
             table,
+            derived_source,
             table_alias,
             joins,
             columns,
@@ -8619,8 +9316,20 @@ impl Parser {
             self.pos += 1;
             return Ok(Expr::Literal(Value::String(head.text)));
         }
-        // Paréntesis: expresión anidada.
+        // Paréntesis: o bien expresión anidada, o bien una subquery
+        // escalar (Bloque H). Detectamos el caso `(SELECT ...)` por
+        // lookahead — el resto sigue siendo una sub-expresión común.
         if head.kind == TokenKind::Symbol && head.text == "(" {
+            let after = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                kind: TokenKind::Eof,
+                text: String::new(),
+            });
+            if after.kind == TokenKind::Ident && after.text.eq_ignore_ascii_case("SELECT") {
+                self.pos += 2; // consume `(` + `SELECT`
+                let subquery = self.parse_select_stmt()?;
+                self.expect_symbol(")")?;
+                return Ok(Expr::ScalarSubquery(Box::new(subquery)));
+            }
             self.pos += 1;
             let inner = self.parse_expr()?;
             self.expect_symbol(")")?;
@@ -9120,22 +9829,15 @@ impl Parser {
             self.pos += 1;
             let subquery = self.parse_select_stmt()?;
             self.expect_symbol(")")?;
-            if negated {
-                // `NOT IN (SELECT ...)` aún no se desugara a un átomo
-                // dedicado en este release — el bloque H del roadmap lo
-                // generaliza junto con NOT IN correlacionado. Acá lo
-                // rechazamos explícitamente para no devolver semántica
-                // silenciosamente incorrecta.
-                return Err(coded(
-                    codes::WHERE_OPERATOR_UNSUPPORTED,
-                    "NOT IN (SELECT ...) no se soporta en este release; usar IN (SELECT ...) \
-                     dentro de NOT (...) tiene semántica distinta (3VL con NULLs) — esperar \
-                     al bloque H del roadmap",
-                ));
-            }
+            // Bloque H (2026-05-26): `NOT IN (SELECT ...)` ahora es un
+            // first-class atom — `negated` se propaga al evaluador que
+            // aplica 3VL: si la subquery proyecta algún NULL, el
+            // resultado del NOT IN es NULL (no false), igual que la
+            // ANSI strict semantics de `5 NOT IN (1, NULL)`.
             return Ok(WhereClause::In {
                 column,
                 subquery: Box::new(subquery),
+                negated,
             });
         }
         // Lista literal: por lo menos un valor.
