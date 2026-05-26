@@ -106,7 +106,12 @@ pub struct DropIndexStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
     pub table: String,
-    pub assignments: Vec<(String, Value)>,
+    /// Bloque G2 (2026-05-26): la RHS de cada assignment pasa de `Value`
+    /// a `Expr`. Eso habilita `SET col = UPPER(col)`, `SET col = COALESCE(col, 0)`,
+    /// CASE/CAST, etc. Para back-compat un literal se construye como
+    /// `Expr::Literal(Value::X(...))`. La expresión se evalúa contra la
+    /// fila **pre-update** (no observa los otros assignments del mismo SET).
+    pub assignments: Vec<(String, Expr)>,
     /// Bloque E3: el WHERE de UPDATE/DELETE es un `WhereExpr` completo —
     /// admite los mismos operadores que `SELECT.where_clause` (=, BETWEEN,
     /// <, >, LIKE, IS NULL, IN literal/SELECT, AND/OR/NOT, etc.). Es
@@ -192,10 +197,12 @@ pub struct OnConflict {
 pub enum OnConflictAction {
     /// `DO NOTHING`: la fila conflictiva se descarta silenciosamente.
     DoNothing,
-    /// `DO UPDATE SET col = value, ...`: actualiza la fila existente con
-    /// los assignments. Las RHS son literales (no se soporta `EXCLUDED.col`
-    /// todavía — P2 dentro del backlog de J2).
-    DoUpdate { assignments: Vec<(String, Value)> },
+    /// `DO UPDATE SET col = expr, ...`: actualiza la fila existente con
+    /// los assignments. Bloque G2 generaliza la RHS a `Expr` (igual que
+    /// `UpdateStmt`), evaluada contra la fila pre-update. `EXCLUDED.col`
+    /// (referirse a la fila intentada) sigue sin soportarse — P2 dentro
+    /// del backlog de J2.
+    DoUpdate { assignments: Vec<(String, Expr)> },
     /// `REPLACE` (desazucar de SQLite-style `REPLACE INTO`): borra las
     /// filas conflictivas vía cascade y reinserta con los valores nuevos.
     Replace,
@@ -699,6 +706,21 @@ pub enum WhereClause {
         column: String,
         values: Vec<Value>,
         negated: bool,
+    },
+    /// Bloque G2 (2026-05-26): predicado expresional general. Cualquier
+    /// `Expr` que evalúe a BOOL (o NULL → 3VL) puede usarse como átomo
+    /// del WHERE. NO tiene fast-path indexada — se evalúa siempre por
+    /// FullScan + post-filter.
+    ///
+    /// Las variantes específicas pre-G2 (`Eq`, `Compare`, `Like`, `IsNull`,
+    /// `InList`, `Between`, ...) se preservan: el parser sigue prefiriendo
+    /// la forma estructural cuando el átomo encaja en `IDENT OP literal`,
+    /// para mantener los fast-paths PK / índice / range scan / EXISTS
+    /// correlacionado intactos. `ExprPredicate` solo se construye cuando
+    /// el parser detecta una forma que NO encaja en las estructurales
+    /// (LHS o RHS son funciones, CASE, CAST, literal a la izquierda, ...).
+    ExprPredicate {
+        expr: Expr,
     },
 }
 
@@ -1496,10 +1518,13 @@ impl<'a> Engine<'a> {
                 match &oc.action {
                     OnConflictAction::DoNothing => return Ok(RowOutcome::Skipped),
                     OnConflictAction::DoUpdate { assignments } => {
-                        // Aplicamos los assignments a cada fila conflictiva.
-                        // Construimos overrides una vez.
-                        let mut overrides: HashMap<String, Value> = HashMap::new();
-                        for (col, val) in assignments {
+                        // Bloque G2: cada `(col, expr)` se valida shape
+                        // una vez (PK / columna existe). La evaluación
+                        // de la Expr ocurre dentro de `apply_update_to_pk`
+                        // contra la fila pre-update — `EXCLUDED.col` sigue
+                        // sin soportarse (J2-P2).
+                        let mut expr_assignments: Vec<(String, Expr)> = Vec::new();
+                        for (col, expr) in assignments {
                             let k = normalize_ident(col);
                             if k == normalize_ident(&meta.primary_key) {
                                 return Err(coded(
@@ -1519,14 +1544,14 @@ impl<'a> Engine<'a> {
                                     ),
                                 ));
                             }
-                            overrides.insert(k, val.clone());
+                            expr_assignments.push((k, expr.clone()));
                         }
                         // Aplicamos a TODAS las filas conflictivas (en la
                         // práctica suele ser 1, pero un mismo INSERT puede
                         // chocar contra más de una constraint).
                         let mut last_row: Option<HashMap<String, Value>> = None;
                         for pk in &conflict_pks {
-                            self.apply_update_to_pk(meta, *pk, &overrides)?;
+                            self.apply_update_to_pk(meta, *pk, &expr_assignments)?;
                             // Leer fila post-update para RETURNING.
                             let bytes = {
                                 let mut catalog = Catalog::open(self.pager);
@@ -1771,6 +1796,7 @@ impl<'a> Engine<'a> {
                             | WhereClause::Like { .. }
                             | WhereClause::IsNull { .. }
                             | WhereClause::InList { .. }
+                            | WhereClause::ExprPredicate { .. }
                     ),
                 };
                 if force {
@@ -2056,7 +2082,8 @@ impl<'a> Engine<'a> {
                 Some(WhereClause::Compare { .. })
                 | Some(WhereClause::Like { .. })
                 | Some(WhereClause::IsNull { .. })
-                | Some(WhereClause::InList { .. }) => Plan::FullScan,
+                | Some(WhereClause::InList { .. })
+                | Some(WhereClause::ExprPredicate { .. }) => Plan::FullScan,
             }
         };
 
@@ -2808,6 +2835,7 @@ impl<'a> Engine<'a> {
                 let key = resolve_joined_column_key(scope, column)?;
                 Ok(eval_in_list(row.get(&key), values, *negated))
             }
+            WhereClause::ExprPredicate { expr } => eval_expr_as_predicate(expr, row),
         }
     }
 
@@ -2911,10 +2939,12 @@ impl<'a> Engine<'a> {
             // Átomos E2 sobre JOIN: dispatch al evaluador 3VL que filtra
             // fila-a-fila. La fast-path optimizada no aplica acá porque
             // estos operadores ya forzaron generic_post_filter arriba.
+            // G2 suma `ExprPredicate` al mismo grupo.
             WhereClause::Compare { .. }
             | WhereClause::Like { .. }
             | WhereClause::IsNull { .. }
-            | WhereClause::InList { .. } => {
+            | WhereClause::InList { .. }
+            | WhereClause::ExprPredicate { .. } => {
                 let mut kept = Vec::with_capacity(rows.len());
                 for row in rows {
                     if matches!(
@@ -3110,6 +3140,7 @@ impl<'a> Engine<'a> {
                 ensure_column_visible(meta, &key, column, row)?;
                 Ok(eval_in_list(row.get(&key), values, *negated))
             }
+            WhereClause::ExprPredicate { expr } => eval_expr_as_predicate(expr, row),
         }
     }
 
@@ -3121,9 +3152,14 @@ impl<'a> Engine<'a> {
                 .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
         };
 
-        // Validar assignments una sola vez (no depende del WHERE).
-        let mut overrides: HashMap<String, Value> = HashMap::new();
-        for (column_name, value) in stmt.assignments {
+        // Validamos shape de assignments (PK / columna existe / duplicados)
+        // una sola vez — esos chequeos no dependen de los valores
+        // calculados por fila. La evaluación de la `Expr` y la coerción
+        // de tipo ocurren más abajo, por cada fila, dentro de
+        // `apply_update_to_pk` vía `expr_assignments`.
+        let mut expr_assignments: Vec<(String, Expr)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (column_name, expr) in stmt.assignments {
             let normalized = normalize_ident(&column_name);
             if normalized == normalize_ident(&meta.primary_key) {
                 return Err(coded(
@@ -3143,7 +3179,7 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
-            if overrides.insert(normalized, value).is_some() {
+            if !seen.insert(normalized.clone()) {
                 return Err(coded(
                     codes::DUPLICATE_COLUMN_NAME,
                     format!(
@@ -3152,6 +3188,7 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
+            expr_assignments.push((normalized, expr));
         }
 
         // Bloque E3: resolver target PKs según el WHERE. Fast-path para
@@ -3177,7 +3214,7 @@ impl<'a> Engine<'a> {
         let mut updated = 0usize;
         let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
         for pk in &target_pks {
-            self.apply_update_to_pk(&meta, *pk, &overrides)?;
+            self.apply_update_to_pk(&meta, *pk, &expr_assignments)?;
             updated += 1;
             if stmt.returning.is_some() {
                 // Bloque J2: re-leer la fila post-update para RETURNING.
@@ -3218,16 +3255,18 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// Bloque E3: aplica los `overrides` (SET column=value) a la fila
-    /// con PK dada. Encapsula todas las validaciones por-fila (NOT NULL,
-    /// UNIQUE, FK), el upsert y el mantenimiento de índices. Se invoca
-    /// una vez por cada PK matcheada por el WHERE — pre-E3 esto ocurría
-    /// inline en `exec_update` para una única fila.
+    /// Bloque E3 + G2: aplica las assignments `(col_normalizada, Expr)`
+    /// a la fila con PK dada. La RHS de cada assignment se evalúa
+    /// contra la fila **pre-update** — todos los `Expr` ven los
+    /// mismos valores de origen, no los que otros assignments del mismo
+    /// SET puedan haber producido. Encapsula todas las validaciones
+    /// por-fila (NOT NULL, UNIQUE, FK), el upsert y el mantenimiento
+    /// de índices.
     fn apply_update_to_pk(
         &mut self,
         meta: &TableMeta,
         pk: i64,
-        overrides: &HashMap<String, Value>,
+        expr_assignments: &[(String, Expr)],
     ) -> DbResult<()> {
         let existing = {
             let mut catalog = Catalog::open(self.pager);
@@ -3239,8 +3278,39 @@ impl<'a> Engine<'a> {
             })?
         };
         let old_row = decode_row(meta, &existing)?;
+        // G2: evaluamos cada Expr contra la fila pre-update y armamos
+        // el `overrides` final. La coerción al tipo de la columna la
+        // hace el encoder (`encode_column_value`) al persistir;
+        // errores de tipo aquí se reportan como `[GBY-4041]`.
+        let mut overrides: HashMap<String, Value> = HashMap::new();
+        for (col_key, expr) in expr_assignments {
+            let val = eval_expr(expr, &old_row)?;
+            // G2: pre-chequeo de tipo. `encode_row` rechazaría el
+            // mismatch igual, pero acá podemos atribuirlo a la columna
+            // exacta del SET y devolver un código (`[GBY-4041]`)
+            // accionable. NULL siempre pasa (lo valida NOT NULL más
+            // abajo); INT en columna FLOAT se promueve sin warning.
+            if let Some(col) = meta.column(col_key) {
+                if !value_fits_column_type(&val, col.column_type) {
+                    return Err(coded(
+                        codes::UPDATE_SET_TYPE_MISMATCH,
+                        format!(
+                            "UPDATE sobre '{}': el valor calculado para '{}' es {} y la \
+                             columna es {}; envolver con CAST(... AS {}) si la conversión \
+                             es intencional",
+                            meta.name,
+                            col.name,
+                            value_type_name(&val),
+                            col.column_type.as_sql(),
+                            col.column_type.as_sql()
+                        ),
+                    ));
+                }
+            }
+            overrides.insert(col_key.clone(), val);
+        }
         let mut current = old_row.clone();
-        for (key, value) in overrides {
+        for (key, value) in &overrides {
             current.insert(key.clone(), value.clone());
         }
 
@@ -5940,7 +6010,11 @@ fn where_expr_has_outer_refs(expr: &WhereExpr) -> bool {
             | WhereClause::Compare { .. }
             | WhereClause::Like { .. }
             | WhereClause::IsNull { .. }
-            | WhereClause::InList { .. } => false,
+            | WhereClause::InList { .. }
+            // G2: `ExprPredicate` no transporta subqueries en este release
+            // — `Expr` aún no contiene `Subquery`/`Outer`. Cuando G3 las
+            // agregue habrá que walkear la Expr aquí.
+            | WhereClause::ExprPredicate { .. } => false,
         },
     }
 }
@@ -6134,6 +6208,28 @@ fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
     }
 }
 
+/// Bloque G2: evalúa una `Expr` como predicado booleano para
+/// WHERE/HAVING. Devuelve `Some(true)`/`Some(false)` cuando la
+/// expresión rinde un BOOL concreto, `None` cuando rinde NULL
+/// (3VL: la fila no pasa el filtro). Cualquier otro tipo es un
+/// error claro `[GBY-4040]` — la expresión sin operador de
+/// comparación (`WHERE LENGTH(x)`) cae acá.
+fn eval_expr_as_predicate(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Option<bool>> {
+    let v = eval_expr(expr, row)?;
+    match v {
+        Value::Bool(b) => Ok(Some(b)),
+        Value::Null => Ok(None),
+        other => Err(coded(
+            codes::WHERE_EXPR_NOT_BOOLEAN,
+            format!(
+                "expresión en WHERE/HAVING debe evaluar a BOOL (o NULL), recibí {}; \
+                 ¿faltó un operador de comparación (=, <, >, ...)?",
+                value_type_name(&other)
+            ),
+        )),
+    }
+}
+
 /// Bloque G1: dispatcher para las funciones escalares "puras" (sin
 /// short-circuit). Los args ya vienen evaluados. NULL propagation:
 /// salvo `Concat` (que adopta la regla ANSI estricta y propaga), si
@@ -6286,6 +6382,27 @@ fn eval_scalar_fn(f: ScalarFunc, args: Vec<Value>) -> DbResult<Value> {
         ScalarFunc::Coalesce | ScalarFunc::Ifnull | ScalarFunc::If | ScalarFunc::Nullif => Err(
             DbError::new("interno: short-circuit fn dispatcheada por eval_scalar_fn"),
         ),
+    }
+}
+
+/// Bloque G2: ¿el `Value` calculado encaja en la columna destino para
+/// un `UPDATE SET col = <expr>`? Reglas:
+/// - NULL siempre cabe (NOT NULL se valida aparte).
+/// - INT cabe tanto en `INT` como en `FLOAT` (promoción implícita).
+/// - FLOAT en `FLOAT`, BOOL en `BOOL`, TEXT en cualquier columna
+///   `stores_as_text()` (`TEXT`/`DATE`/`DATETIME`/`JSON` — la validación
+///   de forma de la fecha la hace el encoder, no acá).
+///
+/// El resto es mismatch.
+fn value_fits_column_type(v: &Value, ct: ColumnType) -> bool {
+    match (v, ct) {
+        (Value::Null, _) => true,
+        (Value::Integer(_), ColumnType::Int) => true,
+        (Value::Integer(_), ColumnType::Float) => true,
+        (Value::Float(_), ColumnType::Float) => true,
+        (Value::Bool(_), ColumnType::Bool) => true,
+        (Value::String(_), t) if t.stores_as_text() => true,
+        _ => false,
     }
 }
 
@@ -6819,7 +6936,11 @@ impl Parser {
         loop {
             let column = self.expect_ident()?;
             self.expect_symbol("=")?;
-            let value = self.expect_value()?;
+            // Bloque G2: la RHS es una `Expr` general (función, CASE,
+            // CAST, COALESCE, literal). Para back-compat con queries
+            // pre-G2, un literal se parsea como `Expr::Literal(...)`
+            // — el evaluador devuelve el `Value` original sin alterar.
+            let value = self.parse_expr()?;
             assignments.push((column, value));
             if !self.match_symbol(",") {
                 break;
@@ -7114,7 +7235,10 @@ impl Parser {
                 loop {
                     let col = self.expect_ident()?;
                     self.expect_symbol("=")?;
-                    let value = self.expect_value()?;
+                    // Bloque G2: igual que `UPDATE SET ...`, la RHS es
+                    // una `Expr`. `EXCLUDED.col` sigue sin habilitarse
+                    // (queda en backlog J2-P2).
+                    let value = self.parse_expr()?;
                     assignments.push((col, value));
                     if !self.match_symbol(",") {
                         break;
@@ -7894,7 +8018,19 @@ impl Parser {
     /// - `[NOT] IN (...)` — lista literal o `(SELECT ...)` (bloque E2 añade lista)
     /// - `[NOT] LIKE 'patron'` (bloque E2)
     /// - `IS [NOT] NULL` (bloque E2)
+    ///
+    /// Bloque G2: cuando el átomo NO encaja en la forma estructural
+    /// `IDENT OP literal` (porque LHS es función, CASE, CAST, literal a
+    /// la izquierda, etc.), caemos al path expresional que parsea ambos
+    /// lados con `parse_expr` y construye un `WhereClause::ExprPredicate`.
+    /// Esto preserva intactas las fast-paths PK/índice/EXISTS del path
+    /// estructural — solo lo expresional paga FullScan + post-filter.
     fn parse_where_atom(&mut self) -> DbResult<WhereClause> {
+        // G2 lookahead: si el átomo NO tiene forma estructural,
+        // delegamos al parser de expresiones general.
+        if !self.peek_atom_is_structural() {
+            return self.parse_where_atom_as_expr();
+        }
         let column = self.parse_where_atom_lhs()?;
         // `=` exacto: misma lógica que pre-E2 (literal | subquery | outer-ref).
         if self.match_symbol("=") {
@@ -8049,6 +8185,104 @@ impl Parser {
             "<>" | "!=" => Some(CompareOp::Ne),
             _ => None,
         }
+    }
+
+    /// Bloque G2: detecta si el átomo del WHERE/HAVING comienza con la
+    /// forma estructural `IDENT [OP ...]` (donde IDENT puede ser una
+    /// agregada en HAVING o un column-ref simple). Devuelve `false`
+    /// cuando el primer token es un literal, un `(`, o un IDENT que
+    /// abre llamada a función / `CASE` / `CAST` — todos casos que solo
+    /// el path expresional sabe parsear. El resultado decide qué rama
+    /// toma `parse_where_atom`; preserva los fast-paths estructurales
+    /// intactos.
+    fn peek_atom_is_structural(&self) -> bool {
+        let t = self.peek();
+        match t.kind {
+            TokenKind::Ident => {
+                let upper = t.text.to_ascii_uppercase();
+                // Constructores expresionales como LHS solo del WHERE
+                // (NULL/TRUE/FALSE como LHS también caen al path expr).
+                if matches!(upper.as_str(), "CASE" | "CAST" | "NULL" | "TRUE" | "FALSE") {
+                    return false;
+                }
+                // Funciones zero-arg sin parens — son expresiones.
+                if matches!(
+                    upper.as_str(),
+                    "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURDATE"
+                ) {
+                    // Si lo siguiente NO es `(`, es una expresión 0-arg.
+                    let next_is_lparen = self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|n| n.kind == TokenKind::Symbol && n.text == "(")
+                        .unwrap_or(false);
+                    if !next_is_lparen {
+                        return false;
+                    }
+                }
+                // Llamada `IDENT(` que NO sea una agregada permitida en
+                // HAVING → función escalar, expresión. En HAVING las
+                // agregadas (`COUNT(*)`, `SUM(col)`, ...) sí son
+                // estructurales: `parse_where_atom_lhs` ya las maneja.
+                let next_is_lparen = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|n| n.kind == TokenKind::Symbol && n.text == "(")
+                    .unwrap_or(false);
+                if next_is_lparen {
+                    // Agregadas: SIEMPRE estructural — en HAVING para
+                    // resolverlas contra los buckets; fuera de HAVING
+                    // para que `parse_where_atom_lhs` devuelva el error
+                    // claro `[GBY-4025]` (agregada fuera de HAVING/SELECT),
+                    // no que el path expresional las confunda con una
+                    // función escalar desconocida (`[GBY-4037]`).
+                    if AggFunc::from_ident(&t.text).is_some() {
+                        return true;
+                    }
+                    // Cualquier otro IDENT( → escalar → expresional.
+                    return false;
+                }
+                true
+            }
+            // Literal/símbolo a la izquierda → expresión por definición.
+            _ => false,
+        }
+    }
+
+    /// Bloque G2: parsea el átomo del WHERE como expresión completa
+    /// (ambos lados son `Expr`). Cubre `LENGTH(x) > 3`,
+    /// `5 < LENGTH(x)`, `UPPER(x) = 'A'`, `CASE ... END = 1`, y la
+    /// forma "expr a secas" (`COALESCE(activo, false)`) que se evalúa
+    /// como predicado booleano directo en `eval_expr_as_predicate`.
+    ///
+    /// Los operadores postfix (`IS [NOT] NULL`, `[NOT] LIKE`,
+    /// `[NOT] IN`, `BETWEEN`) sobre una expresión escalar todavía NO
+    /// se soportan — devolvemos `[GBY-4039]` con guía.
+    fn parse_where_atom_as_expr(&mut self) -> DbResult<WhereClause> {
+        let lhs = self.parse_expr_primary()?;
+        // Operador postfix sobre Expr: rechazamos explícitamente.
+        if self.peek().kind == TokenKind::Ident {
+            let upper = self.peek().text.to_ascii_uppercase();
+            if matches!(upper.as_str(), "IS" | "LIKE" | "IN" | "BETWEEN" | "NOT") {
+                return Err(coded(
+                    codes::EXPR_IN_PREDICATE_NOT_SUPPORTED,
+                    format!(
+                        "operador '{}' sobre expresión escalar aún no se soporta en este release; \
+                         usar comparación directa (=, <>, <, >, <=, >=) o esperar al bloque G3",
+                        upper
+                    ),
+                ));
+            }
+        }
+        if let Some(op) = self.peek_expr_cmp_op() {
+            self.pos += 1;
+            let rhs = self.parse_expr_primary()?;
+            return Ok(WhereClause::ExprPredicate {
+                expr: Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+            });
+        }
+        // Sin comparador: la expr se evalúa tal cual y debe ser BOOL/NULL.
+        Ok(WhereClause::ExprPredicate { expr: lhs })
     }
 
     /// Bloque F: parsea el LHS de un átomo del WHERE/HAVING. En HAVING

@@ -33,7 +33,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **E2** ✅ | Operadores `<`, `>`, `<=`, `>=`, `<>`/`!=`, `LIKE`, `IS NULL`/`IS NOT NULL`, `IN (lista, literal)` | Medio | E1 (para combinar) (**cerrado 2026-05-25**) |
 | **E3** ✅ | `UPDATE`/`DELETE` por columna indexada y por subquery | Medio | E1 (**cerrado 2026-05-25**) |
 | **F** ✅ | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 (**cerrado 2026-05-25**; limitación: sin JOINs aún) |
-| **G1** ✅ | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` — solo en SELECT list | Medio-Alto | E1 (**cerrado 2026-05-26**; G2 extiende a WHERE/HAVING/UPDATE SET) |
+| **G1+G2** ✅ | Funciones escalares (string + numéricas + fecha) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` en SELECT list **y** WHERE/HAVING/UPDATE SET/DELETE WHERE | Medio-Alto | E1 (**cerrado 2026-05-26**; G3 sumará `\|\|`, aritméticos, P2/P3, IS NULL/LIKE/IN/BETWEEN sobre Expr, y `EXCLUDED.col`) |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
 | **I** | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual | Medio | — |
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
@@ -108,7 +108,9 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 
 Hoy sin ninguna función built-in. Lista mínima útil:
 
-> ✅ **Cerrado en G1 (2026-05-26)** para SELECT list: parser + evaluator + 12 integration tests. Limitación residual documentada: estas funciones todavía NO se pueden usar en `WHERE` / `HAVING` / `UPDATE SET` (eso es el bloque G2). El operador `||` para concatenación tampoco se soporta — usar `CONCAT(a, b, ...)`. Detalles en [SQL_REFERENCE.md](SQL_REFERENCE.md).
+> ✅ **Cerrado en G1 (2026-05-26)** para SELECT list: parser + evaluator + 12 integration tests.
+>
+> ✅ **Cerrado en G2 (2026-05-26)** la extensión a `WHERE` / `HAVING` / `UPDATE SET` / `DELETE WHERE` / `ON CONFLICT DO UPDATE SET`: nuevo átomo `WhereClause::ExprPredicate` (FullScan + post-filter, sin perder los fast-paths estructurales) + assignments con RHS `Expr` evaluada contra la fila pre-update + helper `eval_expr_as_predicate` con 3VL. 20 integration tests adicionales. **Limitaciones residuales para G3**: operadores postfix sobre Expr (`IS NULL`/`LIKE`/`IN`/`BETWEEN` con LHS expresional → `[GBY-4039]`), operador `||`, aritméticos binarios (`+`/`-`/`*`/`/`), funciones P2/P3 (TRIM/REPLACE/CEIL/FLOOR/MOD/DATE_ADD/SUB/EXTRACT/...), y `EXCLUDED.col` en UPSERT.
 
 ### String
 | Función | Prioridad |

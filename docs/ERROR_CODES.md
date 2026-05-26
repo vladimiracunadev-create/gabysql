@@ -129,6 +129,9 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4036` | `CAST_INVALID` | `CAST(x AS TYPE)` cuyo valor no se puede convertir al tipo destino (e.g. `CAST('abc' AS INT)`). | Pre-validar el valor; usar `COALESCE`/`CASE` para descartar valores inválidos antes del `CAST`. |
 | `4037` | `SCALAR_FN_UNKNOWN` | Invocación a una función escalar que el motor no reconoce (e.g. `FOO(1)`). | Ver la lista de funciones soportadas en `SQL_REFERENCE.md` (sección "Funciones escalares"); algunas todavía no están implementadas. |
 | `4038` | `CASE_BRANCH_TYPE_MISMATCH` | Condición de un `CASE WHEN` searched que no evalúa a BOOL. | Reescribir la condición como una comparación (`x > 10`, `x IS NULL`, etc.). |
+| `4039` | `EXPR_IN_PREDICATE_NOT_SUPPORTED` | G2: operador postfix (`IS NULL`/`LIKE`/`IN`/`BETWEEN`) con LHS expresional, e.g. `WHERE LENGTH(x) IS NULL`. | Reescribir como comparación directa (`WHERE LENGTH(x) = 0`, `WHERE COALESCE(x, '') = ''`, etc.) o esperar al bloque G3. |
+| `4040` | `WHERE_EXPR_NOT_BOOLEAN` | G2: expresión usada como predicado completo del WHERE/HAVING que no rinde BOOL/NULL, e.g. `WHERE LENGTH(x)` sin comparador. | Agregar el operador de comparación faltante (`= 0`, `> 3`, etc.). |
+| `4041` | `UPDATE_SET_TYPE_MISMATCH` | G2: la RHS de `UPDATE ... SET col = <expr>` rinde un tipo incompatible con la columna (e.g. TEXT en INT). | Envolver con `CAST(... AS TIPO)` explícito si la conversión es intencional. |
 
 ---
 

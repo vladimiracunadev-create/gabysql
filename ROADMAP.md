@@ -56,6 +56,7 @@
 - ~~backup / restore verificado~~ ✅ entregado (ADR-0015, `gabysql backup/restore/verify` con CRC end-to-end)
 - ~~logs estructurados y primeras métricas del server~~ ✅ entregado (ADR-0014, endpoint `/metrics` + flag `-log-json`)
 - ~~funciones escalares en SELECT list (`LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `CONCAT`, `ABS`, `ROUND`, `NOW`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `COALESCE`, `NULLIF`, `IFNULL`, `IF`, `CAST`, `CASE`)~~ ✅ entregado (bloque **G1**, 2026-05-26). Extensión a `WHERE`/`HAVING`/`UPDATE SET` queda para G2.
+- ~~funciones escalares también en `WHERE` / `HAVING` / `UPDATE SET` / `DELETE WHERE` / `ON CONFLICT DO UPDATE SET`~~ ✅ entregado (bloque **G2**, 2026-05-26). G3 sumará `||`, aritméticos binarios (`+`/`-`/`*`/`/`), funciones P2/P3 (TRIM, REPLACE, CEIL/FLOOR, MOD, DATE_ADD/SUB, EXTRACT, …), operadores postfix sobre Expr (`IS NULL`/`LIKE`/`IN`/`BETWEEN`), y `EXCLUDED.col` en UPSERT.
 
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats

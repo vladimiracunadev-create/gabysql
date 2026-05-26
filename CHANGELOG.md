@@ -6,6 +6,54 @@
 
 ---
 
+## 2026-05-26 — Bloque G2: expresiones escalares en WHERE / HAVING / UPDATE SET
+
+> **Un push a `main`** que completa el bloque G iniciado por G1: las mismas funciones escalares / `CAST` / `CASE` / condicionales ahora se aceptan en las superficies de filtrado y mutación. Cierra la mayor limitación residual documentada en el changelog de G1.
+
+### 🆕 Sentencias / cláusulas extendidas
+- `WHERE` (de `SELECT`, `UPDATE`, `DELETE`): cualquier `Expr` BOOL/NULL es válida como átomo. Casos típicos: `WHERE LENGTH(name) > 3`, `WHERE UPPER(name) = 'X'`, `WHERE COALESCE(active, false) = true`, `WHERE CASE WHEN age > 18 THEN true ELSE false END = true`, `WHERE 5 < LENGTH(name)` (LHS literal).
+- `HAVING`: ídem WHERE, conservando la libertad ya existente de referir agregados. Ej: `HAVING UPPER(group_col) = 'X'`.
+- `UPDATE ... SET col = <expr>` y `ON CONFLICT DO UPDATE SET col = <expr>`: RHS pasa de `Value` a `Expr`. Se evalúa contra la fila **pre-update** (`SET a = b, b = a` swap-eligible).
+- `DELETE FROM ... WHERE <expr>`: extensión gratuita gracias a que ya usaba el mismo `WhereExpr` (E3).
+
+### 🔧 AST
+- `UpdateStmt::assignments` y `OnConflictAction::DoUpdate::assignments` cambian de `Vec<(String, Value)>` a `Vec<(String, Expr)>`. Cambio de tipo público — los call-sites internos se actualizaron; los literales viejos siguen funcionando porque el parser construye `Expr::Literal(Value::X(...))`.
+- `WhereClause` suma la variante `ExprPredicate { expr: Expr }`. Solo se construye cuando el átomo NO encaja en la forma estructural `IDENT OP literal` (LHS o RHS son funciones, CASE, CAST, literal a la izquierda, …); las variantes específicas pre-G2 (`Eq`, `Compare`, `Like`, `IsNull`, `InList`, `Between`) se preservan para mantener intactos los fast-paths PK / índice / range scan / EXISTS correlacionado.
+
+### 🚦 Parser
+- `parse_where_atom` arranca con `peek_atom_is_structural` — si el átomo es expresional cae a `parse_where_atom_as_expr` (ambos lados con `parse_expr_primary`, comparador o solo-expr).
+- `parse_update` y la rama `ON CONFLICT DO UPDATE` usan `parse_expr` para la RHS de cada assignment.
+- Las funciones agregadas siguen siendo estructurales en cualquier contexto: en HAVING resuelven contra el bucket; en WHERE el path estructural devuelve el `[GBY-4025]` claro (en vez del genérico `[GBY-4037]` que daría el path expresional).
+
+### 🚦 Executor
+- `eval_atom_single` y `eval_atom_joined` ganan un brazo `ExprPredicate { expr } => eval_expr_as_predicate(expr, row)`. El helper centraliza la 3VL: BOOL pasa tal cual, NULL → unknown (descarta la fila), cualquier otro tipo → `[GBY-4040]`.
+- `filter_joined_rows_atom` agrega `ExprPredicate` al grupo "sin fast-path indexada — caer al evaluador 3VL".
+- `exec_update` separa la validación shape (PK / columna existe / duplicados) — que sigue siendo one-shot — de la evaluación de la `Expr` que ahora ocurre dentro de `apply_update_to_pk` contra la fila pre-update. Pre-chequeo de tipo con `value_fits_column_type` para atribuir el mismatch a la columna exacta (`[GBY-4041]`).
+- El planner (`generic_post_filter` + `Plan::FullScan`) reconoce `ExprPredicate` como predicado sin fast-path indexada, igual que los átomos E2.
+
+### ⚠️ Limitaciones residuales (G3)
+- Operadores postfix sobre expresión escalar (`LENGTH(x) IS NULL`, `UPPER(x) LIKE 'A%'`, `LENGTH(x) IN (...)`, `LENGTH(x) BETWEEN ... AND ...`) → `[GBY-4039]` con guía.
+- Operador `||` para concatenación, aritméticos binarios (`+`/`-`/`*`/`/`), y funciones P2/P3 (`TRIM`, `REPLACE`, `CEIL`/`FLOOR`, `MOD`, `POWER`/`SQRT`, `DATE_ADD`/`DATE_SUB`, `DATEDIFF`, `EXTRACT`, `STRFTIME`, `SPLIT_PART`) siguen sin soporte.
+- `EXCLUDED.col` dentro de `ON CONFLICT DO UPDATE SET` sigue sin soporte (J2-P2 explícito).
+
+### 🧰 Códigos de error nuevos
+- `4039` `EXPR_IN_PREDICATE_NOT_SUPPORTED` — operador postfix sobre Expr.
+- `4040` `WHERE_EXPR_NOT_BOOLEAN` — expresión en WHERE/HAVING que no rinde BOOL/NULL.
+- `4041` `UPDATE_SET_TYPE_MISMATCH` — RHS de `SET col = <expr>` con tipo incompatible.
+
+### 🧪 Validación
+- 20 integration tests nuevos en `tests/integration_test.rs` (`g2_*`): WHERE con LENGTH/UPPER/COALESCE/CASE/CAST/3VL, combinación con E1 (AND/OR), LHS literal, error 4040, error 4039 (IS NULL sobre Expr), UPDATE SET con UPPER/COALESCE/CASE/CAST/PK bloqueado/tipo mismatch, snapshot pre-update (`SET a=UPPER(a), b=a`), HAVING con UPPER, DELETE con LENGTH, UPDATE WHERE con UPPER.
+- 176/176 tests pasan (los 156 previos + 20 g2). `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` limpios.
+
+### 📚 Documentación
+- [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md): sección "Funciones escalares" actualizada con la extensión a WHERE/HAVING/UPDATE SET, ejemplos nuevos, y tres filas de errores típicos (4039/4040/4041).
+- [`docs/MISSING_COMMANDS.md`](docs/MISSING_COMMANDS.md): nota de cierre G2 con limitaciones residuales que pasan a G3.
+- [`docs/STATUS.md`](docs/STATUS.md): fila de "Funciones escalares" promovida a 🟢 con scope completo y limitaciones residuales explícitas.
+- [`docs/ERROR_CODES.md`](docs/ERROR_CODES.md): tres filas nuevas (`4039`–`4041`).
+- [`ROADMAP.md`](ROADMAP.md): bullet de cierre G2 debajo del de G1.
+
+---
+
 ## 2026-05-26 — Bloque G1: funciones escalares en SELECT list
 
 > **Un push a `main`** que abre el subsistema de funciones escalares: built-ins de string / numéricas / fecha + `CAST` + `CASE` + condicionales (`COALESCE`/`NULLIF`/`IFNULL`/`IF`). Cierra los P0/P1 del bloque G en [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md) **dentro del SELECT list** — la extensión a `WHERE`/`HAVING`/`UPDATE SET` queda para G2.

@@ -230,6 +230,21 @@ pub mod codes {
     /// Bloque G1: condición de un `CASE` searched (`CASE WHEN cond …`)
     /// que no evalúa a BOOL.
     pub const CASE_BRANCH_TYPE_MISMATCH: u32 = 4038;
+    /// Bloque G2 (2026-05-26): los operadores postfix `IS [NOT] NULL`,
+    /// `[NOT] LIKE`, `[NOT] IN (...)` y `BETWEEN` aún no aceptan una
+    /// expresión escalar como LHS — solo columnas simples. La forma
+    /// expresional (`LENGTH(x) IS NULL`, `UPPER(x) LIKE 'A%'`, etc.)
+    /// queda para un bloque posterior.
+    pub const EXPR_IN_PREDICATE_NOT_SUPPORTED: u32 = 4039;
+    /// Bloque G2: una expresión escalar usada como predicado completo del
+    /// WHERE/HAVING no evaluó a BOOL (ni NULL en 3VL). Caso típico:
+    /// `WHERE LENGTH(name)` sin comparar contra nada — falta el operador.
+    pub const WHERE_EXPR_NOT_BOOLEAN: u32 = 4040;
+    /// Bloque G2: el valor calculado para un `UPDATE ... SET col = <expr>`
+    /// no encaja en el tipo declarado de la columna (e.g. asignar TEXT a
+    /// una columna INT). Lo dispara el encoder al rechazar el cast
+    /// implícito; con `SET col = CAST(... AS T)` se evita.
+    pub const UPDATE_SET_TYPE_MISMATCH: u32 = 4041;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

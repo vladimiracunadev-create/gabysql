@@ -1058,11 +1058,16 @@ ROLLBACK;
 
 ---
 
-## Funciones escalares (bloque G1)
+## Funciones escalares (bloques G1 + G2)
 
 > Desde el **bloque G1 (2026-05-26)**, el `SELECT` list acepta expresiones escalares además de columnas crudas y agregadas: funciones built-in (`LENGTH`, `UPPER`, `CONCAT`, …), `CAST(x AS TYPE)`, `CASE … END`, literales, y los conditionals `COALESCE`/`NULLIF`/`IFNULL`/`IF`. Cada expresión puede recibir `AS alias` para nombrar la columna del `ResultSet`.
 >
-> **Limitación de G1**: las expresiones escalares solo se aceptan en el `SELECT` list. `WHERE`, `HAVING` y `UPDATE SET` no las aceptan todavía (bloque **G2**). Tampoco hay operadores aritméticos binarios (`+`/`-`/`*`/`/`) ni el operador `||` para concatenar texto — usar `CONCAT`.
+> El **bloque G2 (2026-05-26)** extiende esas mismas expresiones a las superficies de filtrado y mutación:
+> - **`WHERE`** (incluye el WHERE de `SELECT`, `UPDATE`, `DELETE`): cualquier `Expr` que evalúe a BOOL/NULL puede ser un átomo del WHERE. Forma típica: `WHERE LENGTH(nombre) > 3`, `WHERE UPPER(nombre) = 'ANA'`, `WHERE COALESCE(activo, false) = true`, `WHERE 5 < LENGTH(nombre)` (LHS literal, RHS función).
+> - **`HAVING`**: igual que WHERE, con la libertad ya existente de referir agregados. Ej: `HAVING UPPER(grupo) = 'X'`.
+> - **`UPDATE SET col = <expr>`** y **`ON CONFLICT DO UPDATE SET col = <expr>`**: la RHS puede ser cualquier `Expr`. Se evalúa contra la fila **pre-update**, así que `SET a = b, b = a` deja ambos con los valores intercambiados (las dos RHS ven el snapshot original).
+>
+> **Limitaciones residuales (vienen en G3)**: operadores postfix sobre expresión escalar (`LENGTH(x) IS NULL`, `UPPER(x) LIKE 'A%'`, `LENGTH(x) IN (...)`, `LENGTH(x) BETWEEN ... AND ...`) → `[GBY-4039]`. Operador `||` y aritméticos binarios (`+`/`-`/`*`/`/`). Funciones P2/P3 (TRIM, REPLACE, CEIL/FLOOR, MOD, DATE_ADD/SUB, EXTRACT, …). `EXCLUDED.col` dentro de `ON CONFLICT DO UPDATE SET`.
 >
 > **NULL propagation**: por defecto cualquier argumento `NULL` hace que la función devuelva `NULL`. Las excepciones son `COALESCE`/`NULLIF`/`IFNULL`/`IF`/`Now`/`CurrentDate`/`CurrentTimestamp` (la primera tiene su propio short-circuit, las últimas no tienen args).
 
@@ -1119,6 +1124,19 @@ SELECT COALESCE(nickname, name, 'anónimo') FROM users;
 
 SELECT CAST(price AS TEXT) || '?' FROM products; -- error: `||` aún no soportado
 SELECT CONCAT(CAST(price AS TEXT), '?') FROM products; -- forma soportada
+
+-- G2: expresiones en WHERE, HAVING, UPDATE SET
+SELECT id FROM users WHERE LENGTH(name) > 3;
+SELECT id FROM users WHERE UPPER(name) = 'ANA';
+SELECT id FROM users WHERE COALESCE(active, false) = true;
+SELECT id FROM users WHERE CASE WHEN age > 18 THEN true ELSE false END = true;
+
+SELECT g, COUNT(*) FROM t GROUP BY g HAVING UPPER(g) = 'X';
+
+UPDATE users SET name = UPPER(name) WHERE id = 1;
+UPDATE users SET descr = COALESCE(descr, 'sin descr') WHERE id = 2;
+UPDATE users SET tier = CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END;
+DELETE FROM users WHERE LENGTH(name) = 0;
 ```
 
 ### ❌ Errores típicos
@@ -1130,6 +1148,9 @@ SELECT CONCAT(CAST(price AS TEXT), '?') FROM products; -- forma soportada
 | `[GBY-4036] CAST('xyz' AS INT): no es un entero válido` | conversión imposible al tipo destino. |
 | `[GBY-4037] función escalar desconocida: 'FOO'` | nombre no presente en la lista soportada. |
 | `[GBY-4038] CASE WHEN: la condición debe ser BOOL, recibí INT` | `CASE WHEN x THEN …` con `x` no booleano. |
+| `[GBY-4039] operador 'IS' sobre expresión escalar aún no se soporta` | G2: postfix (`IS NULL`/`LIKE`/`IN`/`BETWEEN`) con LHS expresional (`LENGTH(x) IS NULL`) — usar comparación directa o esperar G3. |
+| `[GBY-4040] expresión en WHERE/HAVING debe evaluar a BOOL (o NULL)` | G2: predicado expresional sin comparador (`WHERE LENGTH(x)`) — falta `>`/`=`/etc. |
+| `[GBY-4041] UPDATE sobre 't': el valor calculado para 'col' es TEXT y la columna es INT` | G2: la RHS de un `SET col = <expr>` rinde un tipo incompatible — envolver con `CAST(... AS T)`. |
 
 ---
 

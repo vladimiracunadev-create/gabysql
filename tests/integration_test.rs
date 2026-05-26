@@ -5087,6 +5087,378 @@ fn g1_expression_on_join() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque G2 (2026-05-26): expresiones escalares en WHERE / HAVING / UPDATE SET
+// ============================================================
+//
+// G1 dejó las funciones escalares (`UPPER`, `LENGTH`, `COALESCE`,
+// `CASE`, `CAST`, ...) usables solo dentro del SELECT list. G2 las
+// extiende a las superficies de filtrado y mutación: WHERE, HAVING,
+// UPDATE SET, y por carry-over también UPDATE/DELETE WHERE
+// (que reusan el mismo grammar de WHERE).
+//
+// Operadores postfix sobre Expr (IS NULL, LIKE, IN, BETWEEN) NO
+// están en G2 — error explícito `[GBY-4039]`.
+
+fn setup_g2_table(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, nombre TEXT, edad INT, activo BOOL, descripcion TEXT, precio FLOAT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, nombre, edad, activo, descripcion, precio) VALUES (1, 'Ana', 30, true, 'admin', 12.7);
+         INSERT INTO t (id, nombre, edad, activo, descripcion, precio) VALUES (2, 'Bo', 17, false, NULL, 5.3);
+         INSERT INTO t (id, nombre, edad, activo, descripcion, precio) VALUES (3, 'Charlie', 22, NULL, 'user', 99.0);
+         INSERT INTO t (id, nombre, edad, activo, descripcion, precio) VALUES (4, '', 50, true, NULL, 0.5);",
+    )?;
+    Ok((db, wal))
+}
+
+#[test]
+fn g2_where_length_gt() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_len_gt")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) > 3;")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!("id no-INT"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![3]); // 'Charlie' tiene 7 chars
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_upper_eq_literal() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_upper")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE UPPER(nombre) = 'ANA';")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_coalesce() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_coalesce")?;
+    // activo NULL → COALESCE devuelve false → fila excluida; las dos
+    // con activo=true pasan; la false NO pasa.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE COALESCE(activo, false) = true;",
+    )?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 4]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_case_when() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_case")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE CASE WHEN edad > 18 THEN true ELSE false END = true;",
+    )?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 3, 4]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_cast() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_cast")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE CAST(precio AS INT) > 10;")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]); // precios 12.7 y 99.0
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_3vl_null_propagation() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_3vl")?;
+    // descripcion NULL en id=2 e id=4 → LENGTH(NULL)=NULL → NULL > 0 → NULL → excluido.
+    // id=1 ('admin') len=5, id=3 ('user') len=4. Ambos pasan.
+    let res = run_sql(&db, "SELECT id FROM t WHERE LENGTH(descripcion) > 0;")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_combined_with_and_or() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_combined")?;
+    // LENGTH(nombre) > 2 AND edad >= 22.
+    // id=1 Ana (3) y >=22 → ok
+    // id=2 Bo (2) → no
+    // id=3 Charlie (7) y >=22 → ok
+    // id=4 '' (0) → no
+    let res = run_sql(
+        &db,
+        "SELECT id FROM t WHERE LENGTH(nombre) > 2 AND edad >= 22;",
+    )?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_lhs_literal_rhs_func() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_lhs_lit")?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE 5 < LENGTH(nombre);")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_expr_not_boolean_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_not_bool")?;
+    // LENGTH(nombre) sin comparador → INT → no es BOOL → 4040.
+    let err = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre);").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4040]"),
+        "esperaba GBY-4040: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_where_is_null_on_expr_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_where_isnull_expr")?;
+    let err = run_sql(&db, "SELECT id FROM t WHERE LENGTH(nombre) IS NULL;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4039]"),
+        "esperaba GBY-4039: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_upper() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_update_upper")?;
+    run_sql(&db, "UPDATE t SET nombre = UPPER(nombre) WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT nombre FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("ANA".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_coalesce() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_update_coalesce")?;
+    run_sql(
+        &db,
+        "UPDATE t SET descripcion = COALESCE(descripcion, 'sin descripcion') WHERE id = 2;",
+    )?;
+    let res = run_sql(&db, "SELECT descripcion FROM t WHERE id = 2;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::String("sin descripcion".to_string())
+    );
+    // La fila sin NULL no se afecta (el WHERE no la toca).
+    let res = run_sql(&db, "SELECT descripcion FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("admin".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_case() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_update_case")?;
+    run_sql(
+        &db,
+        "UPDATE t SET descripcion = CASE WHEN edad >= 18 THEN 'adulto' ELSE 'menor' END WHERE id = 2;",
+    )?;
+    let res = run_sql(&db, "SELECT descripcion FROM t WHERE id = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("menor".to_string()));
+    run_sql(
+        &db,
+        "UPDATE t SET descripcion = CASE WHEN edad >= 18 THEN 'adulto' ELSE 'menor' END WHERE id = 1;",
+    )?;
+    let res = run_sql(&db, "SELECT descripcion FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("adulto".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_cast() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_update_cast")?;
+    // edad es INT — CAST(precio AS INT) cae bien.
+    run_sql(&db, "UPDATE t SET edad = CAST(precio AS INT) WHERE id = 3;")?;
+    let res = run_sql(&db, "SELECT edad FROM t WHERE id = 3;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_pk_blocked() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_update_pk")?;
+    let err = run_sql(&db, "UPDATE t SET id = UPPER('x') WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4008]"),
+        "esperaba GBY-4008 (PK no mutable): {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_type_mismatch() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_update_typemis")?;
+    // edad es INT — asignar TEXT directo debería romper.
+    let err = run_sql(&db, "UPDATE t SET edad = UPPER(nombre) WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4041]"),
+        "esperaba GBY-4041: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_set_pre_update_snapshot() -> Result<(), Box<dyn Error>> {
+    // La RHS de cada assignment se evalúa contra la fila PRE-update:
+    // si pedimos `SET a = b, b = a`, ambos ven los valores originales,
+    // no la mutación in-flight. Usamos UPPER para forzar evaluación
+    // contra el valor leído del disco.
+    let (db, wal) = setup_g2_table("g2_update_preupdate")?;
+    run_sql(
+        &db,
+        "UPDATE t SET nombre = UPPER(nombre), descripcion = nombre WHERE id = 1;",
+    )?;
+    let res = run_sql(&db, "SELECT nombre, descripcion FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("ANA".to_string()));
+    // descripcion debe ser el nombre PRE-update ('Ana'), no 'ANA'.
+    assert_eq!(res[0].rows[0][1], Value::String("Ana".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_having_with_scalar_fn() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("g2_having_scalar");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE g (id INT PRIMARY KEY, grupo TEXT, monto INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO g (id, grupo, monto) VALUES (1, 'x', 10);
+         INSERT INTO g (id, grupo, monto) VALUES (2, 'x', 20);
+         INSERT INTO g (id, grupo, monto) VALUES (3, 'y', 30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT grupo, COUNT(*) FROM g GROUP BY grupo HAVING UPPER(grupo) = 'X';",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::String("x".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_delete_where_length() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_del_len")?;
+    run_sql(&db, "DELETE FROM t WHERE LENGTH(nombre) = 0;")?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3]); // se va el id=4 (nombre vacío)
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn g2_update_where_upper() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_g2_table("g2_upd_where_upper")?;
+    // UPPER(descripcion) = 'ADMIN' sobre id=1.
+    run_sql(
+        &db,
+        "UPDATE t SET activo = false WHERE UPPER(descripcion) = 'ADMIN';",
+    )?;
+    let res = run_sql(&db, "SELECT activo FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bool(false));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
