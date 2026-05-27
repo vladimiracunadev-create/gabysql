@@ -48,7 +48,11 @@ struct Xorshift64(u64);
 
 impl Xorshift64 {
     fn new(seed: u64) -> Self {
-        let s = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+        let s = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
         Self(s)
     }
     fn next_u64(&mut self) -> u64 {
@@ -198,7 +202,11 @@ fn summarize(op: &str, samples_ns: Vec<u128>, rows: usize, note: &str) -> Stats 
 fn err_stat(op: &str, note: &str, err: &DbError) -> Stats {
     let truncated = {
         let s = err.to_string();
-        if s.len() > 120 { format!("{}…", &s[..120]) } else { s }
+        if s.len() > 120 {
+            format!("{}…", &s[..120])
+        } else {
+            s
+        }
     };
     Stats {
         op: op.to_string(),
@@ -309,12 +317,7 @@ fn try_exec_batch(pager: &mut Pager, sqls: &[&str]) -> bool {
 }
 
 /// Bulk load — N inserts por commit para mantener el WAL acotado.
-fn bulk_load<F>(
-    pager: &mut Pager,
-    total: usize,
-    batch: usize,
-    mut gen: F,
-) -> DbResult<f64>
+fn bulk_load<F>(pager: &mut Pager, total: usize, batch: usize, mut gen: F) -> DbResult<f64>
 where
     F: FnMut(usize) -> String,
 {
@@ -358,7 +361,9 @@ fn setup_microblog(pager: &mut Pager) -> DbResult<Vec<LoadStat>> {
         ],
     )?;
 
-    let nombres = ["Ana", "Luis", "Maria", "Pedro", "Juan", "Sofia", "Diego", "Lucia"];
+    let nombres = [
+        "Ana", "Luis", "Maria", "Pedro", "Juan", "Sofia", "Diego", "Lucia",
+    ];
     let mut rng = Xorshift64::new(SEED);
     let users_elapsed = bulk_load(pager, MICROBLOG_USERS, 500, |i| {
         let nombre = nombres[(rng.next_u64() as usize) % nombres.len()];
@@ -408,18 +413,33 @@ fn queries_microblog(pager: &mut Pager, iters: usize) -> DbResult<Vec<Stats>> {
     pager.begin()?;
 
     // Q1 — PK lookup random
-    out.push(bench_safe("Q1 PK lookup (users.id)", pager, iters, "1000 ids dispersos", |engine, i| {
-        let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xA1);
-        let id = (rng.next_u64() % MICROBLOG_USERS as u64) as i64;
-        exec_sql_rows(engine, &format!("SELECT * FROM users WHERE id = {}", id))
-    }));
+    out.push(bench_safe(
+        "Q1 PK lookup (users.id)",
+        pager,
+        iters,
+        "1000 ids dispersos",
+        |engine, i| {
+            let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xA1);
+            let id = (rng.next_u64() % MICROBLOG_USERS as u64) as i64;
+            exec_sql_rows(engine, &format!("SELECT * FROM users WHERE id = {}", id))
+        },
+    ));
 
     // Q2a — sin índice (esperamos GBY-4001 → N/A)
-    out.push(bench_safe("Q2a Indexed eq posts.user_id (sin idx)", pager, iters / 5, "pre CREATE INDEX", |engine, i| {
-        let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xB2);
-        let uid = (rng.next_u64() % MICROBLOG_USERS as u64) as i64;
-        exec_sql_rows(engine, &format!("SELECT * FROM posts WHERE user_id = {}", uid))
-    }));
+    out.push(bench_safe(
+        "Q2a Indexed eq posts.user_id (sin idx)",
+        pager,
+        iters / 5,
+        "pre CREATE INDEX",
+        |engine, i| {
+            let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xB2);
+            let uid = (rng.next_u64() % MICROBLOG_USERS as u64) as i64;
+            exec_sql_rows(
+                engine,
+                &format!("SELECT * FROM posts WHERE user_id = {}", uid),
+            )
+        },
+    ));
 
     let _ = pager.commit();
 
@@ -431,18 +451,36 @@ fn queries_microblog(pager: &mut Pager, iters: usize) -> DbResult<Vec<Stats>> {
     pager.begin()?;
 
     // Q2b — con índice
-    out.push(bench_safe("Q2b Indexed eq posts.user_id (con idx)", pager, iters, "idx_posts_user activo", |engine, i| {
-        let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xB2);
-        let uid = (rng.next_u64() % MICROBLOG_USERS as u64) as i64;
-        exec_sql_rows(engine, &format!("SELECT * FROM posts WHERE user_id = {}", uid))
-    }));
+    out.push(bench_safe(
+        "Q2b Indexed eq posts.user_id (con idx)",
+        pager,
+        iters,
+        "idx_posts_user activo",
+        |engine, i| {
+            let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xB2);
+            let uid = (rng.next_u64() % MICROBLOG_USERS as u64) as i64;
+            exec_sql_rows(
+                engine,
+                &format!("SELECT * FROM posts WHERE user_id = {}", uid),
+            )
+        },
+    ));
 
     // Q3 — range scan PK
-    out.push(bench_safe("Q3 Range scan PK (posts.id BETWEEN)", pager, iters, "rango 100", |engine, i| {
-        let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xC3);
-        let a = (rng.next_u64() % (MICROBLOG_POSTS as u64 - 100)) as i64;
-        exec_sql_rows(engine, &format!("SELECT * FROM posts WHERE id BETWEEN {} AND {}", a, a + 99))
-    }));
+    out.push(bench_safe(
+        "Q3 Range scan PK (posts.id BETWEEN)",
+        pager,
+        iters,
+        "rango 100",
+        |engine, i| {
+            let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xC3);
+            let a = (rng.next_u64() % (MICROBLOG_POSTS as u64 - 100)) as i64;
+            exec_sql_rows(
+                engine,
+                &format!("SELECT * FROM posts WHERE id BETWEEN {} AND {}", a, a + 99),
+            )
+        },
+    ));
 
     // Q4 — JOIN index-loop
     out.push(bench_safe("Q4 JOIN posts×users (BETWEEN 1..100)", pager, iters, "join via idx PK", |engine, _| {
@@ -451,9 +489,13 @@ fn queries_microblog(pager: &mut Pager, iters: usize) -> DbResult<Vec<Stats>> {
     }));
 
     // Q5 — Aggregate (likes no tiene idx → puede fallar 4001)
-    out.push(bench_safe("Q5 Aggregate COUNT(*) WHERE likes>50", pager, iters / 2, "full scan posts", |engine, _| {
-        exec_sql_rows(engine, "SELECT COUNT(*) FROM posts WHERE likes > 50")
-    }));
+    out.push(bench_safe(
+        "Q5 Aggregate COUNT(*) WHERE likes>50",
+        pager,
+        iters / 2,
+        "full scan posts",
+        |engine, _| exec_sql_rows(engine, "SELECT COUNT(*) FROM posts WHERE likes > 50"),
+    ));
 
     let _ = pager.commit();
 
@@ -506,7 +548,10 @@ fn queries_microblog(pager: &mut Pager, iters: usize) -> DbResult<Vec<Stats>> {
         (Some(e), true) => err_stat("Q6 UPDATE posts.likes (auto-commit)", upd_note, &e),
         (Some(e), false) => {
             let mut s = summarize("Q6 UPDATE posts.likes (auto-commit)", samples, 1, upd_note);
-            s.note = format!("{} — PARCIAL: falló en iter {} ({})", upd_note, upd_fail_at, e);
+            s.note = format!(
+                "{} — PARCIAL: falló en iter {} ({})",
+                upd_note, upd_fail_at, e
+            );
             s.failed = true;
             s
         }
@@ -563,7 +608,10 @@ fn setup_events(pager: &mut Pager) -> DbResult<Vec<LoadStat>> {
     // Best-effort: con 200K rows + alta cardinalidad de payloads el b+tree puede
     // rechazar entradas grandes (límite de página); si falla, Q3/Q4 caerán a N/A
     // automáticamente via bench_safe.
-    let _ = try_exec_batch(pager, &["CREATE INDEX idx_events_type ON events(event_type)"]);
+    let _ = try_exec_batch(
+        pager,
+        &["CREATE INDEX idx_events_type ON events(event_type)"],
+    );
 
     Ok(vec![LoadStat {
         label: "INSERT events".into(),
@@ -581,35 +629,89 @@ fn queries_events(pager: &mut Pager, iters: usize) -> DbResult<Vec<Stats>> {
     let mid_iters = (iters / 5).max(20);
 
     // Q1 — WHERE latency_ms > 1000 (no indexada → esperado 4001)
-    out.push(bench_safe("Q1 Full scan COUNT WHERE latency>1000", pager, heavy_iters, "scan 200K (latency_ms no idx)", |engine, _| {
-        exec_sql_rows(engine, "SELECT COUNT(*) FROM events WHERE latency_ms > 1000")
-    }));
+    out.push(bench_safe(
+        "Q1 Full scan COUNT WHERE latency>1000",
+        pager,
+        heavy_iters,
+        "scan 200K (latency_ms no idx)",
+        |engine, _| {
+            exec_sql_rows(
+                engine,
+                "SELECT COUNT(*) FROM events WHERE latency_ms > 1000",
+            )
+        },
+    ));
 
-    out.push(bench_safe("Q2 GROUP BY event_type", pager, heavy_iters, "agg + hash group", |engine, _| {
-        exec_sql_rows(engine, "SELECT event_type, COUNT(*), AVG(latency_ms) FROM events GROUP BY event_type")
-    }));
+    out.push(bench_safe(
+        "Q2 GROUP BY event_type",
+        pager,
+        heavy_iters,
+        "agg + hash group",
+        |engine, _| {
+            exec_sql_rows(
+                engine,
+                "SELECT event_type, COUNT(*), AVG(latency_ms) FROM events GROUP BY event_type",
+            )
+        },
+    ));
 
-    out.push(bench_safe("Q3 Indexed lookup type='login' LIMIT 100", pager, mid_iters, "tipo frecuente ~50%", |engine, _| {
-        exec_sql_rows(engine, "SELECT * FROM events WHERE event_type = 'login' LIMIT 100")
-    }));
+    out.push(bench_safe(
+        "Q3 Indexed lookup type='login' LIMIT 100",
+        pager,
+        mid_iters,
+        "tipo frecuente ~50%",
+        |engine, _| {
+            exec_sql_rows(
+                engine,
+                "SELECT * FROM events WHERE event_type = 'login' LIMIT 100",
+            )
+        },
+    ));
 
-    out.push(bench_safe("Q4 Indexed lookup type='admin_action' LIMIT 100", pager, mid_iters, "tipo raro ~1%", |engine, _| {
-        exec_sql_rows(engine, "SELECT * FROM events WHERE event_type = 'admin_action' LIMIT 100")
-    }));
+    out.push(bench_safe(
+        "Q4 Indexed lookup type='admin_action' LIMIT 100",
+        pager,
+        mid_iters,
+        "tipo raro ~1%",
+        |engine, _| {
+            exec_sql_rows(
+                engine,
+                "SELECT * FROM events WHERE event_type = 'admin_action' LIMIT 100",
+            )
+        },
+    ));
 
     // Q5 — LENGTH(payload) > 100 (scalar en WHERE no indexable)
-    out.push(bench_safe("Q5 Scalar func WHERE LENGTH(payload)>100", pager, heavy_iters, "G2 scalar in WHERE", |engine, _| {
-        exec_sql_rows(engine, "SELECT COUNT(*) FROM events WHERE LENGTH(payload) > 100")
-    }));
+    out.push(bench_safe(
+        "Q5 Scalar func WHERE LENGTH(payload)>100",
+        pager,
+        heavy_iters,
+        "G2 scalar in WHERE",
+        |engine, _| {
+            exec_sql_rows(
+                engine,
+                "SELECT COUNT(*) FROM events WHERE LENGTH(payload) > 100",
+            )
+        },
+    ));
 
     out.push(bench_safe("Q6 INTERSECT (latency>500 ∩ user_id<100)", pager, heavy_iters, "I set op", |engine, _| {
         exec_sql_rows(engine,
             "SELECT event_type FROM events WHERE latency_ms > 500 INTERSECT SELECT event_type FROM events WHERE user_id < 100")
     }));
 
-    out.push(bench_safe("Q7 Scalar subquery in SELECT LIMIT 10", pager, mid_iters, "H scalar subquery", |engine, _| {
-        exec_sql_rows(engine, "SELECT id, (SELECT COUNT(*) FROM events) AS total FROM events LIMIT 10")
-    }));
+    out.push(bench_safe(
+        "Q7 Scalar subquery in SELECT LIMIT 10",
+        pager,
+        mid_iters,
+        "H scalar subquery",
+        |engine, _| {
+            exec_sql_rows(
+                engine,
+                "SELECT id, (SELECT COUNT(*) FROM events) AS total FROM events LIMIT 10",
+            )
+        },
+    ));
 
     out.push(bench_safe("Q8 Derived table GROUP BY filter cnt>1000", pager, heavy_iters, "H derived table", |engine, _| {
         exec_sql_rows(engine,
@@ -656,7 +758,10 @@ fn setup_catalog(pager: &mut Pager) -> DbResult<Vec<LoadStat>> {
         )
     })?;
 
-    let _ = try_exec_batch(pager, &["CREATE INDEX idx_lines_order_sku ON order_lines (order_id, line_no)"]);
+    let _ = try_exec_batch(
+        pager,
+        &["CREATE INDEX idx_lines_order_sku ON order_lines (order_id, line_no)"],
+    );
 
     Ok(vec![
         LoadStat {
@@ -678,18 +783,39 @@ fn queries_catalog(pager: &mut Pager, iters: usize) -> DbResult<Vec<Stats>> {
     let mut out = Vec::new();
     pager.begin()?;
 
-    out.push(bench_safe("Q1 Composite PK full (order_id AND line_no)", pager, iters, "lookup exacto", |engine, i| {
-        let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xE1);
-        let oid = (rng.next_u64() % ORDERS_ROWS as u64) as i64;
-        let ln = (rng.next_u64() % 10) as i64;
-        exec_sql_rows(engine, &format!("SELECT * FROM order_lines WHERE order_id = {} AND line_no = {}", oid, ln))
-    }));
+    out.push(bench_safe(
+        "Q1 Composite PK full (order_id AND line_no)",
+        pager,
+        iters,
+        "lookup exacto",
+        |engine, i| {
+            let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xE1);
+            let oid = (rng.next_u64() % ORDERS_ROWS as u64) as i64;
+            let ln = (rng.next_u64() % 10) as i64;
+            exec_sql_rows(
+                engine,
+                &format!(
+                    "SELECT * FROM order_lines WHERE order_id = {} AND line_no = {}",
+                    oid, ln
+                ),
+            )
+        },
+    ));
 
-    out.push(bench_safe("Q2 Composite PK partial (order_id only)", pager, iters / 5, "fallback a scan", |engine, i| {
-        let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xE2);
-        let oid = (rng.next_u64() % ORDERS_ROWS as u64) as i64;
-        exec_sql_rows(engine, &format!("SELECT * FROM order_lines WHERE order_id = {}", oid))
-    }));
+    out.push(bench_safe(
+        "Q2 Composite PK partial (order_id only)",
+        pager,
+        iters / 5,
+        "fallback a scan",
+        |engine, i| {
+            let mut rng = Xorshift64::new(SEED ^ i as u64 ^ 0xE2);
+            let oid = (rng.next_u64() % ORDERS_ROWS as u64) as i64;
+            exec_sql_rows(
+                engine,
+                &format!("SELECT * FROM order_lines WHERE order_id = {}", oid),
+            )
+        },
+    ));
 
     out.push(bench_safe("Q3 JOIN orders×order_lines (id BETWEEN 1..10)", pager, iters, "join + composite", |engine, _| {
         exec_sql_rows(engine,
@@ -770,26 +896,60 @@ fn capture_cmd(cmd: &str, args: &[&str]) -> String {
 }
 
 fn render_metadata() -> String {
-    let now = capture_cmd("powershell", &["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'"]);
+    let now = capture_cmd(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'",
+        ],
+    );
     let commit = capture_cmd("git", &["rev-parse", "--short", "HEAD"]);
     let branch = capture_cmd("git", &["rev-parse", "--abbrev-ref", "HEAD"]);
     let rustc = capture_cmd("rustc", &["--version"]);
     let os = capture_cmd("powershell", &["-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).Caption + ' ' + (Get-CimInstance Win32_OperatingSystem).Version"]);
-    let cpu = capture_cmd("powershell", &["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]);
-    let cores = capture_cmd("powershell", &["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).NumberOfLogicalProcessors"]);
-    let ram_gb = capture_cmd("powershell", &["-NoProfile", "-Command", "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)"]);
+    let cpu = capture_cmd(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_Processor).Name",
+        ],
+    );
+    let cores = capture_cmd(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_Processor).NumberOfLogicalProcessors",
+        ],
+    );
+    let ram_gb = capture_cmd(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)",
+        ],
+    );
 
     let mut s = String::new();
     s.push_str("# Benchmark gabysql\n\n");
     s.push_str("## Metadata\n\n");
     s.push_str(&format!("- **Fecha**: {}\n", now));
-    s.push_str(&format!("- **Commit**: `{}` (branch `{}`)\n", commit, branch));
+    s.push_str(&format!(
+        "- **Commit**: `{}` (branch `{}`)\n",
+        commit, branch
+    ));
     s.push_str(&format!("- **Toolchain**: {}\n", rustc));
     s.push_str(&format!("- **OS**: {}\n", os));
     s.push_str(&format!("- **CPU**: {} ({} threads lógicos)\n", cpu, cores));
     s.push_str(&format!("- **RAM**: {} GB\n", ram_gb));
     s.push_str("- **Build profile**: release (LTO según Cargo.toml)\n");
-    s.push_str(&format!("- **Warmup descartado**: {} iters por operación\n", WARMUP_DISCARD));
+    s.push_str(&format!(
+        "- **Warmup descartado**: {} iters por operación\n",
+        WARMUP_DISCARD
+    ));
     s.push('\n');
     s
 }
@@ -882,7 +1042,10 @@ fn run(args: &Args) -> DbResult<()> {
         }
         md.push_str(&format!("\n## Escenario: {}\n\n", args.scenario));
         md.push_str(&format!("- DB: `{}`\n", args.db.display()));
-        md.push_str(&format!("- iters: {} (warmup descartado: {})\n", args.iters, WARMUP_DISCARD));
+        md.push_str(&format!(
+            "- iters: {} (warmup descartado: {})\n",
+            args.iters, WARMUP_DISCARD
+        ));
         md.push_str(&format!("- phase: {}\n\n", args.phase));
         if !load_stats.is_empty() {
             md.push_str("### Carga\n\n");
@@ -902,7 +1065,11 @@ fn run(args: &Args) -> DbResult<()> {
             }
         }
         append_or_create(out_path, &md)?;
-        println!("\nReporte {} en: {}", if is_first { "creado" } else { "appendeado" }, out_path.display());
+        println!(
+            "\nReporte {} en: {}",
+            if is_first { "creado" } else { "appendeado" },
+            out_path.display()
+        );
     }
 
     Ok(())
