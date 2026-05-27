@@ -36,7 +36,7 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 | 🛡️ | [SECURITY_LAYERS](docs/SECURITY_LAYERS.md) | mapa completo de las 6 capas de seguridad |
 | 🚨 | [ERROR_CODES](docs/ERROR_CODES.md) | catálogo numerado de errores `[GBY-NNNN]` (estilo MySQL `ER_*`) |
 | 🚧 | [MISSING_COMMANDS](docs/MISSING_COMMANDS.md) | **inventario exhaustivo de lo que falta** del SQL clásico — roadmap concreto para cerrar la línea de comandos |
-| 📊 | [BENCHMARK 2026-05-27](BENCHMARK_2026-05-27.md) | **evaluación profesional** sobre 3 escenarios sintéticos (OLTP / analítica / K2 composite): metodología, P50/P95/P99, top fastest/slowest, 6 issues encontrados con repro + fix sugerido |
+| 📊 | [BENCHMARK](BENCHMARK.md) | **evaluación profesional vigente** sobre 3 escenarios sintéticos (OLTP / analítica / K2 composite): metodología, P50/P95/P99, top fastest/slowest, issues encontrados con repro + fix sugerido. Se actualiza in-place con cada mejora; corridas históricas se archivan en `docs/benchmarks/` cuando justifican comparación |
 | 📜 | [ADRs](docs/adr/) | decisiones arquitectónicas (contexto, alternativas, consecuencias) |
 | 🏛️ | Históricos: [POSITIONING](docs/POSITIONING.md) · [COMMERCIAL_ROADMAP](docs/COMMERCIAL_ROADMAP.md) · [COMPETITIVE_ANALYSIS](docs/COMPETITIVE_ANALYSIS.md) | artefactos del intento de pensar `gabysql` como producto. **No son agenda operativa**. |
 

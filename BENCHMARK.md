@@ -1,6 +1,10 @@
-# Benchmark gabysql — sesión 2026-05-27
+# Benchmark gabysql
 
-> **Evaluación profesional de desempeño** sobre `main` post bloques G/H/I/K1/K2 (commit `87583a8`). Tres escenarios sintéticos representativos (OLTP-like, analítica mediana, K2 PK compuesta) corridos en una sola máquina, con metodología reproducible y caveats honestos.
+> **Evaluación profesional de desempeño** sobre `main`. Tres escenarios sintéticos representativos (OLTP-like, analítica mediana, K2 PK compuesta) corridos en una sola máquina, con metodología reproducible y caveats honestos.
+>
+> 📌 **Corrida vigente**: sesión **2026-05-27**, commit `87583a8` (post bloques G/H/I/K1/K2).
+>
+> 📂 **Convención**: este archivo se actualiza in-place a medida que el motor mejora. Corridas previas se archivan en `docs/benchmarks/BENCHMARK-YYYY-MM-DD.md` solo cuando hay un cambio de fondo que justifica mantener el snapshot histórico para comparar (e.g. fix de un issue importante, bump de VERSION en disco, cambio de hardware del runner). Mientras tanto, este es el único reporte.
 
 ---
 
