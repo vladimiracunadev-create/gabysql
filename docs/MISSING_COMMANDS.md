@@ -38,7 +38,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **I** ✅ | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`INTERSECT ALL`/`EXCEPT`/`EXCEPT ALL`/`MINUS`, `VALUES (...)` como query standalone y como tabla virtual en FROM/JOIN (**cerrado 2026-05-26**) | Medio | — |
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
 | **K1** ✅ | DDL safe sin cambios on-disk: `CREATE TABLE AS SELECT`, `RENAME TABLE`, `ALTER TABLE RENAME TO`, `ALTER TABLE DROP COLUMN [IF EXISTS]`, `ALTER TABLE RENAME COLUMN` (**cerrado 2026-05-26**) | Medio | — |
-| **K2** | DDL con cambios on-disk: PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`. Requiere bump VERSION 7→8 + ADR. | Alto | K1 |
+| **K2** ✅ | DDL con cambios on-disk: PK compuesta `PRIMARY KEY (a, b, ...)` y índices compuestos `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`. Bump VERSION 7→8 (**cerrado 2026-05-26**, ver ADR-0019). Restringido a all-INT NOT NULL; partial indexes y `ALTER COLUMN TYPE` siguen pendientes (futuro K3). | Alto | K1 |
 | **L** | Constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE ...`, multi-column UNIQUE | Medio | K |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
 | **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
@@ -249,7 +249,7 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 ### Tabla y schema
 | Comando | Soportado | Prioridad |
 |---|:---:|:---:|
-| `CREATE TABLE` con `PRIMARY KEY(a,b)` compuesta | ❌ | P1 (K2 — requiere bump VERSION 7→8) |
+| `CREATE TABLE` con `PRIMARY KEY(a,b)` compuesta | ✅ (K2, 2026-05-26) | all-INT NOT NULL, ver ADR-0019 |
 | `CREATE TABLE ... AS SELECT ...` (CTAS) | ✅ (K1, 2026-05-26; primera col del SELECT debe ser INT no-NULL → PK) | — |
 | `CREATE TEMPORARY TABLE` | ❌ | P2 |
 | `ALTER TABLE ADD COLUMN` | ✅ | — |
@@ -265,7 +265,7 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 |---|:---:|:---:|
 | `CREATE INDEX ... ON t (col)` single | ✅ | — |
 | `CREATE UNIQUE INDEX` | ✅ | — |
-| `CREATE INDEX ... ON t (a, b, ...)` compuesto | ❌ | P0 |
+| `CREATE INDEX ... ON t (a, b, ...)` compuesto | ✅ (K2, 2026-05-26) | all-INT, equality-only via fingerprint FNV-1a-64 |
 | `CREATE INDEX ... ON t (col) WHERE cond` (partial) | ❌ | P2 |
 | `CREATE INDEX ... INCLUDE (...)` (covering) | ❌ | P3 |
 | `REINDEX` | ❌ | P3 |

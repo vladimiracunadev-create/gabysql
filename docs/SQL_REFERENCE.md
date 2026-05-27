@@ -39,7 +39,9 @@
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
 | Index-loop join optimization (transparente: aplica auto cuando hay índice/PK) | DML | 🟢 |
-| PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| PK compuesta (`PRIMARY KEY (a, b, ...)`) — all-INT NOT NULL | DDL | 🟢 (K2, VERSION 8) |
+| Índices compuestos (`CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`) — all-INT, equality-only | DDL | 🟢 (K2, VERSION 8) |
+| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, FK multi-col, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -443,7 +445,7 @@ ALTER TABLE users ADD score FLOAT DEFAULT 0;     -- COLUMN es opcional
 | `ALTER TABLE ADD COLUMN 'X' UNIQUE con DEFAULT no nulo produciría duplicados en N filas existentes` | el backfill insertaría el mismo valor en todas las filas |
 | `columna 'X': DEFAULT incompatible con tipo TEXT` | mismo validador de tipos que `CREATE TABLE` |
 
-> Restricciones: para `DROP COLUMN`, `RENAME COLUMN` y `RENAME TABLE` ver la sección [DDL extendido (K1)](#ddl-extendido-k1). `ALTER ... TYPE` y PK compuesta quedan para K2 (Camino A).
+> Restricciones: para `DROP COLUMN`, `RENAME COLUMN` y `RENAME TABLE` ver la sección [DDL extendido (K1)](#ddl-extendido-k1). PK compuesta + índices compuestos cerrados en K2 (VERSION 8, ver ADR-0019). `ALTER ... TYPE` y ALTER PK siguen pendientes.
 
 ---
 

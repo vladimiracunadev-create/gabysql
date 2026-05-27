@@ -5,7 +5,7 @@
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-7-2d7a66)](TECHNICAL_SPECS.md)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-8-2d7a66)](TECHNICAL_SPECS.md)
 [![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-283%2F283-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
@@ -20,7 +20,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Pager (header + caché in-memory) | 🟢 | `PageCache` con cap fija + LRU clean-only (default 1024 páginas ≈ 4 MB; tunable con `set_cache_capacity`). Prefetch pendiente. | [src/storage.rs](../src/storage.rs) |
 | WAL after-image + replay | 🟢 | CRC32 verificado por record. Sin checkpoints. | [src/storage.rs](../src/storage.rs) |
 | CRC32 por página | 🟢 | IEEE polynomial, table-based; verifica en lectura y replay. | [src/storage.rs](../src/storage.rs) |
-| Formato en disco versionado | 🟢 | `VERSION = 7`, rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
+| Formato en disco versionado | 🟢 | `VERSION = 8` (K2, 2026-05-26: PK e índices admiten múltiples columnas), rechazo explícito de versiones anteriores. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
 | `Pager::create` no destructivo | 🟢 | Refuses overwrite; `create_force` explícito. | [src/storage.rs](../src/storage.rs) |
 | B+Tree (LEAF + INTERNAL) | 🟡 | Splits OK; falta merge / rebalance al borrar. | [src/bptree.rs](../src/bptree.rs) |
 | Catálogo persistente | 🟢 | FNV-1a-64, estable entre versiones de Rust. | [src/catalog.rs](../src/catalog.rs) |
@@ -28,7 +28,8 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Constraints declarativas (NOT NULL/UNIQUE/DEFAULT) | 🟢 | Inline en `CREATE TABLE`; `CREATE UNIQUE INDEX`; pre-check sin efectos colaterales. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
 | `FOREIGN KEY` declarativas + enforced | 🟢 | Single-column, target = PK del parent, `ON DELETE RESTRICT/CASCADE`, self-ref OK, cycle protection en cascade. | [src/sql.rs](../src/sql.rs), [src/catalog.rs](../src/catalog.rs) |
 | Índices secundarios (equality) | 🟢 | Una columna, backfill, mantenimiento INSERT/UPDATE/DELETE. | [src/index.rs](../src/index.rs) |
-| Índices compuestos | 🔴 | No incluidos en VERSION 7. Requieren B+Tree byte-keyed o encoder multi-columna; diferidos a un futuro bloque. | — |
+| Índices compuestos | 🟢 | K2 (2026-05-26, VERSION 8). `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)` — equality lookup vía fingerprint FNV-1a-64. Restringido a all-INT (`[GBY-4067]`). No range scan (fingerprint no order-preserving). | [src/index.rs](../src/index.rs), [src/sql.rs](../src/sql.rs), [docs/adr/0019-composite-pk-and-index.md](adr/0019-composite-pk-and-index.md) |
+| PRIMARY KEY compuesta | 🟢 | K2 (2026-05-26, VERSION 8). `PRIMARY KEY (a, b, ...)` table-level. Restringido a all-INT NOT NULL (`[GBY-4064]`). UPDATE bloqueado sobre cualquier columna PK (`[GBY-4008]`). Partial lookup (`WHERE a = ?`) cae a full-scan. | [src/catalog.rs](../src/catalog.rs), [src/sql.rs](../src/sql.rs), [docs/adr/0019-composite-pk-and-index.md](adr/0019-composite-pk-and-index.md) |
 | `WHERE col_indexada = val` (no PK) | 🟢 | Plan dispatch: PK vs índice vs error. | [src/sql.rs](../src/sql.rs) |
 | `WHERE BETWEEN` (rango por PK) | 🟢 | Solo en SELECT. | [src/sql.rs](../src/sql.rs) |
 | Range scan por índice secundario | 🟡 | Solo columnas **INT**: el índice usa el valor como clave del B+Tree (ADR-0017, VERSION 7), `WHERE col_idx BETWEEN a AND b` walk en O(log N + k). TEXT/FLOAT/BOOL/DATE/DATETIME indexados siguen equality-only. | [src/index.rs](../src/index.rs), [src/sql.rs](../src/sql.rs) |
@@ -48,7 +49,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | `RENAME TABLE` / `ALTER TABLE ... RENAME TO` | 🟢 | K1 (2026-05-26). Renombra entry del catálogo (remove + put con la nueva clave hash) y arrastra el cambio a las FKs entrantes (otras tablas que apuntaban al nombre viejo). Destino tomado → `[GBY-4062]`; origen ausente → `[GBY-2001]`. | [src/sql.rs](../src/sql.rs) |
 | `ALTER TABLE ... DROP COLUMN [IF EXISTS]` | 🟢 | K1 (2026-05-26). Rewrite in place de cada fila (decode + remove col + re-encode). Bloqueos: PK (`[GBY-4059]`), columna indexada (`[GBY-4060]`, sugiere `DROP INDEX`), FK saliente o entrante (`[GBY-4061]`). `IF EXISTS` → no-op si la columna ya no está. | [src/sql.rs](../src/sql.rs) |
 | `ALTER TABLE ... RENAME COLUMN` | 🟢 | K1 (2026-05-26). On-disk row es posicional → no requiere rewrite; sólo muta `TableMeta.columns[i].name` y arrastra el cambio a `primary_key`, índices y FKs entrantes que referencien la columna. Destino tomado → `[GBY-4062]`. | [src/sql.rs](../src/sql.rs) |
-| DDL pendiente (PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`) | 🔴 | Bloque K2 (planificado aparte; requiere bump de VERSION on-disk 7→8 + ADR). | — |
+| DDL pendiente (partial indexes, `ALTER COLUMN TYPE`, ALTER PK, FK multi-col) | 🟡 | K2 (2026-05-26) cerró PK compuesta e índices compuestos (VERSION 8). Resto sigue pendiente — ver ADR-0019 para limitaciones y bloque siguiente. | [docs/adr/0019-composite-pk-and-index.md](adr/0019-composite-pk-and-index.md) |
 | Subqueries `ALL`/`ANY`/`SOME` / correlated `=` puro fuera de EXISTS / `LATERAL` / CTE / window functions | 🔴 | P2/P3 y bloque W (CTE). | — |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases, multi-tabla, self-join | 🟢 | Nested-loop puro O(N×M×…). WHERE/ORDER BY trabajan sobre filas joineadas. `SELECT *` expande prefijado. | [src/sql.rs](../src/sql.rs) |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | 🟢 | Implementado vía tracking de matched-rows + NULL-fill por kind. `OUTER` opcional. Combinable en chains. | [src/sql.rs](../src/sql.rs) |

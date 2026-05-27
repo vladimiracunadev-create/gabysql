@@ -308,6 +308,60 @@ pub fn ordered_bucket_unique_conflict(pks: &[i64], exclude_pk: Option<i64>) -> O
     pks.iter().copied().find(|pk| Some(*pk) != exclude_pk)
 }
 
+/// Bloque K2 (VERSION 8): fingerprint determinístico de una clave
+/// compuesta (PK o índice compuesto). Reusa la codificación canónica
+/// `encode_column_value` por columna y hashea las bytes con FNV-1a-64,
+/// intercalando un sentinela `0xFF` entre columnas para minimizar
+/// colisiones triviales (`(1, 23) ≠ (12, 3)`).
+///
+/// El resultado se castea a `i64` y se usa como clave del B+Tree —
+/// equality-only por construcción (no es order-preserving). Range scan
+/// sobre claves compuestas no se soporta en este release; el usuario
+/// que necesita range scan usa PK single-column como antes (ADR-0019).
+///
+/// Requiere `columns.len() == values.len()` y rechaza NULL en cualquier
+/// posición (la PK/UNIQUE compuesta no admite NULLs por construcción;
+/// el chequeo aquí es defensa en profundidad).
+pub fn encode_composite_key(columns: &[&Column], values: &[&Value]) -> DbResult<i64> {
+    if columns.len() != values.len() {
+        return Err(DbError::new(format!(
+            "encode_composite_key: arity mismatch — {} columnas vs {} valores",
+            columns.len(),
+            values.len()
+        )));
+    }
+    if columns.is_empty() {
+        return Err(DbError::new(
+            "encode_composite_key: lista vacía (se necesitan ≥ 1 columnas)",
+        ));
+    }
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut fnv: u64 = FNV_OFFSET_BASIS;
+    for (col, val) in columns.iter().zip(values.iter()) {
+        if matches!(val, Value::Null) {
+            return Err(coded(
+                codes::PRIMARY_KEY_NULL,
+                format!(
+                    "columna '{}' es parte de una clave compuesta y no admite NULL",
+                    col.name
+                ),
+            ));
+        }
+        let bytes = encode_column_value(col, val)?;
+        for b in bytes {
+            fnv ^= b as u64;
+            fnv = fnv.wrapping_mul(FNV_PRIME);
+        }
+        // Sentinela inter-columna: distingue tuplas con bytes concatenados
+        // equivalentes (e.g. ('a', 'bc') vs ('ab', 'c')) sin necesidad de
+        // escapado costoso.
+        fnv ^= 0xFF;
+        fnv = fnv.wrapping_mul(FNV_PRIME);
+    }
+    Ok(fnv as i64)
+}
+
 /// Validate that the column type can be used as an index key in this
 /// version. (Today: any of the supported scalar types except JSON, which
 /// has no canonical equality semantics.)

@@ -154,6 +154,11 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4061` | `CANNOT_DROP_REFERENCED_COLUMN` | K1: la columna a borrar participa en una FOREIGN KEY — saliente (la columna referencia otra tabla) o entrante (otra tabla la referencia). | Recrear la tabla sin esa FK o esperar al soporte de `ALTER ... DROP CONSTRAINT`. |
 | `4062` | `RENAME_TARGET_EXISTS` | K1: `RENAME TABLE old TO new` (o `RENAME COLUMN old TO new`) cuyo destino ya está tomado por otra tabla/columna. | Elegir un nombre libre. |
 | `4063` | `CTAS_COLUMN_ALIAS_ARITY` | K1: `CREATE TABLE t (a, b) AS SELECT x, y, z FROM ...` — la lista de aliases no matchea la arity del SELECT. | Igualar el número de aliases al número de columnas que proyecta el SELECT. |
+| `4064` | `COMPOSITE_PK_REQUIRES_ALL_INT` | K2 (2026-05-26): `PRIMARY KEY (a, b, ...)` con alguna columna no-INT o nullable. El fingerprint i64 que sostiene la PK compuesta exige all-INT NOT NULL (ver ADR-0019). | Declarar todas las columnas PK como `INT NOT NULL`, o modelar con surrogate `id INT PRIMARY KEY` + `UNIQUE (a, b, ...)`. |
+| `4065` | `PRIMARY_KEY_DUPLICATED` | K2: `PRIMARY KEY` declarada dos veces — inline en una columna + table-level, o dos columnas con `PRIMARY KEY` inline. | Elegir una única forma de declarar la PK. |
+| `4066` | `FK_TARGET_NOT_INDEXED` | K2 (reservado): una FOREIGN KEY apunta a columna del padre que no es ni PK ni UNIQUE. Hoy se reusa `3004` para los casos prácticos. | Hacer la columna padre PK o UNIQUE. |
+| `4067` | `COMPOSITE_INDEX_REQUIRES_ALL_INT` | K2: `CREATE INDEX idx ON t (a, b, ...)` con alguna columna no-INT. Mismo motivo que 4064. | Indexar solo columnas INT, o crear índices single-column individuales. |
+| `4068` | `PARTIAL_KEY_LOOKUP_UNSUPPORTED` | K2 (reservado): `WHERE a = 1` contra PK compuesta `(a, b)` — el motor cae a full-scan correctamente, sin emitir error. Reservado para un futuro warning explícito. | (no usado hoy). |
 
 ---
 

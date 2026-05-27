@@ -9,13 +9,13 @@
 | Campo | Valor |
 |---|---|
 | Magic | `GABYSQL1` |
-| Versión de formato | `7` |
+| Versión de formato | `8` |
 | Tamaño de página | `4096` bytes (fijo en esta versión) |
 | Trailer de checksum por página | `4` bytes (CRC32-IEEE) |
 | Hashing del catálogo y de claves de índice | FNV-1a-64 (estable entre versiones de Rust) |
 | Tipos de página B+Tree | `LEAF` (1), `INTERNAL` (2) |
 
-> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action); `6` → `7` agregó el campo `kind: IndexKind` (`Hash` | `OrderedInt`) a `IndexMeta` para habilitar índices ordenados sobre columnas `INT` con range scan O(log N + k) — ver [ADR-0017](adr/0017-int-ordered-index-version-7.md). Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action); `6` → `7` agregó el campo `kind: IndexKind` (`Hash` | `OrderedInt`) a `IndexMeta` para habilitar índices ordenados sobre columnas `INT` con range scan O(log N + k) — ver [ADR-0017](adr/0017-int-ordered-index-version-7.md); `7` → `8` extendió `TableMeta.primary_key` y `IndexMeta.column` a múltiples columnas (PK e índices compuestos) — restringido a all-INT NOT NULL, equality lookup via fingerprint FNV-1a-64, ver [ADR-0019](adr/0019-composite-pk-and-index.md). Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
 
 ---
 
@@ -24,7 +24,7 @@
 | Offset | Significado |
 |---|---|
 | `0..7` | magic |
-| `8..11` | versión `u32` little-endian (debe ser `7`) |
+| `8..11` | versión `u32` little-endian (debe ser `8`) |
 | `12..13` | page size `u16` little-endian (debe ser `4096`) |
 | `16..19` | page count `u32` little-endian |
 | `20..23` | `catalog_root_page` `u32` little-endian |

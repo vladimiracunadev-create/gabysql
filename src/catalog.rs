@@ -303,18 +303,56 @@ impl IndexKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexMeta {
     pub name: String,
+    /// Primera columna del índice. Pre-K2 era la única; en VERSION 8
+    /// puede haber más en `extra_columns`. Se preserva para mantener
+    /// el código legacy single-column intacto: cuando `extra_columns`
+    /// está vacío, el índice se comporta exactamente como pre-K2.
     pub column: String,
     pub root_page: u32,
     pub unique: bool,
     /// V7+: distinguishes legacy hash-bucket indexes from new
     /// INT-ordered indexes that support range scan. See [`IndexKind`].
     pub kind: IndexKind,
+    /// Bloque K2 (VERSION 8): columnas adicionales del índice cuando es
+    /// compuesto. Vacío para índices single-column (la mayoría). El
+    /// orden importa: el fingerprint FNV-1a-64 se computa en el orden
+    /// `[column] + extra_columns`. Cuando no está vacío, `kind` siempre
+    /// es `Hash` y todas las columnas deben ser INT NOT NULL.
+    pub extra_columns: Vec<String>,
+}
+
+impl IndexMeta {
+    /// Devuelve la lista completa de columnas del índice en el orden
+    /// canónico (`column` primero, después `extra_columns`). Single-column
+    /// → Vec de tamaño 1; compuesto → tamaño ≥ 2.
+    pub fn all_columns(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(1 + self.extra_columns.len());
+        out.push(self.column.as_str());
+        for c in &self.extra_columns {
+            out.push(c.as_str());
+        }
+        out
+    }
+
+    /// `true` si el índice cubre más de una columna.
+    pub fn is_composite(&self) -> bool {
+        !self.extra_columns.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
     pub name: String,
+    /// Primera columna de la PRIMARY KEY. Para PK single (el caso
+    /// histórico) es la única; para PK compuesta es la primera del
+    /// orden declarado en `PRIMARY KEY (a, b, ...)`.
     pub primary_key: String,
+    /// Bloque K2 (VERSION 8): columnas adicionales de una PRIMARY KEY
+    /// compuesta. Vacío para PK single. Cuando no está vacío, todas las
+    /// columnas de la PK (incluyendo `primary_key`) deben ser INT
+    /// NOT NULL — la PK compuesta se representa internamente como un
+    /// fingerprint FNV-1a-64 i64 (ver ADR-0019).
+    pub primary_key_extra: Vec<String>,
     pub columns: Vec<Column>,
     pub root_page: u32,
     pub indexes: Vec<IndexMeta>,
@@ -330,7 +368,7 @@ impl TableMeta {
     pub fn index_for_column(&self, column: &str) -> Option<&IndexMeta> {
         self.indexes
             .iter()
-            .find(|idx| idx.column.eq_ignore_ascii_case(column))
+            .find(|idx| idx.column.eq_ignore_ascii_case(column) && !idx.is_composite())
     }
 
     pub fn index_by_name(&self, name: &str) -> Option<&IndexMeta> {
@@ -339,9 +377,35 @@ impl TableMeta {
             .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
-    /// VERSION = 7 on-disk layout for a TableMeta record:
+    /// Devuelve la lista completa de columnas de la PK en el orden
+    /// canónico (`primary_key` primero, después `primary_key_extra`).
+    /// PK single → tamaño 1; PK compuesta → tamaño ≥ 2.
+    pub fn pk_columns(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(1 + self.primary_key_extra.len());
+        out.push(self.primary_key.as_str());
+        for c in &self.primary_key_extra {
+            out.push(c.as_str());
+        }
+        out
+    }
+
+    /// `true` si la PRIMARY KEY abarca más de una columna.
+    pub fn has_composite_pk(&self) -> bool {
+        !self.primary_key_extra.is_empty()
+    }
+
+    /// Compara case-insensitive si la columna dada participa en la PK.
+    pub fn is_pk_column(&self, column: &str) -> bool {
+        self.pk_columns()
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(column))
+    }
+
+    /// VERSION = 8 on-disk layout for a TableMeta record:
     ///
-    ///     [name][primary_key][root_page:u32]
+    ///     [name]
+    ///     [pk_count:u8] · pk_count × [pk_col_name]   (pk_count >= 1)
+    ///     [root_page:u32]
     ///     [col_count:u16] · col_count × {
     ///         [name][type_code:u8][flags:u8]
     ///         flags & 0x02 ? DefaultLiteral payload : ∅
@@ -349,11 +413,33 @@ impl TableMeta {
     ///     }
     ///     [idx_count:u16] · idx_count × {
     ///         [name][column][root_page:u32][unique:u8][kind:u8]
+    ///         [extra_cols_count:u8] · extra × [extra_col_name]   (>= 0)
     ///     }
+    ///
+    /// Cambios vs VERSION 7:
+    ///   - La PK pasa de `[string]` a `[u8:count][string × count]`
+    ///     (count siempre >= 1; el caso 1 mapea exactamente al pre-K2).
+    ///   - Cada `IndexMeta` añade al final `[u8:extra_count][string × extra]`
+    ///     para soportar índices compuestos (extra = 0 → equivalente al
+    ///     formato pre-K2).
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
         push_string(&mut out, &self.name)?;
+        // PK: [u8:count][string×count]
+        let pk_total = 1 + self.primary_key_extra.len();
+        if pk_total > u8::MAX as usize {
+            return Err(DbError::new(format!(
+                "PRIMARY KEY de '{}' tiene {} columnas, máximo soportado es {}",
+                self.name,
+                pk_total,
+                u8::MAX
+            )));
+        }
+        out.push(pk_total as u8);
         push_string(&mut out, &self.primary_key)?;
+        for col in &self.primary_key_extra {
+            push_string(&mut out, col)?;
+        }
         out.extend_from_slice(&self.root_page.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
         for column in &self.columns {
@@ -386,6 +472,19 @@ impl TableMeta {
             out.extend_from_slice(&idx.root_page.to_le_bytes());
             out.push(u8::from(idx.unique));
             out.push(idx.kind.code());
+            // K2 trailer: columnas adicionales del índice compuesto.
+            if idx.extra_columns.len() > u8::MAX as usize {
+                return Err(DbError::new(format!(
+                    "índice '{}' tiene {} columnas extra, máximo soportado es {}",
+                    idx.name,
+                    idx.extra_columns.len(),
+                    u8::MAX
+                )));
+            }
+            out.push(idx.extra_columns.len() as u8);
+            for col in &idx.extra_columns {
+                push_string(&mut out, col)?;
+            }
         }
         Ok(out)
     }
@@ -393,7 +492,26 @@ impl TableMeta {
     pub fn deserialize(data: &[u8]) -> DbResult<Self> {
         let mut offset = 0usize;
         let name = take_string(data, &mut offset)?;
+        // K2 (VERSION 8): la PK es [u8:count][string×count].
+        if offset >= data.len() {
+            return Err(DbError::new(format!(
+                "TableMeta '{}' corrupta: falta el byte pk_count en offset {}",
+                name, offset
+            )));
+        }
+        let pk_count = data[offset] as usize;
+        offset += 1;
+        if pk_count == 0 {
+            return Err(DbError::new(format!(
+                "TableMeta '{}' corrupta: pk_count=0 (toda tabla debe tener PRIMARY KEY)",
+                name
+            )));
+        }
         let primary_key = take_string(data, &mut offset)?;
+        let mut primary_key_extra = Vec::with_capacity(pk_count - 1);
+        for _ in 1..pk_count {
+            primary_key_extra.push(take_string(data, &mut offset)?);
+        }
         if offset + 6 > data.len() {
             return Err(DbError::new(format!(
                 "TableMeta corrupta para tabla '{}': necesito 6 bytes en offset {} \
@@ -480,17 +598,36 @@ impl TableMeta {
             offset += 1;
             let kind = IndexKind::from_code(data[offset])?;
             offset += 1;
+            // K2 (VERSION 8): trailer con columnas adicionales del índice.
+            if offset >= data.len() {
+                return Err(DbError::new(format!(
+                    "IndexMeta '{}' corrupta en tabla '{}': falta el byte extra_cols_count \
+                     en offset {} (len={})",
+                    idx_name,
+                    name,
+                    offset,
+                    data.len()
+                )));
+            }
+            let extra_count = data[offset] as usize;
+            offset += 1;
+            let mut extra_columns = Vec::with_capacity(extra_count);
+            for _ in 0..extra_count {
+                extra_columns.push(take_string(data, &mut offset)?);
+            }
             indexes.push(IndexMeta {
                 name: idx_name,
                 column,
                 root_page,
                 unique,
                 kind,
+                extra_columns,
             });
         }
         Ok(Self {
             name,
             primary_key,
+            primary_key_extra,
             columns,
             root_page,
             indexes,
@@ -640,7 +777,7 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
     validate_identifier(&meta.name, "tabla")?;
     if meta.primary_key.trim().is_empty() {
         return Err(DbError::new(
-            "PRIMARY KEY requerida (esta versión solo soporta una PK escalar de tipo INT)",
+            "PRIMARY KEY requerida (esta versión admite PK escalar INT o PK compuesta multi-INT NOT NULL)",
         ));
     }
     if meta.columns.is_empty() {
@@ -651,7 +788,6 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
     }
 
     let mut seen = HashSet::new();
-    let mut pk_ok = false;
     for column in &meta.columns {
         validate_identifier(&column.name, "columna")?;
         let normalized = column.name.to_ascii_lowercase();
@@ -664,22 +800,6 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
                 ),
             ));
         }
-        if column.name.eq_ignore_ascii_case(&meta.primary_key) {
-            if column.column_type != ColumnType::Int {
-                return Err(DbError::new(format!(
-                    "PRIMARY KEY '{}' debe ser INT (esta versión sólo admite PK INT escalar; ver USER_MANUAL)",
-                    column.name
-                )));
-            }
-            if column.default.is_some() {
-                return Err(DbError::new(format!(
-                    "PRIMARY KEY '{}' no admite DEFAULT en esta versión",
-                    column.name
-                )));
-            }
-            pk_ok = true;
-        }
-
         // NOT NULL + DEFAULT NULL is contradictory.
         if column.not_null && matches!(column.default, Some(DefaultLiteral::Null)) {
             return Err(DbError::new(format!(
@@ -687,14 +807,71 @@ pub fn validate_create_table(meta: &TableMeta) -> DbResult<()> {
                 column.name
             )));
         }
-
         // The DEFAULT literal must be compatible with the declared type.
         if let Some(default) = &column.default {
             validate_default_against_type(&column.name, &column.column_type, default)?;
         }
     }
-    if !pk_ok {
-        return Err(DbError::new("PRIMARY KEY debe existir en columnas"));
+
+    // Validar columnas PK — una a una. Para la PK single (caso histórico)
+    // exigimos INT. Para la PK compuesta exigimos además NOT NULL en toda
+    // columna (4064): el fingerprint i64 no puede representar NULL sin
+    // ambigüedad y SQL UNIQUE/PK no admite NULLs en columnas de PK.
+    let is_composite = meta.has_composite_pk();
+    // Dedup case-insensitive sobre las columnas PK declaradas.
+    let mut pk_seen = HashSet::new();
+    for pk_col_name in meta.pk_columns() {
+        let lower = pk_col_name.to_ascii_lowercase();
+        if !pk_seen.insert(lower) {
+            return Err(coded(
+                codes::PRIMARY_KEY_DUPLICATED,
+                format!(
+                    "CREATE TABLE '{}' rechazado: la columna '{}' aparece dos veces en PRIMARY KEY",
+                    meta.name, pk_col_name
+                ),
+            ));
+        }
+        let col = meta.column(pk_col_name).ok_or_else(|| {
+            DbError::new(format!(
+                "PRIMARY KEY '{}' no existe en columnas de '{}'",
+                pk_col_name, meta.name
+            ))
+        })?;
+        if col.column_type != ColumnType::Int {
+            if is_composite {
+                return Err(coded(
+                    codes::COMPOSITE_PK_REQUIRES_ALL_INT,
+                    format!(
+                        "PRIMARY KEY compuesta de '{}' rechazada: columna '{}' es {} (debe ser INT). \
+                         La PK compuesta en VERSION 8 está restringida a multi-INT NOT NULL — \
+                         ver ADR-0019.",
+                        meta.name,
+                        col.name,
+                        col.column_type.as_sql()
+                    ),
+                ));
+            }
+            return Err(DbError::new(format!(
+                "PRIMARY KEY '{}' debe ser INT (esta versión sólo admite PK INT escalar; ver USER_MANUAL)",
+                col.name
+            )));
+        }
+        if col.default.is_some() {
+            return Err(DbError::new(format!(
+                "PRIMARY KEY '{}' no admite DEFAULT en esta versión",
+                col.name
+            )));
+        }
+        if is_composite && !col.not_null {
+            return Err(coded(
+                codes::COMPOSITE_PK_REQUIRES_ALL_INT,
+                format!(
+                    "PRIMARY KEY compuesta de '{}' rechazada: columna '{}' debe ser NOT NULL \
+                     (todas las columnas de una PK compuesta deben serlo)",
+                    meta.name, col.name
+                ),
+            ));
+        }
     }
     Ok(())
 }

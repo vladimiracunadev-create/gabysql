@@ -71,7 +71,17 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        `WHERE col_idx BETWEEN a AND b` range scans. Legacy hash
 //        indexes over TEXT/FLOAT/BOOL/DATE/DATETIME stay equality-only.
 //        V6 files are rejected on open — no automatic upgrade.
-pub const VERSION: u32 = 7;
+//   8 -> Bloque K2: PRIMARY KEY e índices secundarios admiten varias
+//        columnas. `TableMeta` serializa la PK como `[u8:count] +
+//        count × string` (count >= 1) y `IndexMeta` lo mismo para sus
+//        columnas. La PK compuesta y los índices compuestos están
+//        restringidos a multi-INT NOT NULL (ver ADR-0019): se
+//        encodean como un fingerprint i64 FNV-1a-64 que vive como
+//        clave del B+Tree, lo cual permite equality lookup pero NO
+//        range scan sobre claves compuestas. V7 files son rechazados
+//        al abrir con `[GBY-1003]` — la migración es manual: hacer
+//        backup, recrear con binario V8 y volver a cargar los datos.
+pub const VERSION: u32 = 8;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;
@@ -139,7 +149,11 @@ impl Header {
                 codes::UNSUPPORTED_FORMAT_VERSION,
                 format!(
                     "formato de archivo gabysql no soportado: version={} (esperaba {}). \
-                     Re-cree la base de datos con el binario actual.",
+                     Hacé backup del .db, re-creá la base con el binario actual y \
+                     migrá los datos manualmente (dump SELECT desde un binario viejo + \
+                     CREATE TABLE … AS SELECT / INSERT desde el nuevo). El motor no \
+                     intenta auto-upgrade entre versiones incompatibles para evitar \
+                     corrupción silenciosa de índices secundarios.",
                     version, VERSION
                 ),
             ));

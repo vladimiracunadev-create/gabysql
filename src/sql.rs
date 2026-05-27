@@ -6,9 +6,9 @@ use crate::catalog::{
 use crate::errors::{coded, codes};
 use crate::index::{
     bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
-    decode_ordered_bucket, encode_bucket, encode_column_value, encode_ordered_bucket, hash_value,
-    ordered_bucket_insert, ordered_bucket_remove, ordered_bucket_unique_conflict,
-    ordered_int_key_from_value_bytes, validate_indexable,
+    decode_ordered_bucket, encode_bucket, encode_column_value, encode_composite_key,
+    encode_ordered_bucket, hash_value, ordered_bucket_insert, ordered_bucket_remove,
+    ordered_bucket_unique_conflict, ordered_int_key_from_value_bytes, validate_indexable,
 };
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
@@ -236,8 +236,19 @@ pub struct DropDatabaseStmt {
 pub struct CreateIndexStmt {
     pub name: String,
     pub table: String,
+    /// Primera columna del índice. Bloque K2 (2026-05-26): cuando el
+    /// parser ve `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)` con más
+    /// de una columna, `column` lleva la primera y `extra_columns` el
+    /// resto. Para índices single-column (caso histórico)
+    /// `extra_columns` queda vacío.
     pub column: String,
     pub unique: bool,
+    /// Bloque K2: columnas adicionales del índice compuesto. Vacío
+    /// para single-column. Cuando no está vacío, el executor exige
+    /// que todas las columnas sean INT (4067) y genera la clave del
+    /// B+Tree como fingerprint FNV-1a-64 sobre la tupla (ver
+    /// ADR-0019).
+    pub extra_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -282,7 +293,14 @@ pub struct DeleteStmt {
 pub struct CreateTableStmt {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    /// Primera columna de la PRIMARY KEY (inline `… PRIMARY KEY` o la
+    /// primera del table-level `PRIMARY KEY (a, b, ...)`).
     pub primary_key: String,
+    /// Bloque K2 (2026-05-26): columnas adicionales declaradas por un
+    /// table-level `PRIMARY KEY (a, b, ...)`. Vacío para PK single
+    /// (caso histórico). El validator (`validate_create_table`) exige
+    /// que toda columna PK sea INT NOT NULL cuando hay más de una.
+    pub primary_key_extra: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1240,9 +1258,13 @@ impl<'a> Engine<'a> {
             });
         }
 
+        // K2: el parser puede entregar columnas PK adicionales por
+        // table-level `PRIMARY KEY (a, b, ...)`.
+        let primary_key_extra = stmt.primary_key_extra.clone();
         let mut meta = TableMeta {
             name: stmt.name,
             primary_key,
+            primary_key_extra,
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -1290,6 +1312,7 @@ impl<'a> Engine<'a> {
                 root_page: idx_root,
                 unique: true,
                 kind: IndexKind::for_column(col_type),
+                extra_columns: Vec::new(),
             });
         }
 
@@ -1641,6 +1664,7 @@ impl<'a> Engine<'a> {
                 root_page: idx_root,
                 unique: true,
                 kind: IndexKind::for_column(column_type),
+                extra_columns: Vec::new(),
             });
         }
 
@@ -1870,6 +1894,7 @@ impl<'a> Engine<'a> {
         let mut meta = TableMeta {
             name: stmt.name.clone(),
             primary_key: pk_name.clone(),
+            primary_key_extra: Vec::new(),
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -2937,6 +2962,7 @@ impl<'a> Engine<'a> {
         let meta = TableMeta {
             name: alias.to_string(),
             primary_key,
+            primary_key_extra: Vec::new(),
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -3177,6 +3203,7 @@ impl<'a> Engine<'a> {
         let meta = TableMeta {
             name: alias.to_string(),
             primary_key,
+            primary_key_extra: Vec::new(),
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -3284,7 +3311,18 @@ impl<'a> Engine<'a> {
                             // matched); negar matched-PKs no es trivial
                             // sobre el cursor.
                             WhereClause::In { negated: true, .. }
-                        )
+                        ) || match atom {
+                            // K2: lookup parcial / sin todas las columnas
+                            // PK sobre una tabla con PK compuesta. El
+                            // planner cae a FullScan (no puede calcular
+                            // el fingerprint) y el post-filter genérico
+                            // se ocupa del WHERE.
+                            WhereClause::Eq { column, .. }
+                            | WhereClause::Between { column, .. } => {
+                                meta.has_composite_pk() && meta.is_pk_column(column)
+                            }
+                            _ => false,
+                        }
                     }
                 };
                 if force {
@@ -3320,7 +3358,11 @@ impl<'a> Engine<'a> {
                 None => Plan::FullScan,
                 Some(WhereClause::Eq { column, value }) => {
                     let normalized = normalize_ident(&column);
-                    if normalized == normalize_ident(&meta.primary_key) {
+                    // K2: con PK compuesta el match por la primera (o cualquier)
+                    // columna PK no permite calcular el fingerprint — full-scan.
+                    if !meta.has_composite_pk()
+                        && normalized == normalize_ident(&meta.primary_key)
+                    {
                         let pk = match value {
                             Value::Integer(n) => n,
                             _ => {
@@ -3334,6 +3376,10 @@ impl<'a> Engine<'a> {
                     } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
                         let pks = lookup_pks_via_index(self.pager, &meta, &idx, &value)?;
                         Plan::ByPks(pks)
+                    } else if meta.has_composite_pk() && meta.is_pk_column(&normalized) {
+                        // Lookup parcial sobre PK compuesta: cae a FullScan
+                        // y deja que `eval_where_expr_single` filtre.
+                        Plan::FullScan
                     } else {
                         return Err(coded(
                             codes::WHERE_OPERATOR_UNSUPPORTED,
@@ -3347,7 +3393,9 @@ impl<'a> Engine<'a> {
                 }
                 Some(WhereClause::Between { column, from, to }) => {
                     let normalized = normalize_ident(&column);
-                    if normalized == normalize_ident(&meta.primary_key) {
+                    if !meta.has_composite_pk()
+                        && normalized == normalize_ident(&meta.primary_key)
+                    {
                         Plan::Range { from, to }
                     } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
                         // BETWEEN over an indexed column only works when the
@@ -4757,12 +4805,20 @@ impl<'a> Engine<'a> {
         let mut seen: HashSet<String> = HashSet::new();
         for (column_name, expr) in stmt.assignments {
             let normalized = normalize_ident(&column_name);
-            if normalized == normalize_ident(&meta.primary_key) {
+            // K2: bloquear UPDATE de CUALQUIER columna que participe en
+            // la PK (single o compuesta). Antes solo se chequeaba la PK
+            // principal; con PK compuesta cada columna adicional también
+            // forma parte de la identidad del row y mutarla forzaría
+            // un recálculo del fingerprint + rewrite de toda la fila.
+            if meta.is_pk_column(&column_name) {
                 return Err(coded(
                     codes::UPDATE_PK_NOT_ALLOWED,
                     format!(
-                        "UPDATE sobre '{}': no se permite cambiar la PRIMARY KEY '{}' (esta versión)",
-                        meta.name, meta.primary_key
+                        "UPDATE sobre '{}': no se permite cambiar la columna '{}' porque \
+                         participa en la PRIMARY KEY ({})",
+                        meta.name,
+                        column_name,
+                        meta.pk_columns().join(", ")
                     ),
                 ));
             }
@@ -5008,18 +5064,23 @@ impl<'a> Engine<'a> {
         _op_label: &str,
     ) -> DbResult<(Vec<i64>, bool)> {
         // Fast-path: `WHERE pk = literal` (compatibilidad pre-E3).
-        if let WhereExpr::Atom(WhereClause::Eq { column, value }) = where_clause {
-            if normalize_ident(column) == normalize_ident(&meta.primary_key) {
-                let pk = match value {
-                    Value::Integer(n) => *n,
-                    _ => {
-                        return Err(DbError::new(format!(
-                            "PRIMARY KEY '{}' es INT; valor incompatible en WHERE",
-                            meta.primary_key
-                        )))
-                    }
-                };
-                return Ok((vec![pk], true));
+        // K2: solo aplica para PK single — con PK compuesta el match por
+        // una sola columna PK debe caer al full-scan que evalúa todos los
+        // predicados; el fingerprint requiere TODAS las columnas PK.
+        if !meta.has_composite_pk() {
+            if let WhereExpr::Atom(WhereClause::Eq { column, value }) = where_clause {
+                if normalize_ident(column) == normalize_ident(&meta.primary_key) {
+                    let pk = match value {
+                        Value::Integer(n) => *n,
+                        _ => {
+                            return Err(DbError::new(format!(
+                                "PRIMARY KEY '{}' es INT; valor incompatible en WHERE",
+                                meta.primary_key
+                            )))
+                        }
+                    };
+                    return Ok((vec![pk], true));
+                }
             }
         }
         // Fallback genérico: FullScan + evaluador 3VL. Reusa el mismo
@@ -5054,8 +5115,37 @@ impl<'a> Engine<'a> {
                 .ok_or_else(|| DbError::new(format!("tabla no existe: {}", stmt.table)))?
         };
 
-        // 2. Validate column + type.
-        validate_indexable(&meta, &stmt.column)?;
+        // K2 (2026-05-26): índice compuesto — TODAS las columnas deben
+        // ser INT (4067). El fingerprint i64 no acepta otros tipos.
+        let is_composite = !stmt.extra_columns.is_empty();
+        if is_composite {
+            for col_name in std::iter::once(&stmt.column).chain(stmt.extra_columns.iter()) {
+                let col = meta.column(col_name).ok_or_else(|| {
+                    coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!(
+                            "CREATE INDEX '{}': columna '{}' no existe en '{}'",
+                            stmt.name, col_name, meta.name
+                        ),
+                    )
+                })?;
+                if col.column_type != ColumnType::Int {
+                    return Err(coded(
+                        codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
+                        format!(
+                            "CREATE INDEX '{}': columna '{}' es {} — los índices compuestos \
+                             en VERSION 8 exigen INT en todas las columnas (ver ADR-0019)",
+                            stmt.name,
+                            col_name,
+                            col.column_type.as_sql()
+                        ),
+                    ));
+                }
+            }
+        } else {
+            // 2. Validate single-column index + type.
+            validate_indexable(&meta, &stmt.column)?;
+        }
 
         // 3. Reject duplicate index name within this table; also reject
         //    duplicate index *over the same column* (one secondary index
@@ -5069,7 +5159,7 @@ impl<'a> Engine<'a> {
                 ),
             ));
         }
-        if meta.index_for_column(&stmt.column).is_some() {
+        if !is_composite && meta.index_for_column(&stmt.column).is_some() {
             return Err(coded(
                 codes::INDEX_ALREADY_EXISTS,
                 format!(
@@ -5122,36 +5212,109 @@ impl<'a> Engine<'a> {
             let mut catalog = Catalog::open(self.pager);
             catalog.scan_rows(table_root, 0, None)?
         };
-        let mut seen_unique: HashSet<Vec<u8>> = HashSet::new();
-        for kv in rows {
-            let decoded = decode_row(&meta, &kv.value)?;
-            let value = decoded
-                .get(&normalize_ident(&column.name))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let value_bytes = encode_column_value(&column, &value)?;
-            if stmt.unique && value_bytes != [0u8] && !seen_unique.insert(value_bytes.clone()) {
-                return Err(DbError::new(format!(
-                    "CREATE UNIQUE INDEX rechazado: columna '{}' tiene valores duplicados existentes",
-                    column.name
-                )));
+        if is_composite {
+            // Composite index backfill: fingerprint cada fila y guardamos
+            // PKs en un ordered bucket. Para UNIQUE detectamos colisiones
+            // por fingerprint — y como la composición incluye un sentinel
+            // entre columnas, una colisión real es astronómicamente
+            // improbable (FNV-1a-64 sobre tuplas distintas).
+            let composite_columns: Vec<Column> = std::iter::once(stmt.column.clone())
+                .chain(stmt.extra_columns.iter().cloned())
+                .map(|name| {
+                    meta.column(&name)
+                        .cloned()
+                        .ok_or_else(|| DbError::new(format!("columna no existe: {}", name)))
+                })
+                .collect::<DbResult<_>>()?;
+            let mut seen_fp: HashSet<i64> = HashSet::new();
+            for kv in rows {
+                let decoded = decode_row(&meta, &kv.value)?;
+                let values: Vec<Value> = composite_columns
+                    .iter()
+                    .map(|c| {
+                        decoded
+                            .get(&normalize_ident(&c.name))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                let col_refs: Vec<&Column> = composite_columns.iter().collect();
+                let val_refs: Vec<&Value> = values.iter().collect();
+                let fp = encode_composite_key(&col_refs, &val_refs)?;
+                if stmt.unique && !seen_fp.insert(fp) {
+                    return Err(coded(
+                        codes::UNIQUE_VIOLATED,
+                        format!(
+                            "CREATE UNIQUE INDEX '{}' rechazado: ya existen filas con la \
+                             misma combinación de ({}) en '{}'",
+                            stmt.name,
+                            composite_columns
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            meta.name
+                        ),
+                    ));
+                }
+                // Bucket payload: ordered bucket de PKs indexado por el
+                // fingerprint. Reusamos el encoder de OrderedInt para
+                // mantener un solo path de decoder en INTEGRITY CHECK.
+                let mut current = {
+                    let mut tree = Tree::new(self.pager);
+                    match tree.get(idx_root, fp)? {
+                        Some(bytes) => decode_ordered_bucket(&bytes)?,
+                        None => Vec::new(),
+                    }
+                };
+                ordered_bucket_insert(&mut current, kv.key);
+                let encoded = encode_ordered_bucket(&current)?;
+                let mut tree = Tree::new(self.pager);
+                tree.upsert(idx_root, fp, encoded)?;
             }
-            index_upsert_pk(
-                self.pager,
-                idx_root,
-                IndexKind::for_column(column.column_type),
-                &value_bytes,
-                kv.key,
-            )?;
+        } else {
+            let mut seen_unique: HashSet<Vec<u8>> = HashSet::new();
+            for kv in rows {
+                let decoded = decode_row(&meta, &kv.value)?;
+                let value = decoded
+                    .get(&normalize_ident(&column.name))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = encode_column_value(&column, &value)?;
+                if stmt.unique && value_bytes != [0u8] && !seen_unique.insert(value_bytes.clone()) {
+                    return Err(DbError::new(format!(
+                        "CREATE UNIQUE INDEX rechazado: columna '{}' tiene valores duplicados existentes",
+                        column.name
+                    )));
+                }
+                index_upsert_pk(
+                    self.pager,
+                    idx_root,
+                    IndexKind::for_column(column.column_type),
+                    &value_bytes,
+                    kv.key,
+                )?;
+            }
         }
 
         // 6. Publish the index in the catalog.
+        // K2: índices compuestos usan `kind = OrderedInt` para que el
+        // sweep de INTEGRITY CHECK use el decoder correcto (ordered bucket
+        // = lista de PKs sin value-bytes). La clave NO es order-preserving
+        // —es un fingerprint FNV-1a-64 i64— por eso el planner JAMÁS
+        // dispara range scan contra un índice compuesto.
+        let kind = if is_composite {
+            IndexKind::OrderedInt
+        } else {
+            IndexKind::for_column(column.column_type)
+        };
         meta.indexes.push(IndexMeta {
             name: stmt.name,
             column: stmt.column,
             root_page: idx_root,
             unique: stmt.unique,
-            kind: IndexKind::for_column(column.column_type),
+            kind,
+            extra_columns: stmt.extra_columns,
         });
         let mut catalog = Catalog::open(self.pager);
         catalog.put_table(&meta)?;
@@ -6057,13 +6220,22 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult<(i64, Vec<u8>)> {
     let mut out = Vec::new();
     let mut pk = None;
+    // K2 (2026-05-26): cuando la PK es compuesta, ignoramos el `pk`
+    // single-column derivado del loop y al final calculamos el
+    // fingerprint FNV-1a-64 sobre todas las columnas PK. Pre-K2 (PK
+    // single) la lógica no cambia: el path `column.eq_ignore_ascii_case
+    // (&meta.primary_key)` captura el valor INT y lo usa como key.
+    let composite_pk = meta.has_composite_pk();
 
     for column in &meta.columns {
         let normalized = normalize_ident(&column.name);
         let value = values.get(&normalized).cloned().unwrap_or(Value::Null);
         match (&column.column_type, value) {
             (ColumnType::Int, Value::Null) => {
-                if column.name.eq_ignore_ascii_case(&meta.primary_key) {
+                // Cualquier columna PK con NULL → error explícito (single
+                // o compuesta). En compuesta, además el fingerprint no
+                // puede representar NULL sin ambigüedad.
+                if meta.is_pk_column(&column.name) {
                     return Err(coded(
                         codes::PRIMARY_KEY_NULL,
                         format!(
@@ -6077,7 +6249,7 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
             (ColumnType::Int, Value::Integer(number)) => {
                 out.push(1);
                 out.extend_from_slice(&number.to_le_bytes());
-                if column.name.eq_ignore_ascii_case(&meta.primary_key) {
+                if !composite_pk && column.name.eq_ignore_ascii_case(&meta.primary_key) {
                     pk = Some(number);
                 }
             }
@@ -6126,6 +6298,38 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
         }
     }
 
+    if composite_pk {
+        // Composite PK: el row encoding ya incluye los valores de cada
+        // columna PK al lado del resto; la clave del B+Tree es el
+        // fingerprint sobre la tupla. Pedimos cada valor al HashMap por
+        // su nombre normalizado; el `Value::Null` rama de arriba ya
+        // habría disparado 3007 si faltaba.
+        let pk_cols: Vec<Column> = meta
+            .pk_columns()
+            .iter()
+            .map(|name| {
+                meta.column(name).cloned().ok_or_else(|| {
+                    DbError::new(format!(
+                        "PK '{}' apunta a columna inexistente en '{}'",
+                        name, meta.name
+                    ))
+                })
+            })
+            .collect::<DbResult<_>>()?;
+        let pk_vals: Vec<Value> = pk_cols
+            .iter()
+            .map(|c| {
+                values
+                    .get(&normalize_ident(&c.name))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
+        let col_refs: Vec<&Column> = pk_cols.iter().collect();
+        let val_refs: Vec<&Value> = pk_vals.iter().collect();
+        let fp = encode_composite_key(&col_refs, &val_refs)?;
+        return Ok((fp, out));
+    }
     Ok((
         pk.ok_or_else(|| {
             DbError::new(format!(
@@ -9675,13 +9879,24 @@ impl Parser {
         self.expect_keyword("ON")?;
         let table = self.expect_ident()?;
         self.expect_symbol("(")?;
+        // Bloque K2 (2026-05-26): la lista de columnas admite ≥ 1
+        // ident separados por coma. La primera va a `column` para
+        // mantener back-compat con el resto del executor; las
+        // adicionales viajan en `extra_columns`. El validator del
+        // executor exige que toda la lista sea INT cuando hay > 1
+        // columna (`COMPOSITE_INDEX_REQUIRES_ALL_INT`, 4067).
         let column = self.expect_ident()?;
+        let mut extra_columns: Vec<String> = Vec::new();
+        while self.match_symbol(",") {
+            extra_columns.push(self.expect_ident()?);
+        }
         self.expect_symbol(")")?;
         Ok(Statement::CreateIndex(CreateIndexStmt {
             name,
             table,
             column,
             unique,
+            extra_columns,
         }))
     }
 
@@ -9927,21 +10142,82 @@ impl Parser {
         }
         let mut columns = Vec::new();
         let mut primary_key = String::new();
+        // Bloque K2 (2026-05-26): la PK puede declararse de tres formas:
+        //   a) inline en una columna  (id INT PRIMARY KEY)
+        //   b) table-level single     (PRIMARY KEY (id))
+        //   c) table-level composite  (PRIMARY KEY (a, b, ...))
+        // Las tres son mutuamente excluyentes: si aparece más de una se
+        // emite `[GBY-4065] PRIMARY_KEY_DUPLICATED`. `table_level_pk` lleva
+        // las columnas del table-level y, si se eligió esa forma, su
+        // primer ítem se copia a `primary_key` para mantener el shape del
+        // AST. Las adicionales viajan en `primary_key_extra` del Stmt.
+        let mut table_level_pk: Option<Vec<String>> = None;
         loop {
-            let column = self.parse_column_def()?;
-            if column.primary_key {
-                primary_key = column.name.clone();
+            // Detectar table constraint `PRIMARY KEY (a, b, ...)` antes
+            // de delegar a `parse_column_def` — sin ambigüedad porque
+            // una columna SIEMPRE empieza con un Ident seguido de un
+            // tipo, no por la keyword PRIMARY.
+            if self.match_keyword("PRIMARY") {
+                self.expect_keyword("KEY")?;
+                self.expect_symbol("(")?;
+                let mut pk_cols: Vec<String> = vec![self.expect_ident()?];
+                while self.match_symbol(",") {
+                    pk_cols.push(self.expect_ident()?);
+                }
+                self.expect_symbol(")")?;
+                if table_level_pk.is_some() {
+                    return Err(coded(
+                        codes::PRIMARY_KEY_DUPLICATED,
+                        "PRIMARY KEY declarada dos veces a nivel de tabla",
+                    ));
+                }
+                table_level_pk = Some(pk_cols);
+            } else {
+                let column = self.parse_column_def()?;
+                if column.primary_key {
+                    if !primary_key.is_empty() {
+                        return Err(coded(
+                            codes::PRIMARY_KEY_DUPLICATED,
+                            format!(
+                                "PRIMARY KEY ya declarada en columna '{}'; '{}' no puede tenerla también",
+                                primary_key, column.name
+                            ),
+                        ));
+                    }
+                    primary_key = column.name.clone();
+                }
+                columns.push(column);
             }
-            columns.push(column);
             if self.match_symbol(")") {
                 break;
             }
             self.expect_symbol(",")?;
         }
+        // Reconciliar table-level PK contra inline PK.
+        let primary_key_extra = if let Some(pk_cols) = table_level_pk {
+            if !primary_key.is_empty() {
+                return Err(coded(
+                    codes::PRIMARY_KEY_DUPLICATED,
+                    format!(
+                        "PRIMARY KEY ya declarada inline en columna '{}'; no se puede declarar \
+                         también a nivel de tabla con PRIMARY KEY (...)",
+                        primary_key
+                    ),
+                ));
+            }
+            let mut it = pk_cols.into_iter();
+            primary_key = it
+                .next()
+                .expect("parser garantiza ≥ 1 columna en PRIMARY KEY (...)");
+            it.collect()
+        } else {
+            Vec::new()
+        };
         Ok(Statement::CreateTable(CreateTableStmt {
             name,
             columns,
             primary_key,
+            primary_key_extra,
         }))
     }
 

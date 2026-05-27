@@ -6,6 +6,72 @@
 
 ---
 
+## 2026-05-26 — Bloque K2: PK compuesta + índices compuestos (VERSION 7 → 8)
+
+> **Un push a `main`** que cierra el sub-bloque K2 del roadmap: el DDL que **sí** cambia el formato en disco. Habilita `PRIMARY KEY (a, b, ...)` (table-level) y `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`. Bump VERSION 7 → 8 con rechazo limpio de DBs viejas vía `[GBY-1003]`. Ver [ADR-0019](docs/adr/0019-composite-pk-and-index.md) para la decisión y limitaciones.
+
+### 🆕 Sintaxis
+
+- `CREATE TABLE asistencias (curso INT NOT NULL, alumno INT NOT NULL, presente BOOL, PRIMARY KEY (curso, alumno));`
+- `CREATE TABLE t (id INT NOT NULL, v INT, PRIMARY KEY (id));` — PK table-level single-col también soportada (estilo opcional).
+- `CREATE INDEX idx_ab ON t (a, b);`
+- `CREATE UNIQUE INDEX uq_year_month ON ventas (year, month);`
+
+### 🚧 Limitaciones K2 (explícitas)
+
+- PK e índices compuestos **restringidos a all-INT NOT NULL** (`[GBY-4064]` / `[GBY-4067]`). El fingerprint i64 no representa NULL ni tipos no-INT.
+- **No partial lookup indexado**: `WHERE a = 1` contra PK `(a, b)` cae a full-scan (resultado correcto, sin error, sin fast-path).
+- **No range scan compuesto**: el fingerprint FNV-1a-64 no es order-preserving.
+- **FK siguen single-column**: las relaciones multi-col se modelan vía surrogate INT + UNIQUE compuesta.
+- **ALTER PK queda fuera** (creación nueva sí; ALTER no).
+- **Migración V7 → V8 es manual**: hacer backup, recrear con binario nuevo, dump + INSERT.
+
+### 🔧 Catálogo aditivo
+
+- `TableMeta` agrega `primary_key_extra: Vec<String>` (vacío para PK single).
+- `IndexMeta` agrega `extra_columns: Vec<String>` (vacío para single-column).
+- Helpers nuevos: `TableMeta::pk_columns()`, `has_composite_pk()`, `is_pk_column(name)`; `IndexMeta::all_columns()`, `is_composite()`.
+
+### 🔢 Fingerprint compuesto
+
+- `src/index.rs::encode_composite_key(columns, values) -> i64` — FNV-1a-64 sobre `encode_column_value()` de cada par + sentinela `0xFF` entre columnas.
+
+### 🗄️ Formato en disco — VERSION 8
+
+```text
+TableMeta:
+  [name][pk_count:u8][pk_col_name × pk_count][root_page:u32]
+  [col_count:u16] × { [name][type_code:u8][flags:u8] (DEFAULT)? (FK)? }
+  [idx_count:u16] × {
+    [name][column][root_page:u32][unique:u8][kind:u8]
+    [extra_cols_count:u8][extra_col_name × extra_cols_count]
+  }
+```
+
+VERSION 7 se rechaza al abrir con `[GBY-1003] UNSUPPORTED_FORMAT_VERSION` y mensaje que sugiere backup + dump + recreate.
+
+### 🚦 Executor
+
+- `exec_create_table`: el parser entrega `primary_key_extra` desde el table-level `PRIMARY KEY (...)`; el validator (`validate_create_table` en `catalog.rs`) verifica all-INT + NOT NULL en cada columna PK cuando es compuesta.
+- `exec_create_index`: para índices compuestos verifica all-INT (`[GBY-4067]`), backfilea con `encode_composite_key` + ordered bucket layout (`[u16:count] + count × pk:i64`), detecta UNIQUE conflicts por fingerprint (`[GBY-3003]`). Publica con `IndexKind::OrderedInt` para reutilizar el decoder de INTEGRITY CHECK.
+- `encode_row`: cuando `meta.has_composite_pk()` computa el fingerprint sobre todas las columnas PK; NULL en cualquiera → `[GBY-3007] PRIMARY_KEY_NULL`.
+- UPDATE bloquea CUALQUIER columna PK → `[GBY-4008] UPDATE_PK_NOT_ALLOWED` con mensaje que enumera todas las columnas PK.
+- Planner del WHERE: PK compuesta + WHERE sobre columna PK → fuerza `Plan::FullScan` + `generic_post_filter` (correcto via 3VL).
+
+### 🆔 Códigos de error nuevos
+
+- `4064 COMPOSITE_PK_REQUIRES_ALL_INT`
+- `4065 PRIMARY_KEY_DUPLICATED`
+- `4066 FK_TARGET_NOT_INDEXED` (reservado)
+- `4067 COMPOSITE_INDEX_REQUIRES_ALL_INT`
+- `4068 PARTIAL_KEY_LOOKUP_UNSUPPORTED` (reservado)
+
+### 🧪 Tests
+
+17 nuevos `k2_*`. `cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test --all-targets` → **300 passed, 0 failed** (283 prior + 17 k2_*).
+
+---
+
 ## 2026-05-26 — Bloque K1: DDL extendido (CTAS, RENAME, DROP/RENAME COLUMN)
 
 > **Un push a `main`** que cierra el sub-bloque K1 del roadmap (`docs/MISSING_COMMANDS.md` §9): DDL faltante que **no** cambia el formato en disco (VERSION sigue en 7). Cubre `CREATE TABLE [IF NOT EXISTS] [(col_aliases)] AS <select>` (CTAS), `RENAME TABLE` / `ALTER TABLE RENAME TO`, `ALTER TABLE DROP COLUMN [IF EXISTS]` y `ALTER TABLE RENAME COLUMN`. La parte de DDL que sí tocaría el formato on-disk (PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`) queda para K2.

@@ -345,6 +345,33 @@ pub mod codes {
     /// lista de alias de columnas tiene una arity distinta a las
     /// columnas que el SELECT proyecta.
     pub const CTAS_COLUMN_ALIAS_ARITY: u32 = 4063;
+    /// Bloque K2 (2026-05-26): `PRIMARY KEY (a, b, ...)` con alguna
+    /// columna que no es INT o admite NULL. En VERSION 8 la PK compuesta
+    /// está restringida a multi-INT NOT NULL: la implementación usa un
+    /// fingerprint FNV-1a-64 que vive como i64 en el B+Tree y por eso
+    /// no admite NULL ni tipos no-INT (ver ADR-0019).
+    pub const COMPOSITE_PK_REQUIRES_ALL_INT: u32 = 4064;
+    /// Bloque K2: `PRIMARY KEY` declarado dos veces en el mismo
+    /// `CREATE TABLE` — inline en una columna + table-level
+    /// `PRIMARY KEY (...)`, o dos columnas con PRIMARY KEY inline.
+    pub const PRIMARY_KEY_DUPLICATED: u32 = 4065;
+    /// Bloque K2 (reservado): una FOREIGN KEY apunta a una columna del
+    /// padre que no es ni PK ni tiene índice UNIQUE. Pre-K2 sólo se
+    /// admitía apuntar a la PK; con PK compuesta single-col-FK debe
+    /// apuntar a una de las columnas de esa PK o a una UNIQUE. Hoy se
+    /// reusa `FK_PARENT_MISSING (3004)` para los casos prácticos; el
+    /// código se reserva para una futura validación específica.
+    pub const FK_TARGET_NOT_INDEXED: u32 = 4066;
+    /// Bloque K2: `CREATE INDEX idx ON t (a, b, ...)` cuya lista de
+    /// columnas mezcla tipos no-INT. Mismo motivo que 4064 — el bucket
+    /// usa fingerprint i64 y por eso exige INT en todas las columnas.
+    pub const COMPOSITE_INDEX_REQUIRES_ALL_INT: u32 = 4067;
+    /// Bloque K2 (reservado): `WHERE a = 1` contra una PK compuesta
+    /// `(a, b)` cuando el usuario esperaba lookup parcial por la primera
+    /// columna. El motor cae a full-scan en ese caso (no es un error);
+    /// el código queda reservado para un release futuro que ofrezca
+    /// `PARTIAL_KEY_LOOKUP_UNSUPPORTED` como warning explícito.
+    pub const PARTIAL_KEY_LOOKUP_UNSUPPORTED: u32 = 4068;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

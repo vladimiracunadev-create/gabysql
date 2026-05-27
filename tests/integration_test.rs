@@ -7028,6 +7028,335 @@ fn k1_rename_column_indexed_updates_index() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================================
+// Bloque K2 (2026-05-26): PRIMARY KEY compuesta + índices compuestos
+// (VERSION 7 → 8). Ver ADR-0019.
+// ============================================================================
+
+fn k2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn k2_pk_composite_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_basic")?;
+    run_sql(
+        &db,
+        "CREATE TABLE asistencias (
+            curso INT NOT NULL,
+            alumno INT NOT NULL,
+            presente BOOL,
+            PRIMARY KEY (curso, alumno)
+         );
+         INSERT INTO asistencias (curso, alumno, presente) VALUES (1, 10, TRUE);
+         INSERT INTO asistencias (curso, alumno, presente) VALUES (1, 20, FALSE);
+         INSERT INTO asistencias (curso, alumno, presente) VALUES (2, 10, TRUE);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT presente FROM asistencias WHERE curso = 1 AND alumno = 10;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1, "esperaba 1 fila");
+    assert_eq!(res[0].rows[0][0], Value::Bool(true));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_dup_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_dup")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, c) VALUES (1, 2, 100);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (a, b, c) VALUES (1, 2, 200);").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-3001]"),
+        "esperaba 3001, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_not_int_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_notint")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4064]"),
+        "esperaba 4064, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_requires_not_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_nullable")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT, PRIMARY KEY (a, b));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4064]"),
+        "esperaba 4064, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_partial_lookup_fallback_to_scan() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_partial")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, v) VALUES (1, 10, 100);
+         INSERT INTO t (a, b, v) VALUES (1, 20, 200);
+         INSERT INTO t (a, b, v) VALUES (2, 10, 300);",
+    )?;
+    // Lookup parcial (sólo a = 1) cae a full-scan y debe devolver ambas
+    // filas de a=1.
+    let res = run_sql(&db, "SELECT v FROM t WHERE a = 1;")?;
+    let mut vals: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => panic!("v debe ser INT"),
+        })
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![100, 200]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_update_pk_col_blocked() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_upd_blocked")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, v) VALUES (1, 2, 100);",
+    )?;
+    let err = run_sql(&db, "UPDATE t SET b = 99 WHERE a = 1 AND b = 2;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4008]"),
+        "esperaba 4008, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_update_nonpk_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_upd_ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, v) VALUES (1, 2, 100);",
+    )?;
+    run_sql(&db, "UPDATE t SET v = 999 WHERE a = 1 AND b = 2;")?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE a = 1 AND b = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_delete_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_del")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, v) VALUES (1, 2, 100);
+         INSERT INTO t (a, b, v) VALUES (1, 3, 200);",
+    )?;
+    run_sql(&db, "DELETE FROM t WHERE a = 1 AND b = 2;")?;
+    let res = run_sql(&db, "SELECT v FROM t;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(200));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_three_columns() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_3col")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, v INT,
+            PRIMARY KEY (a, b, c)
+         );
+         INSERT INTO t (a, b, c, v) VALUES (1, 2, 3, 100);
+         INSERT INTO t (a, b, c, v) VALUES (1, 2, 4, 200);",
+    )?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE a = 1 AND b = 2 AND c = 3;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(100));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_inline_and_table_level_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_inline_dup")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (a INT PRIMARY KEY, b INT NOT NULL, PRIMARY KEY (a, b));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4065]"),
+        "esperaba 4065, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_two_inline_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_pk_two_inline")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4065]"),
+        "esperaba 4065, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_table_level_single_col() -> Result<(), Box<dyn Error>> {
+    // PK table-level con UNA sola columna debe funcionar igual que
+    // inline — sin romper back-compat para usuarios que prefieren la
+    // forma table-level por estilo.
+    let (db, wal) = k2_setup("k2_pk_tlsingle")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT NOT NULL, v INT, PRIMARY KEY (id));
+         INSERT INTO t (id, v) VALUES (7, 100);",
+    )?;
+    let res = run_sql(&db, "SELECT v FROM t WHERE id = 7;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(100));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_pk_composite_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    // Smoke test del formato VERSION 8: serialize/deserialize del catálogo
+    // reabre la tabla con la PK compuesta intacta.
+    let (db, wal) = k2_setup("k2_pk_reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, v) VALUES (1, 2, 100);",
+    )?;
+    // run_sql ya cierra el pager — segundo run lo reabre.
+    let res = run_sql(&db, "SELECT v FROM t WHERE a = 1 AND b = 2;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(100));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----------------------------- INDICES COMPUESTOS -----------------------------
+
+#[test]
+fn k2_index_composite_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_idx_basic")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);
+         INSERT INTO t (id, a, b) VALUES (1, 10, 20);
+         INSERT INTO t (id, a, b) VALUES (2, 10, 30);
+         INSERT INTO t (id, a, b) VALUES (3, 11, 20);
+         CREATE INDEX idx_ab ON t (a, b);",
+    )?;
+    // Aunque el fast-path planner no use el índice, el SELECT por
+    // FullScan + WHERE 3VL debe devolver los datos correctos. El
+    // índice queda creado y backfilled (visible vía INTEGRITY CHECK).
+    let res = run_sql(&db, "SELECT id FROM t WHERE a = 10 AND b = 20;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    let check = run_sql(&db, "INTEGRITY CHECK;")?;
+    let msg = check[0].message.as_deref().unwrap_or("");
+    assert!(msg.starts_with("OK"), "INTEGRITY CHECK: {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_index_composite_not_int_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_idx_notint")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT);")?;
+    let err = run_sql(&db, "CREATE INDEX idx ON t (a, b);").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4067]"),
+        "esperaba 4067, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_index_composite_unique_blocks_dup_backfill() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_idx_unique_dup")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);
+         INSERT INTO t (id, a, b) VALUES (1, 10, 20);
+         INSERT INTO t (id, a, b) VALUES (2, 10, 20);",
+    )?;
+    let err = run_sql(&db, "CREATE UNIQUE INDEX uq_ab ON t (a, b);").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-3003]"),
+        "esperaba 3003, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k2_index_composite_drop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k2_setup("k2_idx_drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);
+         CREATE INDEX idx_ab ON t (a, b);
+         DROP INDEX idx_ab;",
+    )?;
+    // Recrear el mismo índice debe funcionar tras DROP.
+    run_sql(&db, "CREATE INDEX idx_ab ON t (a, b);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
