@@ -1,6 +1,6 @@
 # 📖 Manual de usuario · gabymodeler v2
 
-> **Modelador ER → DDL** para `gabysql`. Layout PowerDesigner-style. Single-page HTML+CSS+JS vanilla, sin frameworks ni servidor obligatorio. Espejo del motor `gabysql VERSION 7`.
+> **Modelador ER → DDL** para `gabysql`. Layout PowerDesigner-style. Single-page HTML+CSS+JS vanilla, sin frameworks ni servidor obligatorio. Espejo del motor `gabysql VERSION 8`.
 >
 > Este manual te lleva de cero a un schema completo (con constraints, índices y FOREIGN KEYs) listo para ejecutar en `gabysql`. Cada paso tiene su captura.
 
@@ -48,7 +48,7 @@ python3 -m http.server 8000 --directory web
 > ```bash
 > gabysql-server -dir ./data -addr :8080
 > ```
-> Desde `gabysql VERSION 7` el server ya emite headers CORS, así que el modeler en `:8000` puede hablarle al API en `:8080` sin proxy.
+> Desde `gabysql VERSION 8` el server ya emite headers CORS, así que el modeler en `:8000` puede hablarle al API en `:8080` sin proxy.
 
 ---
 
@@ -212,7 +212,7 @@ Abre el SQL completo en un modal con scroll, listo para copiar/descargar:
 1. **Orden topológico**: las tablas referenciadas (parents) se emiten antes que las que las referencian (children). Pegar el SQL en una sola transacción (batch HTTP auto-commit, o envolviéndolo en `BEGIN; ... COMMIT;` explícito desde el bloque T del 2026-05-25) siempre funciona.
 2. **Constraints inline**: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, `REFERENCES <tabla>(<col>) [ON DELETE ...]` van todas dentro del `CREATE TABLE`.
 3. **Quoting tipado**: los DEFAULTs se quotean según el tipo (`'pending'` para TEXT, `0` para INT, `TRUE` para BOOL).
-4. **Header informativo**: las dos primeras líneas son comentarios con el timestamp y el target (`gabysql VERSION 7`).
+4. **Header informativo**: las dos primeras líneas son comentarios con el timestamp y el target (`gabysql VERSION 8`).
 
 Pegalo en `phpgabyadmin → SQL`, o mandalo al endpoint `/exec` con un POST JSON.
 
@@ -228,7 +228,7 @@ Tres campos:
 
 | Campo | Default | Comentario |
 | :--- | :--- | :--- |
-| **API base URL** | `http://localhost:8080` | El endpoint del `gabysql-server`. Desde gabysql VERSION 7 ya tiene CORS habilitado. |
+| **API base URL** | `http://localhost:8080` | El endpoint del `gabysql-server`. Desde gabysql VERSION 8 ya tiene CORS habilitado. |
 | **Token** | (vacío) | Solo si el server fue iniciado con `-token <secret>`. Va como `Authorization: Bearer <token>`. |
 | **Database (.db)** | `<dbName actual>.db` | Nombre exacto del archivo DB. |
 

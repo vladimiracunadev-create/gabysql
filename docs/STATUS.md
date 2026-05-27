@@ -1,12 +1,12 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-25 contra `main` post-bloques E1+E2+E3+F+T+J+J2 (WHERE compuesto + comparadores + UPDATE/DELETE multi-fila + agregados + transacciones explícitas + DML masivo + UPSERT/REPLACE/RETURNING).
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-26 contra `main` post-bloques E1+E2+E3+F+T+J+J2 (sesión 2026-05-25) + G1+G2+G3+H+I+K1+K2 (sesión 2026-05-26): expresiones escalares + aritméticos + concat en SELECT/WHERE/HAVING/UPDATE SET, subqueries P0+P1 (derived tables, NOT IN, scalar subquery en SELECT, correlated multi-pred), set ops UNION/INTERSECT/EXCEPT + VALUES, DDL extendido (CTAS + RENAME + DROP/RENAME COLUMN), PK e índices compuestos all-INT (VERSION 7 → 8).
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-8-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-283%2F283-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-300%2F300-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 ---
@@ -118,16 +118,21 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 
 ---
 
-## 🔭 Próximos bloques (post sesión 2026-05-25)
+## 🔭 Próximos bloques (post sesión 2026-05-26)
 
-> **Fase 1 cerrada · Fase 2 con superficie SQL relacional clásica completa.** Entregado en esta sesión (7 bloques): E1 (`AND`/`OR`/`NOT` + paréntesis), E2 (comparadores `<`/`>`/`LIKE`/`IS NULL`/`IN literal`), E3 (`UPDATE`/`DELETE` con WHERE completo), F (agregaciones + `GROUP BY`/`HAVING`/`DISTINCT`), T (`BEGIN`/`COMMIT`/`ROLLBACK` explícitos), J (multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`), J2 (UPSERT, `REPLACE INTO`, `RETURNING`).
+> **Fase 1 cerrada · Fase 2 con superficie SQL relacional clásica + funciones escalares + subqueries restantes + set ops + DDL extendido + DDL on-disk compuesto.** Entregado en la sesión 2026-05-25 (7 bloques): E1 / E2 / E3 / F / T / J / J2. Entregado en la sesión 2026-05-26 (7 bloques): G1 (funciones escalares en SELECT list), G2 (Expr en WHERE/HAVING/UPDATE SET), G3 (aritméticos + `||` + postfix Expr + funciones P2/P3), H (derived tables + `NOT IN (SELECT)` + scalar subquery en SELECT + correlated multi-pred), I (set ops + `VALUES`), K1 (CTAS + RENAME + DROP/RENAME COLUMN), K2 (PK compuesta + índices compuestos, VERSION 7 → 8).
 >
 > **Pendientes priorizados** (orden recomendado, ver [MISSING_COMMANDS.md](MISSING_COMMANDS.md)):
-> - **G** — funciones escalares (`LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF`, `CASE WHEN`, `CAST`). **Cerrado 2026-05-26 (G1+G2+G3).**
-> - **H** — subqueries restantes: derived tables (`FROM (SELECT ...) t`), `NOT IN (SELECT)`, subquery en SELECT list, multi-predicate correlated. **Cerrado 2026-05-26 (P0+P1).** Sub-pendientes: `ALL/ANY/SOME`, correlated `=` puro, `LATERAL` (P2/P3).
-> - **I** — set operations: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual. **Cerrado 2026-05-26.**
-> - **K** — DDL faltante: PK compuesta, índices compuestos, `CREATE TABLE AS SELECT`, `ALTER TABLE DROP/RENAME COLUMN`, `RENAME TABLE`.
-> - **L** — constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE …`, multi-column UNIQUE.
+> - **L** — constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE …`, multi-column UNIQUE standalone.
+> - **V** — vistas: `CREATE VIEW`/`DROP VIEW`.
+> - **W** — CTE (`WITH ... AS`) + window functions (`ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / `SUM() OVER (...)`).
+> - **X** — stored procedures + triggers.
+> - **Y** — tipos faltantes (DECIMAL, BLOB, UUID, ARRAY, INTERVAL, ENUM).
+> - **Z** — control de acceso SQL-level (`GRANT`/`REVOKE`, roles).
+> - **Sub-pendientes de G**: unary `-` prefix sobre expresión, `EXCLUDED.col` en UPSERT (J2-P2).
+> - **Sub-pendientes de H**: `ALL`/`ANY`/`SOME`, correlated `col = outer.col` puro fuera de `EXISTS`, `LATERAL`.
+> - **Sub-pendientes de I**: `ORDER BY <pos>` posicional sobre set ops, set ops dentro de DML (no ANSI).
+> - **Sub-pendientes de K2**: partial indexes, `ALTER COLUMN TYPE`, ALTER PK sobre tabla existente, FK multi-col, range scan sobre claves compuestas, PK/índices compuestos con columnas no-INT.
 > - **Sub-pendientes de J2**: `EXCLUDED.col` en `DO UPDATE`, `UPDATE ... FROM otra_tabla`.
 > - **Sub-pendientes de T**: `SAVEPOINT`/`ROLLBACK TO`, cross-request transactions vía session state HTTP, isolation levels, read-only.
 > - **Sub-pendientes de F**: agregados sobre `SELECT` con JOIN (hoy `[GBY-4028]`).

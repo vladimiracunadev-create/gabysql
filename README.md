@@ -43,13 +43,13 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 
 ## 🚦 Estado actual del producto
 
-> **Estado**: 🟢 Fase 1 (Robustez funcional) cerrada · Fase 2 con superficie SQL relacional clásica completa (E1+E2+E3+F+T+J+J2 cerrados el 2026-05-25)  
-> **Superficie SQL** (DDL): `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `TRUNCATE [TABLE]`  
-> **Superficie SQL** (DML): `INSERT` (single-row, multi-row `VALUES (..),(..)`, `INSERT INTO t SELECT …`, `ON CONFLICT [(col)] DO NOTHING / DO UPDATE SET …`, `REPLACE INTO`, `RETURNING *`), `SELECT` / `UPDATE` / `DELETE` con `WHERE` completo (`=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE` con `%`/`_`/escape `\`, `[NOT] IN (lista | SELECT)`, `= (SELECT)`, `[NOT] EXISTS (SELECT)`, combinados con `AND`/`OR`/`NOT` y paréntesis — lógica trivaluada ANSI), `UPDATE`/`DELETE` también con `RETURNING`, `JOIN` (INNER/LEFT/RIGHT/FULL/CROSS, USING, NATURAL, index-loop), agregados (`COUNT(*)`/`COUNT(col)`/`COUNT(DISTINCT col)`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`, `INTEGRITY CHECK`  
+> **Estado**: 🟢 Fase 1 (Robustez funcional) cerrada · Fase 2 con superficie SQL relacional clásica completa (E1+E2+E3+F+T+J+J2 cerrados el 2026-05-25 + G1+G2+G3+H+I+K1+K2 cerrados el 2026-05-26)  
+> **Superficie SQL** (DDL): `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `PRIMARY KEY` single o compuesta table-level / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES … ON DELETE RESTRICT|CASCADE`), `CREATE TABLE [IF NOT EXISTS] [(aliases)] AS SELECT …` (CTAS, K1), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN] <coldef>`, `ALTER TABLE DROP COLUMN [IF EXISTS]` (K1), `ALTER TABLE RENAME COLUMN` (K1), `ALTER TABLE RENAME TO` / `RENAME TABLE` (K1), `CREATE [UNIQUE] INDEX idx ON t (col)` o `(a, b, …)` (compuesto all-INT, K2), `DROP INDEX`, `TRUNCATE [TABLE]`  
+> **Superficie SQL** (DML): `INSERT` (single-row, multi-row `VALUES (..),(..)`, `INSERT INTO t SELECT …`, `ON CONFLICT [(col)] DO NOTHING / DO UPDATE SET …`, `REPLACE INTO`, `RETURNING *`), `SELECT` / `UPDATE` / `DELETE` con `WHERE` completo (`=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE` con `%`/`_`/escape `\`, `[NOT] IN (lista | SELECT)`, `NOT IN (SELECT)` (H, 3VL ANSI estricta), `= (SELECT)`, `[NOT] EXISTS (SELECT)` (correlated multi-pred desde H), combinados con `AND`/`OR`/`NOT` y paréntesis — lógica trivaluada ANSI), `UPDATE`/`DELETE` también con `RETURNING`, `JOIN` (INNER/LEFT/RIGHT/FULL/CROSS, USING, NATURAL, index-loop), agregados (`COUNT(*)`/`COUNT(col)`/`COUNT(DISTINCT col)`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`, derived tables `FROM (SELECT …) AS t` (H), subquery escalar en SELECT list (H), set ops `UNION`/`UNION ALL`/`INTERSECT [ALL]`/`EXCEPT [ALL]`/`MINUS` (I), `VALUES (…),(…)` standalone o en FROM con `AS t(c1,…)` (I), expresiones escalares en SELECT list, WHERE, HAVING, UPDATE SET y DELETE WHERE — 27 funciones (`LENGTH/UPPER/LOWER/SUBSTR/CONCAT/TRIM/LTRIM/RTRIM/REPLACE/SPLIT_PART/ABS/ROUND/CEIL/FLOOR/MOD/POWER/SQRT/NOW/CURRENT_DATE/CURRENT_TIMESTAMP/DATE_ADD/DATE_SUB/DATEDIFF/EXTRACT/STRFTIME/COALESCE/NULLIF/IFNULL/IF/IIF`), `CAST`, `CASE` (searched + simple), aritméticos `+/-/*///%`, concat `||`, postfix `IS NULL / LIKE / IN / BETWEEN` sobre cualquier `Expr` (G1+G2+G3), `INTEGRITY CHECK`  
 > **Superficie SQL** (TCL): `BEGIN` / `START TRANSACTION` / `COMMIT` / `END` / `ROLLBACK` (batch-local; cross-request HTTP y `SAVEPOINT` pendientes)  
 > **Persistencia**: `.db` + `.wal` con recovery por `COMMIT`, checksums CRC32 por página, crash tests dirigidos  
-> **Formato en disco**: `VERSION = 7` (B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag + `IndexKind` Hash/OrderedInt, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
-> **Portabilidad**: Windows, Linux y macOS por CI · ~165 integration tests verdes · `/metrics` + `-log-json` para observabilidad básica · `gabysql backup/restore/verify` con CRC end-to-end · `WHERE col_int_idx BETWEEN a AND b` con índice ordenado  
+> **Formato en disco**: `VERSION = 8` (K2: PK e índices admiten múltiples columnas all-INT NOT NULL vía fingerprint FNV-1a-64; B+Tree real, hash de catálogo FNV-1a-64, índices secundarios + `unique` flag + `IndexKind` Hash/OrderedInt, columnas con `not_null` + `default`, `FOREIGN KEY` con `on_delete`)  
+> **Portabilidad**: Windows, Linux y macOS por CI · 300 integration tests verdes · `/metrics` + `-log-json` para observabilidad básica · `gabysql backup/restore/verify` con CRC end-to-end · `WHERE col_int_idx BETWEEN a AND b` con índice ordenado  
 > **Runtime opcional**: Docker + `docker compose`
 
 ## 🎯 Qué resuelve hoy este repositorio
@@ -95,8 +95,13 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
 - `CREATE TABLE` con constraints inline: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]`
+- `CREATE TABLE` con `PRIMARY KEY (a, b, …)` table-level (K2, all-INT NOT NULL)
+- `CREATE TABLE [IF NOT EXISTS] [(col_aliases)] AS <select>` (CTAS, K1)
 - `DROP TABLE [IF EXISTS] <name>`
 - `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
+- `ALTER TABLE <name> DROP COLUMN [IF EXISTS] <col>` (K1; bloqueado sobre PK / indexada / FK)
+- `ALTER TABLE <name> RENAME COLUMN <old> TO <new>` (K1; arrastra PK + índices + FKs entrantes)
+- `ALTER TABLE <name> RENAME TO <new>` / `RENAME TABLE <old> TO <new>` (K1)
 - `INSERT` (aplica DEFAULTs, valida NOT NULL, pre-check de UNIQUE y FK)
 - `SELECT * FROM tabla`
 - `SELECT columnas FROM tabla [ORDER BY <col> [ASC|DESC]] LIMIT/OFFSET`
@@ -110,9 +115,15 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 - `SELECT ... FROM a [AS x] [INNER] JOIN b [AS y] ON x.col = y.col [JOIN c ON ...]` *(INNER + CROSS + comma-syntax + aliases + multi-tabla + self-join; nested-loop O(N×M))*
 - `SELECT ... FROM a LEFT|RIGHT|FULL [OUTER] JOIN b ON x.col = y.col` *(OUTER joins con NULL-fill; `OUTER` opcional)*
 - `SELECT ... FROM a JOIN b USING (col)` y `SELECT ... FROM a NATURAL JOIN b` *(sugar/auto-match; `SELECT *` dedupea la columna común)*
+- `SELECT ... FROM (SELECT ...) AS sub [JOIN ...]` *(derived tables, H; alias obligatorio)*
+- `SELECT (SELECT MAX(x) FROM t) FROM s` *(subquery escalar en SELECT list, H; correlated OK)*
+- `<select> UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL] / MINUS <select>` *(set ops con precedencia ANSI, I)*
+- `VALUES (a,b), (c,d), …` standalone o `FROM (VALUES …) AS t(c1,c2,…)` *(I)*
+- Expresiones escalares en SELECT list / WHERE / HAVING / UPDATE SET / DELETE WHERE: 27 funciones (string, numéricas, fecha), `CAST`, `CASE WHEN`, aritméticos `+/-/*///%`, concat `||`, postfix `IS [NOT] NULL`/`[NOT] LIKE`/`[NOT] IN`/`[NOT] BETWEEN` sobre cualquier `Expr` *(G1+G2+G3)*
 - `UPDATE <tabla> SET col = val[, ...] WHERE <pk> = N` (valida NOT NULL/UNIQUE/FK; mantiene índices)
 - `DELETE FROM <tabla> WHERE <pk> = N` (cascade/restrict según FKs entrantes; mantiene índices)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
+- `CREATE INDEX <nombre> ON <tabla> (a, b, …)` (compuesto, K2; all-INT, equality-only via fingerprint FNV-1a-64)
 - `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` (backfill aborta en duplicados)
 - `DROP INDEX <nombre>`
 - `INTEGRITY CHECK` (sweep operacional: CRCs + filas + índices + FKs)
@@ -210,7 +221,7 @@ php -S localhost:8000 -t web
 | [USE_CASES](docs/USE_CASES.md) | 17 recetas concretas listas para copiar |
 | [SQL_REFERENCE](docs/SQL_REFERENCE.md) | esquema de cada comando con railroad diagram + EBNF |
 | [ADRs](docs/adr/) | decisiones arquitectónicas con contexto y alternativas |
-| [docs/INDEX.md](docs/INDEX.md) | índice técnico completo |
+| [docs/index.md](docs/index.md) | índice técnico completo |
 
 ---
 
@@ -244,15 +255,15 @@ El repositorio ya fue validado con:
 
 ## ⚠️ Limitaciones deliberadas
 
-- `UPDATE` no muta la PK. `UPDATE` y `DELETE` aceptan cualquier `WHERE` válido en `SELECT` (bloque E3) — multi-fila, por columna indexada, por subquery, con combinadores `AND`/`OR`/`NOT`. Fast-path por PK solo cuando el WHERE es exactamente `pk = N` literal; el resto cae a FullScan + filtro 3VL.
-- Los índices secundarios soportan **una sola columna por índice**. `UNIQUE` está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` (índice `OrderedInt`, ADR-0017). **Pendiente**: índices compuestos (multi-columna) y range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados — bloque K del roadmap.
-- `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`).
-- `ORDER BY` ya está soportado. **`JOIN`** (4 bloques cerrados): A) `INNER`, `CROSS`, comma-syntax, aliases, multi-tabla; B) `LEFT/RIGHT/FULL [OUTER]` con NULL-fill; C) `USING (col)` y `NATURAL JOIN` con dedup en `SELECT *`; D) index-loop optimization (transparente, INNER/LEFT con PK/índice). **Agregados** (bloque F): `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` single-table; agregados sobre `SELECT` con JOIN devuelven `[GBY-4028]` y quedan para una iteración futura. Window functions/CTE no implementadas.
-- Subqueries: `WHERE col IN (SELECT ...)`, `WHERE col = (SELECT ...)` y `WHERE [NOT] EXISTS (SELECT ...)`. `IN` y `=` solo no-correlacionados; `EXISTS` soporta correlacionado single-eq (`inner_col = outer.col`). Derived tables (`FROM (SELECT ...) t`), correlacionadas con múltiples predicados y CTE/window functions quedan en backlog (bloque H).
+- `UPDATE` no muta la PK (bloqueado sobre **cualquier** columna PK, también compuesta). `UPDATE` y `DELETE` aceptan cualquier `WHERE` válido en `SELECT` (bloque E3) — multi-fila, por columna indexada, por subquery, con combinadores `AND`/`OR`/`NOT`. Fast-path por PK solo cuando el WHERE es exactamente `pk = N` literal; el resto cae a FullScan + filtro 3VL.
+- Los índices secundarios soportan single-column en cualquier tipo escalar **e** índices compuestos all-INT NOT NULL (K2, equality-only via fingerprint FNV-1a-64 — no range scan, no mezcla de tipos). `UNIQUE` está soportado (inline o `CREATE UNIQUE INDEX`); `BETWEEN` por índice secundario funciona sobre columnas `INT` single-column (índice `OrderedInt`, ADR-0017). **Pendiente**: range scan sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` indexados, índices compuestos con columnas no-INT, partial indexes, `ALTER COLUMN TYPE`.
+- `FOREIGN KEY` solo single-column; el target debe ser la PK del parent. `ON DELETE` admite `RESTRICT` y `CASCADE` (no `SET NULL`/`SET DEFAULT`). FK multi-col pendiente.
+- `ORDER BY` ya está soportado. **`JOIN`** (4 bloques cerrados): A) `INNER`, `CROSS`, comma-syntax, aliases, multi-tabla; B) `LEFT/RIGHT/FULL [OUTER]` con NULL-fill; C) `USING (col)` y `NATURAL JOIN` con dedup en `SELECT *`; D) index-loop optimization (transparente, INNER/LEFT con PK/índice). **Agregados** (bloque F): `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` single-table; agregados sobre `SELECT` con JOIN devuelven `[GBY-4028]` y quedan para una iteración futura. Window functions/CTE no implementadas (bloque W).
+- Subqueries: `WHERE col IN (SELECT ...)`, `WHERE col NOT IN (SELECT ...)` (H, 3VL ANSI estricta), `WHERE col = (SELECT ...)`, `WHERE [NOT] EXISTS (SELECT ...)` con correlated multi-predicado dentro de `AND`/`OR`/`NOT` (H), derived tables `FROM (SELECT ...) AS t` (H, alias obligatorio), subquery escalar en SELECT list `SELECT (SELECT MAX(x) FROM t) FROM s` (H). **Pendiente**: `ALL`/`ANY`/`SOME`, correlated `col = outer.col` puro fuera de `EXISTS`, `LATERAL`, CTE/`WITH` (bloque W).
 - **Transacciones explícitas** (bloque T): `BEGIN`/`COMMIT`/`ROLLBACK` batch-local. **Pendiente**: `SAVEPOINT`, cross-request transactions via session state HTTP, isolation levels explícitos, read-only transactions.
 - **UPSERT** (bloque J2): `ON CONFLICT [(col)] DO NOTHING | DO UPDATE SET col = literal`. **Pendiente**: `EXCLUDED.col` en RHS de `DO UPDATE` (workaround: precomputar valor en cliente). **`UPDATE ... FROM otra_tabla`** también pendiente.
 - Sin planner cost-based; el optimizer es deterministic (PK lookup > index lookup > full scan).
-- La PK debe ser una sola columna `INT`. `ALTER TABLE ADD COLUMN` no admite agregar PK.
+- La PK puede ser una sola columna `INT` o compuesta `(a, b, ...)` all-INT NOT NULL (K2). `ALTER TABLE ADD COLUMN` no admite agregar PK; ALTER PK sobre tabla existente no soportado.
 - `JSON` no es indexable (sin semántica de igualdad canónica).
 - No hay MVCC. Existe lock advisory cross-process sobre el `.db` (ADR-0013), pero sin MVCC un solo escritor a la vez por archivo.
 - El servidor cap por defecto a 64 conexiones simultáneas (`-max-connections N` para ajustar).

@@ -96,7 +96,7 @@ flowchart LR
 
 ## CREATE DATABASE
 
-> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 7`. En modo single-DB (`-db`) responde `405`.
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 8`. En modo single-DB (`-db`) responde `405`.
 
 ### 🛤️ Railroad
 

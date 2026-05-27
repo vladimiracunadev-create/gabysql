@@ -46,17 +46,11 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 ---
 
-### 2. Cobertura SQL para comparaciones realistas
+### 2. Cobertura SQL para comparaciones realistas — ✅ entregada
 
-**Qué**: agregar `JOIN` (INNER al menos), `WHERE` sobre columnas no-PK no-indexadas (full scan filtrado), y `COUNT(*)` / `SUM` / `AVG` mínimos.
+**Estado al 2026-05-26**: cerrada. JOINs ANSI completos (INNER/LEFT/RIGHT/FULL/CROSS/USING/NATURAL + index-loop optimization) entregados antes de la sesión 2026-05-25; `WHERE` completo (E1+E2+E3), agregados single-table (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` + `GROUP BY`/`HAVING`/`DISTINCT` — bloque F), DML masivo (J), UPSERT/RETURNING (J2), funciones escalares + aritméticos en cualquier cláusula (G1+G2+G3), subqueries restantes (H), set ops + VALUES (I), DDL extendido (K1+K2 con PK compuesta + índices compuestos all-INT) en sesiones 2026-05-25 y 2026-05-26. La superficie SQL operacional clásica está completa.
 
-**Por qué importa**: cualquier workload comparativo realista usa varias tablas. Sin `JOIN`, la mitad de las queries de TPC-H, YCSB o cualquier benchmark estándar no corren. La comparativa con SQLite/DuckDB sería sobre el subset trivial donde `gabysql` opera; deshonesto.
-
-**Costo**: mediano-alto. `JOIN` toca planner + executor + probablemente requiere reordenar `Plan` enum. Agregados (`COUNT`, `SUM`, `AVG`) son más chicos.
-
-**Tensión**: contradice parte de la "anti-agenda" del AGENDA_INVESTIGACION.md ("no JOIN porque no aprendo nada nuevo"). La resolución: bajo el marco "aprendizaje puro" eso era cierto; bajo el marco "el proyecto comparativo necesita esto", deja de serlo. La agenda debe actualizarse explicitando el cambio cuando esto se haga.
-
-**Esfuerzo**: 2–3 intervenciones por separado (JOIN una, agregados otra, planner cleanup otra).
+**Pendiente residual**: agregados sobre `SELECT` con JOIN (hoy `[GBY-4028]`), CTE/window functions (bloque W), `UPDATE ... FROM`, `EXCLUDED.col` en UPSERT. Ninguno bloquea el proyecto comparativo.
 
 ---
 

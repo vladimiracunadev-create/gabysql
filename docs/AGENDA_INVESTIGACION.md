@@ -203,7 +203,7 @@ Cada fase tiene un **objetivo cognitivo** (qué quiero entender), no un objetivo
 
 **Entregables**:
 
-1. Bump VERSION 7 → 8: `Column` gana `semantic_tag: Option<String>`.
+1. Bump VERSION 8 → 9: `Column` gana `semantic_tag: Option<String>`.
 2. Sintaxis SQL: `CREATE TABLE users (id INT PRIMARY KEY, email TEXT SEMANTIC 'email' NOT NULL);`.
 3. Gateway MCP expone `gabysql_describe_schema` que incluye los semantic_tags.
 4. Documento de vocabulario: qué tags reconoce el motor y por qué (deliberadamente corto al principio: `email`, `url`, `embedded_from:<col>`, `raw_text`, `id_external`).

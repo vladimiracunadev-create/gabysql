@@ -37,10 +37,10 @@ cargo run --release --bin gabysql -- init demo.db
 
 ---
 
-## 🔢 `unsupported gabysql file format: version=N (expected 7)`
+## 🔢 `unsupported gabysql file format: version=N (expected 8)`
 
 ### Causa
-Intentas abrir un archivo con una versión de formato anterior. La versión actual es `7`. Las versiones `1` a `6` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`, `7` agregó `IndexKind` para índices INT-ordenados). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
+Intentas abrir un archivo con una versión de formato anterior. La versión actual es `8`. Las versiones `1` a `7` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`, `7` agregó `IndexKind` para índices INT-ordenados, `8` agregó PK e índices compuestos all-INT — K2, ADR-0019). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
 
 ### Solución
 - Re-crear la base con el binario actual: `gabysql init <file.db>`.

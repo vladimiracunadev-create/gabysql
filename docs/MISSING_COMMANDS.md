@@ -2,7 +2,7 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-25 contra `main` post-bloque **J2** (UPSERT, REPLACE INTO, RETURNING).
+> Última verificación: 2026-05-26 contra `main` post-bloque **K2** (PK e índices compuestos, VERSION 7 → 8). Bloques cerrados en esta sesión: G1 + G2 + G3 + H + I + K1 + K2.
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -378,33 +378,39 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 
 ## 🛣️ Ruta recomendada para "línea de comandos completa"
 
-Si el objetivo es **portar una app SQL clásica sin sorpresas**, esta es la secuencia mínima:
+Si el objetivo es **portar una app SQL clásica sin sorpresas**, esta es la secuencia mínima (todos cerrados hoy):
 
 ```
-E1 (AND/OR/NOT en WHERE)
+E1 (AND/OR/NOT en WHERE)                                ✅
   ↓
-E2 (operadores <, >, LIKE, IS NULL, IN literal)
+E2 (operadores <, >, LIKE, IS NULL, IN literal)         ✅
   ↓
-E3 (UPDATE/DELETE por col indexada y subquery)
+E3 (UPDATE/DELETE por col indexada y subquery)          ✅
   ↓
-F (GROUP BY + HAVING + agregados + DISTINCT)
+F (GROUP BY + HAVING + agregados + DISTINCT)            ✅ (sin JOINs)
   ↓
-G (funciones escalares + CAST + CASE + COALESCE)
+T (BEGIN / COMMIT / ROLLBACK explícitos)                ✅ (batch-local)
   ↓
-T (BEGIN / COMMIT / ROLLBACK explícitos)
+J (multi-row INSERT, INSERT...SELECT, TRUNCATE)         ✅
   ↓
-J (multi-row INSERT, INSERT...SELECT, RETURNING, UPSERT)
+J2 (UPSERT, REPLACE INTO, RETURNING)                    ✅ (sin EXCLUDED.col)
   ↓
-H (derived tables, NOT IN, subquery en SELECT)
+G1+G2+G3 (funciones escalares + CAST + CASE +
+          COALESCE + aritméticos + || + postfix Expr)   ✅
   ↓
-I (UNION, INTERSECT, EXCEPT, VALUES)
+H (derived tables, NOT IN (SELECT), subquery en SELECT,
+   correlated multi-pred)                               ✅
   ↓
-K (PK compuesta, ALTER DROP/RENAME, índices compuestos)
+I (UNION, INTERSECT, EXCEPT, MINUS, VALUES)             ✅
   ↓
-L (CHECK, ON DELETE SET NULL, multi-col UNIQUE)
+K1 (CTAS, RENAME TABLE, DROP/RENAME COLUMN)             ✅
+  ↓
+K2 (PK compuesta + índices compuestos all-INT)          ✅ (VERSION 8)
+  ↓
+L (CHECK, ON DELETE SET NULL, multi-col UNIQUE)         ⏳
 ```
 
-Con E1+E2+E3+F+G+T+J cerrados, gabysql cubre la **superficie SQL operacional clásica** completa. Lo demás (vistas, CTE, window, triggers, tipos exóticos, RLS) es ya material para casos especializados.
+Con E1→K2 cerrados, gabysql cubre la **superficie SQL operacional clásica** completa. Lo que sigue (L = constraints adicionales, V = vistas, W = CTE + window, X = triggers + stored procs, Y = tipos exóticos DECIMAL/BLOB/UUID, Z = RLS) es material para casos especializados.
 
 ---
 

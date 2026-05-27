@@ -119,7 +119,7 @@ Cada `TableMeta` contiene:
 - página raíz de la tabla (root de su B+Tree)
 - lista de `IndexMeta { name, column, root_page, unique, kind }` (vacía si la tabla no tiene índices secundarios). `kind: IndexKind` es `Hash` (default; el bucket vive en un B+Tree hash-keyed) u `OrderedInt` (clave física = valor `INT`; habilita `BETWEEN` por índice).
 
-Layout binario v7 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`.
+Layout binario v8 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`. Cada `TableMeta` además persiste `[pk_count:u8]` columnas PK (≥1; >1 implica PK compuesta all-INT NOT NULL, K2) y cada `IndexMeta` persiste `[extra_cols_count:u8]` columnas extra (>0 implica índice compuesto all-INT). Ver [ADR-0019](adr/0019-composite-pk-and-index.md).
 - Default: `[kind:u8] + payload` (kinds: 0 Null, 1 Int, 2 Float, 3 Bool, 4 String).
 - FK: `[target_table:string][target_column:string][on_delete:u8]` con `0 = RESTRICT`, `1 = CASCADE`.
 
@@ -129,7 +129,7 @@ El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowerca
 
 ## 🔍 Índices secundarios
 
-Desde VERSION 7, cada `IndexMeta` lleva un campo `kind: IndexKind`:
+Desde VERSION 7 cada `IndexMeta` lleva un campo `kind: IndexKind` (Hash | OrderedInt). Desde VERSION 8 (K2) además admite columnas extra para índices compuestos (`extra_columns: Vec<String>`, vacío para single-column):
 
 - **`Hash`** (default; usado para `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` y para `INT` salvo override) — equality only.
 - **`OrderedInt`** (solo aplica a columnas `INT`) — el B+Tree del índice usa el valor `INT` directamente como clave física, lo que habilita `WHERE col_int_idx BETWEEN a AND b` en O(log N + k). `NULL` no se almacena (consistente con la semántica SQL de `BETWEEN`/`UNIQUE`).
@@ -152,10 +152,10 @@ Operaciones:
 - `DROP INDEX`: remueve `IndexMeta` del `TableMeta`. **No libera páginas** — el reclaim es trabajo de un futuro `vacuum`.
 
 Restricciones de la versión actual:
-- Una columna por índice (no compuestos).
+- Single-column en cualquier tipo escalar; índices compuestos soportados desde K2 (VERSION 8) **restringidos a all-INT NOT NULL**, equality-only via fingerprint FNV-1a-64 (no range scan, no mezcla de tipos).
 - `JSON` no es indexable.
 - El nombre del índice es único en toda la base de datos.
-- Equality (`=`) sobre cualquier columna indexada. **`BETWEEN` solo sobre columnas `INT` con índice `OrderedInt`** (default automático al crear índice sobre una columna `INT`); `BETWEEN` sobre `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados devuelve error claro.
+- Equality (`=`) sobre cualquier columna indexada. **`BETWEEN` solo sobre columnas `INT` con índice `OrderedInt`** (default automático al crear índice single-column sobre `INT`); `BETWEEN` sobre `TEXT`/`FLOAT`/`BOOL`/`DATE`/`DATETIME` indexados, y sobre cualquier índice compuesto, devuelve error claro.
 
 Modo `UNIQUE`:
 - `CREATE UNIQUE INDEX` o constraint inline `column UNIQUE` setean `IndexMeta.unique = true`.
@@ -165,7 +165,7 @@ Modo `UNIQUE`:
 
 ---
 
-## 🔗 FOREIGN KEY (VERSION 7+)
+## 🔗 FOREIGN KEY (VERSION 6+)
 
 Cada columna puede declarar como mucho una FK single-column. Se persiste en `Column.references = Some(ForeignKeyMeta { table, column, on_delete })`.
 
@@ -199,7 +199,7 @@ Enforcement en runtime:
 ## 🧱 Reglas de fila
 
 - todos los identificadores (tabla, columna, índice) cumplen `[A-Za-z_][A-Za-z0-9_]*`, longitud ≤ `MAX_IDENT_LEN = 64`, no reservados — definido y enforzado en [`catalog::validate_identifier`](../src/catalog.rs)
-- la PK debe ser una sola columna `INT` escalar (no se admiten PKs compuestas ni de otros tipos en esta versión); es implícitamente `NOT NULL`
+- la PK puede ser una sola columna `INT` escalar o un grupo compuesto `(a, b, ...)` all-INT NOT NULL declarado table-level (K2, VERSION 8); en cualquier caso es implícitamente `NOT NULL`
 - la PK no puede ser `NULL`
 - una PK duplicada devuelve error en `INSERT`
 - `UPDATE` no permite mutar la PK
@@ -218,16 +218,22 @@ Enforcement en runtime:
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI; intercept antes de abrir Pager)*
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
-- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]`
+- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]`, y `PRIMARY KEY (a, b, ...)` table-level (K2, all-INT NOT NULL)
+- `CREATE TABLE [IF NOT EXISTS] [(col_aliases)] AS <select_query>` (CTAS, K1)
 - `DROP TABLE [IF EXISTS] <name>` (catalog-only; páginas backing no liberadas)
 - `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
+- `ALTER TABLE <name> DROP COLUMN [IF EXISTS] <col>` (K1; bloqueado sobre PK / indexada / FK)
+- `ALTER TABLE <name> RENAME COLUMN <old> TO <new>` (K1; arrastra PK + índices + FKs entrantes)
+- `ALTER TABLE <name> RENAME TO <new>` / `RENAME TABLE <old> TO <new>` (K1)
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ... [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n]`
-- `WHERE` con la siguiente gramática (idéntica en `SELECT`, `UPDATE`, `DELETE` desde el bloque E3):
-  - Operadores atómicos: `=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN n AND m`, `IS [NOT] NULL`, `[NOT] LIKE 'patron'` (wildcards `%`/`_` + escape `\`), `[NOT] IN (lit, ...)`, `IN (SELECT ...)`, `= (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`
+- `WHERE` con la siguiente gramática (idéntica en `SELECT`, `UPDATE`, `DELETE` desde el bloque E3, extendida por G2/G3/H):
+  - Operadores atómicos: `=`, `<`, `>`, `<=`, `>=`, `<>`/`!=`, `BETWEEN n AND m`, `IS [NOT] NULL`, `[NOT] LIKE 'patron'` (wildcards `%`/`_` + escape `\`), `[NOT] IN (lit, ...)`, `IN (SELECT ...)`, `NOT IN (SELECT ...)` (H, 3VL ANSI estricta), `= (SELECT ...)`, `[NOT] EXISTS (SELECT ...)` (correlated multi-pred OK desde H).
+  - Postfix sobre cualquier `Expr` (G3): `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN`, `[NOT] BETWEEN`.
+  - Expresiones escalares (G1+G2+G3) como LHS/RHS: 27 funciones (string, numéricas, fecha/hora), `CAST(x AS TYPE)`, `CASE WHEN ... THEN ... ELSE ... END` (searched + simple), `COALESCE`/`NULLIF`/`IFNULL`/`IF`/`IIF`, aritméticos binarios `+`/`-`/`*`/`/`/`%`, concat `||`.
   - Combinadores: `AND`, `OR`, `NOT`, paréntesis. Precedencia estándar SQL (`OR` < `AND` < `NOT` < átomo).
   - Lógica trivaluada (3VL) ANSI para NULL en todos los operadores (con la única excepción de `IS [NOT] NULL`).
-  - Fast-paths indexadas activas solo cuando el WHERE es un único átomo del tipo `=` (PK o índice), `BETWEEN` (PK o `OrderedInt`), `IN (SELECT)` (PK o índice), `= (SELECT)` (PK o índice), `EXISTS`. Cualquier otra forma (combinadores o átomos E2) cae a FullScan + filtro 3VL.
+  - Fast-paths indexadas activas solo cuando el WHERE es un único átomo del tipo `=` (PK o índice), `BETWEEN` (PK o `OrderedInt`), `IN (SELECT)` (PK o índice), `= (SELECT)` (PK o índice), `EXISTS`. Cualquier otra forma (combinadores, átomos E2, expresiones escalares, postfix Expr) cae a FullScan + filtro 3VL.
 - `ORDER BY <col> [ASC|DESC]` (sort post-scan o por índice OrderedInt)
 - `FROM a [AS x] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN b [AS y] (ON l = r | USING (col))` y la comma-syntax
 - `FROM a NATURAL [INNER|LEFT|RIGHT|FULL] JOIN b`
@@ -237,22 +243,29 @@ Enforcement en runtime:
 - `UPDATE <tabla> SET col = val[, ...] WHERE <where_clause>` (cualquier WHERE válido en SELECT; multi-fila)
 - `DELETE FROM <tabla> WHERE <where_clause>` (cualquier WHERE válido en SELECT; cascade FK por fila)
 - `CREATE INDEX <nombre> ON <tabla> (<columna>)` (con backfill automático)
-- `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` (backfill aborta en duplicados)
+- `CREATE INDEX <nombre> ON <tabla> (a, b, ...)` (compuesto, K2; all-INT, equality-only via fingerprint FNV-1a-64)
+- `CREATE UNIQUE INDEX <nombre> ON <tabla> (<columna>)` o `(a, b, ...)` (backfill aborta en duplicados)
 - `DROP INDEX <nombre>`
+- `BEGIN` / `START TRANSACTION` / `COMMIT` / `END` / `ROLLBACK` (batch-local, T)
+- Multi-row `INSERT INTO t VALUES (...), (...)`, `INSERT INTO t SELECT ...`, `TRUNCATE [TABLE]` (J)
+- `INSERT ... ON CONFLICT [(col)] DO NOTHING | DO UPDATE SET col = literal`, `REPLACE INTO`, `RETURNING *` o `RETURNING col, ...` en `INSERT`/`UPDATE`/`DELETE` (J2)
+- `FROM (SELECT ...) AS sub` derived tables (H, alias obligatorio); `SELECT (SELECT MAX(x) FROM t) FROM s` scalar subquery en SELECT list (H, correlated OK)
+- Set ops `UNION` / `UNION ALL` / `INTERSECT [ALL]` / `EXCEPT [ALL]` / `MINUS` con precedencia ANSI (INTERSECT > UNION/EXCEPT) y `ORDER BY`/`LIMIT`/`OFFSET` al nivel del resultado combinado (I)
+- `VALUES (a, b), (c, d), ...` standalone o `FROM (VALUES ...) AS t(c1, c2, ...)` con alias obligatorio (I)
 - `INTEGRITY CHECK` (sweep operacional de páginas + índices + FKs)
 
 ### No soportado todavía
-- Agregados sobre `SELECT` con `JOIN` (devuelve `[GBY-4028]`). `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` single-table sí están soportados desde el bloque F (2026-05-25)
+- Agregados sobre `SELECT` con `JOIN` (devuelve `[GBY-4028]`). `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` single-table sí están soportados desde el bloque F
 - `GROUP_CONCAT` / `STRING_AGG` / `JSON_AGG` / `ARRAY_AGG`
-- Window functions, CTE (`WITH ... AS`), `WITH RECURSIVE`
+- Window functions, CTE (`WITH ... AS`), `WITH RECURSIVE` (bloque W)
 - `ILIKE`, `REGEXP`, `GLOB`, `IS TRUE`/`IS FALSE`
 - `WHERE` por columnas no PK ni indexadas usa FullScan (no es bloqueante — solo perf)
 - Optimización indexada para operadores no-`=`/no-`BETWEEN` (`<`, `>`, `LIKE`, `IN literal`) — hoy cae a FullScan aunque la columna tenga índice
-- Subqueries correlacionadas con AND/OR/NOT envolventes (devuelve `[GBY-4024]`); derived tables (`FROM (SELECT ...) t`); CTE; window functions
-- `NOT IN (SELECT ...)` — solo se soporta `NOT IN (lista literal)`; con subquery requiere semántica 3VL especial que queda para el bloque H
+- Subqueries `ALL` / `ANY` / `SOME`, correlated `col = outer.col` puro fuera de `EXISTS`, `LATERAL`
 - `JOIN` con predicados no-equi en `ON` (`<`, `>`, multi-cond con `AND`), `USING` multi-columna, `NATURAL` con >1 columna común
-- Índices compuestos (multi-columna)
-- `UPDATE ... FROM otra_tabla` (UPDATE con JOIN) y `DELETE ... JOIN`
+- PK / índices compuestos con columnas no-INT o nullables (K2 sólo all-INT NOT NULL); range scan sobre claves compuestas; partial indexes; `ALTER COLUMN TYPE`; ALTER PK sobre tabla existente; FK multi-col
+- `UPDATE ... FROM otra_tabla` (UPDATE con JOIN), `DELETE ... JOIN`, `EXCLUDED.col` en UPSERT
+- Unary `-` / `+` prefix sobre expresiones; `SAVEPOINT` / isolation levels / read-only tx / cross-request tx
 
 ---
 

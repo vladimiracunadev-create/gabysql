@@ -68,20 +68,29 @@ CREATE TABLE orders (
 );
 ```
 
-Constraints disponibles por columna (gabysql `VERSION 7+`):
-- `PRIMARY KEY` — una sola, debe ser `INT`, implícitamente `NOT NULL`.
+Constraints disponibles por columna (gabysql `VERSION 8+`):
+- `PRIMARY KEY` — escalar `INT` inline, o compuesta `PRIMARY KEY (a, b, ...)` table-level (K2, all-INT NOT NULL, equality-only via fingerprint FNV-1a-64). Implícitamente `NOT NULL`.
 - `NOT NULL` — rechaza `NULL` literal y omisión sin DEFAULT.
 - `UNIQUE` — auto-genera índice unique `uq_<tabla>_<col>`. Múltiples NULL permitidos.
 - `DEFAULT <literal>` — INT/FLOAT/BOOL/TEXT/DATE/DATETIME/JSON o `NULL`. Tipo validado al CREATE.
 - `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]` — single-column FK; el target debe ser la PK del parent.
 
-### DDL — `DROP TABLE` y `ALTER TABLE`
+### DDL — `CREATE TABLE AS SELECT`, `DROP TABLE`, `ALTER TABLE`, `RENAME TABLE`
 ```sql
+CREATE TABLE [IF NOT EXISTS] dst [(col_aliases)] AS <select_query>;
 DROP TABLE [IF EXISTS] <name>;
 ALTER TABLE <name> ADD [COLUMN] <coldef>;
+ALTER TABLE <name> DROP COLUMN [IF EXISTS] <col>;
+ALTER TABLE <name> RENAME COLUMN <old> TO <new>;
+ALTER TABLE <name> RENAME TO <new>;
+RENAME TABLE <old> TO <new>;
 ```
+- **CTAS** (K1): la primera columna del SELECT debe ser `INT` no-NULL — se usa como PK de la nueva tabla. Sin DEFAULT/UNIQUE/FK heredadas.
 - `DROP TABLE` quita la entrada del catálogo (las páginas backing no se liberan; reclamo futuro vía `vacuum`).
 - `ALTER TABLE ADD COLUMN` no reescribe filas previas; éstas se decodifican con el `DEFAULT` de la columna nueva (o `NULL`). El rewrite ocurre naturalmente en el siguiente `UPDATE`. Restricciones: no admite `PRIMARY KEY`; `NOT NULL` requiere `DEFAULT` no nulo; `UNIQUE` con DEFAULT no nulo se rechaza si la tabla tiene > 1 fila.
+- **`ALTER TABLE DROP COLUMN`** (K1): rewrite in place. Bloqueado sobre PK (`[GBY-4059]`), columna indexada (`[GBY-4060]`, sugiere `DROP INDEX` previo) y FK saliente o entrante (`[GBY-4061]`). `IF EXISTS` → no-op si la columna ya no está.
+- **`ALTER TABLE RENAME COLUMN`** (K1): on-disk row es posicional → no rewrite; muta `TableMeta.columns[i].name` y arrastra el cambio a PK, índices y FKs entrantes. Destino tomado → `[GBY-4062]`.
+- **`ALTER TABLE RENAME TO` / `RENAME TABLE`** (K1): renombra entry del catálogo y arrastra el cambio a FKs entrantes. Destino tomado → `[GBY-4062]`; origen ausente → `[GBY-2001]`.
 
 ### DDL de bases de datos (server multi-DB / CLI)
 ```sql
@@ -241,7 +250,7 @@ Devuelve un JSON con `started_unix`, `uptime_s`, `requests_total`, `requests_by_
 
 ## 5. 📐 `gabymodeler v2` — modelador web (PowerDesigner-style)
 
-`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 7`.
+`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 8`.
 
 ### Levantarlo
 ```bash

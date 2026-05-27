@@ -95,7 +95,7 @@ Congelar una base confiable antes de tocar componentes críticos.
 
 ## Fase 1 — Integridad del storage y recovery
 
-> **Estado**: entregada — `INTEGRITY CHECK` operacional, crash tests dirigidos y WAL recovery por `COMMIT` funcionando desde 2026-05 (ver hitos completos en [CHANGELOG](../CHANGELOG.md), con superficie SQL extendida en la sesión del 2026-05-25 con E1+E2+E3+F+T+J+J2).
+> **Estado**: entregada — `INTEGRITY CHECK` operacional, crash tests dirigidos y WAL recovery por `COMMIT` funcionando desde 2026-05 (ver hitos completos en [CHANGELOG](../CHANGELOG.md), con superficie SQL extendida en la sesión del 2026-05-25 con E1+E2+E3+F+T+J+J2 y en la sesión del 2026-05-26 con G1+G2+G3+H+I+K1+K2).
 
 ### Objetivo
 Endurecer el corazón del motor sin ampliar demasiado la superficie SQL.
@@ -184,7 +184,7 @@ Completar las operaciones esenciales del motor y dejar reglas de datos más seri
 
 ## Fase 3 — Índices y consultas usables
 
-> **Estado**: parcialmente entregada. `ORDER BY`, índices secundarios simples (Hash y OrderedInt para INT con range scan vía ADR-0017) + `WHERE` por columna no-PK + JOINs ANSI (INNER/LEFT/RIGHT/FULL/CROSS/USING/NATURAL con index-loop) + agregados single-table (bloque F) ya están en main al 2026-05-25. **Pendientes**: índices compuestos (multi-columna) y partial indexes — bloque K del roadmap; range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`.
+> **Estado**: parcialmente entregada. `ORDER BY`, índices secundarios simples (Hash y OrderedInt para INT con range scan vía ADR-0017), índices compuestos all-INT vía fingerprint FNV-1a-64 (K2/VERSION 8, ADR-0019), `WHERE` por columna no-PK, JOINs ANSI (INNER/LEFT/RIGHT/FULL/CROSS/USING/NATURAL con index-loop), agregados single-table (bloque F), derived tables y scalar subqueries (H), set ops (I) y DDL extendido (K1+K2) ya están en main al 2026-05-26. **Pendientes**: partial indexes, `ALTER COLUMN TYPE`, ALTER PK, FK multi-col, range scan sobre claves compuestas, range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`.
 
 ### Objetivo
 Quitar a la PK la carga de ser la única vía eficiente de consulta.

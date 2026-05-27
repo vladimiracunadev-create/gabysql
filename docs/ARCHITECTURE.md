@@ -61,7 +61,7 @@ graph LR
 Responsable de:
 - crear (sin sobrescribir) y abrir archivos `.db`; expone `create_force` para reset explícito
 - adquirir un **lock exclusivo cross-process** sobre el `.db` con `File::try_lock()` en cada `create/open`: dos procesos `gabysql` apuntando al mismo archivo → el segundo falla rápido con `database is locked by another process` (ver [ADR-0013](adr/0013-process-level-file-lock.md))
-- mantener el header del formato `VERSION=7` (rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md))
+- mantener el header del formato `VERSION=8` (rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md))
 - gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
 - finalizar el checksum antes de cada flush y verificarlo al leer
 - escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`
@@ -83,9 +83,9 @@ Responsable de:
 Responsable de:
 - registrar tablas usando hashing **FNV-1a-64** (estable entre versiones de Rust)
 - leer schema y resolver páginas raíz de cada tabla
-- validar `CREATE TABLE` (PK obligatoria, escalar `INT`; identificadores `[A-Za-z_][A-Za-z0-9_]*`, ≤ 64 chars, no reservados)
-- persistir `Column { name, type, not_null, default?, references? }` con flags por bit (`0x01` NOT NULL, `0x02` HAS_DEFAULT, `0x04` HAS_FK) — VERSION 7
-- persistir la lista de `IndexMeta { name, column, root_page, unique, kind }` en `TableMeta` (`kind: IndexKind = Hash | OrderedInt`, ADR-0017)
+- validar `CREATE TABLE` (PK obligatoria, escalar `INT` o compuesta `(a, b, ...)` all-INT NOT NULL desde K2; identificadores `[A-Za-z_][A-Za-z0-9_]*`, ≤ 64 chars, no reservados)
+- persistir `Column { name, type, not_null, default?, references? }` con flags por bit (`0x01` NOT NULL, `0x02` HAS_DEFAULT, `0x04` HAS_FK) — VERSION 5+
+- persistir `TableMeta.primary_key_extra: Vec<String>` (vacío para PK single, K2/VERSION 8) y la lista de `IndexMeta { name, column, root_page, unique, kind, extra_columns: Vec<String> }` en `TableMeta` (`kind: IndexKind = Hash | OrderedInt`, ADR-0017; `extra_columns` no vacío implica índice compuesto all-INT, ADR-0019)
 - persistir `ForeignKeyMeta { table, column, on_delete: RESTRICT|CASCADE }` por columna
 - validar FK targets al DDL (target table existe o es self-ref, target column es la PK del target, tipos coinciden)
 - exponer `insert_row`, `upsert_row`, `delete_row`, `get_row`, `scan_rows`, `range_rows`, `remove_table`

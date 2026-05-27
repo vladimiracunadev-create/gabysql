@@ -63,7 +63,7 @@
 
 - compatibilidad SQL completa con Postgres / MySQL.
 - MVCC, replicación, clustering, sharding, wire protocol.
-- planner cost-based, window functions, CTE/vistas, `SAVEPOINT` y transacciones cross-request en el server HTTP. (`GROUP BY`/`HAVING`/agregados single-table soportados desde el bloque F el 2026-05-25; agregados sobre `JOIN` aún no. `BEGIN`/`COMMIT`/`ROLLBACK` explícitos batch-local soportados desde el bloque T el 2026-05-25.)
+- planner cost-based, window functions, CTE/vistas, `SAVEPOINT` y transacciones cross-request en el server HTTP. (`GROUP BY`/`HAVING`/agregados single-table soportados desde el bloque F el 2026-05-25; agregados sobre `JOIN` aún no. `BEGIN`/`COMMIT`/`ROLLBACK` explícitos batch-local soportados desde el bloque T el 2026-05-25. Funciones escalares + `CAST` + `CASE` + aritméticos + `||` en SELECT/WHERE/HAVING/UPDATE SET — G1+G2+G3 (2026-05-26). Set ops `UNION/INTERSECT/EXCEPT/MINUS` + `VALUES` — I (2026-05-26). Derived tables + scalar subquery en SELECT + correlated multi-pred — H (2026-05-26). CTAS + `RENAME TABLE` + `ALTER TABLE DROP/RENAME COLUMN` — K1 (2026-05-26). PK e índices compuestos all-INT — K2 (2026-05-26, VERSION 7 → 8).)
 - soporte de producción comercial (no hay SLA).
 
 ## 🌐 Contacto
