@@ -289,6 +289,31 @@ pub mod codes {
     /// paréntesis envolventes. `SELECT SELECT x FROM t` no se acepta;
     /// debe ir `(SELECT x FROM t)`.
     pub const SCALAR_SUBQUERY_IN_EXPR_REQUIRES_PARENS: u32 = 4051;
+    /// Bloque I (2026-05-26): `FROM (VALUES (...), ...)` sin alias. La
+    /// cláusula VALUES no provee nombres por sí misma, por lo que ANSI
+    /// exige un alias de tabla (`AS t`). gabysql además exige el alias
+    /// de columnas (`AS t(c1, c2, ...)`) para que el outer pueda
+    /// referenciarlas — sin esa lista, el resolver no tiene names.
+    pub const VALUES_IN_FROM_REQUIRES_ALIAS: u32 = 4052;
+    /// Bloque I: la lista de aliases de columna de una `VALUES` en FROM
+    /// (`AS t(c1, c2, ...)`) tiene una arity distinta a las tuplas, o
+    /// dos tuplas de un mismo `VALUES` tienen arity distinta entre sí.
+    /// Ambos casos rompen el shape rectangular de la tabla virtual.
+    pub const VALUES_COLUMN_ALIAS_ARITY: u32 = 4053;
+    /// Bloque I: una operación de conjunto (`UNION` / `INTERSECT` /
+    /// `EXCEPT`) entre dos queries cuyo número de columnas no coincide.
+    /// ANSI exige `arity(lhs) == arity(rhs)`.
+    pub const SET_OP_ARITY_MISMATCH: u32 = 4054;
+    /// Bloque I: una operación de conjunto entre dos queries cuyas
+    /// columnas, en alguna posición, tienen tipos no compatibles. INT
+    /// y FLOAT promueven; el resto exige match exacto (o NULL).
+    pub const SET_OP_TYPE_MISMATCH: u32 = 4055;
+    /// Bloque I: dos filas de un mismo `VALUES (..), (..)` tienen
+    /// distinto número de expresiones. Toda fila debe tener la misma
+    /// arity (la del primer row).
+    pub const VALUES_ROW_ARITY_MISMATCH: u32 = 4056;
+    /// Bloque I: `VALUES` sin ninguna fila — sintaxis inválida.
+    pub const VALUES_EMPTY: u32 = 4057;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -42,6 +42,8 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | `WHERE col NOT IN (SELECT …)` | 🟢 | H (2026-05-26). ANSI 3VL estricta: NULL en la subquery propaga NULL al resultado (`5 NOT IN (1, NULL)` → NULL). | [src/sql.rs](../src/sql.rs) |
 | Derived tables `FROM (SELECT …) AS sub` | 🟢 | H (2026-05-26). Alias obligatorio (`[GBY-4048]`). Permitido en FROM o RHS de JOIN. Inferencia de tipo por columna; mezcla → TEXT. Sin índices (full scan); sin UPDATE/DELETE/INSERT sobre derived. | [src/sql.rs](../src/sql.rs) |
 | Subquery escalar en SELECT list `SELECT (SELECT MAX(x) FROM t) FROM s` | 🟢 | H (2026-05-26). Correlated OK vía outer_stack. `Expr::ScalarSubquery` evaluada con `Engine::eval_expr_full` (fast-path puro `eval_expr` cuando el árbol no la contiene). | [src/sql.rs](../src/sql.rs) |
+| Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`INTERSECT ALL`/`EXCEPT`/`EXCEPT ALL`/`MINUS`) | 🟢 | I (2026-05-26). Precedencia ANSI (INTERSECT > UNION/EXCEPT, asoc-izquierda). ORDER BY / LIMIT / OFFSET al nivel del resultado combinado. Headers heredados del LHS. Validación de arity (`[GBY-4054]`) y tipos compatibles (`[GBY-4055]`, INT/FLOAT promueven). Multisets con counts: ALL preserva, sin ALL dedup. | [src/sql.rs](../src/sql.rs) |
+| `VALUES (...), (...)` como query o tabla virtual | 🟢 | I (2026-05-26). Standalone (`VALUES (1,'a'),(2,'b');` → ResultSet con headers `column1`,`column2`,...) y en FROM/JOIN (`FROM (VALUES (...),...) AS t(c1,c2,...)` con alias de tabla y de columnas obligatorios, `[GBY-4052]`/`[GBY-4053]`). Cada fila se evalúa como `Expr` (admite expresiones constantes). | [src/sql.rs](../src/sql.rs) |
 | Subqueries `ALL`/`ANY`/`SOME` / correlated `=` puro fuera de EXISTS / `LATERAL` / CTE / window functions | 🔴 | P2/P3 y bloque W (CTE). | — |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases, multi-tabla, self-join | 🟢 | Nested-loop puro O(N×M×…). WHERE/ORDER BY trabajan sobre filas joineadas. `SELECT *` expande prefijado. | [src/sql.rs](../src/sql.rs) |
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | 🟢 | Implementado vía tracking de matched-rows + NULL-fill por kind. `OUTER` opcional. Combinable en chains. | [src/sql.rs](../src/sql.rs) |
@@ -117,7 +119,7 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > **Pendientes priorizados** (orden recomendado, ver [MISSING_COMMANDS.md](MISSING_COMMANDS.md)):
 > - **G** — funciones escalares (`LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF`, `CASE WHEN`, `CAST`). **Cerrado 2026-05-26 (G1+G2+G3).**
 > - **H** — subqueries restantes: derived tables (`FROM (SELECT ...) t`), `NOT IN (SELECT)`, subquery en SELECT list, multi-predicate correlated. **Cerrado 2026-05-26 (P0+P1).** Sub-pendientes: `ALL/ANY/SOME`, correlated `=` puro, `LATERAL` (P2/P3).
-> - **I** — set operations: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual.
+> - **I** — set operations: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual. **Cerrado 2026-05-26.**
 > - **K** — DDL faltante: PK compuesta, índices compuestos, `CREATE TABLE AS SELECT`, `ALTER TABLE DROP/RENAME COLUMN`, `RENAME TABLE`.
 > - **L** — constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE …`, multi-column UNIQUE.
 > - **Sub-pendientes de J2**: `EXCLUDED.col` en `DO UPDATE`, `UPDATE ... FROM otra_tabla`.

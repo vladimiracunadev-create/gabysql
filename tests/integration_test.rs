@@ -6271,6 +6271,376 @@ fn h_correlated_two_exists_and() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ===================== Bloque I (set ops + VALUES) =====================
+
+fn setup_i_two_tables(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, nombre TEXT); \
+         CREATE TABLE b (id INT PRIMARY KEY, nombre TEXT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO a (id, nombre) VALUES (1, 'Ana'); \
+         INSERT INTO a (id, nombre) VALUES (2, 'Beto'); \
+         INSERT INTO a (id, nombre) VALUES (3, 'Carla');",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO b (id, nombre) VALUES (2, 'Beto'); \
+         INSERT INTO b (id, nombre) VALUES (3, 'Carla'); \
+         INSERT INTO b (id, nombre) VALUES (4, 'Dani');",
+    )?;
+    Ok((db, wal))
+}
+
+fn rs_int_vec(rs: &gabysql::sql::ResultSet, col: usize) -> Vec<i64> {
+    rs.rows
+        .iter()
+        .map(|r| match &r[col] {
+            Value::Integer(n) => *n,
+            other => panic!("expected int, got {:?}", other),
+        })
+        .collect()
+}
+
+#[test]
+fn i_union_basic_dedup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_dedup")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a UNION SELECT id FROM b ORDER BY id ASC;",
+    )?;
+    // a={1,2,3}, b={2,3,4} → UNION = {1,2,3,4}
+    assert_eq!(rs_int_vec(&res[0], 0), vec![1, 2, 3, 4]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_all_keeps_dupes() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_all")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id ASC;",
+    )?;
+    // a={1,2,3}, b={2,3,4} → 6 filas con 2 y 3 duplicados.
+    assert_eq!(rs_int_vec(&res[0], 0), vec![1, 2, 2, 3, 3, 4]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_three_way() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_3way")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a UNION SELECT id FROM b UNION VALUES (99) ORDER BY id ASC;",
+    )?;
+    assert_eq!(rs_int_vec(&res[0], 0), vec![1, 2, 3, 4, 99]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_arity_mismatch_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_arity")?;
+    let err = run_sql(&db, "SELECT id FROM a UNION SELECT id, nombre FROM b;");
+    assert!(err.is_err(), "expected arity mismatch");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("[GBY-4054]"), "msg = {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_type_mismatch_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_type")?;
+    let err = run_sql(&db, "SELECT id FROM a UNION SELECT nombre FROM b;");
+    assert!(err.is_err());
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("[GBY-4055]"), "msg = {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_with_null_dedup() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_union_null");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, name) VALUES (1, NULL); \
+         INSERT INTO t (id, name) VALUES (2, 'x');",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT name FROM t UNION SELECT name FROM t ORDER BY name ASC;",
+    )?;
+    // Dos NULL colapsan a uno + 'x' una sola vez.
+    assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_with_order_by_outer() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_order_outer")?;
+    let res = run_sql(
+        &db,
+        "(SELECT id FROM a) UNION (SELECT id FROM b) ORDER BY id DESC;",
+    )?;
+    assert_eq!(rs_int_vec(&res[0], 0), vec![4, 3, 2, 1]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_with_limit_outer() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_limit_outer")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a UNION SELECT id FROM b ORDER BY id ASC LIMIT 2;",
+    )?;
+    assert_eq!(rs_int_vec(&res[0], 0), vec![1, 2]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_union_headers_from_lhs() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_union_headers")?;
+    // Headers vienen del LHS (regla ANSI). `a.id` y `b.nombre` proyectan
+    // nombres distintos; el output usa el del LHS.
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a UNION SELECT id FROM b ORDER BY id ASC LIMIT 1;",
+    )?;
+    assert_eq!(res[0].columns, vec!["id"]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_intersect_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_intersect")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a INTERSECT SELECT id FROM b ORDER BY id ASC;",
+    )?;
+    // a={1,2,3}, b={2,3,4} → {2,3}
+    assert_eq!(rs_int_vec(&res[0], 0), vec![2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_intersect_all_counts_min() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_intersect_all");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    // INTERSECT ALL precisa multisets — usamos VALUES standalone.
+    let res = run_sql(
+        &db,
+        "VALUES (1), (1), (2), (3) INTERSECT ALL VALUES (1), (1), (1), (2);",
+    )?;
+    // multiset L: {1:2, 2:1, 3:1}, R: {1:3, 2:1} → min = {1:2, 2:1}
+    let mut got = rs_int_vec(&res[0], 0);
+    got.sort();
+    assert_eq!(got, vec![1, 1, 2]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_except_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_except")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a EXCEPT SELECT id FROM b ORDER BY id ASC;",
+    )?;
+    // a - b = {1}
+    assert_eq!(rs_int_vec(&res[0], 0), vec![1]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_except_all_counts_subtract() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_except_all");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let res = run_sql(
+        &db,
+        "VALUES (1), (1), (1), (2) EXCEPT ALL VALUES (1), (2), (2);",
+    )?;
+    // L: {1:3, 2:1}, R: {1:1, 2:2} → diff = {1:2, 2:0} = [1, 1]
+    let mut got = rs_int_vec(&res[0], 0);
+    got.sort();
+    assert_eq!(got, vec![1, 1]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_minus_alias_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_minus")?;
+    let res = run_sql(
+        &db,
+        "SELECT id FROM a MINUS SELECT id FROM b ORDER BY id ASC;",
+    )?;
+    assert_eq!(rs_int_vec(&res[0], 0), vec![1]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_standalone_returns_rs() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_values_standalone");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let res = run_sql(&db, "VALUES (1, 'a'), (2, 'b'), (3, 'c');")?;
+    assert_eq!(res[0].columns, vec!["column1", "column2"]);
+    assert_eq!(res[0].rows.len(), 3);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[2][1], Value::String("c".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_arity_mismatch_error() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_values_arity");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let err = run_sql(&db, "VALUES (1, 'a'), (2);");
+    assert!(err.is_err());
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("[GBY-4056]"), "msg = {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_empty_error() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_values_empty");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    // Sin paréntesis siquiera.
+    let err = run_sql(&db, "VALUES;");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_in_from_basic() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_values_from_basic");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let res = run_sql(
+        &db,
+        "SELECT id, name FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name) ORDER BY id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::String("a".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_in_from_join_with_persistent() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = setup_i_two_tables("i_values_join")?;
+    // JOIN entre tabla persistente y VALUES virtual.
+    let res = run_sql(
+        &db,
+        "SELECT a.id, t.tag FROM a INNER JOIN (VALUES (1, 'uno'), (3, 'tres')) AS t(id, tag) \
+         ON a.id = t.id ORDER BY a.id ASC;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::String("uno".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_in_from_requires_alias_error() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_values_no_alias");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let err = run_sql(&db, "SELECT * FROM (VALUES (1, 'a'));");
+    assert!(err.is_err());
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("[GBY-4052]"), "msg = {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_values_in_from_column_arity_error() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_values_col_arity");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let err = run_sql(
+        &db,
+        "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(only_one);",
+    );
+    assert!(err.is_err());
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("[GBY-4053]"), "msg = {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn i_intersect_binds_tighter_than_union() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("i_precedence");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    // VALUES (1),(2) UNION VALUES (3),(4) INTERSECT VALUES (4),(5)
+    //   == VALUES (1),(2) UNION (VALUES (3),(4) INTERSECT VALUES (4),(5))
+    //   == {1,2} UNION {4} = {1,2,4}
+    let res = run_sql(
+        &db,
+        "VALUES (1), (2) UNION VALUES (3), (4) INTERSECT VALUES (4), (5);",
+    )?;
+    let mut got = rs_int_vec(&res[0], 0);
+    got.sort();
+    assert_eq!(got, vec![1, 2, 4]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

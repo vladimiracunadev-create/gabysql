@@ -20,7 +20,13 @@ pub enum Statement {
     DropTable(DropTableStmt),
     AlterTableAddColumn(AlterAddColumnStmt),
     Insert(InsertStmt),
-    Select(SelectStmt),
+    /// Bloque I (2026-05-26): el SELECT statement pasa de envolver un
+    /// `SelectStmt` plano a envolver un `SelectQuery`, que admite además
+    /// operaciones de conjunto (`UNION`/`INTERSECT`/`EXCEPT`) y
+    /// `VALUES (...), (...)` standalone como query. El caso `SELECT ...`
+    /// puro sigue funcionando idéntico — se construye como
+    /// `SelectQuery::Select(stmt)`.
+    Select(Box<SelectQuery>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateIndex(CreateIndexStmt),
@@ -64,6 +70,79 @@ pub enum Statement {
     /// se pierden, porque el wrap externo es una única transacción
     /// física; documentado como limitación de la versión inicial de T.
     Rollback,
+}
+
+/// Bloque I (2026-05-26): nivel superior de un statement SELECT.
+///
+/// Antes de I, un `SELECT` siempre se representaba como `SelectStmt`
+/// (un solo cuerpo con FROM/WHERE/...). Con set ops (`UNION`,
+/// `INTERSECT`, `EXCEPT`/`MINUS`) y con `VALUES` como query standalone,
+/// hace falta un wrapper que pueda ser cualquiera de las tres formas.
+/// El árbol queda izquierdo-anidado (asociativo a izquierda según
+/// ANSI), y la precedencia se aplica en el parser:
+/// `INTERSECT` ata más fuerte que `UNION` / `EXCEPT`.
+///
+/// El `ORDER BY` / `LIMIT` / `OFFSET` que aparece DESPUÉS del último
+/// término de un árbol de set ops aplica al resultado combinado y vive
+/// en la variante `SetOp` (no en cada lado). Cuando el SELECT es plano
+/// (sin set ops), el ORDER BY/LIMIT/OFFSET vive en el `SelectStmt` como
+/// hasta ahora.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectQuery {
+    /// SELECT puro — wrapper trivial sobre la representación pre-I.
+    Select(Box<SelectStmt>),
+    /// Operación de conjunto entre dos sub-queries.
+    SetOp {
+        lhs: Box<SelectQuery>,
+        op: SetOpKind,
+        /// `true` cuando es la forma `... ALL` (preserva duplicados).
+        all: bool,
+        rhs: Box<SelectQuery>,
+        /// `ORDER BY` opcional a nivel del resultado combinado.
+        /// Resuelto por nombre contra el header del resultset final
+        /// (que viene del LHS — semántica ANSI estándar).
+        order_by: Option<OrderClause>,
+        /// `LIMIT` y `OFFSET` opcionales aplicados al resultado
+        /// combinado y post-ORDER BY.
+        limit: Option<usize>,
+        offset: usize,
+    },
+    /// `VALUES (row), (row), ...` como query standalone.
+    Values(ValuesClause),
+}
+
+/// Bloque I: tipo de operación de conjunto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    /// `EXCEPT` (ANSI) y `MINUS` (alias Oracle) — un solo variant.
+    Except,
+}
+
+impl SetOpKind {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            SetOpKind::Union => "UNION",
+            SetOpKind::Intersect => "INTERSECT",
+            SetOpKind::Except => "EXCEPT",
+        }
+    }
+}
+
+/// Bloque I: lista de filas literales para `VALUES (...)`. Cada fila es
+/// un `Vec<Expr>` (expresiones, no `Value`) — esto permite literales
+/// directos (`1`, `'a'`) pero también expresiones constantes evaluables
+/// sin contexto de fila (`1+2`, `LENGTH('abc')`). El executor evalúa
+/// cada `Expr` contra una fila vacía (`HashMap` vacío) — referencias a
+/// columnas dentro de un `VALUES` fallan limpio porque el row está vacío.
+///
+/// Invariantes garantizadas por el parser:
+/// - `rows.len() >= 1` (`VALUES` vacío → `[GBY-4057]`).
+/// - Toda fila tiene la misma arity (mismatch → `[GBY-4056]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValuesClause {
+    pub rows: Vec<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +322,13 @@ pub struct SelectStmt {
     /// una tabla virtual cuyo nombre es `table`. ANSI exige el alias —
     /// el parser devuelve `[GBY-4048]` si lo omite.
     pub derived_source: Option<Box<SelectStmt>>,
+    /// Bloque I (2026-05-26): cuando es `Some`, el FROM es un
+    /// `(VALUES (...), (...)) AS table(c1, c2, ...)`. El primer
+    /// elemento es la cláusula VALUES; el segundo, la lista de aliases
+    /// de columna (obligatoria, validada por el parser). El executor
+    /// materializa igual que `derived_source` y la entrega como tabla
+    /// virtual al `JoinScope`. Mutuamente excluyente con `derived_source`.
+    pub values_source: Option<(Box<ValuesClause>, Vec<String>)>,
     /// Alias opcional de la base table (`FROM alumnos a`). Aplica también
     /// cuando hay JOINs — es la forma estándar de des-ambiguar columnas.
     pub table_alias: Option<String>,
@@ -282,6 +368,16 @@ pub struct TableRef {
     /// `alias` es siempre `None` (la sintaxis pone el alias dentro del
     /// constructor). El executor materializa antes de joinear.
     pub derived: Option<Box<SelectStmt>>,
+    /// Bloque I (2026-05-26): cuando es `Some`, el operand es un
+    /// `(VALUES (...), (...)) AS alias(c1, c2, ...)` — una tabla
+    /// virtual literal. `name` lleva el alias obligatorio (4052) y
+    /// `values_columns` lleva la lista de aliases de columna,
+    /// también obligatoria con arity que matchea el row (4053).
+    pub values: Option<Box<ValuesClause>>,
+    /// Bloque I: alias de columna para una VALUES en FROM. `Some` sí y
+    /// sólo sí `values.is_some()`. Mismo número de entradas que la
+    /// arity de las tuplas (validado por el parser, 4053).
+    pub values_columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -953,7 +1049,7 @@ impl<'a> Engine<'a> {
             Statement::DropTable(stmt) => self.exec_drop_table(stmt),
             Statement::AlterTableAddColumn(stmt) => self.exec_alter_add_column(stmt),
             Statement::Insert(stmt) => self.exec_insert(stmt),
-            Statement::Select(stmt) => self.exec_select(stmt),
+            Statement::Select(query) => self.exec_select_query(*query),
             Statement::Update(stmt) => self.exec_update(stmt),
             Statement::Delete(stmt) => self.exec_delete(stmt),
             Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
@@ -2236,6 +2332,174 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Bloque I (2026-05-26): entry-point del SELECT statement. Despacha
+    /// entre SELECT plano, operación de conjunto, o VALUES standalone.
+    /// El path `Select(stmt)` delega al `exec_select` clásico — todo el
+    /// pipeline pre-I sigue intacto sin regresión.
+    pub fn exec_select_query(&mut self, query: SelectQuery) -> DbResult<ResultSet> {
+        match query {
+            SelectQuery::Select(stmt) => self.exec_select(*stmt),
+            SelectQuery::Values(v) => self.exec_values_clause(&v, None),
+            SelectQuery::SetOp {
+                lhs,
+                op,
+                all,
+                rhs,
+                order_by,
+                limit,
+                offset,
+            } => {
+                let left = self.exec_select_query(*lhs)?;
+                let right = self.exec_select_query(*rhs)?;
+                let mut combined = combine_set_op(left, right, op, all)?;
+                if let Some(order) = order_by {
+                    apply_order_by_on_resultset(&mut combined, &order)?;
+                }
+                apply_limit_offset_on_resultset(&mut combined, limit, offset);
+                Ok(combined)
+            }
+        }
+    }
+
+    /// Bloque I: materializa una `VALUES` standalone como ResultSet. Sin
+    /// `alias_columns`, los headers son `column1, column2, ...` (estándar
+    /// SQL92). Con `alias_columns`, esos nombres se usan en el header.
+    fn exec_values_clause(
+        &mut self,
+        clause: &ValuesClause,
+        alias_columns: Option<&[String]>,
+    ) -> DbResult<ResultSet> {
+        if clause.rows.is_empty() {
+            return Err(coded(
+                codes::VALUES_EMPTY,
+                "VALUES requiere al menos una fila — `VALUES ();` o `VALUES;` no se aceptan",
+            ));
+        }
+        let arity = clause.rows[0].len();
+        if arity == 0 {
+            return Err(coded(
+                codes::VALUES_ROW_ARITY_MISMATCH,
+                "VALUES: cada fila debe tener al menos una expresión",
+            ));
+        }
+        for (i, row) in clause.rows.iter().enumerate() {
+            if row.len() != arity {
+                return Err(coded(
+                    codes::VALUES_ROW_ARITY_MISMATCH,
+                    format!(
+                        "VALUES: fila {} tiene {} expresiones pero la fila 1 tiene {}",
+                        i + 1,
+                        row.len(),
+                        arity
+                    ),
+                ));
+            }
+        }
+        let columns: Vec<String> = if let Some(aliases) = alias_columns {
+            if aliases.len() != arity {
+                return Err(coded(
+                    codes::VALUES_COLUMN_ALIAS_ARITY,
+                    format!(
+                        "lista de aliases de columna tiene {} entradas pero las filas \
+                         de VALUES tienen {}",
+                        aliases.len(),
+                        arity
+                    ),
+                ));
+            }
+            aliases.to_vec()
+        } else {
+            (1..=arity).map(|i| format!("column{}", i)).collect()
+        };
+        // Evaluamos cada Expr con una fila VACÍA — VALUES no puede
+        // referirse a columnas (no hay scope). Una referencia a columna
+        // dentro de un VALUES fallará limpio en eval_expr_full ("columna
+        // no encontrada"). Subqueries escalares sí funcionan: el outer
+        // stack pasa por el engine y no por el row.
+        let empty_row: HashMap<String, Value> = HashMap::new();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(clause.rows.len());
+        for row_exprs in &clause.rows {
+            let mut out = Vec::with_capacity(arity);
+            for expr in row_exprs {
+                let v = self.eval_expr_full(expr, &empty_row, None)?;
+                out.push(v);
+            }
+            rows.push(out);
+        }
+        Ok(ResultSet {
+            columns,
+            rows,
+            message: None,
+        })
+    }
+
+    /// Bloque I: materializa una VALUES clause en el formato que necesita
+    /// el JOIN path — `MaterializedDerived` con `TableMeta` virtual.
+    /// Reusa `exec_values_clause` para la evaluación, y arma el meta
+    /// con tipos inferidos del primer no-NULL de cada columna (igual
+    /// estrategia que derived tables).
+    fn materialize_values_in_from(
+        &mut self,
+        clause: &ValuesClause,
+        alias: &str,
+        alias_columns: &[String],
+    ) -> DbResult<MaterializedDerived> {
+        let rs = self.exec_values_clause(clause, Some(alias_columns))?;
+        // Inferir tipos columna a columna.
+        let n_cols = rs.columns.len();
+        let mut inferred: Vec<Option<ColumnType>> = vec![None; n_cols];
+        let mut conflicting: Vec<bool> = vec![false; n_cols];
+        for row in &rs.rows {
+            for (i, v) in row.iter().enumerate() {
+                let t = match v {
+                    Value::Null => continue,
+                    Value::Integer(_) => ColumnType::Int,
+                    Value::Float(_) => ColumnType::Float,
+                    Value::Bool(_) => ColumnType::Bool,
+                    Value::String(_) => ColumnType::Text,
+                };
+                match inferred[i] {
+                    None => inferred[i] = Some(t),
+                    Some(prev) if prev == t => {}
+                    Some(_) => conflicting[i] = true,
+                }
+            }
+        }
+        let columns: Vec<Column> = rs
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let ty = if conflicting[i] {
+                    ColumnType::Text
+                } else {
+                    inferred[i].unwrap_or(ColumnType::Text)
+                };
+                Column::plain(name.clone(), ty)
+            })
+            .collect();
+        let primary_key = columns.first().map(|c| c.name.clone()).unwrap_or_default();
+        let meta = TableMeta {
+            name: alias.to_string(),
+            primary_key,
+            columns,
+            root_page: 0,
+            indexes: Vec::new(),
+        };
+        let rows: Vec<HashMap<String, Value>> = rs
+            .rows
+            .into_iter()
+            .map(|r| {
+                rs.columns
+                    .iter()
+                    .zip(r)
+                    .map(|(name, val)| (normalize_ident(name), val))
+                    .collect()
+            })
+            .collect();
+        Ok(MaterializedDerived { meta, rows })
+    }
+
     fn exec_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
         // SELECT con JOINs sigue una ruta distinta (nested-loop, schema
         // combinado, WHERE como post-filter). El single-table path queda
@@ -2246,7 +2510,7 @@ impl<'a> Engine<'a> {
         // sin JOINs), también delegamos al pipeline del JOIN — opera
         // sobre filas materializadas en HashMap que es exactamente lo
         // que necesitamos para una virtual table sin pager.
-        if !stmt.joins.is_empty() || stmt.derived_source.is_some() {
+        if !stmt.joins.is_empty() || stmt.derived_source.is_some() || stmt.values_source.is_some() {
             return self.exec_select_joined(stmt);
         }
         let meta = {
@@ -3169,6 +3433,10 @@ impl<'a> Engine<'a> {
         let (base_meta, base_virtual_rows) = if let Some(sub) = stmt.derived_source.as_ref() {
             let materialized = self.materialize_derived_table(sub, &stmt.table)?;
             (materialized.meta, Some(materialized.rows))
+        } else if let Some((vals, aliases)) = stmt.values_source.as_ref() {
+            // Bloque I: VALUES en FROM como base table.
+            let materialized = self.materialize_values_in_from(vals, &stmt.table, aliases)?;
+            (materialized.meta, Some(materialized.rows))
         } else {
             let m = {
                 let mut catalog = Catalog::open(self.pager);
@@ -3192,8 +3460,19 @@ impl<'a> Engine<'a> {
         });
         for join in &stmt.joins {
             // Bloque H: el RHS de un JOIN también puede ser derived.
+            // Bloque I: o un VALUES en FROM.
             let (meta, virtual_rows) = if let Some(sub) = join.right.derived.as_ref() {
                 let materialized = self.materialize_derived_table(sub, &join.right.name)?;
+                (materialized.meta, Some(materialized.rows))
+            } else if let Some(vals) = join.right.values.as_ref() {
+                let aliases = join.right.values_columns.as_ref().ok_or_else(|| {
+                    coded(
+                        codes::VALUES_IN_FROM_REQUIRES_ALIAS,
+                        "VALUES en JOIN requiere alias de columnas `AS t(c1, c2, ...)`",
+                    )
+                })?;
+                let materialized =
+                    self.materialize_values_in_from(vals, &join.right.name, aliases)?;
                 (materialized.meta, Some(materialized.rows))
             } else {
                 let m = {
@@ -4775,6 +5054,249 @@ fn dedup_preserving_order(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         }
     }
     out
+}
+
+/// Bloque I (2026-05-26): combina dos `ResultSet` con la semántica de
+/// `UNION` / `INTERSECT` / `EXCEPT` (con o sin `ALL`).
+///
+/// Headers de salida: los del LHS (regla ANSI: el primer SELECT impone
+/// los names). Validaciones:
+/// - Mismo número de columnas (`[GBY-4054]`).
+/// - Tipos compatibles columna a columna: INT/FLOAT promueven entre
+///   sí, los demás tipos exigen match exacto (NULL no chequea).
+///   `[GBY-4055]` si rompe.
+///
+/// Multiplicidades:
+/// - `Union`: append (con dedup si `!all`).
+/// - `Intersect`: intersección de bags. Con ALL: `min(count_l, count_r)`.
+///   Sin ALL: presencia en ambos, count 1.
+/// - `Except`: bag-diff. Con ALL: `max(0, count_l - count_r)`. Sin
+///   ALL: presente en LHS y NO en RHS, count 1.
+///
+/// Para hashear filas con NULL se usa `encode_group_key` — dos NULLs
+/// son iguales acá, comportamiento ANSI de set ops.
+fn combine_set_op(
+    left: ResultSet,
+    right: ResultSet,
+    op: SetOpKind,
+    all: bool,
+) -> DbResult<ResultSet> {
+    if left.columns.len() != right.columns.len() {
+        return Err(coded(
+            codes::SET_OP_ARITY_MISMATCH,
+            format!(
+                "{} entre queries con {} y {} columnas — ambas deben proyectar la misma arity",
+                op.keyword(),
+                left.columns.len(),
+                right.columns.len()
+            ),
+        ));
+    }
+    // Validar compatibilidad de tipos por columna.
+    let n_cols = left.columns.len();
+    for col in 0..n_cols {
+        let lty = infer_column_type(&left.rows, col);
+        let rty = infer_column_type(&right.rows, col);
+        if !set_op_types_compatible(lty, rty) {
+            return Err(coded(
+                codes::SET_OP_TYPE_MISMATCH,
+                format!(
+                    "{}: la columna {} del LHS es {:?} y la del RHS es {:?} — \
+                     tipos incompatibles (sólo INT/FLOAT promueven entre sí)",
+                    op.keyword(),
+                    col + 1,
+                    lty,
+                    rty
+                ),
+            ));
+        }
+    }
+    let headers = left.columns.clone();
+    // Construir un multiset de cada lado.
+    let mut left_counts: HashMap<Vec<u8>, (Vec<Value>, usize)> = HashMap::new();
+    for row in left.rows {
+        let key = encode_group_key(&row);
+        left_counts
+            .entry(key)
+            .and_modify(|(_, c)| *c += 1)
+            .or_insert((row, 1));
+    }
+    let mut right_counts: HashMap<Vec<u8>, (Vec<Value>, usize)> = HashMap::new();
+    for row in right.rows {
+        let key = encode_group_key(&row);
+        right_counts
+            .entry(key)
+            .and_modify(|(_, c)| *c += 1)
+            .or_insert((row, 1));
+    }
+    // Para preservar un orden estable de salida (LHS-first, luego RHS
+    // en el orden en que aparecieron por primera vez en el RHS),
+    // iteramos sobre los rows originales — pero usamos los counts del
+    // multiset combinado.
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    match op {
+        SetOpKind::Union => {
+            // Construir orden: claves del LHS (con su row), luego claves
+            // del RHS que no aparecieron en LHS.
+            let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+            for (key, (row, lcount)) in left_counts.iter() {
+                let rcount = right_counts.get(key).map(|(_, c)| *c).unwrap_or(0);
+                let total = if all { lcount + rcount } else { 1 };
+                for _ in 0..total {
+                    out_rows.push(row.clone());
+                }
+                seen_keys.insert(key.clone());
+            }
+            for (key, (row, rcount)) in right_counts.iter() {
+                if seen_keys.contains(key) {
+                    continue;
+                }
+                let total = if all { *rcount } else { 1 };
+                for _ in 0..total {
+                    out_rows.push(row.clone());
+                }
+            }
+        }
+        SetOpKind::Intersect => {
+            for (key, (row, lcount)) in left_counts.iter() {
+                if let Some((_, rcount)) = right_counts.get(key) {
+                    let total = if all { (*lcount).min(*rcount) } else { 1 };
+                    for _ in 0..total {
+                        out_rows.push(row.clone());
+                    }
+                }
+            }
+        }
+        SetOpKind::Except => {
+            for (key, (row, lcount)) in left_counts.iter() {
+                let rcount = right_counts.get(key).map(|(_, c)| *c).unwrap_or(0);
+                let total = if all {
+                    lcount.saturating_sub(rcount)
+                } else if rcount == 0 {
+                    1
+                } else {
+                    0
+                };
+                for _ in 0..total {
+                    out_rows.push(row.clone());
+                }
+            }
+        }
+    }
+    Ok(ResultSet {
+        columns: headers,
+        rows: out_rows,
+        message: None,
+    })
+}
+
+/// Bloque I: tipo "dominante" de los valores no-NULL de una columna en
+/// un ResultSet. Devuelve `None` si todas las celdas son NULL — eso es
+/// compatible con cualquier otro tipo.
+fn infer_column_type(rows: &[Vec<Value>], col: usize) -> Option<ColumnType> {
+    let mut current: Option<ColumnType> = None;
+    for row in rows {
+        if col >= row.len() {
+            continue;
+        }
+        let t = match &row[col] {
+            Value::Null => continue,
+            Value::Integer(_) => ColumnType::Int,
+            Value::Float(_) => ColumnType::Float,
+            Value::Bool(_) => ColumnType::Bool,
+            Value::String(_) => ColumnType::Text,
+        };
+        match current {
+            None => current = Some(t),
+            Some(prev) if prev == t => {}
+            // Mezcla INT+FLOAT en el MISMO lado → promociona a FLOAT.
+            Some(ColumnType::Int) if t == ColumnType::Float => current = Some(ColumnType::Float),
+            Some(ColumnType::Float) if t == ColumnType::Int => {}
+            // Cualquier otra mezcla cae a TEXT como compromiso (se
+            // valida contra el otro lado luego).
+            Some(_) => current = Some(ColumnType::Text),
+        }
+    }
+    current
+}
+
+/// Bloque I: dos tipos son compatibles entre set-op-lados si:
+/// - alguno es `None` (sólo NULLs en ese lado),
+/// - son iguales,
+/// - o ambos son numéricos (INT/FLOAT — promueven).
+fn set_op_types_compatible(a: Option<ColumnType>, b: Option<ColumnType>) -> bool {
+    match (a, b) {
+        (None, _) | (_, None) => true,
+        (Some(x), Some(y)) if x == y => true,
+        (Some(ColumnType::Int), Some(ColumnType::Float))
+        | (Some(ColumnType::Float), Some(ColumnType::Int)) => true,
+        _ => false,
+    }
+}
+
+/// Bloque I: aplica un `ORDER BY` sobre un `ResultSet` ya combinado.
+/// La columna se resuelve por nombre (case-insensitive) contra los
+/// headers. Si no existe → `[GBY-2002]`. Ordena estable; NULLs van al
+/// final igual que el ORDER BY de SELECT plano (regla pre-I).
+fn apply_order_by_on_resultset(rs: &mut ResultSet, order: &OrderClause) -> DbResult<()> {
+    let target = normalize_ident(&order.column);
+    let idx = rs
+        .columns
+        .iter()
+        .position(|c| normalize_ident(c) == target)
+        .ok_or_else(|| {
+            coded(
+                codes::COLUMN_NOT_FOUND,
+                format!(
+                    "ORDER BY: la columna '{}' no figura en el output de la operación de conjunto",
+                    order.column
+                ),
+            )
+        })?;
+    let desc = matches!(order.direction, OrderDir::Desc);
+    rs.rows.sort_by(|a, b| {
+        let ord = compare_values_nulls_last(&a[idx], &b[idx]);
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+    Ok(())
+}
+
+/// Bloque I: aplica `LIMIT`/`OFFSET` sobre un ResultSet ya combinado.
+fn apply_limit_offset_on_resultset(rs: &mut ResultSet, limit: Option<usize>, offset: usize) {
+    if offset > 0 {
+        let drop = offset.min(rs.rows.len());
+        rs.rows.drain(..drop);
+    }
+    if let Some(lim) = limit {
+        rs.rows.truncate(lim);
+    }
+}
+
+/// Bloque I: comparación de valores para ORDER BY (NULLs últimos).
+/// Mezcla INT/FLOAT promueve; otras mezclas se ordenan por nombre de
+/// tipo (estable, suficiente para el ResultSet combinado).
+fn compare_values_nulls_last(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Integer(x), Value::Float(y)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::Integer(y)) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+        }
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (x, y) => format!("{:?}", x).cmp(&format!("{:?}", y)),
+    }
 }
 
 pub fn parse(sql_text: &str) -> DbResult<Vec<Statement>> {
@@ -7966,6 +8488,11 @@ fn is_post_table_keyword(text: &str) -> bool {
             | "GROUP"
             | "HAVING"
             | "AS"
+            // Bloque I: set operations al final del término.
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "MINUS"
     )
 }
 
@@ -7986,7 +8513,18 @@ fn is_value_keyword(text: &str) -> bool {
 fn is_select_terminator_keyword(text: &str) -> bool {
     matches!(
         text.to_ascii_uppercase().as_str(),
-        "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "LIMIT" | "OFFSET"
+        "FROM"
+            | "WHERE"
+            | "GROUP"
+            | "HAVING"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            // Bloque I: set ops también terminan un SELECT body.
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "MINUS"
     )
 }
 
@@ -8287,8 +8825,40 @@ impl Parser {
             return self.parse_replace();
         }
         if self.match_keyword("SELECT") {
+            // Bloque I: a partir del primer SELECT puede venir un árbol
+            // de set operations o un único SELECT. `parse_select_query`
+            // consume el lhs y, si encuentra UNION/INTERSECT/EXCEPT,
+            // arma el árbol con precedencia ANSI; si no, devuelve el
+            // SELECT envuelto trivialmente en `SelectQuery::Select`.
             let stmt = self.parse_select_stmt()?;
-            return Ok(Statement::Select(stmt));
+            let lhs = SelectQuery::Select(Box::new(stmt));
+            let query = self.parse_set_ops_after(lhs)?;
+            return Ok(Statement::Select(Box::new(query)));
+        }
+        if self.match_keyword("VALUES") {
+            // Bloque I: `VALUES (..), (..);` como statement standalone.
+            let values = self.parse_values_body()?;
+            let lhs = SelectQuery::Values(values);
+            let query = self.parse_set_ops_after(lhs)?;
+            return Ok(Statement::Select(Box::new(query)));
+        }
+        // Bloque I: `(SELECT ...) UNION (SELECT ...)` también empieza
+        // con `(` — el statement-level se reconoce por el lookahead.
+        if self.peek().kind == TokenKind::Symbol
+            && self.peek().text == "("
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .map(|t| {
+                    t.kind == TokenKind::Ident
+                        && (t.text.eq_ignore_ascii_case("SELECT")
+                            || t.text.eq_ignore_ascii_case("VALUES"))
+                })
+                .unwrap_or(false)
+        {
+            let lhs = self.parse_select_term()?;
+            let query = self.parse_set_ops_after(lhs)?;
+            return Ok(Statement::Select(Box::new(query)));
         }
         if self.match_keyword("UPDATE") {
             return self.parse_update();
@@ -8735,6 +9305,19 @@ impl Parser {
     }
 
     fn parse_select_stmt(&mut self) -> DbResult<SelectStmt> {
+        self.parse_select_stmt_inner(true)
+    }
+
+    /// Bloque I: como `parse_select_stmt` pero con `allow_trailing_order_limit`
+    /// configurable. Cuando se llama desde el RHS de un set-op sin
+    /// paréntesis envolventes, hay que dejar el `ORDER BY` / `LIMIT`
+    /// final al outer (regla ANSI). Cuando se llama desde un statement
+    /// top-level o desde dentro de un `( SELECT ... )` con paréntesis,
+    /// el ORDER BY/LIMIT pertenece al SELECT mismo.
+    fn parse_select_stmt_inner(
+        &mut self,
+        allow_trailing_order_limit: bool,
+    ) -> DbResult<SelectStmt> {
         // Bloque F: `DISTINCT` opcional inmediatamente después de SELECT.
         // No se combina con agregados sin GROUP BY de manera explícita —
         // el executor valida la coherencia ANSI más abajo.
@@ -8746,7 +9329,8 @@ impl Parser {
         // `(SELECT ...) [AS] alias`. En ese caso el "table" es solo el
         // alias y `derived_source` lleva la subquery. El alias es
         // obligatorio (ANSI estricto, `[GBY-4048]`).
-        let (table, table_alias, derived_source) = if self.peek().kind == TokenKind::Symbol
+        let (table, table_alias, derived_source, values_source) = if self.peek().kind
+            == TokenKind::Symbol
             && self.peek().text == "("
             && self
                 .tokens
@@ -8774,14 +9358,29 @@ impl Parser {
                 coded(
                     codes::DERIVED_TABLE_REQUIRES_ALIAS,
                     "derived table `(SELECT ...)` requiere un alias obligatorio \
-                     (`(SELECT ...) AS sub`); ANSI no permite omitirlo",
+                         (`(SELECT ...) AS sub`); ANSI no permite omitirlo",
                 )
             })?;
-            (alias, None, Some(Box::new(sub)))
+            (alias, None, Some(Box::new(sub)), None)
+        } else if self.peek().kind == TokenKind::Symbol
+            && self.peek().text == "("
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .map(|t| t.kind == TokenKind::Ident && t.text.eq_ignore_ascii_case("VALUES"))
+                .unwrap_or(false)
+        {
+            // Bloque I: `FROM (VALUES (...), ...) AS t(c1, c2, ...)`.
+            self.expect_symbol("(")?;
+            self.expect_keyword("VALUES")?;
+            let values = self.parse_values_body()?;
+            self.expect_symbol(")")?;
+            let (alias, cols) = self.parse_values_in_from_alias()?;
+            (alias, None, None, Some((Box::new(values), cols)))
         } else {
             let t = self.expect_ident()?;
             let a = self.try_parse_alias()?;
-            (t, a, None)
+            (t, a, None, None)
         };
 
         // Cero o más JOINs en cadena. Aceptamos tres formas:
@@ -8861,6 +9460,29 @@ impl Parser {
                     name: alias,
                     alias: None,
                     derived: Some(Box::new(sub)),
+                    values: None,
+                    values_columns: None,
+                }
+            } else if self.peek().kind == TokenKind::Symbol
+                && self.peek().text == "("
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|t| t.kind == TokenKind::Ident && t.text.eq_ignore_ascii_case("VALUES"))
+                    .unwrap_or(false)
+            {
+                // Bloque I: VALUES en JOIN.
+                self.expect_symbol("(")?;
+                self.expect_keyword("VALUES")?;
+                let values = self.parse_values_body()?;
+                self.expect_symbol(")")?;
+                let (alias, cols) = self.parse_values_in_from_alias()?;
+                TableRef {
+                    name: alias,
+                    alias: None,
+                    derived: None,
+                    values: Some(Box::new(values)),
+                    values_columns: Some(cols),
                 }
             } else {
                 let right_name = self.expect_ident()?;
@@ -8869,6 +9491,8 @@ impl Parser {
                     name: right_name,
                     alias: right_alias,
                     derived: None,
+                    values: None,
+                    values_columns: None,
                 }
             };
             // Resolución de la cláusula del JOIN — pueden venir ON, USING
@@ -8958,8 +9582,14 @@ impl Parser {
         // Optional ORDER BY <ident> [ASC|DESC]. Has to come after WHERE
         // and before LIMIT/OFFSET — that's the standard SQL order and
         // also what most callers expect.
+        //
+        // Bloque I: cuando este SELECT es un sub-término dentro de un
+        // árbol de set ops sin paréntesis envolventes
+        // (`SELECT ... UNION SELECT ... ORDER BY x`), el ORDER BY/LIMIT
+        // pertenece al outer y NO debe consumirse acá. El flag
+        // `allow_trailing_order_limit` decide.
         let mut order_by = None;
-        if self.match_keyword("ORDER") {
+        if allow_trailing_order_limit && self.match_keyword("ORDER") {
             self.expect_keyword("BY")?;
             let column = self.expect_ident()?;
             // ASC is the default. We still consume the literal ASC
@@ -8979,6 +9609,9 @@ impl Parser {
         let mut seen_limit = false;
         let mut seen_offset = false;
         loop {
+            if !allow_trailing_order_limit {
+                break;
+            }
             if self.match_keyword("LIMIT") {
                 if seen_limit {
                     return Err(coded(
@@ -9021,6 +9654,7 @@ impl Parser {
         Ok(SelectStmt {
             table,
             derived_source,
+            values_source,
             table_alias,
             joins,
             columns,
@@ -9032,6 +9666,251 @@ impl Parser {
             limit,
             offset,
         })
+    }
+
+    /// Bloque I (2026-05-26): parsea el cuerpo de un `VALUES`: una o
+    /// más tuplas `( expr [, expr]* )` separadas por coma. Cada `expr`
+    /// se parsea con `parse_expr` para admitir literales y expresiones
+    /// constantes (`1+2`, `LENGTH('abc')`). Toda tupla debe tener la
+    /// misma arity — la validación final ocurre en el executor (4056)
+    /// porque también lo chequea el path standalone que no pasa por
+    /// este parser (e.g. INSERT...VALUES preexistente).
+    fn parse_values_body(&mut self) -> DbResult<ValuesClause> {
+        let mut rows: Vec<Vec<Expr>> = Vec::new();
+        loop {
+            self.expect_symbol("(")?;
+            let mut row: Vec<Expr> = Vec::new();
+            row.push(self.parse_expr()?);
+            while self.match_symbol(",") {
+                row.push(self.parse_expr()?);
+            }
+            self.expect_symbol(")")?;
+            rows.push(row);
+            if !self.match_symbol(",") {
+                break;
+            }
+        }
+        if rows.is_empty() {
+            return Err(coded(
+                codes::VALUES_EMPTY,
+                "VALUES sin filas — la cláusula necesita al menos `(...)`",
+            ));
+        }
+        Ok(ValuesClause { rows })
+    }
+
+    /// Bloque I: tras un `(VALUES ...)` dentro de FROM, parsea el alias
+    /// obligatorio de tabla + el alias obligatorio de columnas
+    /// (`AS t(c1, c2, ...)` o `t(c1, c2, ...)`).
+    fn parse_values_in_from_alias(&mut self) -> DbResult<(String, Vec<String>)> {
+        let _ = self.match_keyword("AS");
+        let alias = if self.peek().kind == TokenKind::Ident
+            && !is_select_terminator_keyword(&self.peek().text)
+        {
+            let a = self.peek().text.clone();
+            self.pos += 1;
+            a
+        } else {
+            return Err(coded(
+                codes::VALUES_IN_FROM_REQUIRES_ALIAS,
+                "VALUES en FROM requiere alias de tabla obligatorio: \
+                 `(VALUES (...), ...) AS t(c1, c2, ...)`",
+            ));
+        };
+        if !self.match_symbol("(") {
+            return Err(coded(
+                codes::VALUES_IN_FROM_REQUIRES_ALIAS,
+                format!(
+                    "VALUES en FROM '{}' requiere lista de aliases de columna: \
+                     `AS {}(c1, c2, ...)`",
+                    alias, alias
+                ),
+            ));
+        }
+        let mut cols: Vec<String> = Vec::new();
+        cols.push(self.expect_ident()?);
+        while self.match_symbol(",") {
+            cols.push(self.expect_ident()?);
+        }
+        self.expect_symbol(")")?;
+        Ok((alias, cols))
+    }
+
+    /// Bloque I: tras un `lhs` ya parseado (SELECT plano o VALUES),
+    /// consume opcionalmente un árbol de set operations a su derecha,
+    /// con la precedencia ANSI: INTERSECT ata más fuerte que
+    /// UNION/EXCEPT. Si después del árbol viene `ORDER BY`/`LIMIT`/
+    /// `OFFSET` a nivel top, lo cuelga del nodo `SetOp` resultante.
+    fn parse_set_ops_after(&mut self, lhs: SelectQuery) -> DbResult<SelectQuery> {
+        // Primero: si lo siguiente es INTERSECT, vamos a un sub-nivel
+        // de "intersect" con LHS = `lhs`, luego sigue UNION/EXCEPT.
+        let mut current = self.parse_intersect_after(lhs)?;
+        // Capa UNION/EXCEPT (asociativos a izquierda).
+        loop {
+            let op = if self.match_keyword("UNION") {
+                SetOpKind::Union
+            } else if self.match_keyword("EXCEPT") || self.match_keyword("MINUS") {
+                SetOpKind::Except
+            } else {
+                break;
+            };
+            let all = self.match_keyword("ALL");
+            let rhs_term = self.parse_select_term()?;
+            // El RHS también puede tener INTERSECT que ate más fuerte.
+            let rhs = self.parse_intersect_after(rhs_term)?;
+            current = SelectQuery::SetOp {
+                lhs: Box::new(current),
+                op,
+                all,
+                rhs: Box::new(rhs),
+                order_by: None,
+                limit: None,
+                offset: 0,
+            };
+        }
+        // ORDER BY / LIMIT / OFFSET top-level — sólo si el resultado es
+        // un SetOp (si fue SELECT plano, ya los consumió parse_select_stmt).
+        if let SelectQuery::SetOp { .. } = &current {
+            let (top_order, top_limit, top_offset) = self.parse_top_order_limit()?;
+            if top_order.is_some() || top_limit.is_some() || top_offset != 0 {
+                if let SelectQuery::SetOp {
+                    lhs, op, all, rhs, ..
+                } = current
+                {
+                    current = SelectQuery::SetOp {
+                        lhs,
+                        op,
+                        all,
+                        rhs,
+                        order_by: top_order,
+                        limit: top_limit,
+                        offset: top_offset,
+                    };
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    /// Bloque I: nivel INTERSECT (ata más fuerte que UNION/EXCEPT).
+    fn parse_intersect_after(&mut self, lhs: SelectQuery) -> DbResult<SelectQuery> {
+        let mut current = lhs;
+        while self.match_keyword("INTERSECT") {
+            let all = self.match_keyword("ALL");
+            let rhs = self.parse_select_term()?;
+            current = SelectQuery::SetOp {
+                lhs: Box::new(current),
+                op: SetOpKind::Intersect,
+                all,
+                rhs: Box::new(rhs),
+                order_by: None,
+                limit: None,
+                offset: 0,
+            };
+        }
+        Ok(current)
+    }
+
+    /// Bloque I: un "término" en un árbol de set ops — un SELECT, un
+    /// VALUES, o un `( <select_query> )`.
+    fn parse_select_term(&mut self) -> DbResult<SelectQuery> {
+        if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+            // Look-ahead: `(SELECT ...)` o `(VALUES ...)` — set-op-paren.
+            let lookahead = self.tokens.get(self.pos + 1).cloned();
+            let is_select_or_values = lookahead
+                .map(|t| {
+                    t.kind == TokenKind::Ident
+                        && (t.text.eq_ignore_ascii_case("SELECT")
+                            || t.text.eq_ignore_ascii_case("VALUES"))
+                })
+                .unwrap_or(false);
+            if is_select_or_values {
+                self.expect_symbol("(")?;
+                let inner_lhs = if self.match_keyword("SELECT") {
+                    SelectQuery::Select(Box::new(self.parse_select_stmt()?))
+                } else {
+                    self.expect_keyword("VALUES")?;
+                    SelectQuery::Values(self.parse_values_body()?)
+                };
+                // Permitir set ops anidados dentro del paréntesis.
+                let inner = self.parse_set_ops_after(inner_lhs)?;
+                self.expect_symbol(")")?;
+                return Ok(inner);
+            }
+            // No es `(SELECT|VALUES ...)` — caer por error abajo.
+        }
+        if self.match_keyword("SELECT") {
+            // Sin paréntesis: ORDER BY/LIMIT al final pertenecen al outer.
+            let stmt = self.parse_select_stmt_inner(false)?;
+            return Ok(SelectQuery::Select(Box::new(stmt)));
+        }
+        if self.match_keyword("VALUES") {
+            return Ok(SelectQuery::Values(self.parse_values_body()?));
+        }
+        Err(DbError::new(
+            "se esperaba SELECT, VALUES o `(SELECT ...)` después de UNION/INTERSECT/EXCEPT",
+        ))
+    }
+
+    /// Bloque I: parsea ORDER BY/LIMIT/OFFSET al nivel top de un árbol
+    /// de set ops. Reusa la misma semántica que `parse_select_stmt`.
+    fn parse_top_order_limit(&mut self) -> DbResult<(Option<OrderClause>, Option<usize>, usize)> {
+        let mut order_by: Option<OrderClause> = None;
+        if self.match_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            let column = self.expect_ident()?;
+            let direction = if self.match_keyword("DESC") {
+                OrderDir::Desc
+            } else {
+                let _ = self.match_keyword("ASC");
+                OrderDir::Asc
+            };
+            order_by = Some(OrderClause { column, direction });
+        }
+        let mut limit: Option<usize> = None;
+        let mut offset: usize = 0;
+        let mut seen_limit = false;
+        let mut seen_offset = false;
+        loop {
+            if self.match_keyword("LIMIT") {
+                if seen_limit {
+                    return Err(coded(
+                        codes::LIMIT_DUPLICATED,
+                        "LIMIT aparece más de una vez en la query",
+                    ));
+                }
+                let raw = self.expect_integer()?;
+                if raw < 0 {
+                    return Err(coded(
+                        codes::LIMIT_NEGATIVE,
+                        format!("LIMIT debe ser >= 0; recibí {}", raw),
+                    ));
+                }
+                limit = Some(raw as usize);
+                seen_limit = true;
+                continue;
+            }
+            if self.match_keyword("OFFSET") {
+                if seen_offset {
+                    return Err(coded(
+                        codes::OFFSET_DUPLICATED,
+                        "OFFSET aparece más de una vez en la query",
+                    ));
+                }
+                let raw = self.expect_integer()?;
+                if raw < 0 {
+                    return Err(coded(
+                        codes::OFFSET_NEGATIVE,
+                        format!("OFFSET debe ser >= 0; recibí {}", raw),
+                    ));
+                }
+                offset = raw as usize;
+                seen_offset = true;
+                continue;
+            }
+            break;
+        }
+        Ok((order_by, limit, offset))
     }
 
     /// Bloque F: parsea el SELECT list. Acepta una mezcla de columnas

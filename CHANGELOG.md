@@ -6,6 +6,54 @@
 
 ---
 
+## 2026-05-26 — Bloque I: UNION / INTERSECT / EXCEPT + VALUES como tabla
+
+> **Un push a `main`** que cierra el bloque I del roadmap (`docs/MISSING_COMMANDS.md` §5): operaciones de conjunto entre queries (`UNION` / `UNION ALL`, `INTERSECT` / `INTERSECT ALL`, `EXCEPT` / `EXCEPT ALL` con alias `MINUS`), y `VALUES (...), (...)` usable tanto como statement standalone (`VALUES (1,'a'), (2,'b');` devuelve un ResultSet) como tabla virtual dentro del FROM (`FROM (VALUES (1,'a'), (2,'b')) AS t(c1, c2)`).
+
+### 🆕 Sintaxis
+- `SELECT ... UNION [ALL] SELECT ...` — append/dedup de queries con la misma arity.
+- `SELECT ... INTERSECT [ALL] SELECT ...` — filas presentes en ambos lados.
+- `SELECT ... EXCEPT [ALL] SELECT ...` (alias `MINUS`) — filas del LHS no presentes en el RHS.
+- Precedencia ANSI: `INTERSECT` ata más fuerte que `UNION` / `EXCEPT`; los tres son asociativos a izquierda.
+- `(SELECT ...) UNION (SELECT ...) ORDER BY col LIMIT n OFFSET m` — ORDER BY / LIMIT / OFFSET al nivel del resultado combinado.
+- `VALUES (1, 'a'), (2, 'b');` — statement standalone, devuelve ResultSet con headers `column1`, `column2`, ....
+- `SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)` — tabla virtual literal en el FROM o como RHS de un JOIN (alias de tabla **y** lista de columnas obligatorios).
+
+### 🔧 AST + Parser
+- Nuevo enum `SelectQuery { Select(Box<SelectStmt>) | SetOp { lhs, op, all, rhs, order_by, limit, offset } | Values(ValuesClause) }`. `Statement::Select(SelectStmt)` pasa a `Statement::Select(Box<SelectQuery>)` (boxed para que el enum `Statement` no infle por culpa del variant más grande). El path `Select(stmt)` envuelve trivialmente el SelectStmt clásico — todos los call-sites pre-I siguen funcionando vía wrap/unwrap.
+- Nuevo enum `SetOpKind { Union, Intersect, Except }` y struct `ValuesClause { rows: Vec<Vec<Expr>> }`.
+- `SelectStmt` suma `values_source: Option<(Box<ValuesClause>, Vec<String>)>` para la forma `FROM (VALUES ...) AS t(c1, c2, ...)` como base table; `TableRef` suma `values` + `values_columns` para la forma equivalente en el RHS de un JOIN.
+- Parser de set ops: `parse_set_ops_after` (nivel UNION/EXCEPT) → `parse_intersect_after` (sub-nivel INTERSECT, más alta precedencia) → `parse_select_term` (SELECT plano, VALUES, o `(SELECT|VALUES ...)` con sub-árbol). El `ORDER BY` / `LIMIT` / `OFFSET` que sigue al árbol top-level se cuelga del nodo `SetOp`.
+- `parse_select_stmt_inner(allow_trailing_order_limit: bool)` — variante interna usada por `parse_select_term` cuando parsea un SELECT sin paréntesis envolventes dentro de un árbol de set ops: el ORDER BY/LIMIT trailing pertenece al outer, no al SELECT.
+- `is_post_table_keyword` / `is_select_terminator_keyword` reconocen ahora `UNION` / `INTERSECT` / `EXCEPT` / `MINUS` como cortes del cuerpo del SELECT.
+
+### 🚦 Executor
+- `Engine::exec_select_query(SelectQuery)` despacha: `Select(stmt)` al path clásico `exec_select`, `Values(v)` a `exec_values_clause`, `SetOp { ... }` ejecuta ambos lados, llama a `combine_set_op` y aplica ORDER BY / LIMIT / OFFSET sobre el resultset combinado.
+- `combine_set_op` valida arity (`[GBY-4054]`) y compatibilidad de tipos columna a columna (`[GBY-4055]` — INT/FLOAT promueven, otros tipos exigen match o NULL); usa `encode_group_key` (de F) para hashear filas y construir multisets con counts; aplica las reglas ANSI de bag-semantics: `UNION ALL` suma counts, `UNION` dedup; `INTERSECT ALL` toma `min(count_l, count_r)`, sin ALL devuelve 1; `EXCEPT ALL` toma `max(0, count_l - count_r)`, sin ALL devuelve 1 si la fila no está en el RHS.
+- VALUES en FROM se materializa con `materialize_values_in_from` (mismo patrón que derived tables): infiere tipo por columna sobre los no-NULL, arma un `TableMeta` virtual sin storage, y delega al `JoinScope` igual que un derived. Sin alias de tabla → `[GBY-4052]`; sin lista de columnas o arity distinta → `[GBY-4053]`.
+- `apply_order_by_on_resultset` resuelve el ORDER BY top-level por nombre (case-insensitive) contra los headers del resultset combinado (que son los del LHS — regla ANSI); falta de columna → `[GBY-2002]`. NULLs van al final igual que el ORDER BY pre-I.
+
+### ⚠️ Limitaciones residuales (futuros bloques)
+- `WITH ... AS (...)` / CTE — bloque W (planificado aparte).
+- Set ops dentro de `UPDATE` / `DELETE` — no es estándar ANSI; no se planea.
+- `INSERT INTO t (cols) VALUES (...), (...)` ya existía pre-I (bloque J multi-row); el VALUES de I es la forma standalone / FROM y no toca el path INSERT.
+- `ALL`/`ANY`/`SOME` sobre subqueries (`col > ALL (SELECT ...)`) — backlog H-P2.
+- `VALUES (...), (...) ORDER BY 1` con referencia posicional al ordinal — actualmente ORDER BY exige nombre.
+
+### 🧰 Códigos de error nuevos
+- `4052` `VALUES_IN_FROM_REQUIRES_ALIAS` — `FROM (VALUES ...)` sin alias de tabla / sin lista de columnas.
+- `4053` `VALUES_COLUMN_ALIAS_ARITY` — arity de `t(c1, c2, ...)` no coincide con las filas de VALUES.
+- `4054` `SET_OP_ARITY_MISMATCH` — `UNION` / `INTERSECT` / `EXCEPT` entre queries con distinto número de columnas.
+- `4055` `SET_OP_TYPE_MISMATCH` — tipos incompatibles entre las columnas del LHS y del RHS de un set op.
+- `4056` `VALUES_ROW_ARITY_MISMATCH` — dos filas del mismo `VALUES` con distinta arity.
+- `4057` `VALUES_EMPTY` — `VALUES` sin filas.
+
+### 🧪 Validación
+- 22 tests nuevos `i_*` cubriendo: UNION basic/dedup/ALL/three-way/null-dedup/headers-from-lhs; UNION con ORDER BY y LIMIT a nivel top; UNION arity/type mismatch; INTERSECT basic e INTERSECT ALL counts; EXCEPT basic y EXCEPT ALL counts; alias `MINUS`; VALUES standalone / arity mismatch / empty; VALUES en FROM básico / JOIN con tabla persistente / alias requerido / arity de aliases; precedencia (`INTERSECT` ata más fuerte que `UNION`).
+- 255 tests integración total (233 pre-I + 22 I), `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` limpios.
+
+---
+
 ## 2026-05-26 — Bloque H: derived tables + NOT IN + scalar subquery in SELECT + multi-predicate correlated
 
 > **Un push a `main`** que cierra los P0 + P1 del bloque H del roadmap (`docs/MISSING_COMMANDS.md` §4): derived tables `FROM (SELECT ...) AS alias`, `WHERE col NOT IN (SELECT ...)` con semántica ANSI 3VL, subqueries escalares en SELECT list (`SELECT id, (SELECT COUNT(*) FROM other) FROM t`), y `EXISTS` correlacionado dentro de combinadores `AND`/`OR`/`NOT` (levanta el bloqueo histórico `[GBY-4024]`).

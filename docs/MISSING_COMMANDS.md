@@ -35,7 +35,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **F** ✅ | `GROUP BY` + `HAVING` + agregados (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, `DISTINCT`) | Alto (nuevo executor stage) | E1 (**cerrado 2026-05-25**; limitación: sin JOINs aún) |
 | **G1+G2+G3** ✅ | Funciones escalares (string + numéricas + fecha, incluyendo P2/P3) + `CAST` + `CASE WHEN` + `COALESCE`/`NULLIF` + operadores aritméticos `+/-/*///%` + concat `\|\|` + postfix `IS NULL`/`LIKE`/`IN`/`BETWEEN` sobre cualquier `Expr`, en SELECT list / WHERE / HAVING / UPDATE SET / DELETE WHERE | Medio-Alto | E1 (**cerrado 2026-05-26**; pendiente sólo `EXCLUDED.col` en UPSERT — sub-pendiente J2-P2) |
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
-| **I** | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `VALUES (...)` como tabla virtual | Medio | — |
+| **I** ✅ | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`INTERSECT ALL`/`EXCEPT`/`EXCEPT ALL`/`MINUS`, `VALUES (...)` como query standalone y como tabla virtual en FROM/JOIN (**cerrado 2026-05-26**) | Medio | — |
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
 | **K** | DDL faltante: PK compuesta, `CREATE TABLE AS SELECT`, `DROP/RENAME COLUMN`, `RENAME TABLE`, índices compuestos y partial indexes | Alto | — |
 | **L** | Constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE ...`, multi-column UNIQUE | Medio | K |
@@ -189,15 +189,19 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 
 ---
 
-## 🔴 6. Set operations (Bloque I)
+## 🟢 6. Set operations (Bloque I) — ✅ cerrado 2026-05-26
 
 | Operación | Soportado | Prioridad |
 |---|:---:|:---:|
-| `UNION` | ❌ | P1 |
-| `UNION ALL` | ❌ | P1 |
-| `INTERSECT` | ❌ | P2 |
-| `EXCEPT` / `MINUS` | ❌ | P2 |
-| `VALUES (a,b), (c,d)` como tabla virtual | ❌ | P2 |
+| `UNION` | ✅ (I, 2026-05-26) | P1 |
+| `UNION ALL` | ✅ (I, 2026-05-26) | P1 |
+| `INTERSECT` | ✅ (I, 2026-05-26) | P2 |
+| `INTERSECT ALL` | ✅ (I, 2026-05-26) | P2 |
+| `EXCEPT` / `MINUS` | ✅ (I, 2026-05-26) | P2 |
+| `EXCEPT ALL` | ✅ (I, 2026-05-26) | P2 |
+| `VALUES (a,b), (c,d)` standalone | ✅ (I, 2026-05-26) | P2 |
+| `FROM (VALUES (a,b), (c,d)) AS t(c1, c2)` | ✅ (I, 2026-05-26) | P2 |
+| `(SELECT ...) UNION (SELECT ...) ORDER BY x LIMIT n` (top-level) | ✅ (I, 2026-05-26) | P2 |
 
 ---
 

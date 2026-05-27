@@ -1284,6 +1284,98 @@ WHERE EXISTS (SELECT 1 FROM alumnos WHERE alumnos.curso_id = cursos.id)
 
 ---
 
+## Set operations y `VALUES` (bloque I)
+
+> **Operaciones de conjunto entre queries** (`UNION` / `INTERSECT` / `EXCEPT`) con su variante `ALL`, alias `MINUS` de Oracle, y **`VALUES`** usable como query standalone o como tabla virtual dentro del FROM.
+
+### 📜 EBNF
+
+```
+select_query    ::= select_term { ( "UNION" | "EXCEPT" | "MINUS" ) [ "ALL" ] intersect_term }*
+                    [ "ORDER" "BY" ident [ "ASC" | "DESC" ] ]
+                    [ "LIMIT" int ] [ "OFFSET" int ]
+intersect_term  ::= select_term { "INTERSECT" [ "ALL" ] select_term }*
+select_term     ::= select_stmt
+                  | values_stmt
+                  | "(" select_query ")"
+values_stmt     ::= "VALUES" row { "," row }*
+row             ::= "(" expr { "," expr }* ")"
+```
+
+### 🪜 Precedencia (ANSI)
+
+1. `INTERSECT` (más alta — ata más fuerte).
+2. `UNION` y `EXCEPT` / `MINUS` (misma precedencia, asociativos a izquierda).
+
+`A UNION B INTERSECT C` se parsea como `A UNION (B INTERSECT C)`. Para forzar otro orden, usar paréntesis.
+
+### 🧮 Semántica de multisets
+
+- **`UNION ALL`**: append (preserva duplicados). `count_out = count_l + count_r`.
+- **`UNION`** (sin `ALL`): append + dedup. `count_out = 1` para cada fila distinta.
+- **`INTERSECT ALL`**: `count_out = min(count_l, count_r)` por fila distinta.
+- **`INTERSECT`**: `count_out = 1` para cada fila presente en ambos.
+- **`EXCEPT ALL`**: `count_out = max(0, count_l - count_r)` por fila distinta.
+- **`EXCEPT`**: `count_out = 1` para cada fila presente en LHS y no en RHS.
+- Dos `NULL` son **iguales** acá (comportamiento ANSI de set ops).
+
+### 🪧 Compatibilidad columna a columna
+
+- Ambos lados deben tener la **misma arity** (`[GBY-4054]` si no).
+- Los tipos deben ser **compatibles**: INT/FLOAT promueven entre sí, cualquier otra mezcla rompe con `[GBY-4055]`. NULL no chequea tipo.
+- Los **headers del output** vienen del LHS (regla ANSI: el primer SELECT impone los nombres).
+
+### ✅ Ejemplos
+
+```sql
+-- Unión simple con dedup
+SELECT id FROM a UNION SELECT id FROM b ORDER BY id ASC;
+
+-- Unión preservando duplicados
+SELECT nombre FROM clientes_2024 UNION ALL SELECT nombre FROM clientes_2025;
+
+-- Intersección + ORDER BY al nivel del resultado
+(SELECT id FROM activos) INTERSECT (SELECT id FROM premium) ORDER BY id DESC LIMIT 10;
+
+-- Diferencia con alias MINUS
+SELECT id FROM a MINUS SELECT id FROM b;
+
+-- VALUES standalone (devuelve ResultSet con headers column1, column2, ...)
+VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+-- VALUES como tabla virtual en FROM
+SELECT id, name FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name) ORDER BY id ASC;
+
+-- JOIN entre persistente y VALUES virtual
+SELECT a.id, t.tag
+FROM a INNER JOIN (VALUES (1, 'uno'), (3, 'tres')) AS t(id, tag) ON a.id = t.id;
+
+-- Precedencia: INTERSECT ata más fuerte que UNION
+-- ( == A UNION (B INTERSECT C) )
+VALUES (1), (2) UNION VALUES (3), (4) INTERSECT VALUES (4), (5);
+-- → 1, 2, 4
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4054] UNION entre queries con N y M columnas` | Distinta arity entre LHS y RHS. |
+| `[GBY-4055] UNION: la columna K del LHS es Int y la del RHS es Text` | Tipos incompatibles (sin promoción INT↔FLOAT). |
+| `[GBY-4052] VALUES en FROM requiere alias de tabla obligatorio` | Falta `AS t(c1, c2, ...)` tras `(VALUES ...)`. |
+| `[GBY-4053] lista de aliases de columna tiene X entradas pero las filas de VALUES tienen Y` | Mismatch entre `t(c1, c2)` y la arity de las tuplas. |
+| `[GBY-4056] VALUES: fila K tiene N expresiones pero la fila 1 tiene M` | Dos filas del VALUES con distinta arity. |
+| `[GBY-4057] VALUES requiere al menos una fila` | `VALUES;` sin tuplas. |
+
+### ⚠️ No soportado todavía
+
+- `WITH ... AS (...)` / CTE — bloque W (planificado aparte).
+- `ORDER BY 1` posicional sobre el output de un set op (usar nombre).
+- Set ops dentro de `UPDATE` / `DELETE` (no es ANSI estándar).
+- `ALL` / `ANY` / `SOME` sobre subqueries (backlog H-P2).
+
+---
+
 ## INTEGRITY CHECK
 
 > Recorre la DB abierta y reporta toda inconsistencia detectable: páginas con CRC inválido, filas no decodificables, entradas de índice secundario huérfanas (apuntan a PKs que ya no existen) y FKs huérfanas (valor no NULL sin parent). De solo lectura — no modifica nada.

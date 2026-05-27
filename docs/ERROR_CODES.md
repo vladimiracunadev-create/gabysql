@@ -142,6 +142,12 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4049` | `DERIVED_DUPLICATE_COLUMN` | H: la subquery de un derived table proyecta dos columnas con el mismo nombre. | Usar alias en la subquery (`SELECT a AS x, b AS y`). |
 | `4050` | `DERIVED_COLUMN_TYPE_AMBIGUOUS` | H: reservado para validación estricta futura de tipos mixtos en derived. Por ahora el motor cae a TEXT como fallback documentado. | — |
 | `4051` | `SCALAR_SUBQUERY_IN_EXPR_REQUIRES_PARENS` | H: reservado para subquery escalar en Expr sin paréntesis envolventes. Por ahora el parser solo acepta `(SELECT ...)`. | — |
+| `4052` | `VALUES_IN_FROM_REQUIRES_ALIAS` | I (2026-05-26): `FROM (VALUES (...), ...)` sin alias de tabla, o sin lista de columnas (`AS t(c1, c2, ...)`). VALUES no provee nombres por sí mismo. | Agregar `AS t(c1, c2, ...)` después del `)`. |
+| `4053` | `VALUES_COLUMN_ALIAS_ARITY` | I: la lista `t(c1, c2, ...)` tiene una arity distinta a las tuplas de `VALUES`. | Igualar el número de aliases al número de expresiones por fila. |
+| `4054` | `SET_OP_ARITY_MISMATCH` | I: `UNION` / `INTERSECT` / `EXCEPT` entre dos queries con distinto número de columnas. | Igualar la arity proyectada por ambos SELECT. |
+| `4055` | `SET_OP_TYPE_MISMATCH` | I: tipos incompatibles entre la columna `N` del LHS y la del RHS de un set op. INT/FLOAT promueven entre sí; cualquier otra mezcla rompe. | Aplicar `CAST` para uniformar, o reordenar columnas. |
+| `4056` | `VALUES_ROW_ARITY_MISMATCH` | I: dos filas del mismo `VALUES` con distinta arity. | Igualar el número de expresiones en cada fila. |
+| `4057` | `VALUES_EMPTY` | I: `VALUES` sin ninguna fila — sintaxis inválida. | Agregar al menos una tupla `(...)`. |
 
 ---
 
