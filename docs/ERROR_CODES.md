@@ -148,6 +148,12 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4055` | `SET_OP_TYPE_MISMATCH` | I: tipos incompatibles entre la columna `N` del LHS y la del RHS de un set op. INT/FLOAT promueven entre sí; cualquier otra mezcla rompe. | Aplicar `CAST` para uniformar, o reordenar columnas. |
 | `4056` | `VALUES_ROW_ARITY_MISMATCH` | I: dos filas del mismo `VALUES` con distinta arity. | Igualar el número de expresiones en cada fila. |
 | `4057` | `VALUES_EMPTY` | I: `VALUES` sin ninguna fila — sintaxis inválida. | Agregar al menos una tupla `(...)`. |
+| `4058` | `CTAS_REQUIRES_INT_FIRST_COLUMN` | K1 (2026-05-26): `CREATE TABLE t AS SELECT ...` cuya primera columna del result-set no es INT no-NULL. La primera columna se usa como PK INT de la nueva tabla. | Antepoñer un `id INT` en el SELECT, o usar la forma `CREATE TABLE t (id, ...) AS SELECT 1, ...`. |
+| `4059` | `CANNOT_DROP_PRIMARY_KEY` | K1: `ALTER TABLE t DROP COLUMN <pk>` — la PRIMARY KEY no se puede borrar. | Usar `DROP TABLE` si la intención es rehacer el esquema. |
+| `4060` | `CANNOT_DROP_INDEXED_COLUMN` | K1: la columna a borrar tiene un índice asociado (`CREATE INDEX` o `UNIQUE` inline). | Ejecutar `DROP INDEX <name>` antes del `DROP COLUMN`. |
+| `4061` | `CANNOT_DROP_REFERENCED_COLUMN` | K1: la columna a borrar participa en una FOREIGN KEY — saliente (la columna referencia otra tabla) o entrante (otra tabla la referencia). | Recrear la tabla sin esa FK o esperar al soporte de `ALTER ... DROP CONSTRAINT`. |
+| `4062` | `RENAME_TARGET_EXISTS` | K1: `RENAME TABLE old TO new` (o `RENAME COLUMN old TO new`) cuyo destino ya está tomado por otra tabla/columna. | Elegir un nombre libre. |
+| `4063` | `CTAS_COLUMN_ALIAS_ARITY` | K1: `CREATE TABLE t (a, b) AS SELECT x, y, z FROM ...` — la lista de aliases no matchea la arity del SELECT. | Igualar el número de aliases al número de columnas que proyecta el SELECT. |
 
 ---
 

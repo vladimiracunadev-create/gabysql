@@ -6,6 +6,55 @@
 
 ---
 
+## 2026-05-26 — Bloque K1: DDL extendido (CTAS, RENAME, DROP/RENAME COLUMN)
+
+> **Un push a `main`** que cierra el sub-bloque K1 del roadmap (`docs/MISSING_COMMANDS.md` §9): DDL faltante que **no** cambia el formato en disco (VERSION sigue en 7). Cubre `CREATE TABLE [IF NOT EXISTS] [(col_aliases)] AS <select>` (CTAS), `RENAME TABLE` / `ALTER TABLE RENAME TO`, `ALTER TABLE DROP COLUMN [IF EXISTS]` y `ALTER TABLE RENAME COLUMN`. La parte de DDL que sí tocaría el formato on-disk (PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`) queda para K2.
+
+### 🆕 Sintaxis
+- `CREATE TABLE [IF NOT EXISTS] dst AS SELECT id, ... FROM src [WHERE ...];` — la fuente puede ser cualquier `SelectQuery` (SELECT puro, set ops, VALUES).
+- `CREATE TABLE dst (pk, label, score) AS SELECT id, nombre, total FROM src;` — alias de columnas opcionales; arity debe matchear.
+- `RENAME TABLE old TO new;` y `ALTER TABLE old RENAME TO new;` — equivalentes.
+- `ALTER TABLE t DROP COLUMN [IF EXISTS] col;` — la palabra `COLUMN` es obligatoria (para no colisionar con futuros `DROP CONSTRAINT`).
+- `ALTER TABLE t RENAME COLUMN old TO new;` — arrastra el cambio a PK / índices / FKs entrantes.
+
+### 🔧 AST + Parser
+- Nuevas variantes en `Statement`: `CreateTableAs(CreateTableAsStmt)`, `RenameTable(RenameTableStmt)`, `AlterTableDropColumn(AlterDropColumnStmt)`, `AlterTableRenameColumn(AlterRenameColumnStmt)`.
+- `parse_create` ahora reconoce `IF NOT EXISTS` y distingue CTAS de la forma clásica vía lookahead: tras `(` snapshotea `self.pos`, intenta consumir una lista de idents simples seguida de `)` + `AS` y, si no matchea, rollback al snapshot y cae al path tradicional (`col TIPO constraints, ...`).
+- `parse_alter` se generaliza para `ADD [COLUMN]` (path histórico) / `DROP COLUMN [IF EXISTS]` / `RENAME TO` / `RENAME COLUMN`. `parse_statement` reconoce el top-level `RENAME TABLE` (alias estilo MySQL).
+- Helpers: `try_parse_ctas_column_aliases` (lookahead lista de idents simples), `parse_select_query_for_ctas` (reusa el árbol del bloque I).
+
+### 🚦 Executor
+- `exec_create_table_as`: materializa la fuente con `exec_select_query`, valida arity de los alias (`[GBY-4063]`), valida ident y dedup de los headers, infiere tipos por columna (mismo variant en todos los no-NULL → ese tipo; INT+FLOAT promueven; mezcla → TEXT fallback), exige primera columna INT no-NULL como PK (`[GBY-4058]`), detecta duplicados de PK temprano (`[GBY-3001]`), crea la root_page, publica en el catálogo y rellena fila a fila vía `encode_row` + `Catalog::insert_row`. Toda la operación corre dentro de la transacción del batch — si algo falla, el wrap externo hace rollback.
+- `exec_rename_table`: valida ident del nuevo nombre, exige que el origen exista (`[GBY-2001]`) y el destino no (`[GBY-4062]`), borra la entry vieja del catálogo + publica la nueva (FNV-1a-64 sobre el nuevo nombre), y barre la lista de tablas re-escribiendo los `ForeignKeyMeta::table` que apuntaban al nombre viejo.
+- `exec_alter_drop_column`: chequea existencia (con respeto de `IF EXISTS`), bloquea sobre PK (`[GBY-4059]`), columnas indexadas (`[GBY-4060]`, mensaje sugiere `DROP INDEX <name>`), FKs salientes y entrantes (`[GBY-4061]`); luego full-scan de filas, decode con la meta vieja, remove de la columna del HashMap, re-encode con la meta nueva y `upsert_row` (mismo patrón que `ALTER TABLE ADD COLUMN`).
+- `exec_alter_rename_column`: valida ident destino, exige existencia del origen y no-existencia del destino (`[GBY-4062]`); como el on-disk row es posicional, no requiere rewrite — sólo muta `TableMeta.columns[i].name`, `primary_key` (si la columna renombrada era la PK), `IndexMeta::column` y los `ForeignKeyMeta::column` entrantes de otras tablas.
+
+### ⚠️ Limitaciones residuales (cierra K1; abre K2)
+- **PK compuesta** y **índices compuestos** quedan para K2 — requieren un encoder multi-columna y bump VERSION 7→8 + ADR.
+- **`ALTER COLUMN TYPE`** queda para K2 — requiere rewrite tipado con compatibilidad de defaults.
+- **CTAS sin `id INT`**: el motor exige que la primera columna del SELECT sirva como PK (única estrategia compatible con la limitación de PK escalar INT). Sin esa columna, error `[GBY-4058]` explícito. El usuario tiene dos workarounds: (a) anteponer `id INT` en el SELECT, (b) usar la forma con alias `CREATE TABLE t (id, ...) AS SELECT 1, ...`.
+- **CTAS con result-set vacío**: rechazado con `[GBY-4058]` — sin filas no se puede confirmar que la primera columna sea INT. Trabajar con `LIMIT 0` no es portable a esquemas en blanco; usar `CREATE TABLE ... (id INT PRIMARY KEY, ...)` clásico.
+- **CTAS no hereda DEFAULT/NOT NULL/UNIQUE/FK** del origen: la nueva tabla queda con sólo la PK INT NOT NULL. Si el usuario los necesita, hay que recrear el esquema con DDL clásico + `INSERT INTO ... SELECT ...`.
+- **DROP COLUMN sobre la única columna no-PK** está permitido (la tabla queda con sólo PK; estado válido).
+- **DROP TABLE ... CASCADE** sigue pendiente (P2).
+
+### 🧰 Códigos de error nuevos
+- `4058` `CTAS_REQUIRES_INT_FIRST_COLUMN` — CTAS cuya primera columna no es INT no-NULL.
+- `4059` `CANNOT_DROP_PRIMARY_KEY` — DROP COLUMN sobre la PK.
+- `4060` `CANNOT_DROP_INDEXED_COLUMN` — DROP COLUMN sobre una columna con índice (mensaje sugiere `DROP INDEX`).
+- `4061` `CANNOT_DROP_REFERENCED_COLUMN` — DROP COLUMN sobre una columna con FK saliente o entrante.
+- `4062` `RENAME_TARGET_EXISTS` — RENAME TABLE / RENAME COLUMN cuyo destino ya existe.
+- `4063` `CTAS_COLUMN_ALIAS_ARITY` — `CREATE TABLE t (alias_list) AS SELECT ...` con arity de aliases ≠ arity del SELECT.
+
+### 🧪 Validación
+- 28 tests nuevos `k1_*` cubriendo: CTAS basic / con WHERE / con column-aliases / arity-mismatch / desde set op / desde VALUES / primera col no-INT (4058) / result-set vacío (4058) / `IF NOT EXISTS` no-op / destino tomado (2004) / GROUP BY con primera col TEXT (4058); RENAME TABLE basic / via `ALTER TABLE RENAME TO` / destino tomado (4062) / origen ausente (2001) / FKs entrantes actualizadas; DROP COLUMN basic / `IF EXISTS` no-op / faltante sin IF EXISTS (2002) / PK (4059) / indexada (4060 con sugerencia DROP INDEX) / FK local (4061) / round-trip de datos en columnas restantes; RENAME COLUMN basic / destino tomado (4062) / origen ausente (2002) / sobre PK / sobre columna indexada.
+- 283 tests integración total (255 pre-K1 + 28 K1), `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` limpios.
+
+### 🗂️ Formato en disco
+- `VERSION = 7` sin cambios. K1 no introduce ningún campo nuevo en `TableMeta`, `Column`, `IndexMeta` ni `ForeignKeyMeta`. DBs creadas con un binario pre-K1 abren sin migración y viceversa.
+
+---
+
 ## 2026-05-26 — Bloque I: UNION / INTERSECT / EXCEPT + VALUES como tabla
 
 > **Un push a `main`** que cierra el bloque I del roadmap (`docs/MISSING_COMMANDS.md` §5): operaciones de conjunto entre queries (`UNION` / `UNION ALL`, `INTERSECT` / `INTERSECT ALL`, `EXCEPT` / `EXCEPT ALL` con alias `MINUS`), y `VALUES (...), (...)` usable tanto como statement standalone (`VALUES (1,'a'), (2,'b');` devuelve un ResultSet) como tabla virtual dentro del FROM (`FROM (VALUES (1,'a'), (2,'b')) AS t(c1, c2)`).

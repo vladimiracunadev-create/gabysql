@@ -19,6 +19,7 @@
 | [`CREATE TABLE`](#create-table) | DDL | 🟢 |
 | [`DROP TABLE`](#drop-table) | DDL | 🟢 |
 | [`ALTER TABLE ADD COLUMN`](#alter-table-add-column) | DDL | 🟢 |
+| [`CREATE TABLE AS SELECT` / `RENAME TABLE` / `ALTER TABLE DROP/RENAME COLUMN`](#ddl-extendido-k1) | DDL (K1) | 🟢 |
 | [`CREATE INDEX`](#create-index) | DDL | 🟢 |
 | [`DROP INDEX`](#drop-index) | DDL | 🟢 |
 | [`INSERT`](#insert) | DML | 🟢 |
@@ -38,7 +39,7 @@
 | `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN` con NULL-fill | DML | 🟢 |
 | `JOIN ... USING (col)`, `NATURAL JOIN` con SELECT * dedup | DML | 🟢 |
 | Index-loop join optimization (transparente: aplica auto cuando hay índice/PK) | DML | 🟢 |
-| `ALTER TABLE DROP/RENAME COLUMN`, derived tables (`FROM (SELECT ...)`), correlated multi-predicate, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -442,7 +443,74 @@ ALTER TABLE users ADD score FLOAT DEFAULT 0;     -- COLUMN es opcional
 | `ALTER TABLE ADD COLUMN 'X' UNIQUE con DEFAULT no nulo produciría duplicados en N filas existentes` | el backfill insertaría el mismo valor en todas las filas |
 | `columna 'X': DEFAULT incompatible con tipo TEXT` | mismo validador de tipos que `CREATE TABLE` |
 
-> Restricciones: solo `ADD`. No hay `DROP COLUMN`, `RENAME COLUMN`, `RENAME TABLE` ni `ALTER ... TYPE` en esta versión — están en el roadmap del [Camino A](COMMERCIAL_ROADMAP.md).
+> Restricciones: para `DROP COLUMN`, `RENAME COLUMN` y `RENAME TABLE` ver la sección [DDL extendido (K1)](#ddl-extendido-k1). `ALTER ... TYPE` y PK compuesta quedan para K2 (Camino A).
+
+---
+
+## DDL extendido (K1)
+
+> Bloque K1 (2026-05-26). Cuatro sentencias DDL adicionales que **no** cambian el formato en disco (VERSION sigue en 7).
+
+### `CREATE TABLE [IF NOT EXISTS] [(col_aliases)] AS SELECT`
+
+Materializa el resultado de una `SelectQuery` (SELECT, set ops o VALUES) como una tabla nueva. La primera columna del result-set debe ser INT no-NULL y se promueve a `PRIMARY KEY`.
+
+```
+ctas ::= "CREATE" "TABLE" ("IF" "NOT" "EXISTS")? identifier
+         ("(" identifier ("," identifier)* ")")?
+         "AS" select_query ";"
+```
+
+```sql
+CREATE TABLE activos AS SELECT id, nombre FROM usuarios WHERE id > 0;
+CREATE TABLE IF NOT EXISTS dst (pk, label) AS SELECT id, nombre FROM src;
+CREATE TABLE lit (id, label) AS VALUES (1, 'a'), (2, 'b');
+CREATE TABLE merged AS SELECT id, nombre FROM a UNION SELECT id, nombre FROM b;
+```
+
+Errores típicos: `[GBY-4058]` primera columna no INT no-NULL · `[GBY-4063]` arity de aliases ≠ arity del SELECT · `[GBY-2004]` el destino ya existe (sin `IF NOT EXISTS`).
+
+### `RENAME TABLE` / `ALTER TABLE ... RENAME TO`
+
+```
+rename_table ::= "RENAME" "TABLE" identifier "TO" identifier ";"
+              |  "ALTER" "TABLE" identifier "RENAME" "TO" identifier ";"
+```
+
+```sql
+RENAME TABLE old TO new;
+ALTER TABLE old RENAME TO new;
+```
+
+Las FKs entrantes (otras tablas que referencien `old`) se reescriben automáticamente al nuevo nombre. Errores: `[GBY-4062]` destino tomado · `[GBY-2001]` origen no existe.
+
+### `ALTER TABLE ... DROP COLUMN [IF EXISTS]`
+
+```
+alter_drop ::= "ALTER" "TABLE" identifier "DROP" "COLUMN"
+               ("IF" "EXISTS")? identifier ";"
+```
+
+```sql
+ALTER TABLE users DROP COLUMN nick;
+ALTER TABLE users DROP COLUMN IF EXISTS deprecated_flag;
+```
+
+Bloqueado sobre la PK (`[GBY-4059]`), columnas indexadas (`[GBY-4060]`, sugiere `DROP INDEX <name>` primero) y columnas con FK saliente o entrante (`[GBY-4061]`). Implementación: rewrite in place de cada fila (`decode` + `remove` + `encode` + `upsert`).
+
+### `ALTER TABLE ... RENAME COLUMN`
+
+```
+alter_rename_col ::= "ALTER" "TABLE" identifier "RENAME" "COLUMN"
+                     identifier "TO" identifier ";"
+```
+
+```sql
+ALTER TABLE users RENAME COLUMN nick TO handle;
+ALTER TABLE pedidos RENAME COLUMN id TO pedido_id;  -- arrastra PK + FKs entrantes
+```
+
+No reescribe filas (el on-disk row es posicional). Si la columna es la PK, `TableMeta.primary_key` se actualiza; si está indexada, `IndexMeta.column` se actualiza; las FKs entrantes que referencien la columna se reescriben. Errores: `[GBY-4062]` destino tomado · `[GBY-2002]` origen no existe.
 
 ---
 

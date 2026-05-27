@@ -37,7 +37,8 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **H** | Subqueries restantes: `NOT IN`, derived tables (`FROM (SELECT...) t`), subquery en SELECT list, `ANY`/`ALL` | Medio | F (para subqueries con agg) |
 | **I** ✅ | Set ops: `UNION`/`UNION ALL`/`INTERSECT`/`INTERSECT ALL`/`EXCEPT`/`EXCEPT ALL`/`MINUS`, `VALUES (...)` como query standalone y como tabla virtual en FROM/JOIN (**cerrado 2026-05-26**) | Medio | — |
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
-| **K** | DDL faltante: PK compuesta, `CREATE TABLE AS SELECT`, `DROP/RENAME COLUMN`, `RENAME TABLE`, índices compuestos y partial indexes | Alto | — |
+| **K1** ✅ | DDL safe sin cambios on-disk: `CREATE TABLE AS SELECT`, `RENAME TABLE`, `ALTER TABLE RENAME TO`, `ALTER TABLE DROP COLUMN [IF EXISTS]`, `ALTER TABLE RENAME COLUMN` (**cerrado 2026-05-26**) | Medio | — |
+| **K2** | DDL con cambios on-disk: PK compuesta, índices compuestos, partial indexes, `ALTER COLUMN TYPE`. Requiere bump VERSION 7→8 + ADR. | Alto | K1 |
 | **L** | Constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE ...`, multi-column UNIQUE | Medio | K |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
 | **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
@@ -248,15 +249,15 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 ### Tabla y schema
 | Comando | Soportado | Prioridad |
 |---|:---:|:---:|
-| `CREATE TABLE` con `PRIMARY KEY(a,b)` compuesta | ❌ | P1 |
-| `CREATE TABLE ... AS SELECT ...` (CTAS) | ❌ | P1 |
+| `CREATE TABLE` con `PRIMARY KEY(a,b)` compuesta | ❌ | P1 (K2 — requiere bump VERSION 7→8) |
+| `CREATE TABLE ... AS SELECT ...` (CTAS) | ✅ (K1, 2026-05-26; primera col del SELECT debe ser INT no-NULL → PK) | — |
 | `CREATE TEMPORARY TABLE` | ❌ | P2 |
 | `ALTER TABLE ADD COLUMN` | ✅ | — |
-| `ALTER TABLE DROP COLUMN` | ❌ | P1 |
-| `ALTER TABLE RENAME COLUMN` | ❌ | P1 |
-| `ALTER TABLE RENAME TO` | ❌ | P1 |
+| `ALTER TABLE DROP COLUMN` | ✅ (K1, 2026-05-26; con `IF EXISTS`; bloqueado sobre PK / indexada / FK) | — |
+| `ALTER TABLE RENAME COLUMN` | ✅ (K1, 2026-05-26; arrastra PK + índices + FKs entrantes) | — |
+| `ALTER TABLE RENAME TO` | ✅ (K1, 2026-05-26; alias `RENAME TABLE`; arrastra FKs entrantes) | — |
 | `ALTER TABLE ADD CONSTRAINT` | ❌ | P2 |
-| `ALTER TABLE ALTER COLUMN ... TYPE ...` | ❌ | P2 |
+| `ALTER TABLE ALTER COLUMN ... TYPE ...` | ❌ | P2 (K2 — requiere rewrite tipado) |
 | `DROP TABLE ... CASCADE` | ❌ | P2 |
 
 ### Índices

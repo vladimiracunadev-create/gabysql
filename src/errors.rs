@@ -314,6 +314,37 @@ pub mod codes {
     pub const VALUES_ROW_ARITY_MISMATCH: u32 = 4056;
     /// Bloque I: `VALUES` sin ninguna fila — sintaxis inválida.
     pub const VALUES_EMPTY: u32 = 4057;
+    /// Bloque K1 (2026-05-26): `CREATE TABLE <t> AS SELECT ...` cuya
+    /// primera columna del result-set no es INT (o admite NULL). En este
+    /// release gabysql exige que la primera columna proyectada del
+    /// SELECT sirva como PRIMARY KEY de la tabla destino (única estrategia
+    /// disponible: PK escalar INT). Soluciones: anteponer un `id INT` en
+    /// el SELECT, o reescribir la fuente con un `ROW_NUMBER()` materializado
+    /// como columna INT — pendiente para un release posterior.
+    pub const CTAS_REQUIRES_INT_FIRST_COLUMN: u32 = 4058;
+    /// Bloque K1: `ALTER TABLE <t> DROP COLUMN <c>` rechazado porque `c`
+    /// es la PRIMARY KEY de la tabla. La PK no se puede borrar; usar
+    /// `DROP TABLE` si la intención es rehacer el esquema.
+    pub const CANNOT_DROP_PRIMARY_KEY: u32 = 4059;
+    /// Bloque K1: `ALTER TABLE <t> DROP COLUMN <c>` rechazado porque `c`
+    /// tiene un índice asociado (`CREATE INDEX` o `UNIQUE` inline). Hay
+    /// que ejecutar `DROP INDEX <name>` antes para desreferenciar la
+    /// columna.
+    pub const CANNOT_DROP_INDEXED_COLUMN: u32 = 4060;
+    /// Bloque K1: `ALTER TABLE <t> DROP COLUMN <c>` rechazado porque `c`
+    /// participa en una FOREIGN KEY — saliente (la columna es FK hacia
+    /// otra tabla) o entrante (otra tabla apunta a esta columna como su
+    /// parent). Hay que recrear/eliminar la FK antes.
+    pub const CANNOT_DROP_REFERENCED_COLUMN: u32 = 4061;
+    /// Bloque K1: `ALTER TABLE <t> RENAME COLUMN <a> TO <b>` o
+    /// `RENAME TABLE <a> TO <b>` cuando `b` ya existe (otra columna /
+    /// otra tabla). El motor no auto-sobrescribe: hay que elegir un
+    /// nombre libre.
+    pub const RENAME_TARGET_EXISTS: u32 = 4062;
+    /// Bloque K1: `CREATE TABLE t (c1, c2, ...) AS SELECT ...` cuya
+    /// lista de alias de columnas tiene una arity distinta a las
+    /// columnas que el SELECT proyecta.
+    pub const CTAS_COLUMN_ALIAS_ARITY: u32 = 4063;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

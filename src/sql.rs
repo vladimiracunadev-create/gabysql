@@ -19,6 +19,26 @@ pub enum Statement {
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
     AlterTableAddColumn(AlterAddColumnStmt),
+    /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
+    /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
+    /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
+    /// primera columna del result-set debe ser INT y se promueve a PK
+    /// de la nueva tabla — sin esa columna, error `[GBY-4058]`.
+    CreateTableAs(CreateTableAsStmt),
+    /// Bloque K1: `RENAME TABLE <old> TO <new>` y la forma equivalente
+    /// `ALTER TABLE <old> RENAME TO <new>`. Renombra la entry del
+    /// catálogo y actualiza las FKs que apuntaban al nombre viejo.
+    RenameTable(RenameTableStmt),
+    /// Bloque K1: `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <col>`.
+    /// Rewrite in place de cada fila (decode + remove col + re-encode +
+    /// insert). Bloqueado sobre PK, columnas indexadas, y columnas con
+    /// FK saliente o entrante.
+    AlterTableDropColumn(AlterDropColumnStmt),
+    /// Bloque K1: `ALTER TABLE <t> RENAME COLUMN <old> TO <new>`. No
+    /// reescribe filas (el on-disk row es posicional); solo muta
+    /// `TableMeta.columns[i].name`, `primary_key`, índices y FKs que
+    /// referencien la columna.
+    AlterTableRenameColumn(AlterRenameColumnStmt),
     Insert(InsertStmt),
     /// Bloque I (2026-05-26): el SELECT statement pasa de envolver un
     /// `SelectStmt` plano a envolver un `SelectQuery`, que admite además
@@ -155,6 +175,49 @@ pub struct DropTableStmt {
 pub struct AlterAddColumnStmt {
     pub table: String,
     pub column: ColumnDef,
+}
+
+/// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
+/// [ (col_alias, ...) ] AS <select_query>`. La fuente reusa el árbol del
+/// bloque I (`SelectQuery`), por lo que admite SELECT puro, operaciones
+/// de conjunto y `VALUES (...), (...)` como fuente.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableAsStmt {
+    pub name: String,
+    pub source: Box<SelectQuery>,
+    /// `true` cuando vino `CREATE TABLE IF NOT EXISTS ... AS ...`. Con
+    /// ese flag, si el destino ya existe la sentencia es no-op (devuelve
+    /// un mensaje informativo); sin el flag, error `[GBY-2004]`.
+    pub if_not_exists: bool,
+    /// Lista opcional de alias para las columnas (`AS dst (a, b, c)`).
+    /// Si está presente sustituye los headers del result-set y debe
+    /// coincidir en arity (`[GBY-4063]`). Si es `None`, se usan los
+    /// headers del SELECT/VALUES tal cual.
+    pub column_aliases: Option<Vec<String>>,
+}
+
+/// Bloque K1: AST común de `RENAME TABLE <old> TO <new>` y
+/// `ALTER TABLE <old> RENAME TO <new>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameTableStmt {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// Bloque K1: AST de `ALTER TABLE <table> DROP COLUMN [IF EXISTS] <col>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterDropColumnStmt {
+    pub table: String,
+    pub column: String,
+    pub if_exists: bool,
+}
+
+/// Bloque K1: AST de `ALTER TABLE <table> RENAME COLUMN <old> TO <new>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterRenameColumnStmt {
+    pub table: String,
+    pub old_name: String,
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1048,6 +1111,10 @@ impl<'a> Engine<'a> {
             Statement::CreateTable(stmt) => self.exec_create(stmt),
             Statement::DropTable(stmt) => self.exec_drop_table(stmt),
             Statement::AlterTableAddColumn(stmt) => self.exec_alter_add_column(stmt),
+            Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
+            Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
+            Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
+            Statement::AlterTableRenameColumn(stmt) => self.exec_alter_rename_column(stmt),
             Statement::Insert(stmt) => self.exec_insert(stmt),
             Statement::Select(query) => self.exec_select_query(*query),
             Statement::Update(stmt) => self.exec_update(stmt),
@@ -1584,6 +1651,634 @@ impl<'a> Engine<'a> {
             columns: Vec::new(),
             rows: Vec::new(),
             message: Some("OK".to_string()),
+        })
+    }
+
+    /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
+    /// [(c1, c2, ...)] AS <select>`. Ejecuta la fuente, valida que la
+    /// primera columna del result-set sea INT (única estrategia disponible
+    /// hoy para producir la PK de la nueva tabla — ver `[GBY-4058]`),
+    /// crea la tabla y la rellena fila a fila. Toda la operación corre
+    /// dentro de la transacción del batch — si falla la inserción de
+    /// cualquier fila, el wrap del caller hace rollback y el catálogo
+    /// queda sin la tabla a medias.
+    fn exec_create_table_as(&mut self, stmt: CreateTableAsStmt) -> DbResult<ResultSet> {
+        validate_identifier(&stmt.name, "tabla")?;
+
+        // Pre-check de existencia con respeto del flag IF NOT EXISTS.
+        let already_exists = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.name)?.is_some()
+        };
+        if already_exists {
+            if stmt.if_not_exists {
+                return Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!(
+                        "OK · tabla '{}' ya existe, CTAS no-op (IF NOT EXISTS)",
+                        stmt.name
+                    )),
+                });
+            }
+            return Err(coded(
+                codes::TABLE_ALREADY_EXISTS,
+                format!(
+                    "CREATE TABLE AS rechazado: ya existe una tabla llamada '{}'",
+                    stmt.name
+                ),
+            ));
+        }
+
+        // Materializa la fuente como ResultSet (reusa todo el path de I).
+        let mut source_rs = self.exec_select_query(*stmt.source)?;
+
+        // Aplica los alias de columnas (si vinieron) — debe matchear arity.
+        if let Some(aliases) = &stmt.column_aliases {
+            if aliases.len() != source_rs.columns.len() {
+                return Err(coded(
+                    codes::CTAS_COLUMN_ALIAS_ARITY,
+                    format!(
+                        "CREATE TABLE '{}' (...) AS: la lista de alias tiene {} columnas \
+                         pero el SELECT proyecta {}",
+                        stmt.name,
+                        aliases.len(),
+                        source_rs.columns.len()
+                    ),
+                ));
+            }
+            for alias in aliases {
+                validate_identifier(alias, "columna")?;
+            }
+            // Chequeo de duplicados case-insensitive (la misma regla que
+            // CREATE TABLE clásica usa más adelante).
+            let mut seen = HashSet::new();
+            for alias in aliases {
+                if !seen.insert(alias.to_ascii_lowercase()) {
+                    return Err(coded(
+                        codes::DUPLICATE_COLUMN_NAME,
+                        format!(
+                            "CREATE TABLE '{}' (...) AS: nombre de columna duplicado '{}'",
+                            stmt.name, alias
+                        ),
+                    ));
+                }
+            }
+            source_rs.columns = aliases.clone();
+        }
+
+        if source_rs.columns.is_empty() {
+            return Err(DbError::new(format!(
+                "CREATE TABLE '{}' AS: el SELECT no proyecta ninguna columna",
+                stmt.name
+            )));
+        }
+        // Dedup de los headers (sin alias explícito puede venir un SELECT
+        // con dos columnas del mismo nombre — error temprano).
+        {
+            let mut seen = HashSet::new();
+            for h in &source_rs.columns {
+                if !seen.insert(h.to_ascii_lowercase()) {
+                    return Err(coded(
+                        codes::DUPLICATE_COLUMN_NAME,
+                        format!(
+                            "CREATE TABLE '{}' AS: el SELECT proyecta dos columnas con el \
+                             mismo nombre '{}' — usá alias en el SELECT o la cláusula \
+                             '(col_aliases)' del CTAS para desambiguar",
+                            stmt.name, h
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Validar cada header como ident (mismo strict de columna).
+        for h in &source_rs.columns {
+            validate_identifier(h, "columna")?;
+        }
+
+        // Infiere tipos por columna sobre los valores no-NULL. Estrategia:
+        // mismo variant en todos los no-NULL → ese tipo; INT + FLOAT
+        // promueven a FLOAT; cualquier otra mezcla → TEXT como fallback.
+        let n_cols = source_rs.columns.len();
+        let mut inferred: Vec<Option<ColumnType>> = vec![None; n_cols];
+        let mut fallback_text: Vec<bool> = vec![false; n_cols];
+        for row in &source_rs.rows {
+            for (i, v) in row.iter().enumerate() {
+                let t = match v {
+                    Value::Null => continue,
+                    Value::Integer(_) => ColumnType::Int,
+                    Value::Float(_) => ColumnType::Float,
+                    Value::Bool(_) => ColumnType::Bool,
+                    Value::String(_) => ColumnType::Text,
+                };
+                match inferred[i] {
+                    None => inferred[i] = Some(t),
+                    Some(prev) if prev == t => {}
+                    Some(ColumnType::Int) if t == ColumnType::Float => {
+                        inferred[i] = Some(ColumnType::Float);
+                    }
+                    Some(ColumnType::Float) if t == ColumnType::Int => {}
+                    Some(_) => fallback_text[i] = true,
+                }
+            }
+        }
+
+        // La PK es la primera columna y debe inferir como INT (estrategia
+        // explícita: queremos error claro si el usuario olvidó un id).
+        // Caso tabla vacía: la inferencia es None → tratar como NO-INT
+        // (no podemos asumir nada sin evidencia).
+        let first_is_int = matches!(inferred.first(), Some(Some(ColumnType::Int)));
+        if !first_is_int || fallback_text.first().copied().unwrap_or(false) {
+            return Err(coded(
+                codes::CTAS_REQUIRES_INT_FIRST_COLUMN,
+                format!(
+                    "CREATE TABLE '{}' AS rechazado: la primera columna del SELECT debe \
+                     proyectar valores INT no-nulos (se usa como PRIMARY KEY de la nueva tabla). \
+                     Antepoñé un `id INT` en el SELECT o usá `CREATE TABLE t (id, ...) AS \
+                     SELECT 1, ...` con un literal INT explícito",
+                    stmt.name
+                ),
+            ));
+        }
+        // Además exigimos que la PK no contenga NULL ni duplicados — el
+        // path normal de insert capturaría eso fila a fila, pero mejor
+        // error temprano y limpio.
+        let mut pk_seen: HashSet<i64> = HashSet::with_capacity(source_rs.rows.len());
+        for (i, row) in source_rs.rows.iter().enumerate() {
+            match row.first() {
+                Some(Value::Integer(n)) => {
+                    if !pk_seen.insert(*n) {
+                        return Err(coded(
+                            codes::DUPLICATE_PRIMARY_KEY,
+                            format!(
+                                "CREATE TABLE '{}' AS rechazado: la fila {} duplica la PK \
+                                 ({}); el SELECT debe producir valores únicos en la primera columna",
+                                stmt.name,
+                                i + 1,
+                                n
+                            ),
+                        ));
+                    }
+                }
+                Some(Value::Null) | None => {
+                    return Err(coded(
+                        codes::PRIMARY_KEY_NULL,
+                        format!(
+                            "CREATE TABLE '{}' AS rechazado: la fila {} tiene NULL en la \
+                             primera columna (que se usa como PRIMARY KEY)",
+                            stmt.name,
+                            i + 1
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(coded(
+                        codes::CTAS_REQUIRES_INT_FIRST_COLUMN,
+                        format!(
+                            "CREATE TABLE '{}' AS rechazado: la fila {} tiene un valor \
+                             no-INT en la primera columna",
+                            stmt.name,
+                            i + 1
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Construye los ColumnDef de la nueva tabla. La primera columna
+        // es PK INT NOT NULL; el resto toma el tipo inferido (o TEXT
+        // como fallback en columnas conflictivas / 100% NULL).
+        let pk_name = source_rs.columns[0].clone();
+        let mut columns: Vec<Column> = Vec::with_capacity(n_cols);
+        for (i, name) in source_rs.columns.iter().enumerate() {
+            let ty = if i == 0 {
+                ColumnType::Int
+            } else if fallback_text[i] {
+                ColumnType::Text
+            } else {
+                inferred[i].unwrap_or(ColumnType::Text)
+            };
+            columns.push(Column {
+                name: name.clone(),
+                column_type: ty,
+                not_null: i == 0,
+                default: None,
+                references: None,
+            });
+        }
+        let mut meta = TableMeta {
+            name: stmt.name.clone(),
+            primary_key: pk_name.clone(),
+            columns,
+            root_page: 0,
+            indexes: Vec::new(),
+        };
+        validate_create_table(&meta)?;
+
+        // Reserva la root_page de la tabla y publica el catálogo.
+        let root_page = self.pager.new_page()?;
+        let mut leaf_page = vec![0; self.pager.page_size()];
+        init_leaf_page(&mut leaf_page);
+        self.pager.write_page(root_page, &leaf_page, true)?;
+        meta.root_page = root_page;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_table(&meta)?;
+        }
+
+        // Inserta cada fila vía encode_row + insert_row (sin pasar por
+        // el path normal de INSERT — no hay UNIQUE/FK/defaults a aplicar
+        // porque la tabla recién creada no los declara).
+        let row_count = source_rs.rows.len();
+        for row in source_rs.rows {
+            let mut values: HashMap<String, Value> = HashMap::with_capacity(n_cols);
+            for (i, v) in row.into_iter().enumerate() {
+                values.insert(normalize_ident(&source_rs.columns[i]), v);
+            }
+            let (pk, row_bytes) = encode_row(&meta, &values)?;
+            let mut catalog = Catalog::open(self.pager);
+            catalog.insert_row(meta.root_page, pk, row_bytes)?;
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · tabla '{}' creada con {} fila{} ({} columna{})",
+                stmt.name,
+                row_count,
+                if row_count == 1 { "" } else { "s" },
+                n_cols,
+                if n_cols == 1 { "" } else { "s" }
+            )),
+        })
+    }
+
+    /// Bloque K1 (2026-05-26): `RENAME TABLE <old> TO <new>` o la forma
+    /// equivalente `ALTER TABLE <old> RENAME TO <new>`. Renombra la
+    /// entry del catálogo (remove + put con la nueva clave hash) y
+    /// actualiza los `ForeignKeyMeta::table` de otras tablas que
+    /// apuntaban al nombre viejo. Las páginas de datos no se mueven —
+    /// la tabla mantiene su `root_page`, sus filas y sus índices.
+    fn exec_rename_table(&mut self, stmt: RenameTableStmt) -> DbResult<ResultSet> {
+        validate_identifier(&stmt.new_name, "tabla")?;
+
+        if stmt.old_name.eq_ignore_ascii_case(&stmt.new_name) {
+            // No-op silencioso: renombrar a sí mismo es idempotente.
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!("OK · '{}' = '{}'", stmt.old_name, stmt.new_name)),
+            });
+        }
+
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.old_name)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("RENAME TABLE: tabla origen '{}' no existe", stmt.old_name),
+                )
+            })?
+        };
+
+        // El destino no puede existir ya.
+        let target_exists = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.new_name)?.is_some()
+        };
+        if target_exists {
+            return Err(coded(
+                codes::RENAME_TARGET_EXISTS,
+                format!(
+                    "RENAME TABLE rechazado: ya existe una tabla llamada '{}'",
+                    stmt.new_name
+                ),
+            ));
+        }
+
+        let old_name = meta.name.clone();
+        meta.name = stmt.new_name.clone();
+
+        // Persiste el cambio: borrar la entry vieja, escribir la nueva,
+        // actualizar las FKs entrantes en otras tablas.
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.remove_table(&old_name)?;
+            catalog.put_table(&meta)?;
+        }
+
+        // Recorre el catálogo y reescribe las FKs que apunten al nombre
+        // viejo. Hacemos snapshot primero para no chocar con la iteración.
+        let all_tables: Vec<TableMeta> = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_tables()?
+        };
+        for mut other in all_tables {
+            if other.name.eq_ignore_ascii_case(&meta.name) {
+                continue;
+            }
+            let mut changed = false;
+            for col in other.columns.iter_mut() {
+                if let Some(fk) = col.references.as_mut() {
+                    if fk.table.eq_ignore_ascii_case(&old_name) {
+                        fk.table = meta.name.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.put_table(&other)?;
+            }
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · tabla renombrada de '{}' a '{}'",
+                old_name, meta.name
+            )),
+        })
+    }
+
+    /// Bloque K1 (2026-05-26): `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <col>`.
+    /// Bloqueos: PK (`[GBY-4059]`), columna indexada (`[GBY-4060]`),
+    /// FK saliente o entrante (`[GBY-4061]`). Implementación: full scan
+    /// de filas, decodifica con la meta vieja, descarta la columna,
+    /// re-encodea con la meta nueva y reinserta (mismo patrón que
+    /// `ALTER TABLE ADD COLUMN`).
+    fn exec_alter_drop_column(&mut self, stmt: AlterDropColumnStmt) -> DbResult<ResultSet> {
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("DROP COLUMN: tabla '{}' no existe", stmt.table),
+                )
+            })?
+        };
+
+        let col_norm = normalize_ident(&stmt.column);
+        let col_idx = meta
+            .columns
+            .iter()
+            .position(|c| normalize_ident(&c.name) == col_norm);
+        let Some(idx) = col_idx else {
+            if stmt.if_exists {
+                return Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!(
+                        "OK · columna '{}' no existía en '{}' (IF EXISTS)",
+                        stmt.column, meta.name
+                    )),
+                });
+            }
+            return Err(coded(
+                codes::COLUMN_NOT_FOUND,
+                format!(
+                    "DROP COLUMN: columna '{}' no existe en '{}'",
+                    stmt.column, meta.name
+                ),
+            ));
+        };
+
+        let column = meta.columns[idx].clone();
+
+        // Bloqueo: PK.
+        if column.name.eq_ignore_ascii_case(&meta.primary_key) {
+            return Err(coded(
+                codes::CANNOT_DROP_PRIMARY_KEY,
+                format!(
+                    "DROP COLUMN '{}': es la PRIMARY KEY de '{}' y no se puede borrar; \
+                     usá DROP TABLE si la intención es rehacer el esquema",
+                    stmt.column, meta.name
+                ),
+            ));
+        }
+
+        // Bloqueo: columna indexada (incluye índices UNIQUE inline).
+        if let Some(idx_meta) = meta
+            .indexes
+            .iter()
+            .find(|i| normalize_ident(&i.column) == col_norm)
+        {
+            return Err(coded(
+                codes::CANNOT_DROP_INDEXED_COLUMN,
+                format!(
+                    "DROP COLUMN '{}': existe el índice '{}' sobre esa columna. \
+                     Ejecutá 'DROP INDEX {}' primero",
+                    stmt.column, idx_meta.name, idx_meta.name
+                ),
+            ));
+        }
+
+        // Bloqueo: FK saliente desde esta columna.
+        if column.references.is_some() {
+            return Err(coded(
+                codes::CANNOT_DROP_REFERENCED_COLUMN,
+                format!(
+                    "DROP COLUMN '{}': la columna declara una FOREIGN KEY hacia otra tabla. \
+                     Hay que recrear la tabla sin esa FK o esperar al soporte de \
+                     ALTER ... DROP CONSTRAINT (no implementado en este release)",
+                    stmt.column
+                ),
+            ));
+        }
+
+        // Bloqueo: FK entrante — otra tabla apunta a esta columna como su
+        // parent. Esto sólo aplica si la columna es la PK del padre, lo
+        // cual ya está descartado arriba; igual lo mantenemos por defense
+        // in depth en caso de que `references.column` apunte a una
+        // columna distinta a la PK (futuro release).
+        let all_tables: Vec<TableMeta> = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_tables()?
+        };
+        for other in &all_tables {
+            if other.name.eq_ignore_ascii_case(&meta.name) {
+                continue;
+            }
+            for c in &other.columns {
+                if let Some(fk) = &c.references {
+                    if fk.table.eq_ignore_ascii_case(&meta.name)
+                        && normalize_ident(&fk.column) == col_norm
+                    {
+                        return Err(coded(
+                            codes::CANNOT_DROP_REFERENCED_COLUMN,
+                            format!(
+                                "DROP COLUMN '{}': la tabla '{}' (columna '{}') tiene una \
+                                 FOREIGN KEY que apunta a esta columna",
+                                stmt.column, other.name, c.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Build de la nueva meta (sin la columna).
+        let mut new_meta = meta.clone();
+        new_meta.columns.remove(idx);
+        validate_create_table(&new_meta)?;
+
+        // Full scan + rewrite. Decodificamos con la meta vieja,
+        // sacamos la columna del HashMap y re-encodeamos con la nueva.
+        let kvs = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(meta.root_page, 0, None)?
+        };
+        for kv in kvs {
+            let mut row = decode_row(&meta, &kv.value)?;
+            row.remove(&col_norm);
+            let (pk, bytes) = encode_row(&new_meta, &row)?;
+            // sanity: la PK no debería cambiar al borrar otra columna.
+            debug_assert_eq!(pk, kv.key, "DROP COLUMN movió la PK — bug en encode_row");
+            let mut catalog = Catalog::open(self.pager);
+            catalog.upsert_row(new_meta.root_page, pk, bytes)?;
+        }
+
+        // Reemplaza el catálogo (mismo nombre/clave hash → upsert).
+        meta = new_meta;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_table(&meta)?;
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · columna '{}' eliminada de '{}'",
+                column.name, meta.name
+            )),
+        })
+    }
+
+    /// Bloque K1 (2026-05-26): `ALTER TABLE <t> RENAME COLUMN <old> TO <new>`.
+    /// El on-disk row es posicional, así que no requiere rewrite de
+    /// datos: alcanza con mutar `TableMeta.columns[i].name` y arrastrar
+    /// el cambio a `primary_key`, índices y FKs que referencien la
+    /// columna (locales y entrantes).
+    fn exec_alter_rename_column(&mut self, stmt: AlterRenameColumnStmt) -> DbResult<ResultSet> {
+        validate_identifier(&stmt.new_name, "columna")?;
+
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("RENAME COLUMN: tabla '{}' no existe", stmt.table),
+                )
+            })?
+        };
+
+        let old_norm = normalize_ident(&stmt.old_name);
+        let new_norm = normalize_ident(&stmt.new_name);
+
+        if old_norm == new_norm {
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!(
+                    "OK · columna '{}' ya se llamaba así en '{}'",
+                    stmt.old_name, meta.name
+                )),
+            });
+        }
+
+        // La columna origen tiene que existir.
+        let idx = meta
+            .columns
+            .iter()
+            .position(|c| normalize_ident(&c.name) == old_norm)
+            .ok_or_else(|| {
+                coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "RENAME COLUMN: columna '{}' no existe en '{}'",
+                        stmt.old_name, meta.name
+                    ),
+                )
+            })?;
+
+        // El nombre destino no puede coincidir con otra columna ya
+        // presente (case-insensitive).
+        if meta
+            .columns
+            .iter()
+            .any(|c| normalize_ident(&c.name) == new_norm)
+        {
+            return Err(coded(
+                codes::RENAME_TARGET_EXISTS,
+                format!(
+                    "RENAME COLUMN rechazado: ya existe una columna llamada '{}' en '{}'",
+                    stmt.new_name, meta.name
+                ),
+            ));
+        }
+
+        // Mutaciones in-place.
+        let old_actual = meta.columns[idx].name.clone();
+        meta.columns[idx].name = stmt.new_name.clone();
+        if meta.primary_key.eq_ignore_ascii_case(&old_actual) {
+            meta.primary_key = stmt.new_name.clone();
+        }
+        for ix in meta.indexes.iter_mut() {
+            if normalize_ident(&ix.column) == old_norm {
+                ix.column = stmt.new_name.clone();
+            }
+        }
+        // No tocamos la FK saliente de la propia columna: el `column`
+        // del ForeignKeyMeta apunta a la columna PARENT, no a la
+        // columna local — el rename no afecta a esa referencia.
+
+        // Validar el resultado y persistirlo.
+        validate_create_table(&meta)?;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_table(&meta)?;
+        }
+
+        // FKs entrantes: otras tablas pueden tener `fk.column = old_name`
+        // si apuntaban a esta columna como parent. Hoy las FKs sólo
+        // apuntan a la PK del parent, así que si renombramos la PK
+        // tenemos que arrastrar el cambio.
+        let all_tables: Vec<TableMeta> = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_tables()?
+        };
+        for mut other in all_tables {
+            if other.name.eq_ignore_ascii_case(&meta.name) {
+                continue;
+            }
+            let mut changed = false;
+            for col in other.columns.iter_mut() {
+                if let Some(fk) = col.references.as_mut() {
+                    if fk.table.eq_ignore_ascii_case(&meta.name)
+                        && normalize_ident(&fk.column) == old_norm
+                    {
+                        fk.column = stmt.new_name.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.put_table(&other)?;
+            }
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · columna '{}' renombrada a '{}' en '{}'",
+                old_actual, meta.name, stmt.new_name
+            )),
         })
     }
 
@@ -8879,6 +9574,18 @@ impl Parser {
             self.expect_keyword("CHECK")?;
             return Ok(Statement::IntegrityCheck);
         }
+        if self.match_keyword("RENAME") {
+            // Bloque K1: `RENAME TABLE <old> TO <new>;` (alias estilo
+            // MySQL de `ALTER TABLE <old> RENAME TO <new>`).
+            self.expect_keyword("TABLE")?;
+            let old_name = self.expect_ident()?;
+            self.expect_keyword("TO")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Statement::RenameTable(RenameTableStmt {
+                old_name,
+                new_name,
+            }));
+        }
         if self.match_keyword("TRUNCATE") {
             // Bloque J: `TRUNCATE TABLE <name>` (palabra TABLE opcional,
             // como en MySQL/SQLite).
@@ -8915,7 +9622,7 @@ impl Parser {
             return Ok(Statement::Rollback);
         }
         Err(DbError::new(
-            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/SHOW/INTEGRITY/TRUNCATE/BEGIN/COMMIT/ROLLBACK)",
+            "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/RENAME/SHOW/INTEGRITY/TRUNCATE/BEGIN/COMMIT/ROLLBACK)",
         ))
     }
 
@@ -9009,14 +9716,51 @@ impl Parser {
     fn parse_alter(&mut self) -> DbResult<Statement> {
         self.expect_keyword("TABLE")?;
         let table = self.expect_ident()?;
-        self.expect_keyword("ADD")?;
-        // The COLUMN keyword is optional, matching most other dialects.
-        let _ = self.match_keyword("COLUMN");
-        let column = self.parse_column_def()?;
-        Ok(Statement::AlterTableAddColumn(AlterAddColumnStmt {
-            table,
-            column,
-        }))
+        if self.match_keyword("ADD") {
+            // The COLUMN keyword is optional, matching most other dialects.
+            let _ = self.match_keyword("COLUMN");
+            let column = self.parse_column_def()?;
+            return Ok(Statement::AlterTableAddColumn(AlterAddColumnStmt {
+                table,
+                column,
+            }));
+        }
+        // Bloque K1: `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <col>`.
+        // La palabra `COLUMN` es obligatoria para no colisionar con
+        // futuros `DROP CONSTRAINT` / `DROP INDEX`.
+        if self.match_keyword("DROP") {
+            self.expect_keyword("COLUMN")?;
+            let if_exists = self.parse_if_exists()?;
+            let column = self.expect_ident()?;
+            return Ok(Statement::AlterTableDropColumn(AlterDropColumnStmt {
+                table,
+                column,
+                if_exists,
+            }));
+        }
+        // Bloque K1: `ALTER TABLE <old> RENAME TO <new>` (rename tabla)
+        // o `ALTER TABLE <t> RENAME COLUMN <old> TO <new>` (rename col).
+        if self.match_keyword("RENAME") {
+            if self.match_keyword("TO") {
+                let new_name = self.expect_ident()?;
+                return Ok(Statement::RenameTable(RenameTableStmt {
+                    old_name: table,
+                    new_name,
+                }));
+            }
+            self.expect_keyword("COLUMN")?;
+            let old_name = self.expect_ident()?;
+            self.expect_keyword("TO")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Statement::AlterTableRenameColumn(AlterRenameColumnStmt {
+                table,
+                old_name,
+                new_name,
+            }));
+        }
+        Err(DbError::new(
+            "ALTER TABLE: se esperaba ADD [COLUMN], DROP COLUMN, o RENAME [TO|COLUMN]",
+        ))
     }
 
     /// Shared between `CREATE TABLE` and `ALTER TABLE ADD COLUMN`. Reads
@@ -9133,8 +9877,54 @@ impl Parser {
             return self.parse_create_database();
         }
         self.expect_keyword("TABLE")?;
+        // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS
+        // (la forma clásica de CREATE TABLE rechaza el nombre duplicado y
+        // por compatibilidad ignora el flag — mantenido para no romper
+        // SQL existente de usuarios que ya lo escriben por costumbre).
+        let if_not_exists = if self.match_keyword("IF") {
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
         let name = self.expect_ident()?;
+
+        // Bloque K1: distinguir `CREATE TABLE t AS <select>` (CTAS, sin
+        // paréntesis) y `CREATE TABLE t (col_aliases...) AS <select>`
+        // (CTAS con alias de columnas) del clásico `CREATE TABLE t (col_def, ...)`.
+        if self.match_keyword("AS") {
+            let source = self.parse_select_query_for_ctas()?;
+            return Ok(Statement::CreateTableAs(CreateTableAsStmt {
+                name,
+                source: Box::new(source),
+                if_not_exists,
+                column_aliases: None,
+            }));
+        }
         self.expect_symbol("(")?;
+        // Lookahead K1: si todo lo que hay dentro del paréntesis es una
+        // lista de idents simples (sin tipo, sin constraints) cerrada por
+        // `)` y seguida de `AS`, es la forma CTAS con alias de columnas.
+        // Snapshotteamos `self.pos` y si el intento falla volvemos atrás
+        // y caemos al path clásico.
+        let snapshot = self.pos;
+        if let Some(aliases) = self.try_parse_ctas_column_aliases() {
+            // Después de `)` consumido por try_parse_ctas_column_aliases,
+            // exige `AS`. Si no está, volver al snapshot — era un
+            // CREATE TABLE clásico cuya primera columna era un Ident sin
+            // tipo (que va a fallar después como error de parsing).
+            if self.match_keyword("AS") {
+                let source = self.parse_select_query_for_ctas()?;
+                return Ok(Statement::CreateTableAs(CreateTableAsStmt {
+                    name,
+                    source: Box::new(source),
+                    if_not_exists,
+                    column_aliases: Some(aliases),
+                }));
+            }
+            self.pos = snapshot;
+        }
         let mut columns = Vec::new();
         let mut primary_key = String::new();
         loop {
@@ -9153,6 +9943,65 @@ impl Parser {
             columns,
             primary_key,
         }))
+    }
+
+    /// Bloque K1: intenta consumir `(ident, ident, ...)` como lista de
+    /// alias de columnas para CTAS. Devuelve `Some(aliases)` si el cierre
+    /// `)` aparece sin que aparezca ningún token incompatible (tipo,
+    /// constraint, símbolo distinto a `,` o `)`); el caller decide si la
+    /// secuencia es realmente CTAS examinando si después viene `AS`.
+    /// En caso de no matchear, deja `self.pos` justo después del `(`
+    /// inicial (el caller hace rollback al snapshot original).
+    fn try_parse_ctas_column_aliases(&mut self) -> Option<Vec<String>> {
+        let start = self.pos;
+        let mut aliases = Vec::new();
+        // Caso vacío `()` no se acepta — siempre habrá al menos un ident.
+        loop {
+            let tok = self.peek().clone();
+            if tok.kind != TokenKind::Ident {
+                self.pos = start;
+                return None;
+            }
+            self.pos += 1;
+            aliases.push(tok.text);
+            let next = self.peek().clone();
+            if next.kind == TokenKind::Symbol && next.text == "," {
+                self.pos += 1;
+                continue;
+            }
+            if next.kind == TokenKind::Symbol && next.text == ")" {
+                self.pos += 1;
+                return Some(aliases);
+            }
+            // Cualquier otra cosa (otro ident, keyword tipo `INT`, etc.)
+            // → no era CTAS aliases.
+            self.pos = start;
+            return None;
+        }
+    }
+
+    /// Bloque K1: parsea la fuente de un CTAS (`SELECT ...`, `VALUES ...`,
+    /// o un set-op de cualquiera de las dos formas). Reusa el camino
+    /// completo del bloque I.
+    fn parse_select_query_for_ctas(&mut self) -> DbResult<SelectQuery> {
+        if self.match_keyword("SELECT") {
+            let stmt = self.parse_select_stmt()?;
+            let lhs = SelectQuery::Select(Box::new(stmt));
+            return self.parse_set_ops_after(lhs);
+        }
+        if self.match_keyword("VALUES") {
+            let values = self.parse_values_body()?;
+            let lhs = SelectQuery::Values(values);
+            return self.parse_set_ops_after(lhs);
+        }
+        // `(SELECT ...) UNION ...` también es válido.
+        if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+            let lhs = self.parse_select_term()?;
+            return self.parse_set_ops_after(lhs);
+        }
+        Err(DbError::new(
+            "CREATE TABLE AS: se esperaba SELECT, VALUES o un subquery entre paréntesis",
+        ))
     }
 
     fn parse_insert(&mut self) -> DbResult<Statement> {

@@ -6641,6 +6641,393 @@ fn i_intersect_binds_tighter_than_union() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque K1 (2026-05-26): DDL safe — CTAS, RENAME TABLE,
+// DROP COLUMN, RENAME COLUMN. Sin cambios de formato en disco.
+// ============================================================
+
+fn k1_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(label);
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, nombre TEXT, activo BOOL);
+         INSERT INTO src (id, nombre, activo) VALUES (1, 'Ana', TRUE);
+         INSERT INTO src (id, nombre, activo) VALUES (2, 'Beto', FALSE);
+         INSERT INTO src (id, nombre, activo) VALUES (3, 'Carla', TRUE);",
+    )?;
+    Ok((db, wal))
+}
+
+#[test]
+fn k1_ctas_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_basic")?;
+    run_sql(&db, "CREATE TABLE dst AS SELECT id, nombre FROM src;")?;
+    let res = run_sql(&db, "SELECT id, nombre FROM dst;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    assert_eq!(res[0].columns, vec!["id", "nombre"]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_with_where() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_where")?;
+    run_sql(
+        &db,
+        "CREATE TABLE altos AS SELECT id, nombre FROM src WHERE id BETWEEN 2 AND 9;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM altos;")?;
+    let mut ids = rs_int_vec(&res[0], 0);
+    ids.sort();
+    assert_eq!(ids, vec![2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_with_column_aliases() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_aliases")?;
+    run_sql(
+        &db,
+        "CREATE TABLE dst (pk, label) AS SELECT id, nombre FROM src;",
+    )?;
+    let res = run_sql(&db, "SELECT pk, label FROM dst;")?;
+    assert_eq!(res[0].columns, vec!["pk", "label"]);
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_column_alias_arity_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_alias_arity")?;
+    let err = run_sql(&db, "CREATE TABLE dst (a) AS SELECT id, nombre FROM src;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4063]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_from_set_op() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_setop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t2 (id INT PRIMARY KEY, nombre TEXT);
+         INSERT INTO t2 (id, nombre) VALUES (10, 'Z');",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE merged AS SELECT id, nombre FROM src UNION SELECT id, nombre FROM t2;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM merged;")?;
+    assert_eq!(res[0].rows.len(), 4);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_from_values() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_values")?;
+    run_sql(
+        &db,
+        "CREATE TABLE lit (id, label) AS VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+    )?;
+    let res = run_sql(&db, "SELECT id, label FROM lit;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_first_column_not_int_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_not_int")?;
+    let err = run_sql(&db, "CREATE TABLE dst AS SELECT nombre, id FROM src;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4058]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_if_not_exists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_ifnotexists")?;
+    run_sql(&db, "CREATE TABLE dst AS SELECT id, nombre FROM src;")?;
+    // Segunda vez con IF NOT EXISTS: no-op, no error.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE IF NOT EXISTS dst AS SELECT id, nombre FROM src;",
+    )?;
+    let msg = res[0].message.clone().unwrap_or_default();
+    assert!(
+        msg.contains("ya existe") || msg.contains("no-op"),
+        "msg = {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_target_exists_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_target_exists")?;
+    run_sql(&db, "CREATE TABLE dst AS SELECT id, nombre FROM src;")?;
+    let err = run_sql(&db, "CREATE TABLE dst AS SELECT id, nombre FROM src;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-2004]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_empty_result() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_empty")?;
+    // WHERE FALSE → 0 rows. Como no hay evidencia de tipo INT en la
+    // primera columna, gabysql rechaza con 4058 (no se puede inferir
+    // que la PK sea INT). Documentado en el código de error.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE dst AS SELECT id, nombre FROM src WHERE id = 99999;",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("[GBY-4058]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_ctas_with_aggregate_text_first_col_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_ctas_agg_text")?;
+    // GROUP BY nombre — primera col del SELECT es TEXT, no INT → 4058.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE per_name AS SELECT nombre, COUNT(*) cnt FROM src GROUP BY nombre;",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("[GBY-4058]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----------------------------- RENAME TABLE -----------------------------
+
+#[test]
+fn k1_rename_table_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rename_basic")?;
+    run_sql(&db, "RENAME TABLE src TO src2;")?;
+    let res = run_sql(&db, "SELECT id FROM src2;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    // La tabla vieja ya no existe.
+    let err = run_sql(&db, "SELECT id FROM src;").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[GBY-2001]") || msg.contains("tabla no existe"),
+        "{}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_alter_table_rename_to() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_alter_rename")?;
+    run_sql(&db, "ALTER TABLE src RENAME TO src3;")?;
+    let res = run_sql(&db, "SELECT id FROM src3;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_table_target_exists_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rename_target_exists")?;
+    run_sql(&db, "CREATE TABLE other (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "RENAME TABLE src TO other;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4062]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_table_source_missing_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rename_source_missing")?;
+    let err = run_sql(&db, "RENAME TABLE nope TO whatever;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-2001]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_table_updates_fk_references() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rename_fk")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent INT REFERENCES src(id));
+         INSERT INTO child (id, parent) VALUES (10, 1);",
+    )?;
+    run_sql(&db, "RENAME TABLE src TO papa;")?;
+    // El INSERT de child contra el nuevo nombre debe respetar la FK.
+    run_sql(&db, "INSERT INTO child (id, parent) VALUES (11, 2);")?;
+    let err = run_sql(&db, "INSERT INTO child (id, parent) VALUES (12, 999);").unwrap_err();
+    assert!(err.to_string().contains("[GBY-3004]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----------------------------- DROP COLUMN ------------------------------
+
+#[test]
+fn k1_drop_column_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_basic")?;
+    run_sql(&db, "ALTER TABLE src DROP COLUMN activo;")?;
+    let res = run_sql(&db, "SELECT id, nombre FROM src;")?;
+    assert_eq!(res[0].columns, vec!["id", "nombre"]);
+    assert_eq!(res[0].rows.len(), 3);
+    // INSERT con la columna eliminada falla.
+    let err = run_sql(
+        &db,
+        "INSERT INTO src (id, nombre, activo) VALUES (9, 'X', TRUE);",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("[GBY-2002]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_drop_column_if_exists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_ifexists")?;
+    let res = run_sql(&db, "ALTER TABLE src DROP COLUMN IF EXISTS nope;")?;
+    let msg = res[0].message.clone().unwrap_or_default();
+    assert!(msg.contains("OK"), "msg = {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_drop_column_missing_no_if_exists_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_missing")?;
+    let err = run_sql(&db, "ALTER TABLE src DROP COLUMN nope;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-2002]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_drop_column_pk_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_pk")?;
+    let err = run_sql(&db, "ALTER TABLE src DROP COLUMN id;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4059]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_drop_column_indexed_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_indexed")?;
+    run_sql(&db, "CREATE INDEX idx_nombre ON src (nombre);")?;
+    let err = run_sql(&db, "ALTER TABLE src DROP COLUMN nombre;").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[GBY-4060]"), "{}", msg);
+    assert!(
+        msg.contains("DROP INDEX"),
+        "esperaba sugerencia DROP INDEX: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_drop_column_fk_local_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_fk_local")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent INT REFERENCES src(id));",
+    )?;
+    let err = run_sql(&db, "ALTER TABLE child DROP COLUMN parent;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4061]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_drop_column_data_round_trip() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_drop_roundtrip")?;
+    run_sql(&db, "ALTER TABLE src DROP COLUMN activo;")?;
+    // Las filas viejas siguen accesibles por las columnas restantes.
+    let res = run_sql(&db, "SELECT id, nombre FROM src WHERE id = 2;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(
+        res[0].rows[0],
+        vec![Value::Integer(2), Value::String("Beto".to_string())]
+    );
+    // Y se puede seguir insertando con el nuevo schema.
+    run_sql(&db, "INSERT INTO src (id, nombre) VALUES (99, 'Nuevo');")?;
+    let res2 = run_sql(&db, "SELECT id FROM src WHERE id = 99;")?;
+    assert_eq!(res2[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ---------------------------- RENAME COLUMN -----------------------------
+
+#[test]
+fn k1_rename_column_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rencol_basic")?;
+    run_sql(&db, "ALTER TABLE src RENAME COLUMN nombre TO label;")?;
+    let res = run_sql(&db, "SELECT id, label FROM src WHERE id = 1;")?;
+    assert_eq!(res[0].columns, vec!["id", "label"]);
+    assert_eq!(res[0].rows[0][1], Value::String("Ana".to_string()));
+    // Nombre viejo ya no resuelve.
+    let err = run_sql(&db, "SELECT nombre FROM src;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-2002]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_column_target_exists_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rencol_target_exists")?;
+    let err = run_sql(&db, "ALTER TABLE src RENAME COLUMN nombre TO activo;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-4062]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_column_missing_source_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rencol_src_missing")?;
+    let err = run_sql(&db, "ALTER TABLE src RENAME COLUMN nope TO algo;").unwrap_err();
+    assert!(err.to_string().contains("[GBY-2002]"), "{}", err);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_column_pk_updates_meta() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rencol_pk")?;
+    run_sql(&db, "ALTER TABLE src RENAME COLUMN id TO pk;")?;
+    // El query por la nueva PK debe seguir resolviendo via index path.
+    let res = run_sql(&db, "SELECT pk, nombre FROM src WHERE pk = 2;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k1_rename_column_indexed_updates_index() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = k1_setup("k1_rencol_indexed")?;
+    run_sql(&db, "CREATE INDEX idx_nombre ON src (nombre);")?;
+    run_sql(&db, "ALTER TABLE src RENAME COLUMN nombre TO label;")?;
+    let res = run_sql(&db, "SELECT id FROM src WHERE label = 'Ana';")?;
+    assert_eq!(res[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
