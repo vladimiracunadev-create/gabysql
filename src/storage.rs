@@ -81,7 +81,7 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        range scan sobre claves compuestas. V7 files son rechazados
 //        al abrir con `[GBY-1003]` — la migración es manual: hacer
 //        backup, recrear con binario V8 y volver a cargar los datos.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

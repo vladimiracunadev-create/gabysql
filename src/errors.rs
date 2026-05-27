@@ -112,6 +112,18 @@ pub mod codes {
     pub const ROW_NOT_FOUND_FOR_PK: u32 = 3006;
     /// `PRIMARY KEY` recibió valor `NULL`.
     pub const PRIMARY_KEY_NULL: u32 = 3007;
+    /// Bloque L (2026-05-27): `INSERT`/`UPDATE`/`UPSERT` viola un
+    /// constraint `CHECK (expr)`. La expresión evaluó a FALSE
+    /// (NULL pasa según 3VL ANSI, igual que en PostgreSQL/SQLite).
+    pub const CHECK_VIOLATED: u32 = 3008;
+    /// Bloque L: `ON DELETE SET NULL` intentó poner NULL en una FK
+    /// child cuya columna está declarada `NOT NULL`. La cascade aborta
+    /// la operación entera (no hay rollback parcial).
+    pub const FK_SET_NULL_VIOLATES_NOT_NULL: u32 = 3009;
+    /// Bloque L: `ON DELETE SET DEFAULT` no encontró un DEFAULT
+    /// declarado para la columna FK del child. Sin DEFAULT no hay valor
+    /// para reasignar; la cascade aborta.
+    pub const FK_SET_DEFAULT_MISSING: u32 = 3010;
 
     // ---------- SQL Surface (4000s) ----------
     /// `WHERE` con operador no soportado (solo `=`, `BETWEEN` e `IN (SELECT ...)`).
