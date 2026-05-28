@@ -316,9 +316,16 @@ fn update_and_delete_by_pk_roundtrip() -> Result<(), Box<dyn Error>> {
     let err = run_sql(&db, "UPDATE u SET name = 'X' WHERE id = 999;").unwrap_err();
     assert!(err.to_string().contains("fila no existe"));
 
-    // Cannot change PK.
-    let err = run_sql(&db, "UPDATE u SET id = 99 WHERE id = 1;").unwrap_err();
-    assert!(err.to_string().contains("PRIMARY KEY"));
+    // Residual #4 (2026-05-27): UPDATE de PK ahora SÍ está permitido.
+    // El motor mueve la fila (delete old + insert new). Tras este
+    // UPDATE, la fila con id=1 debe haber pasado a id=99.
+    run_sql(&db, "UPDATE u SET id = 99 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT id FROM u WHERE id = 99;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    let res = run_sql(&db, "SELECT id FROM u WHERE id = 1;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    // Restaurar para que el resto del test siga viendo id=1.
+    run_sql(&db, "UPDATE u SET id = 1 WHERE id = 99;")?;
 
     // Desde E3, DELETE por col no-PK es válido (FullScan + 3VL). Comparar
     // TEXT name contra INT 1 da type-mismatch → 0 filas matchean; no es
@@ -5353,12 +5360,16 @@ fn g2_update_set_cast() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn g2_update_set_pk_blocked() -> Result<(), Box<dyn Error>> {
+fn g2_update_set_pk_uses_expr_value() -> Result<(), Box<dyn Error>> {
+    // Residual #4 (2026-05-27): UPDATE de PK ya está permitido. El SET
+    // evalúa la Expr y mueve la fila al nuevo PK. `UPPER('x')` produce
+    // TEXT y la columna id es INT, por lo que esperamos un type
+    // mismatch ([GBY-4041]) en vez del [GBY-4008] histórico.
     let (db, wal) = setup_g2_table("g2_update_pk")?;
     let err = run_sql(&db, "UPDATE t SET id = UPPER('x') WHERE id = 1;").unwrap_err();
     assert!(
-        err.to_string().contains("[GBY-4008]"),
-        "esperaba GBY-4008 (PK no mutable): {}",
+        err.to_string().contains("[GBY-4041]"),
+        "esperaba GBY-4041 (type mismatch al asignar TEXT a INT): {}",
         err
     );
     cleanup(&[&db, &wal]);
@@ -7147,19 +7158,23 @@ fn k2_pk_composite_partial_lookup_fallback_to_scan() -> Result<(), Box<dyn Error
 }
 
 #[test]
-fn k2_pk_composite_update_pk_col_blocked() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = k2_setup("k2_pk_upd_blocked")?;
+fn k2_pk_composite_update_pk_col_moves_row() -> Result<(), Box<dyn Error>> {
+    // Residual #4 (2026-05-27): UPDATE sobre una columna PK compuesta
+    // ya está permitido. El motor recomputa el fingerprint y mueve la
+    // fila al nuevo PK.
+    let (db, wal) = k2_setup("k2_pk_upd_ok_now")?;
     run_sql(
         &db,
         "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b));
          INSERT INTO t (a, b, v) VALUES (1, 2, 100);",
     )?;
-    let err = run_sql(&db, "UPDATE t SET b = 99 WHERE a = 1 AND b = 2;").unwrap_err();
-    assert!(
-        err.to_string().contains("[GBY-4008]"),
-        "esperaba 4008, got {}",
-        err
-    );
+    run_sql(&db, "UPDATE t SET b = 99 WHERE a = 1 AND b = 2;")?;
+    // Vieja PK (1, 2) ya no existe; nueva PK (1, 99) sí.
+    let res = run_sql(&db, "SELECT v FROM t WHERE a = 1 AND b = 99;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(100));
+    let res = run_sql(&db, "SELECT v FROM t WHERE a = 1 AND b = 2;")?;
+    assert_eq!(res[0].rows.len(), 0);
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -8518,6 +8533,296 @@ fn r3_v11_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
         msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
         "expected refusal, got: {}",
         msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----- Residual #4 de L (2026-05-27): activación real de ON UPDATE +
+//        lift de UPDATE_PK_NOT_ALLOWED. -----
+
+fn r4_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("r4-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn r4_update_pk_single_moves_row() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("pk-single-move")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO t (id, name) VALUES (1, 'a');
+         INSERT INTO t (id, name) VALUES (2, 'b');",
+    )?;
+    run_sql(&db, "UPDATE t SET id = 99 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT name FROM t WHERE id = 99;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("a".into()));
+    let res = run_sql(&db, "SELECT id FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_update_pk_to_existing_value_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("pk-dup")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO t (id, name) VALUES (1, 'a');
+         INSERT INTO t (id, name) VALUES (2, 'b');",
+    )?;
+    let err = run_sql(&db, "UPDATE t SET id = 2 WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3001"),
+        "esperaba DUPLICATE_PRIMARY_KEY, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_cascade_single_col() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("cascade-single")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent (id) ON UPDATE CASCADE
+         );
+         INSERT INTO parent (id, name) VALUES (1, 'p');
+         INSERT INTO child (id, parent_id) VALUES (10, 1);
+         INSERT INTO child (id, parent_id) VALUES (11, 1);",
+    )?;
+    run_sql(&db, "UPDATE parent SET id = 99 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT parent_id FROM child ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    for row in &res[0].rows {
+        assert_eq!(row[0], Value::Integer(99));
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_set_null_single_col() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("setnull-single")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY);
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent (id) ON UPDATE SET NULL
+         );
+         INSERT INTO parent (id) VALUES (1);
+         INSERT INTO child (id, parent_id) VALUES (10, 1);",
+    )?;
+    run_sql(&db, "UPDATE parent SET id = 99 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT parent_id FROM child WHERE id = 10;")?;
+    assert!(matches!(res[0].rows[0][0], Value::Null));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_set_default_single_col() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("setdefault-single")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY);
+         INSERT INTO parent (id) VALUES (1);
+         INSERT INTO parent (id) VALUES (999);
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT NOT NULL DEFAULT 999
+                REFERENCES parent (id) ON UPDATE SET DEFAULT
+         );
+         INSERT INTO child (id, parent_id) VALUES (10, 1);",
+    )?;
+    run_sql(&db, "UPDATE parent SET id = 5 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT parent_id FROM child WHERE id = 10;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_restrict_blocks() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("restrict")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY);
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent (id) ON UPDATE RESTRICT
+         );
+         INSERT INTO parent (id) VALUES (1);
+         INSERT INTO child (id, parent_id) VALUES (10, 1);",
+    )?;
+    let err = run_sql(&db, "UPDATE parent SET id = 99 WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4073"),
+        "esperaba FK_RESTRICT_BLOCKS_UPDATE, got: {}",
+        err
+    );
+    // El parent sigue intacto, sin estado parcial.
+    let res = run_sql(&db, "SELECT id FROM parent;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_default_no_action_blocks_like_restrict() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("default-noaction")?;
+    // Sin ON UPDATE → default NoAction. Hoy se trata como RESTRICT.
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY);
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent (id)
+         );
+         INSERT INTO parent (id) VALUES (1);
+         INSERT INTO child (id, parent_id) VALUES (10, 1);",
+    )?;
+    let err = run_sql(&db, "UPDATE parent SET id = 99 WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4073"),
+        "esperaba FK_RESTRICT_BLOCKS_UPDATE para NO ACTION default, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_cascade_multi_col() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("cascade-multi")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+                ON UPDATE CASCADE
+         );
+         INSERT INTO parent (a, b) VALUES (10, 20);
+         INSERT INTO child (id, pa, pb) VALUES (1, 10, 20);
+         INSERT INTO child (id, pa, pb) VALUES (2, 10, 20);",
+    )?;
+    // Cambiamos AMBOS componentes de la PK del parent.
+    run_sql(
+        &db,
+        "UPDATE parent SET a = 100, b = 200 WHERE a = 10 AND b = 20;",
+    )?;
+    let res = run_sql(&db, "SELECT pa, pb FROM child ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    for row in &res[0].rows {
+        assert_eq!(row[0], Value::Integer(100));
+        assert_eq!(row[1], Value::Integer(200));
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_on_update_no_op_when_target_unchanged() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("no-op")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent (id) ON UPDATE RESTRICT
+         );
+         INSERT INTO parent (id, label) VALUES (1, 'a');
+         INSERT INTO child (id, parent_id) VALUES (10, 1);",
+    )?;
+    // UPDATE sobre label (no-PK col) NO debe disparar la cascade
+    // RESTRICT — la PK no cambió.
+    run_sql(&db, "UPDATE parent SET label = 'b' WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT parent_id FROM child WHERE id = 10;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_cascade_affects_child_pk_rejected() -> Result<(), Box<dyn Error>> {
+    // Caso degenerado: el child usa el mismo INT como FK + PK. Cascade
+    // CASCADE intentaría cambiar la PK del child → no soportado.
+    let (db, wal) = r4_setup("affects-child-pk")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY);
+         CREATE TABLE child (
+            id INT PRIMARY KEY REFERENCES parent (id) ON UPDATE CASCADE
+         );
+         INSERT INTO parent (id) VALUES (1);
+         INSERT INTO child (id) VALUES (1);",
+    )?;
+    let err = run_sql(&db, "UPDATE parent SET id = 99 WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4074"),
+        "esperaba FK_UPDATE_CASCADE_AFFECTS_CHILD_PK, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_update_pk_maintains_secondary_index() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r4_setup("idx-maintenance")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
+         CREATE INDEX idx_name ON t (name);
+         INSERT INTO t (id, name) VALUES (1, 'a');
+         INSERT INTO t (id, name) VALUES (2, 'b');",
+    )?;
+    run_sql(&db, "UPDATE t SET id = 99 WHERE id = 1;")?;
+    // El índice secundario sobre `name` debe seguir funcionando tras
+    // el PK move (la entry del bucket usa el nuevo PK).
+    let res = run_sql(&db, "SELECT id FROM t WHERE name = 'a';")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    // INTEGRITY CHECK debería pasar.
+    let res = run_sql(&db, "INTEGRITY CHECK;")?;
+    let msg = res[0].message.as_deref().unwrap_or("");
+    assert!(msg.starts_with("OK"), "INTEGRITY CHECK: {}", msg);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_update_pk_in_upsert_still_blocked() -> Result<(), Box<dyn Error>> {
+    // ON CONFLICT DO UPDATE sigue rechazando UPDATE de PK ([GBY-4008]):
+    // sería conceptualmente weird que el UPSERT cambiara la fila que
+    // disparó el conflicto.
+    let (db, wal) = r4_setup("upsert-pk-blocked")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 100);",
+    )?;
+    let err = run_sql(
+        &db,
+        "INSERT INTO t (id, v) VALUES (1, 200) ON CONFLICT (id) DO UPDATE SET id = 99;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4008"),
+        "esperaba GBY-4008 en UPSERT DO UPDATE, got: {}",
+        err
     );
     cleanup(&[&db, &wal]);
     Ok(())

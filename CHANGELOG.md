@@ -6,6 +6,54 @@
 
 ---
 
+## 2026-05-27 — Residual #4 de L: activación real de `ON UPDATE` + UPDATE sobre PK
+
+> **Un push a `main`** que cierra el residual #4 — el último listado tras #2/#3. Con este push, el **bloque L completo** (constraints) queda 100% entregado: CHECK, referential actions, naming, multi-col FK y ahora ON UPDATE activo. Sin bump de formato: el byte `on_update` ya estaba persistido desde L1.
+
+### 🆕 Operaciones habilitadas
+
+- `UPDATE t SET pk_col = <expr> WHERE ...` ahora **funciona**. Antes rebotaba con `[GBY-4008] UPDATE_PK_NOT_ALLOWED`; ahora el motor:
+  - Computa el nuevo PK (single-col INT o compuesto fingerprint K2).
+  - Verifica que no haya otra fila con ese PK (`[GBY-3001]` si la hay).
+  - Dispara la acción `ON UPDATE` declarada en cada FK entrante.
+  - Mueve la fila (`delete(old_pk)` + `insert(new_pk)`) y mantiene los índices secundarios.
+- `INSERT ... ON CONFLICT DO UPDATE SET pk_col = ...` **sigue rebotando** con `[GBY-4008]` (intencional — el UPSERT identifica el row por la PK conflictiva, cambiarla rompe la semántica).
+
+### 🛡️ Acciones `ON UPDATE` ahora activas
+
+| Acción | Comportamiento |
+|---|---|
+| `CASCADE` | propaga los nuevos target values a todas las source cols de cada child que matcheaba el OLD value |
+| `SET NULL` | mismo path; valida que ninguna source col del child sea NOT NULL (`[GBY-3009]` si lo es) |
+| `SET DEFAULT` | reasigna cada source col al DEFAULT declarado; `[GBY-3010]` si falta DEFAULT, `[GBY-3002]` si DEFAULT NULL + NOT NULL |
+| `RESTRICT` | rebota con `[GBY-4073]` antes de tocar disco |
+| `NO ACTION` (default si se omite) | alias de RESTRICT en este release |
+
+ON UPDATE es **no-op** si la columna target específica no cambió. Una `UPDATE parent SET label = ...` que no toca `id` (target de la FK) no dispara cascade.
+
+### 🚧 Limitaciones
+
+- **Cascade que afectaría la PK del child**: si una source col de la FK también participa en la PK del child (caso degenerado tipo `CREATE TABLE c (id INT PRIMARY KEY REFERENCES p (id) ON UPDATE CASCADE)`), el cascade quedaría encadenando moves indefinidamente. Rebota con `[GBY-4074] FK_UPDATE_CASCADE_AFFECTS_CHILD_PK`. Diferido a futuro.
+- `INSERT ... ON CONFLICT DO UPDATE SET pk_col = ...` no soportado por las razones de arriba.
+- Sin bump de formato — V12 sigue.
+
+### 🆕 Errores
+
+- `[GBY-4073] FK_RESTRICT_BLOCKS_UPDATE`
+- `[GBY-4074] FK_UPDATE_CASCADE_AFFECTS_CHILD_PK`
+
+### 🧪 Tests
+
+3 tests legacy (`update_and_delete_by_pk_roundtrip`, `g2_update_set_pk_blocked`, `k2_pk_composite_update_pk_col_blocked`) que esperaban `[GBY-4008]` se reescribieron al nuevo contrato (`r4_*` los reemplaza con cobertura más amplia).
+
+Nuevos (12): `r4_update_pk_single_moves_row`, `r4_update_pk_to_existing_value_rejected`, `r4_on_update_cascade_single_col`, `r4_on_update_set_null_single_col`, `r4_on_update_set_default_single_col`, `r4_on_update_restrict_blocks`, `r4_on_update_default_no_action_blocks_like_restrict`, `r4_on_update_cascade_multi_col`, `r4_on_update_no_op_when_target_unchanged`, `r4_cascade_affects_child_pk_rejected`, `r4_update_pk_maintains_secondary_index`, `r4_update_pk_in_upsert_still_blocked`.
+
+Total integration tests: 363 (351 pre-#4 + 12 nuevos), todos verdes.
+
+Decisiones y limitaciones en [ADR-0024](docs/adr/0024-on-update-activation.md).
+
+---
+
 ## 2026-05-27 — Residual #3 de L: multi-column FOREIGN KEY (VERSION 11 → 12)
 
 > **Un push a `main`** que cierra el residual #3 listado tras #2: `FOREIGN KEY (a, b) REFERENCES p (x, y)` con todos los `ON DELETE` (CASCADE, SET NULL, SET DEFAULT, RESTRICT, NO ACTION) y `ON UPDATE` persistido. Bump VERSION 11→12 con rechazo limpio de V11 vía `[GBY-1003]`. Ver [ADR-0023](docs/adr/0023-multi-col-foreign-key.md).

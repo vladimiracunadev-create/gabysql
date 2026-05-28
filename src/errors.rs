@@ -404,6 +404,19 @@ pub mod codes {
     /// de la tabla; rehacer el esquema con `DROP TABLE` + recreate si
     /// la intención es cambiarla.
     pub const CANNOT_DROP_PRIMARY_KEY_CONSTRAINT: u32 = 4072;
+    /// Residual #4 de L (2026-05-27): `UPDATE` cambió un PK que tiene
+    /// children con `ON UPDATE RESTRICT` (o `NO ACTION`, que en este
+    /// release es alias). El motor aborta el UPDATE entero sin estado
+    /// parcial. Solución: borrar/actualizar primero los children, o
+    /// declarar la FK con `ON UPDATE CASCADE` / `SET NULL` /
+    /// `SET DEFAULT`.
+    pub const FK_RESTRICT_BLOCKS_UPDATE: u32 = 4073;
+    /// Residual #4 de L: `UPDATE` con `ON UPDATE CASCADE` haría que la
+    /// PK del child cambie (porque una columna source de la FK también
+    /// participa en la PK del child). Este release no soporta cascadas
+    /// de PK encadenadas. Solución: rediseñar la FK o reescribir el
+    /// UPDATE como DELETE + INSERT con una transacción explícita.
+    pub const FK_UPDATE_CASCADE_AFFECTS_CHILD_PK: u32 = 4074;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

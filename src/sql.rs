@@ -5500,23 +5500,17 @@ impl<'a> Engine<'a> {
         let mut seen: HashSet<String> = HashSet::new();
         for (column_name, expr) in stmt.assignments {
             let normalized = normalize_ident(&column_name);
-            // K2: bloquear UPDATE de CUALQUIER columna que participe en
-            // la PK (single o compuesta). Antes solo se chequeaba la PK
-            // principal; con PK compuesta cada columna adicional también
-            // forma parte de la identidad del row y mutarla forzaría
-            // un recálculo del fingerprint + rewrite de toda la fila.
-            if meta.is_pk_column(&column_name) {
-                return Err(coded(
-                    codes::UPDATE_PK_NOT_ALLOWED,
-                    format!(
-                        "UPDATE sobre '{}': no se permite cambiar la columna '{}' porque \
-                         participa en la PRIMARY KEY ({})",
-                        meta.name,
-                        column_name,
-                        meta.pk_columns().join(", ")
-                    ),
-                ));
-            }
+            // Residual #4 de L (2026-05-27): UPDATE sobre columnas PK
+            // ya está permitido. `apply_update_to_pk` detecta el cambio
+            // de PK comparando encoded_pk vs el pk del WHERE y, si
+            // difieren, mueve la fila (delete viejo + insert nuevo) y
+            // dispara la acción ON UPDATE declarada en cada FK
+            // entrante. La regla `[GBY-4008]` queda como código
+            // reservado pero el motor ya no lo emite desde aquí.
+            //
+            // ON CONFLICT DO UPDATE (UPSERT) SIGUE rechazando UPDATE
+            // de PK: cambiarla rompería la noción del "conflicto" que
+            // disparó el UPSERT.
             if meta.column(&normalized).is_none() {
                 return Err(coded(
                     codes::COLUMN_NOT_FOUND,
@@ -5720,12 +5714,17 @@ impl<'a> Engine<'a> {
         enforce_fk_on_update(self.pager, meta, &old_row, &current, pk)?;
 
         let (encoded_pk, row_bytes) = encode_row(meta, &current)?;
+        // Residual #4 (2026-05-27): si el SET cambió alguna columna PK,
+        // `encoded_pk != pk`. Disparar el camino de "PK move" — incluye
+        // chequeo de duplicado en new_pk, cascade ON UPDATE sobre los
+        // children, y move atómico de la fila + índices del propio
+        // padre. Para PK estable (caso histórico), seguimos por el
+        // upsert directo.
         if encoded_pk != pk {
-            return Err(DbError::new(format!(
-                "inconsistencia interna en UPDATE sobre '{}': la PK reconstruida del row \
-                 es {} pero el WHERE pidió pk={}",
-                meta.name, encoded_pk, pk
-            )));
+            self.move_row_and_cascade_on_update(
+                meta, pk, encoded_pk, &old_row, &current, row_bytes, &overrides,
+            )?;
+            return Ok(());
         }
         {
             let mut catalog = Catalog::open(self.pager);
@@ -5770,6 +5769,283 @@ impl<'a> Engine<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Residual #4 de L (2026-05-27): cuando un UPDATE cambia alguna
+    /// columna PK, esta función orquesta el "PK move":
+    ///
+    /// 1. **Duplicate guard**: si ya hay otra fila con `new_pk`,
+    ///    aborta con `[GBY-3001] DUPLICATE_PRIMARY_KEY`.
+    /// 2. **ON UPDATE cascade**: para cada FK entrante a esta tabla,
+    ///    aplica la acción declarada — CASCADE propaga `new` target
+    ///    values, SET NULL/SET DEFAULT mutan source cols, RESTRICT
+    ///    (y NO ACTION en este release) aborta con `[GBY-4073]`.
+    /// 3. **Self-FK edge case**: si esta tabla se referencia a sí
+    ///    misma (`fk.table == meta.name`), incluimos la propia fila
+    ///    en el cascade — el `cascade_set_fk_tuple` sobre la misma
+    ///    fila después del move funciona idempotente.
+    /// 4. **Data move**: delete row at `old_pk`, insert at `new_pk`.
+    /// 5. **Index move**: para cada índice secundario, remove old +
+    ///    insert new con las values correspondientes.
+    ///
+    /// Sin estado parcial: cualquier rama de error aborta antes de
+    /// tocar disco (orden: duplicate check → cascade RESTRICT check
+    /// → cascade application → data move → indexes).
+    #[allow(clippy::too_many_arguments)]
+    fn move_row_and_cascade_on_update(
+        &mut self,
+        meta: &TableMeta,
+        old_pk: i64,
+        new_pk: i64,
+        old_row: &HashMap<String, Value>,
+        new_row: &HashMap<String, Value>,
+        new_row_bytes: Vec<u8>,
+        overrides: &HashMap<String, Value>,
+    ) -> DbResult<()> {
+        // 1. Duplicate guard. Self-row no debe rebotar — pero
+        //    `new_pk != old_pk` ya garantiza que mirar new_pk no nos
+        //    devuelve la fila que estamos por mover.
+        let already_there = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_row(meta.root_page, new_pk)?.is_some()
+        };
+        if already_there {
+            return Err(coded(
+                codes::DUPLICATE_PRIMARY_KEY,
+                format!(
+                    "UPDATE sobre '{}': la nueva PK ya existe en otra fila (PK destino = {})",
+                    meta.name, new_pk
+                ),
+            ));
+        }
+
+        // 2. ON UPDATE cascade. Snapshot del catálogo: la cascade
+        //    sólo muta DATOS de tablas, no schema.
+        let snapshot = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_tables()?
+        };
+        for child_table in &snapshot {
+            for child_col in &child_table.columns {
+                let Some(fk) = &child_col.references else {
+                    continue;
+                };
+                if !fk.table.eq_ignore_ascii_case(&meta.name) {
+                    continue;
+                }
+                // Target values del parent en el orden declarado.
+                let old_target_values: Vec<Value> = fk
+                    .target_columns()
+                    .iter()
+                    .map(|t| {
+                        old_row
+                            .get(&normalize_ident(t))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                let new_target_values: Vec<Value> = fk
+                    .target_columns()
+                    .iter()
+                    .map(|t| {
+                        new_row
+                            .get(&normalize_ident(t))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                // Sólo cascadeamos si los target values CAMBIARON.
+                // ON UPDATE x es no-op si la columna FK target no
+                // está entre los overrides.
+                if old_target_values == new_target_values {
+                    continue;
+                }
+                let child_pks = find_child_pks_with_fk_value(
+                    self.pager,
+                    child_table,
+                    fk,
+                    &child_col.name,
+                    &old_target_values,
+                )?;
+                if child_pks.is_empty() {
+                    continue;
+                }
+                // Source col names del child para esta FK (anchored
+                // en child_col.name; resto en extra_source_columns).
+                let source_col_names = fk.source_columns(&child_col.name);
+                // Edge case: cascade CASCADE/SET NULL/SET DEFAULT
+                // sobre columnas que también son PK del child. No
+                // soportado en este release — error claro en vez
+                // de corromper el B+Tree.
+                let cascade_touches_child_pk =
+                    source_col_names.iter().any(|c| child_table.is_pk_column(c));
+                let needs_mutation = matches!(
+                    fk.on_update,
+                    OnUpdate::Cascade | OnUpdate::SetNull | OnUpdate::SetDefault
+                );
+                if needs_mutation && cascade_touches_child_pk {
+                    return Err(coded(
+                        codes::FK_UPDATE_CASCADE_AFFECTS_CHILD_PK,
+                        format!(
+                            "UPDATE sobre '{}' bloqueado: la cascade ON UPDATE en '{}' \
+                             mutaría columnas que también participan en la PK del child \
+                             ({}). Este release no encadena PK-moves.",
+                            meta.name,
+                            child_table.name,
+                            source_col_names.join(", ")
+                        ),
+                    ));
+                }
+                match fk.on_update {
+                    OnUpdate::NoAction | OnUpdate::Restrict => {
+                        return Err(coded(
+                            codes::FK_RESTRICT_BLOCKS_UPDATE,
+                            format!(
+                                "UPDATE sobre '{}' bloqueado: '{}.{}' referencia esta fila \
+                                 con ON UPDATE {} ({} fila(s) hijas afectarían)",
+                                meta.name,
+                                child_table.name,
+                                child_col.name,
+                                fk.on_update.as_sql(),
+                                child_pks.len()
+                            ),
+                        ));
+                    }
+                    OnUpdate::Cascade => {
+                        let cols_refs: Vec<&str> = source_col_names.to_vec();
+                        for cpk in child_pks {
+                            cascade_set_fk_tuple(
+                                self.pager,
+                                child_table,
+                                cpk,
+                                &cols_refs,
+                                &new_target_values,
+                            )?;
+                        }
+                    }
+                    OnUpdate::SetNull => {
+                        // Validar que ninguna source col del child sea NOT NULL.
+                        for src in &source_col_names {
+                            let scol = child_table.column(src).ok_or_else(|| {
+                                DbError::new(format!(
+                                    "FK rota: columna source '{}' no existe en '{}'",
+                                    src, child_table.name
+                                ))
+                            })?;
+                            if scol.not_null {
+                                return Err(coded(
+                                    codes::FK_SET_NULL_VIOLATES_NOT_NULL,
+                                    format!(
+                                        "UPDATE sobre '{}' bloqueado: '{}.{}' es NOT NULL y la \
+                                         FK declaró ON UPDATE SET NULL ({} fila(s) hijas \
+                                         afectarían)",
+                                        meta.name,
+                                        child_table.name,
+                                        src,
+                                        child_pks.len()
+                                    ),
+                                ));
+                            }
+                        }
+                        let nulls: Vec<Value> =
+                            source_col_names.iter().map(|_| Value::Null).collect();
+                        let cols_refs: Vec<&str> = source_col_names.to_vec();
+                        for cpk in child_pks {
+                            cascade_set_fk_tuple(self.pager, child_table, cpk, &cols_refs, &nulls)?;
+                        }
+                    }
+                    OnUpdate::SetDefault => {
+                        let mut defaults: Vec<Value> = Vec::with_capacity(source_col_names.len());
+                        for src in &source_col_names {
+                            let scol = child_table.column(src).ok_or_else(|| {
+                                DbError::new(format!(
+                                    "FK rota: columna source '{}' no existe en '{}'",
+                                    src, child_table.name
+                                ))
+                            })?;
+                            let Some(default) = &scol.default else {
+                                return Err(coded(
+                                    codes::FK_SET_DEFAULT_MISSING,
+                                    format!(
+                                        "UPDATE sobre '{}' bloqueado: '{}.{}' no tiene DEFAULT \
+                                         y la FK declaró ON UPDATE SET DEFAULT ({} fila(s) hijas)",
+                                        meta.name,
+                                        child_table.name,
+                                        src,
+                                        child_pks.len()
+                                    ),
+                                ));
+                            };
+                            let v = default_to_value(default);
+                            if matches!(v, Value::Null) && scol.not_null {
+                                return Err(coded(
+                                    codes::NOT_NULL_VIOLATED,
+                                    format!(
+                                        "UPDATE sobre '{}' bloqueado: ON UPDATE SET DEFAULT \
+                                         pondría '{}.{}' (NOT NULL) en NULL — el DEFAULT \
+                                         declarado es NULL",
+                                        meta.name, child_table.name, src
+                                    ),
+                                ));
+                            }
+                            defaults.push(v);
+                        }
+                        let cols_refs: Vec<&str> = source_col_names.to_vec();
+                        for cpk in child_pks {
+                            cascade_set_fk_tuple(
+                                self.pager,
+                                child_table,
+                                cpk,
+                                &cols_refs,
+                                &defaults,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Data move: delete old, insert new. NO usar upsert_row con
+        //    new_pk porque la key cambió — necesitamos un delete real
+        //    de old_pk seguido de insert en new_pk.
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.delete_row(meta.root_page, old_pk)?;
+            catalog.insert_row(meta.root_page, new_pk, new_row_bytes)?;
+        }
+
+        // 4. Mantener índices secundarios — TODOS, no sólo los
+        //    tocados por overrides, porque el PK cambió y el bucket
+        //    almacena el PK como payload junto al value.
+        let _ = overrides; // overrides ya no nos sirve; recalc por meta
+        for idx in &meta.indexes {
+            if idx.is_composite() {
+                let old_fp = composite_fp_for_values(meta, idx, old_row)?;
+                let new_fp = composite_fp_for_values(meta, idx, new_row)?;
+                composite_index_remove(self.pager, idx.root_page, old_fp, old_pk)?;
+                composite_index_upsert(self.pager, idx.root_page, new_fp, new_pk)?;
+            } else {
+                let idx_col = meta.column(&idx.column).ok_or_else(|| {
+                    DbError::new(format!(
+                        "índice apunta a columna inexistente: {}",
+                        idx.column
+                    ))
+                })?;
+                let old_value = old_row
+                    .get(&normalize_ident(&idx.column))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let new_value = new_row
+                    .get(&normalize_ident(&idx.column))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let old_bytes = encode_column_value(idx_col, &old_value)?;
+                let new_bytes = encode_column_value(idx_col, &new_value)?;
+                index_remove_pk(self.pager, idx.root_page, idx.kind, &old_bytes, old_pk)?;
+                index_upsert_pk(self.pager, idx.root_page, idx.kind, &new_bytes, new_pk)?;
+            }
+        }
         Ok(())
     }
 

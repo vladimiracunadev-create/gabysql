@@ -166,6 +166,8 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4070` | `CHECK_EXPR_NOT_BOOLEAN` | L2 (reservado): predicado declarado en `CHECK` no evalúa a BOOL (ni NULL). Hoy el evaluador rebota con el error genérico del eval; el código queda para una validación DDL estricta futura. | Comparar la expresión contra algo (`CHECK (LENGTH(x) > 0)` en vez de `CHECK (LENGTH(x))`). |
 | `4071` | `CONSTRAINT_NOT_FOUND` | Residual #2 (2026-05-27): `ALTER TABLE DROP CONSTRAINT <name>` no encontró ningún CHECK/UNIQUE/FK con ese nombre. El mensaje incluye un breakdown de los constraints visibles. | Verificar el nombre con `INTEGRITY CHECK;` o usar `DROP CONSTRAINT IF EXISTS` para silenciar. |
 | `4072` | `CANNOT_DROP_PRIMARY_KEY_CONSTRAINT` | Residual #2: `DROP CONSTRAINT <name>` apuntando a la PK. La PK es inmutable durante la vida de la tabla. | Usar `DROP TABLE` si la intención es rehacer el esquema. |
+| `4073` | `FK_RESTRICT_BLOCKS_UPDATE` | Residual #4 (2026-05-27): `UPDATE` que cambió un PK tiene children con `ON UPDATE RESTRICT` (o `NO ACTION`, alias). Sin estado parcial. | Borrar/actualizar primero los children, o declarar la FK con `ON UPDATE CASCADE`/`SET NULL`/`SET DEFAULT`. |
+| `4074` | `FK_UPDATE_CASCADE_AFFECTS_CHILD_PK` | Residual #4: `ON UPDATE CASCADE` mutaría una columna que también participa en la PK del child. No soportado en este release. | Rediseñar la FK o reescribir como DELETE + INSERT en una transacción explícita. |
 
 ---
 
