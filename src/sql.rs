@@ -948,6 +948,11 @@ pub enum AggArg {
     Column(String),
     /// `COUNT(DISTINCT col)`. P1 del roadmap; solo aplica a `Count`.
     DistinctColumn(String),
+    /// Issue #5 (2026-05-27): `SUM(qty * price)`, `AVG(salary * 1.1)`,
+    /// etc. — el argumento es un `Expr` arbitrario (G1+G2+G3), no
+    /// sólo un ident. Se evalúa por fila contra el row decodificado
+    /// y se agrega el `Value` resultante.
+    Expr(Expr),
 }
 
 impl SelectItem {
@@ -970,6 +975,10 @@ impl SelectItem {
                     AggArg::DistinctColumn(c) => {
                         format!("{}_distinct_{}", func_lower, normalize_ident(c))
                     }
+                    // Issue #5: para `SUM(qty*price)` no hay un column
+                    // name canónico; usamos un label sintético sobre el
+                    // Expr (mismo helper que SelectItem::Expression).
+                    AggArg::Expr(expr) => format!("{}_{}", func_lower, expr_default_label(expr)),
                 }
             }
             SelectItem::Expression { expr, alias } => {
@@ -2822,6 +2831,116 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Issue #1 (2026-05-27): pre-evalúa toda `ScalarSubquery` no
+    /// correlacionada dentro de `expr` y la sustituye por
+    /// `Expr::Literal(value)`. Recursivo: si una subquery contiene
+    /// otras subqueries no-correlated, también las memoiza.
+    ///
+    /// Ahorro práctico: en `SELECT (SELECT COUNT(*) FROM t) FROM t LIMIT N`
+    /// el sub-COUNT pasa de O(N · |t|) (re-evaluado por fila del outer)
+    /// a O(|t|) (una sola pasada).
+    fn memoize_uncorrelated_scalar_subqueries(&mut self, expr: &mut Expr) -> DbResult<()> {
+        match expr {
+            Expr::Literal(_) | Expr::Column(_) => Ok(()),
+            Expr::ScalarSubquery(sub) => {
+                // Si es correlacionada, NO podemos memoizar — depende
+                // del row del outer. Recursamos dentro por si la
+                // subquery a su vez contiene scalar subqueries
+                // memoizables en su SELECT list.
+                if select_stmt_is_correlated(sub) {
+                    for item in sub.columns.iter_mut() {
+                        if let SelectItem::Expression { expr: inner, .. } = item {
+                            self.memoize_uncorrelated_scalar_subqueries(inner)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                // No correlacionada → ejecutar UNA vez y reemplazar
+                // por el literal resultante. Si la subquery falla
+                // (e.g. multi-row, multi-column), el error sale acá
+                // como saldría en el path original — semánticamente
+                // idéntico, no se postergó a runtime.
+                let inner_stmt = (**sub).clone();
+                let inner_res = self.exec_select(inner_stmt)?;
+                if inner_res.columns.len() != 1 {
+                    return Err(coded(
+                        codes::SUBQUERY_MUST_RETURN_ONE_COLUMN,
+                        format!(
+                            "subquery escalar debe devolver exactamente 1 columna; devolvió {}",
+                            inner_res.columns.len()
+                        ),
+                    ));
+                }
+                if inner_res.rows.len() > 1 {
+                    return Err(coded(
+                        codes::SCALAR_SUBQUERY_TOO_MANY_ROWS,
+                        format!(
+                            "subquery escalar devolvió {} filas; debe devolver a lo sumo 1",
+                            inner_res.rows.len()
+                        ),
+                    ));
+                }
+                let v = inner_res
+                    .rows
+                    .into_iter()
+                    .next()
+                    .and_then(|mut r| r.pop())
+                    .unwrap_or(Value::Null);
+                *expr = Expr::Literal(v);
+                Ok(())
+            }
+            Expr::Func(_, args) => {
+                for a in args.iter_mut() {
+                    self.memoize_uncorrelated_scalar_subqueries(a)?;
+                }
+                Ok(())
+            }
+            Expr::Cast(inner, _) => self.memoize_uncorrelated_scalar_subqueries(inner),
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(e) = operand.as_mut() {
+                    self.memoize_uncorrelated_scalar_subqueries(e)?;
+                }
+                for (c, v) in branches.iter_mut() {
+                    self.memoize_uncorrelated_scalar_subqueries(c)?;
+                    self.memoize_uncorrelated_scalar_subqueries(v)?;
+                }
+                if let Some(e) = else_branch.as_mut() {
+                    self.memoize_uncorrelated_scalar_subqueries(e)?;
+                }
+                Ok(())
+            }
+            Expr::Compare(l, _, r) | Expr::Arith(l, _, r) => {
+                self.memoize_uncorrelated_scalar_subqueries(l)?;
+                self.memoize_uncorrelated_scalar_subqueries(r)
+            }
+            Expr::IsNull(i, _) | Expr::Like(i, _, _) | Expr::InList(i, _, _) => {
+                self.memoize_uncorrelated_scalar_subqueries(i)
+            }
+            Expr::Between(l, lo, hi, _) => {
+                self.memoize_uncorrelated_scalar_subqueries(l)?;
+                self.memoize_uncorrelated_scalar_subqueries(lo)?;
+                self.memoize_uncorrelated_scalar_subqueries(hi)
+            }
+        }
+    }
+
+    /// Issue #1: aplica `memoize_uncorrelated_scalar_subqueries` a
+    /// todas las Expr que aparecen en el SELECT list, GROUP BY,
+    /// HAVING, ORDER BY de un SelectStmt. Llamado al inicio de
+    /// `exec_select` y `exec_select_joined` antes de iterar filas.
+    fn memoize_select_stmt(&mut self, stmt: &mut SelectStmt) -> DbResult<()> {
+        for item in stmt.columns.iter_mut() {
+            if let SelectItem::Expression { expr, .. } = item {
+                self.memoize_uncorrelated_scalar_subqueries(expr)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Bloque V (2026-05-27): si `stmt.table` apunta a una vista, parsea
     /// el source SQL de la vista y lo embebe como derived table del
     /// FROM. Idempotente para tablas (no-op). Llamado desde
@@ -4206,6 +4325,13 @@ impl<'a> Engine<'a> {
         // re-expandimos como derived source ANTES de cualquier otro
         // dispatch — así el resto del pipeline ve la query post-rewrite.
         self.expand_view_in_from(&mut stmt)?;
+        // Issue #1 (2026-05-27): memoize toda scalar subquery
+        // no-correlacionada en el SELECT list — una sola evaluación
+        // en vez de N (factor ~1000× para LIMIT 10 sobre tablas
+        // grandes). Tiene que correr ANTES del dispatch a
+        // exec_select_joined para que el path JOIN también se
+        // beneficie.
+        self.memoize_select_stmt(&mut stmt)?;
         // SELECT con JOINs sigue una ruta distinta (nested-loop, schema
         // combinado, WHERE como post-filter). El single-table path queda
         // exactamente como estaba — sin regresión en performance ni
@@ -4274,7 +4400,21 @@ impl<'a> Engine<'a> {
         // cualquier otro caso (combinadores AND/OR/NOT, o átomos E2 que
         // por ahora no tienen optimización indexada) caemos a FullScan +
         // post-filter genérico 3VL.
+        // Issue #4 (2026-05-27): detección temprana del fast-path por
+        // PK compuesta antes de decidir `generic_post_filter`. Si el
+        // WHERE es un puro AND-of-equality que cubre toda la PK
+        // compuesta, no necesitamos post-filter — el lookup directo
+        // por fingerprint devuelve exactamente la fila pedida.
+        let composite_pk_fast_path_active: bool = meta.has_composite_pk()
+            && stmt
+                .where_clause
+                .as_ref()
+                .and_then(extract_and_equality_map)
+                .map(|map| map.len() == meta.pk_columns().len())
+                .unwrap_or(false);
+
         let generic_post_filter: Option<WhereExpr> = match &stmt.where_clause {
+            Some(_) if composite_pk_fast_path_active => None,
             Some(expr) => {
                 let force = match expr.as_atom() {
                     None => true,
@@ -4333,7 +4473,52 @@ impl<'a> Engine<'a> {
         let where_atom: Option<WhereClause> =
             stmt.where_clause.clone().and_then(|e| e.into_atom().ok());
 
-        let plan = if exists_postfilter.is_some() || generic_post_filter.is_some() {
+        // Issue #4 (2026-05-27): fast-path para `WHERE pk_a = ? AND pk_b = ? [AND ...]`
+        // sobre PK compuesta. Si el WHERE es un AND de Eq que cubre
+        // EXACTAMENTE todas las cols de la PK compuesta, computamos el
+        // fingerprint y vamos directo al B+Tree (O(log n) en vez de full
+        // scan O(n)). Antes del fix, ese caso degeneraba a full scan
+        // — bug detectado por el benchmark (composite PK lookup 145 ms
+        // vs los <500 µs esperados).
+        let composite_pk_plan: Option<Plan> = if meta.has_composite_pk()
+            && exists_postfilter.is_none()
+            && generic_post_filter.is_none()
+        {
+            stmt.where_clause
+                .as_ref()
+                .and_then(extract_and_equality_map)
+                .and_then(|map| {
+                    let pk_cols = meta.pk_columns();
+                    if pk_cols.len() != map.len() {
+                        return None;
+                    }
+                    // Reunir los Value en el orden EXACTO de la PK.
+                    let mut ordered: Vec<Value> = Vec::with_capacity(pk_cols.len());
+                    for pc in &pk_cols {
+                        let key = normalize_ident(pc);
+                        let v = map.get(&key)?;
+                        ordered.push(v.clone());
+                    }
+                    // Tipos deben coincidir con las columnas PK.
+                    let col_metas: Vec<Column> = pk_cols
+                        .iter()
+                        .filter_map(|pc| meta.column(pc).cloned())
+                        .collect();
+                    if col_metas.len() != pk_cols.len() {
+                        return None;
+                    }
+                    let col_refs: Vec<&Column> = col_metas.iter().collect();
+                    let val_refs: Vec<&Value> = ordered.iter().collect();
+                    let fp = encode_composite_key(&col_refs, &val_refs).ok()?;
+                    Some(Plan::ByPks(vec![fp]))
+                })
+        } else {
+            None
+        };
+
+        let plan = if let Some(p) = composite_pk_plan {
+            p
+        } else if exists_postfilter.is_some() || generic_post_filter.is_some() {
             // El filtrado real ocurre en el post-filter; el scan barre todo.
             Plan::FullScan
         } else {
@@ -4364,14 +4549,16 @@ impl<'a> Engine<'a> {
                         // y deja que `eval_where_expr_single` filtre.
                         Plan::FullScan
                     } else {
-                        return Err(coded(
-                            codes::WHERE_OPERATOR_UNSUPPORTED,
-                            format!(
-                                "WHERE solo soporta PK ({}) o columnas con índice secundario; \
-                             '{}' no está indexada",
-                                meta.primary_key, column
-                            ),
-                        ));
+                        // Issue #3 (2026-05-27): antes rebotábamos con
+                        // [GBY-4001] para `WHERE col_no_indexada = val`,
+                        // mientras que `>`, `<`, `LIKE`, `IS NULL`, etc.,
+                        // sí aceptaban full-scan. La inconsistencia
+                        // confundía al usuario. Ahora `=` también cae
+                        // a FullScan + post-filter — misma semántica
+                        // que el resto de operadores. `[GBY-4001]` queda
+                        // como código reservado.
+                        let _ = column;
+                        Plan::FullScan
                     }
                 }
                 Some(WhereClause::Between { column, from, to }) => {
@@ -4869,34 +5056,113 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            // --- Fallback: nested-loop puro ---
+            // --- Fallback: hash join (Issue #6, 2026-05-27) o nested-loop ---
+            //
+            // Issue #6: si el ON es un equi-predicado, construimos un
+            // HashMap por value bytes del right table y probamos cada
+            // left row en O(1). Para CROSS JOIN (sin predicate) o
+            // cualquier futuro non-equi (que el AST actual no soporta
+            // pero sí podría) caemos al nested-loop O(N×M). Bench pre-fix:
+            // 100 posts × 10K users ≈ 479 ms; post-fix esperado: <20 ms.
             let right = &scope.tables[i + 1];
             let right_rows = self.scan_qualified(right)?;
             let mut next: Vec<HashMap<String, Value>> =
                 Vec::with_capacity(current.len() * right_rows.len() / 2 + 1);
             let mut left_matched = vec![false; current.len()];
             let mut right_matched = vec![false; right_rows.len()];
-            for (li, left_row) in current.iter().enumerate() {
-                for (ri, right_row) in right_rows.iter().enumerate() {
-                    let pass = match effective_on {
-                        None => true, // CROSS JOIN o comma-syntax
-                        Some(pred) => evaluate_join_predicate(left_row, right_row, pred, &scope)?,
-                    };
-                    if !pass {
+
+            // Hash join fast-path: precompute keys del predicado y
+            // decidir en qué lado vive cada uno, igual que el fallback
+            // de `evaluate_join_predicate`. Salto al nested-loop si
+            // no hay predicate (CROSS JOIN) o si una key no resuelve.
+            let hash_join_plan: Option<(String, String)> = if let Some(pred) = effective_on {
+                let lkey = resolve_joined_column_key(&scope, &column_ref_to_raw(&pred.left))?;
+                let rkey = resolve_joined_column_key(&scope, &column_ref_to_raw(&pred.right))?;
+                // Determinar cuál key indexa right_rows mirando
+                // el primer right row (todas las filas comparten
+                // el mismo conjunto de claves prefijadas).
+                let right_has_rkey = right_rows.first().is_some_and(|r| r.contains_key(&rkey));
+                let right_has_lkey = right_rows.first().is_some_and(|r| r.contains_key(&lkey));
+                if right_has_rkey {
+                    Some((rkey, lkey))
+                } else if right_has_lkey {
+                    Some((lkey, rkey))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((right_index_key, left_probe_key)) = hash_join_plan {
+                // Build: hash sobre los valores del right_index_key.
+                // NULL nunca matchea (SQL standard: NULL = NULL → NULL),
+                // así que filas NULL del right se omiten del hash y
+                // sólo aparecen vía LEFT/RIGHT/FULL fill-null.
+                let mut hash: HashMap<Vec<u8>, Vec<usize>> =
+                    HashMap::with_capacity(right_rows.len());
+                for (ri, r) in right_rows.iter().enumerate() {
+                    let v = r.get(&right_index_key).cloned().unwrap_or(Value::Null);
+                    if matches!(v, Value::Null) {
                         continue;
                     }
-                    left_matched[li] = true;
-                    right_matched[ri] = true;
-                    // Merge: las claves nunca chocan porque van prefijadas
-                    // con alias/tabla únicos (validados arriba).
-                    let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
-                    for (k, v) in left_row {
-                        merged.insert(k.clone(), v.clone());
+                    let bytes = encode_group_key(&[v]);
+                    hash.entry(bytes).or_default().push(ri);
+                }
+                // Probe.
+                for (li, left_row) in current.iter().enumerate() {
+                    let lv = left_row
+                        .get(&left_probe_key)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if matches!(lv, Value::Null) {
+                        continue;
                     }
-                    for (k, v) in right_row {
-                        merged.insert(k.clone(), v.clone());
+                    let bytes = encode_group_key(&[lv]);
+                    let Some(ris) = hash.get(&bytes) else {
+                        continue;
+                    };
+                    for &ri in ris {
+                        left_matched[li] = true;
+                        right_matched[ri] = true;
+                        let right_row = &right_rows[ri];
+                        let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
+                        for (k, v) in left_row {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        for (k, v) in right_row {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        next.push(merged);
                     }
-                    next.push(merged);
+                }
+            } else {
+                // Nested-loop O(N×M): CROSS JOIN o caso donde el
+                // hash join no aplica (predicate keys irresolvibles).
+                for (li, left_row) in current.iter().enumerate() {
+                    for (ri, right_row) in right_rows.iter().enumerate() {
+                        let pass = match effective_on {
+                            None => true, // CROSS JOIN o comma-syntax
+                            Some(pred) => {
+                                evaluate_join_predicate(left_row, right_row, pred, &scope)?
+                            }
+                        };
+                        if !pass {
+                            continue;
+                        }
+                        left_matched[li] = true;
+                        right_matched[ri] = true;
+                        // Merge: las claves nunca chocan porque van prefijadas
+                        // con alias/tabla únicos (validados arriba).
+                        let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
+                        for (k, v) in left_row {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        for (k, v) in right_row {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        next.push(merged);
+                    }
                 }
             }
             let needs_left_fill = matches!(join.kind, JoinKind::Left | JoinKind::Full);
@@ -6989,6 +7255,9 @@ fn validate_aggregate_select(stmt: &SelectStmt, meta: &TableMeta) -> DbResult<()
                         ));
                     }
                 }
+                // Issue #5: el chequeo de columnas para Expr se hace en
+                // runtime al evaluar (eval_expr ya rebota COLUMN_NOT_FOUND).
+                AggArg::Expr(_) => {}
             },
             SelectItem::Expression { .. } => {
                 // Bloque G1: expresiones escalares en SELECT con
@@ -7056,6 +7325,22 @@ fn compute_aggregate(
     arg: &AggArg,
     rows: &[HashMap<String, Value>],
 ) -> DbResult<Value> {
+    // Issue #5 (2026-05-27): si el argumento es un `Expr` arbitrario
+    // (e.g. `SUM(qty * price)`), pre-evaluamos contra cada fila para
+    // obtener un vector de `Value` y reutilizamos el mismo motor de
+    // agregación que para columnas, sintetizando una clave anónima.
+    if let AggArg::Expr(expr) = arg {
+        let synthetic_key = "__agg_expr__";
+        let mut synthetic_rows: Vec<HashMap<String, Value>> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let v = eval_expr(expr, r)?;
+            let mut m: HashMap<String, Value> = HashMap::with_capacity(1);
+            m.insert(synthetic_key.to_string(), v);
+            synthetic_rows.push(m);
+        }
+        let synthetic_arg = AggArg::Column(synthetic_key.to_string());
+        return compute_aggregate(func, &synthetic_arg, &synthetic_rows);
+    }
     match (func, arg) {
         (AggFunc::Count, AggArg::Star) => Ok(Value::Integer(rows.len() as i64)),
         (AggFunc::Count, AggArg::Column(col)) => {
@@ -10448,6 +10733,124 @@ fn format_func_call(f: ScalarFunc, args: &[Expr]) -> DbResult<String> {
     }
     let rendered: Vec<String> = args.iter().map(format_expr).collect::<DbResult<_>>()?;
     Ok(format!("{}({})", f.keyword(), rendered.join(", ")))
+}
+
+/// Issue #1 (2026-05-27): chequea si un `SelectStmt` (típicamente el
+/// body de una `Expr::ScalarSubquery`) referencia el outer scope. Eso
+/// pasa cuando hay un `WhereClause::EqColumnRef` en cualquier nivel
+/// del WHERE — esa es la ÚNICA forma de leer outer.col en gabysql
+/// (`Expr::Column` siempre se resuelve contra el row local del scope
+/// en que se evalúa). Si no hay ninguna, la subquery es
+/// **no-correlacionada** y su valor se puede memoizar: evaluar una
+/// vez antes del loop del outer, sustituir el `ScalarSubquery` por
+/// un `Literal(value)` y ahorrar los N-1 re-cómputos.
+///
+/// Bench pre-fix: `SELECT (SELECT COUNT(*) FROM events) FROM events LIMIT 10`
+/// tardaba 7.5 s (re-evalúa el subquery por cada una de las 10 filas).
+/// Post-fix: <10 ms (una sola evaluación).
+fn select_stmt_is_correlated(stmt: &SelectStmt) -> bool {
+    fn where_has_eq_columnref(w: &WhereExpr) -> bool {
+        match w {
+            WhereExpr::Atom(c) => matches!(c, WhereClause::EqColumnRef { .. }),
+            WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
+                where_has_eq_columnref(l) || where_has_eq_columnref(r)
+            }
+            WhereExpr::Not(inner) => where_has_eq_columnref(inner),
+        }
+    }
+    if let Some(w) = &stmt.where_clause {
+        if where_has_eq_columnref(w) {
+            return true;
+        }
+    }
+    // Conservative: si hay subqueries anidadas (en columns, derived_source,
+    // etc.) cuyos cuerpos referencien outer, también marca como correlated.
+    for item in &stmt.columns {
+        if let SelectItem::Expression { expr, .. } = item {
+            if expr_contains_correlated_subquery(expr) {
+                return true;
+            }
+        }
+    }
+    if let Some(sub) = &stmt.derived_source {
+        if select_stmt_is_correlated(sub) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Issue #1: walker que detecta si una Expr contiene una scalar
+/// subquery cuyo body referencia el outer scope (i.e., correlacionada
+/// transitivamente).
+fn expr_contains_correlated_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::ScalarSubquery(s) => select_stmt_is_correlated(s),
+        Expr::Func(_, args) => args.iter().any(expr_contains_correlated_subquery),
+        Expr::Cast(inner, _) => expr_contains_correlated_subquery(inner),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| expr_contains_correlated_subquery(e))
+                || branches.iter().any(|(c, v)| {
+                    expr_contains_correlated_subquery(c) || expr_contains_correlated_subquery(v)
+                })
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|e| expr_contains_correlated_subquery(e))
+        }
+        Expr::Compare(l, _, r) | Expr::Arith(l, _, r) => {
+            expr_contains_correlated_subquery(l) || expr_contains_correlated_subquery(r)
+        }
+        Expr::IsNull(i, _) | Expr::Like(i, _, _) | Expr::InList(i, _, _) => {
+            expr_contains_correlated_subquery(i)
+        }
+        Expr::Between(l, lo, hi, _) => {
+            expr_contains_correlated_subquery(l)
+                || expr_contains_correlated_subquery(lo)
+                || expr_contains_correlated_subquery(hi)
+        }
+    }
+}
+
+/// Issue #4 (2026-05-27): si `expr` es un AND-tree de `Eq { col, val }`
+/// con valores literales (sin subqueries ni column-refs correlated),
+/// devuelve un map `col_normalizada → Value`. Caso contrario `None`.
+/// Usado por el planner para detectar `WHERE a = X AND b = Y AND ...`
+/// y activar el fast-path por fingerprint sobre PK compuesta.
+fn extract_and_equality_map(expr: &WhereExpr) -> Option<HashMap<String, Value>> {
+    fn walk(expr: &WhereExpr, out: &mut HashMap<String, Value>) -> bool {
+        match expr {
+            WhereExpr::Atom(WhereClause::Eq { column, value }) => {
+                let key = normalize_ident(column);
+                // Si la misma columna aparece dos veces con valores
+                // distintos, no es seguro (and de eqs contradictorios
+                // = 0 rows, pero el planner no lo necesita): caemos
+                // a None.
+                if let Some(prev) = out.get(&key) {
+                    if prev != value {
+                        return false;
+                    }
+                }
+                out.insert(key, value.clone());
+                true
+            }
+            WhereExpr::And(l, r) => walk(l, out) && walk(r, out),
+            // OR/NOT/otros tipos de atom → no es un puro AND-of-equality
+            _ => false,
+        }
+    }
+    let mut out = HashMap::new();
+    if walk(expr, &mut out) && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Bloque V (2026-05-27): reconstruye SQL re-parseable a partir de
@@ -14344,8 +14747,16 @@ impl Parser {
             let col = self.expect_ident()?;
             return Ok(AggArg::DistinctColumn(col));
         }
-        let col = self.expect_ident()?;
-        Ok(AggArg::Column(col))
+        // Issue #5 (2026-05-27): parse_expr en lugar de expect_ident,
+        // para que `SUM(qty * price)`, `AVG(LENGTH(name))`, etc., compilen.
+        // Si la Expr resultante es justo `Column(name)`, colapsamos a
+        // `AggArg::Column(name)` para mantener el fast-path y el output_name
+        // pre-Issue-#5.
+        let expr = self.parse_expr()?;
+        Ok(match expr {
+            Expr::Column(name) => AggArg::Column(name),
+            other => AggArg::Expr(other),
+        })
     }
 
     /// Acepta `AS alias` o `alias` directo (bare). El alias bare se

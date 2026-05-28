@@ -97,6 +97,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | `SUM(col)` | ✅ (F; INT/FLOAT con promoción) | — |
 | `AVG(col)` | ✅ (F; FLOAT) | — |
 | `MIN(col)` / `MAX(col)` | ✅ (F) | — |
+| `SUM/AVG/MIN/MAX/COUNT(expr)` con `Expr` arbitrario — e.g. `SUM(qty * price)`, `AVG(LENGTH(name))` | ✅ (Issue #5, 2026-05-27; via `AggArg::Expr`) | — |
 | `DISTINCT` — `SELECT DISTINCT col` | ✅ (F) | — |
 | `COUNT(DISTINCT col)` | ✅ (F) | — |
 | **Agregados sobre `SELECT` con `JOIN`** | ❌ ([GBY-4028]) | P1 |

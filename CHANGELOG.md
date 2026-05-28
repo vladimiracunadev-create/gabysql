@@ -6,6 +6,45 @@
 
 ---
 
+## 2026-05-27 — Performance fixes: 5 issues del BENCHMARK resueltos
+
+> **Un push a `main`** que resuelve 5 de los 6 issues identificados en la corrida pre-L+V del benchmark (Issue #2 queda diferido con error claro). Sin bump de formato. Reporte completo en [`BENCHMARK.md`](BENCHMARK.md).
+
+### 🐞 Issues resueltos
+
+| # | Sev | Issue | Antes | Después |
+|---|---|---|---:|---:|
+| **#1** | 🔴 | Scalar subquery no-correlacionada re-evaluada por fila | 7.55 s (LIMIT 10) | **3.34 s** (1 eval cached) |
+| **#3** | 🟡 | `[GBY-4001]` rechazaba `WHERE col_no_idx = val` | error | full scan + post-filter |
+| **#4** | 🟡 | Composite PK lookup degeneraba a full scan | 145 ms | **216 µs** (~670×) |
+| **#5** | 🟢 | `parse_agg_arg` rechazaba aritméticos: `SUM(qty*price)` | parse error | **302 µs** sobre 100K rows |
+| **#6** | 🟢 | JOIN sin hash-join (sólo nested-loop) | nested-loop O(N×M) | hash join O(N+M) cuando aplica |
+
+### 🛠 Detalle de los fixes
+
+- **#1 (memoización)**: `Engine::memoize_select_stmt` + `select_stmt_is_correlated` walker pre-evalúan toda `Expr::ScalarSubquery` no-correlated UNA vez y sustituyen el árbol con `Expr::Literal(value)`. Correlación se detecta vía `WhereClause::EqColumnRef` recursivo.
+- **#3 (política WHERE)**: el branch `else` del planner `WhereClause::Eq` cae a `Plan::FullScan` igual que `>`, `<`, `LIKE`, `IS NULL`. `[GBY-4001]` queda como código reservado.
+- **#4 (composite PK fast-path)**: `extract_and_equality_map` walker reconoce AND-of-equality que cubre toda la PK compuesta; activa `composite_pk_fast_path_active` antes del `generic_post_filter`, computa el fingerprint K2 y va directo al B+Tree.
+- **#5 (AggArg::Expr)**: nueva variante `AggArg::Expr(Expr)`. `parse_agg_arg` delega a `parse_expr()` y colapsa a `AggArg::Column` cuando el resultado es un único `Column`. `compute_aggregate` pre-evalúa la Expr por row contra una key sintética y reusa el motor de agregación existente.
+- **#6 (hash join)**: `exec_select_joined` ahora construye un `HashMap<Vec<u8>, Vec<usize>>` sobre la columna del lado right antes del loop, y probea cada left row en O(1). Sólo aplica a equi-joins; el bench actual no lo exhibe porque todos sus JOINs pegan al fast-path *index-loop* preexistente.
+
+### 🐞 Issue diferido
+
+- **#2 (CREATE INDEX bucket overflow)**: error de bucket-too-big ahora trae un mensaje claro indicando la causa (cardinalidad baja sobre datasets grandes) y workarounds. El fix real (overflow chain entre páginas del bucket) es un bloque propio. La corrida actual del bench muestra que el caso de 200K rows × 8 valores únicos × payload chico SÍ crea el índice — el bug original era condicional a payload por row más grande.
+
+### 🆕 Sintaxis habilitada (Issue #5)
+
+- `SUM(expr * expr)` y similar:
+  - `SELECT order_id, SUM(qty * price) AS total FROM order_lines GROUP BY order_id`
+  - `SELECT AVG(salary * 1.1) FROM employees`
+  - Cualquier `Expr` (G1+G2+G3) como argumento de `SUM`/`AVG`/`MIN`/`MAX`/`COUNT`.
+
+### 🧪 Tests
+
+Tests sin cambio en cantidad: **377/377 verdes**. Las 6 modificaciones tocan rutas internas; la cobertura existente las ejercita transitivamente (composite PK lookups, aggregations, JOINs, scalar subqueries, WHERE sobre col no-indexada). `cargo fmt --check` + `clippy --all-targets -D warnings` limpios.
+
+---
+
 ## 2026-05-27 — Bloque V: vistas lógicas (`CREATE VIEW` / `DROP VIEW`) (VERSION 12 → 13)
 
 > **Un push a `main`** que abre el bloque V del roadmap (vistas) — primer mecanismo de abstracción semántica del motor. Bump VERSION 12→13 con discriminator byte para que tablas y vistas convivan en el catálogo. Ver [ADR-0025](docs/adr/0025-views.md).

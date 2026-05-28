@@ -268,10 +268,17 @@ fn secondary_index_lookup_and_maintenance() -> Result<(), Box<dyn Error>> {
     let res = run_sql(&db, "SELECT id FROM u WHERE name = 'X' AND score = 1;")?;
     assert_eq!(res[0].rows.len(), 0);
 
-    // DROP INDEX falls back to "column not indexed" error on next lookup.
+    // Issue #3 (2026-05-27): tras DROP INDEX, `WHERE name = ...` ya
+    // NO rebota con [GBY-4001] — cae a FullScan + post-filter como
+    // cualquier otro operador. Verificamos que devuelve correctamente
+    // la(s) fila(s) que matchean.
     run_sql(&db, "DROP INDEX idx_u_name;")?;
-    let err = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';").unwrap_err();
-    assert!(err.to_string().contains("no está indexada"));
+    let res = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';")?;
+    assert!(
+        res[0].rows.iter().any(|r| r[0] == Value::Integer(1)),
+        "esperaba id=1 (Ana) en el resultset tras DROP INDEX, got: {:?}",
+        res[0].rows
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())

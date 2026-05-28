@@ -228,9 +228,25 @@ impl<'a> Tree<'a> {
                 }
                 let split = leaf.kvs.len() / 2;
                 if split == 0 {
+                    // Issue #2 (2026-05-27): cuando un único KV excede
+                    // una página completa, ocurre típicamente porque
+                    // un bucket de índice secundario sobre una columna
+                    // de baja cardinalidad acumula miles de row_ids
+                    // bajo un mismo `hash(value)`. Hoy no hay overflow
+                    // chain — el fix completo requiere reescribir el
+                    // bucket layer. Workarounds disponibles:
+                    //   - filtrar más antes de indexar (partial index, P2)
+                    //   - usar la columna como segunda en un índice
+                    //     compuesto sobre una columna de cardinalidad alta
+                    //   - aceptar el full-scan post-Issue-#3
                     return Err(DbError::new(format!(
                         "hoja B+Tree (página {}) no admite una sola entrada (key={}): \
-                         el valor excede el espacio útil de la página",
+                         el valor excede el espacio útil de la página. \
+                         Causa típica (Issue #2 del BENCHMARK): índice secundario sobre \
+                         una columna de baja cardinalidad con muchos row_ids por valor — \
+                         el bucket no entra en una sola página y no hay overflow chain todavía. \
+                         Workaround: filtrá la columna o usá un índice compuesto cuya \
+                         primera columna sea de alta cardinalidad.",
                         page_no, key
                     )));
                 }
