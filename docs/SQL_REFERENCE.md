@@ -41,7 +41,13 @@
 | Index-loop join optimization (transparente: aplica auto cuando hay índice/PK) | DML | 🟢 |
 | PK compuesta (`PRIMARY KEY (a, b, ...)`) — all-INT NOT NULL | DDL | 🟢 (K2, VERSION 8) |
 | Índices compuestos (`CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`) — all-INT, equality-only | DDL | 🟢 (K2, VERSION 8) |
-| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, FK multi-col, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| FK referential actions completas (`ON DELETE` / `ON UPDATE` con `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`) | DDL+DML | 🟢 (L1/VERSION 9 + residual #4) |
+| `CHECK (expr)` column-level y table-level, `ALTER TABLE ADD [CONSTRAINT n] CHECK (expr)` | DDL | 🟢 (L2/VERSION 10 + L3) |
+| Nombres de constraint (`CONSTRAINT <name>` en PK/UNIQUE/FK/CHECK) + `ALTER TABLE DROP CONSTRAINT [IF EXISTS] <name>` | DDL | 🟢 (residual #2/VERSION 11) |
+| FK multi-col (`FOREIGN KEY (a, b) REFERENCES p (x, y)`) | DDL | 🟢 (residual #3/VERSION 12) |
+| `UPDATE` de PK con re-encode + cascade `ON UPDATE` (regular UPDATE; UPSERT DO UPDATE sigue restringido) | DML | 🟢 (residual #4) |
+| `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v`, `SELECT ... FROM v` | DDL+DML | 🟢 (bloque V/VERSION 13) |
+| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -96,7 +102,7 @@ flowchart LR
 
 ## CREATE DATABASE
 
-> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 8`. En modo single-DB (`-db`) responde `405`.
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 13`. En modo single-DB (`-db`) responde `405`.
 
 ### 🛤️ Railroad
 
@@ -226,26 +232,38 @@ flowchart LR
 ### 📜 EBNF
 
 ```
-create_table   ::= "CREATE" "TABLE" identifier "(" column_def ("," column_def)* ")"
+create_table   ::= "CREATE" "TABLE" identifier "(" table_item ("," table_item)* ")"
+table_item     ::= column_def | table_constraint
 column_def     ::= identifier type column_constraint*
-column_constraint ::= "PRIMARY" "KEY"
+column_constraint ::= [ "CONSTRAINT" identifier ]
+                    ( "PRIMARY" "KEY"
                     | "NOT" "NULL"
                     | "UNIQUE"
                     | "DEFAULT" literal
-                    | "REFERENCES" identifier "(" identifier ")" on_delete?
-on_delete      ::= "ON" "DELETE" ("RESTRICT" | "CASCADE")
+                    | "CHECK" "(" expr ")"
+                    | "REFERENCES" identifier "(" identifier ")" fk_action* )
+table_constraint  ::= [ "CONSTRAINT" identifier ]
+                    ( "PRIMARY" "KEY" "(" identifier { "," identifier } ")"
+                    | "UNIQUE" "(" identifier { "," identifier } ")"
+                    | "CHECK" "(" expr ")"
+                    | "FOREIGN" "KEY" "(" identifier { "," identifier } ")"
+                        "REFERENCES" identifier "(" identifier { "," identifier } ")" fk_action* )
+fk_action      ::= ("ON" "DELETE" | "ON" "UPDATE")
+                   ("RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT" | "NO" "ACTION")
 type           ::= "INT" | "TEXT" | "BOOL" | "FLOAT" | "DATE" | "DATETIME" | "JSON"
 literal        ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
 identifier     ::= [A-Za-z_][A-Za-z0-9_]*
 ```
 
 Notas:
-- `PRIMARY KEY` implica `NOT NULL`. Sigue habiendo una sola PK por tabla y debe ser `INT`.
-- `UNIQUE` inline auto-genera un índice unique con nombre `uq_<tabla>_<col>` (ver `CREATE UNIQUE INDEX`).
+- `PRIMARY KEY` implica `NOT NULL`. Sigue habiendo una sola PK por tabla (puede ser compuesta `PRIMARY KEY (a, b, ...)` con K2/VERSION 8, todas INT NOT NULL).
+- `UNIQUE` inline auto-genera un índice unique con nombre `uq_<tabla>_<col>` (ver `CREATE UNIQUE INDEX`). `UNIQUE (a, b, ...)` table-level reusa el encoder K2.
 - `DEFAULT NULL` es válido pero incompatible con `NOT NULL` en la misma columna.
 - `DEFAULT` no se admite sobre la PK.
 - El literal de `DEFAULT` debe coincidir con el tipo de la columna; `name TEXT DEFAULT 1` se rechaza en `CREATE TABLE`.
-- `REFERENCES <tabla>(<col>)`: el target column debe ser la PK del parent (no se admiten FKs contra `UNIQUE` no-PK en esta versión). El tipo de la FK debe coincidir con el de la PK referenciada (hoy ambos son siempre `INT`). Self-references (`employee.manager_id REFERENCES employee(id)`) son válidas. `ON DELETE` por default es `RESTRICT`.
+- **`CHECK (expr)`** (L2/VERSION 10) admite cualquier expresión Expr (booleana 3VL ANSI). Se evalúa en INSERT/UPDATE/UPSERT/cascade. Subqueries dentro de `CHECK` se rechazan con `[GBY-4069]`. Persistencia como texto canónico vía `format_expr` + reparse en cada open. `[GBY-3008] CHECK_VIOLATED` cuando falla.
+- **`REFERENCES <tabla>(<col>)`**: el target column debe ser la PK del parent (no se admiten FKs contra `UNIQUE` no-PK). El tipo de la FK debe coincidir con el de la PK referenciada. Self-references válidas. Acciones referenciales completas en `ON DELETE` y `ON UPDATE` (L1/V9 + residual #4): `RESTRICT` (default), `CASCADE`, `SET NULL`, `SET DEFAULT`, `NO ACTION`. **FK multi-col** (residual #3/V12) via constraint table-level `FOREIGN KEY (a, b) REFERENCES p (x, y)` — target debe ser la PK compuesta del parent, lookup O(log n) por fingerprint K2.
+- **`CONSTRAINT <name>`** (residual #2/V11): nombre opcional para PK/UNIQUE/FK/CHECK; útil con `ALTER TABLE DROP CONSTRAINT <name>` después.
 
 ### ✅ Ejemplos válidos
 
@@ -513,6 +531,97 @@ ALTER TABLE pedidos RENAME COLUMN id TO pedido_id;  -- arrastra PK + FKs entrant
 ```
 
 No reescribe filas (el on-disk row es posicional). Si la columna es la PK, `TableMeta.primary_key` se actualiza; si está indexada, `IndexMeta.column` se actualiza; las FKs entrantes que referencien la columna se reescriben. Errores: `[GBY-4062]` destino tomado · `[GBY-2002]` origen no existe.
+
+---
+
+## ALTER TABLE ADD CHECK (L3) / DROP CONSTRAINT (residual #2)
+
+> **L3 (2026-05-27)**: agrega un `CHECK` después del `CREATE TABLE`. Hace **full-scan** de la tabla y revalida todas las filas existentes contra la expresión — si alguna viola, la sentencia se aborta sin persistir el constraint. Costo O(n) en filas, una sola vez.
+>
+> **Residual #2 (2026-05-27)**: elimina por nombre cualquier constraint nombrado (CHECK / UNIQUE / FK). PK siempre rechazada (`[GBY-4072]`).
+
+### 📜 EBNF
+
+```
+alter_add_check    ::= "ALTER" "TABLE" identifier "ADD"
+                       [ "CONSTRAINT" identifier ] "CHECK" "(" expr ")" ";"
+alter_drop_constraint ::= "ALTER" "TABLE" identifier "DROP" "CONSTRAINT"
+                          [ "IF" "EXISTS" ] identifier ";"
+```
+
+### ✅ Ejemplos
+
+```sql
+-- Agregar CHECK con re-validación O(n)
+ALTER TABLE products ADD CHECK (price >= 0);
+ALTER TABLE products ADD CONSTRAINT chk_stock_positivo CHECK (stock >= 0);
+
+-- Quitar constraints nombradas
+ALTER TABLE products DROP CONSTRAINT chk_stock_positivo;
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS fk_orders_user;
+ALTER TABLE users DROP CONSTRAINT uq_users_email;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-3008] CHECK_VIOLATED` (en `ALTER TABLE ADD CHECK`) | alguna fila existente viola el predicado — sentencia abortada |
+| `[GBY-4069]` subquery dentro de CHECK | el AST de CHECK no admite subqueries en esta versión |
+| `[GBY-4071] CONSTRAINT_NOT_FOUND` | nombre no existe (omite con `IF EXISTS`) |
+| `[GBY-4072] CANNOT_DROP_PRIMARY_KEY_CONSTRAINT` | intento de drop sobre la PK |
+
+---
+
+## CREATE VIEW / DROP VIEW (bloque V)
+
+> Bloque V (2026-05-27, VERSION 13). Vistas lógicas read-only sobre el SELECT que las definió. La vista guarda únicamente el `source_sql` + alias de columnas; en cada query se expande dentro del FROM como una derived table. Tablas y vistas comparten namespace.
+
+### 📜 EBNF
+
+```
+create_view ::= "CREATE" "VIEW" [ "IF" "NOT" "EXISTS" ] identifier
+                [ "(" identifier ("," identifier)* ")" ]
+                "AS" select_stmt ";"
+drop_view   ::= "DROP" "VIEW" [ "IF" "EXISTS" ] identifier ";"
+```
+
+### ✅ Ejemplos
+
+```sql
+CREATE VIEW activos AS
+  SELECT id, nombre, email FROM users WHERE active = TRUE;
+
+SELECT * FROM activos ORDER BY nombre;
+
+CREATE VIEW IF NOT EXISTS resumen (cliente, total)
+  AS SELECT customer_id, SUM(total) FROM orders GROUP BY customer_id;
+
+-- DML sobre vistas no se permite
+-- INSERT INTO activos VALUES (...);  -- [GBY-4075] VIEWS_ARE_READONLY
+
+-- Vistas anidadas (la fuente puede referenciar otra vista; cycle guard depth=32)
+CREATE VIEW vips AS SELECT * FROM activos WHERE id IN (SELECT user_id FROM gold_members);
+
+DROP VIEW IF EXISTS resumen;
+```
+
+### ⚠️ Reglas
+
+- **Read-only**: `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` sobre una vista devuelven `[GBY-4075]`.
+- **SELECT simple**: la fuente debe ser un `SELECT` plano. Set ops (`UNION`/`INTERSECT`/`EXCEPT`) o `VALUES` como fuente devuelven `[GBY-4078]`.
+- **Cycle guard**: expansión limitada a `MAX_VIEW_DEPTH = 32`. Ciclos o cadenas muy profundas devuelven `[GBY-4076] VIEW_DEPTH_EXCEEDED`.
+- **Namespace compartido**: una vista con el nombre de una tabla existente (o viceversa) devuelve `[GBY-4077] NAME_ALREADY_EXISTS`.
+- Los `column_aliases` (si se declaran) deben tener la misma arity que el SELECT.
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4075] VIEWS_ARE_READONLY` | DML sobre vista |
+| `[GBY-4076] VIEW_DEPTH_EXCEEDED` | recursión / ciclo entre vistas más allá de 32 niveles |
+| `[GBY-4077] NAME_ALREADY_EXISTS` | colisión de nombre tabla ↔ vista |
+| `[GBY-4078] VIEW_SOURCE_NOT_SIMPLE_SELECT` | la fuente no es un SELECT simple |
 
 ---
 
@@ -984,7 +1093,7 @@ UPDATE users SET status = 'banned'
 | Mensaje | Causa |
 | :--- | :--- |
 | `fila no existe: PK=N` | el WHERE era `pk = N` y N no está en la tabla. Solo aplica al fast-path de PK literal; un WHERE compuesto con 0 matches devuelve OK con cuenta 0. |
-| `no se permite cambiar la PRIMARY KEY en UPDATE (esta versión)` | se intentó `SET pk = ...` |
+| `[GBY-4008] UPDATE_PK_NOT_ALLOWED` (solo UPSERT DO UPDATE) | `SET pk = ...` dentro de `ON CONFLICT DO UPDATE`. En el `UPDATE` regular está **permitido** desde residual #4 (2026-05-27): se hace re-encode + move físico de la fila y cascade `ON UPDATE` a las hijas. Errores típicos del nuevo path: `[GBY-4073] FK_RESTRICT_BLOCKS_UPDATE` (hijos con `RESTRICT`) y `[GBY-4074] FK_UPDATE_CASCADE_AFFECTS_CHILD_PK`. |
 | `columna duplicada en SET` | dos asignaciones a la misma columna |
 
 > Solo los índices cuya columna está en el `SET` se tocan; los demás no pagan costo. La resolución del WHERE en E3 hace **FullScan + filtro 3VL** salvo cuando el WHERE es exactamente `pk = N` (fast-path por PK). La optimización para `= col_indexada` y `IN (SELECT)` queda en backlog (correctitud primero). Ver [src/sql.rs:exec_update](../src/sql.rs).

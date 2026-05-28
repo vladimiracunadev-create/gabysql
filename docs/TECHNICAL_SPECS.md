@@ -9,13 +9,13 @@
 | Campo | Valor |
 |---|---|
 | Magic | `GABYSQL1` |
-| Versión de formato | `8` |
+| Versión de formato | `13` |
 | Tamaño de página | `4096` bytes (fijo en esta versión) |
 | Trailer de checksum por página | `4` bytes (CRC32-IEEE) |
 | Hashing del catálogo y de claves de índice | FNV-1a-64 (estable entre versiones de Rust) |
 | Tipos de página B+Tree | `LEAF` (1), `INTERNAL` (2) |
 
-> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action); `6` → `7` agregó el campo `kind: IndexKind` (`Hash` | `OrderedInt`) a `IndexMeta` para habilitar índices ordenados sobre columnas `INT` con range scan O(log N + k) — ver [ADR-0017](adr/0017-int-ordered-index-version-7.md); `7` → `8` extendió `TableMeta.primary_key` y `IndexMeta.column` a múltiples columnas (PK e índices compuestos) — restringido a all-INT NOT NULL, equality lookup via fingerprint FNV-1a-64, ver [ADR-0019](adr/0019-composite-pk-and-index.md). Las DBs de versiones anteriores son rechazadas explícitamente al abrir.
+> Bumps de versión: `1` → `2` cambió el hash del catálogo de `DefaultHasher` a FNV-1a-64; `2` → `3` reservó el trailer CRC y agregó verificación en lectura/replay; `3` → `4` extendió `TableMeta` con la lista de índices secundarios; `4` → `5` agregó `NOT NULL` + `DEFAULT` por columna y el flag `unique` por índice; `5` → `6` agregó `FOREIGN KEY` opcional por columna (target table + target column + `ON DELETE` action); `6` → `7` agregó el campo `kind: IndexKind` (`Hash` | `OrderedInt`) a `IndexMeta` para habilitar índices ordenados sobre columnas `INT` con range scan O(log N + k) — ver [ADR-0017](adr/0017-int-ordered-index-version-7.md); `7` → `8` extendió `TableMeta.primary_key` y `IndexMeta.column` a múltiples columnas (PK e índices compuestos) — restringido a all-INT NOT NULL, equality lookup via fingerprint FNV-1a-64, ver [ADR-0019](adr/0019-composite-pk-and-index.md); `8` → `9` (L1) extendió `ForeignKeyMeta` con `on_delete` ampliado (`SET NULL` / `SET DEFAULT` / `NO ACTION`) y nuevo `on_update` con las cinco acciones — ver [ADR-0020](adr/0020-fk-referential-actions.md); `9` → `10` (L2) agregó `CHECK (expr)` column-level y table-level persistidas como texto canónico vía `format_expr` — ver [ADR-0021](adr/0021-check-constraints.md); `10` → `11` (residual #2) agregó nombres opcionales para PK/UNIQUE/FK/CHECK (`pk_name`, `fk_name`, etc.) habilitando `ALTER TABLE DROP CONSTRAINT` — ver [ADR-0022](adr/0022-named-constraints.md); `11` → `12` (residual #3) agregó `extra_source_columns` + `extra_target_columns` a `ForeignKeyMeta` para FK multi-col `FOREIGN KEY (a, b) REFERENCES p (x, y)` con lookup O(log n) via fingerprint K2 — ver [ADR-0023](adr/0023-multi-col-fk.md); `12` → `13` (bloque V) agregó un **discriminator byte por record del catalog** (`0x01 = table`, `0x02 = view`) y el persiste `ViewMeta { name, source_sql, column_aliases }` para vistas lógicas — ver [ADR-0025](adr/0025-logical-views.md). Las DBs de versiones anteriores son rechazadas explícitamente al abrir con `[GBY-1003]`.
 
 ---
 
@@ -24,7 +24,7 @@
 | Offset | Significado |
 |---|---|
 | `0..7` | magic |
-| `8..11` | versión `u32` little-endian (debe ser `8`) |
+| `8..11` | versión `u32` little-endian (debe ser `13`) |
 | `12..13` | page size `u16` little-endian (debe ser `4096`) |
 | `16..19` | page count `u32` little-endian |
 | `20..23` | `catalog_root_page` `u32` little-endian |
@@ -119,9 +119,11 @@ Cada `TableMeta` contiene:
 - página raíz de la tabla (root de su B+Tree)
 - lista de `IndexMeta { name, column, root_page, unique, kind }` (vacía si la tabla no tiene índices secundarios). `kind: IndexKind` es `Hash` (default; el bucket vive en un B+Tree hash-keyed) u `OrderedInt` (clave física = valor `INT`; habilita `BETWEEN` por índice).
 
-Layout binario v8 por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`. Cada `TableMeta` además persiste `[pk_count:u8]` columnas PK (≥1; >1 implica PK compuesta all-INT NOT NULL, K2) y cada `IndexMeta` persiste `[extra_cols_count:u8]` columnas extra (>0 implica índice compuesto all-INT). Ver [ADR-0019](adr/0019-composite-pk-and-index.md).
+Layout binario v13 por record del catalog: cada entry comienza con un **discriminator byte** (`0x01 = TableMeta`, `0x02 = ViewMeta`, bloque V/ADR-0025). Para tablas, el cuerpo es el `TableMeta` clásico extendido. Por columna: `[name][type_code:u8][flags:u8]` seguido del payload del default cuando `flags & 0x02`, y del payload del FK cuando `flags & 0x04`. Bits: `0x01 = NOT NULL`, `0x02 = HAS_DEFAULT`, `0x04 = HAS_FK`. Cada `TableMeta` además persiste `[pk_count:u8]` columnas PK (≥1; >1 implica PK compuesta all-INT NOT NULL, K2), un `pk_name: Option<String>` (residual #2/V11) y cada `IndexMeta` persiste `[extra_cols_count:u8]` columnas extra (>0 implica índice compuesto all-INT) + `name: Option<String>`.
 - Default: `[kind:u8] + payload` (kinds: 0 Null, 1 Int, 2 Float, 3 Bool, 4 String).
-- FK: `[target_table:string][target_column:string][on_delete:u8]` con `0 = RESTRICT`, `1 = CASCADE`.
+- FK (V12+): `[target_table:string][target_column:string][on_delete:u8][on_update:u8][extra_source_count:u8][extra_source_cols...][extra_target_count:u8][extra_target_cols...][fk_name:opt_string]`. Acciones (V9+): `0 = RESTRICT`, `1 = CASCADE`, `2 = SET NULL`, `3 = SET DEFAULT`, `4 = NO ACTION`. `extra_*_count > 0` indica FK multi-col (residual #3/V12).
+- CHECK trailer (V10+): por `TableMeta` se persiste `[check_count:u16] + check_count × ([name:opt_string][source_sql:string])`; el cuerpo se reparsea a `Expr` en cada open via `parse_expr_str` (L2/ADR-0021).
+- ViewMeta (V13+): `[discriminator:0x02][name:string][source_sql:string][col_aliases_count:u16][aliases...]`.
 
 El catálogo direcciona por **FNV-1a-64** del nombre normalizado (trim + lowercase). Una colisión de hash devuelve error explícito al abrir.
 
@@ -202,7 +204,7 @@ Enforcement en runtime:
 - la PK puede ser una sola columna `INT` escalar o un grupo compuesto `(a, b, ...)` all-INT NOT NULL declarado table-level (K2, VERSION 8); en cualquier caso es implícitamente `NOT NULL`
 - la PK no puede ser `NULL`
 - una PK duplicada devuelve error en `INSERT`
-- `UPDATE` no permite mutar la PK
+- `UPDATE` regular permite mutar la PK desde residual #4 (re-encode + move de la fila + cascade `ON UPDATE` con todas las acciones); `UPSERT DO UPDATE` sigue rechazándolo (`[GBY-4008]`)
 - `UPDATE` y `DELETE` sobre una PK inexistente retornan error explícito
 - columnas no presentes en `INSERT` toman su `DEFAULT` si lo tienen; si no, quedan en `NULL`
 - filas previas a un `ALTER TABLE ADD COLUMN` se decodifican con el `DEFAULT` de la columna nueva (o `NULL` si no tiene); se materializan en disco en el próximo `UPDATE`
@@ -218,13 +220,16 @@ Enforcement en runtime:
 - `CREATE DATABASE [IF NOT EXISTS] <name>` *(server multi-DB / CLI; intercept antes de abrir Pager)*
 - `DROP DATABASE [IF EXISTS] <name>`
 - `SHOW DATABASES`
-- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]`, y `PRIMARY KEY (a, b, ...)` table-level (K2, all-INT NOT NULL)
+- `CREATE TABLE` con constraints inline `PRIMARY KEY` / `NOT NULL` / `UNIQUE` / `DEFAULT <literal>` / `CHECK (expr)` / `REFERENCES <tabla>(<col>) [ON DELETE <action>] [ON UPDATE <action>]` con `<action>` ∈ `RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION` (L1/V9 + residual #4 que activó `ON UPDATE`). Constraints table-level: `PRIMARY KEY (a, b, ...)` (K2, all-INT NOT NULL), `UNIQUE (a, b, ...)`, `CHECK (expr)` (L2), `FOREIGN KEY (a, b) REFERENCES p (x, y) [ON DELETE...] [ON UPDATE...]` (residual #3/V12). Nombres opcionales con `CONSTRAINT <name>` para PK/UNIQUE/FK/CHECK (residual #2/V11).
 - `CREATE TABLE [IF NOT EXISTS] [(col_aliases)] AS <select_query>` (CTAS, K1)
 - `DROP TABLE [IF EXISTS] <name>` (catalog-only; páginas backing no liberadas)
 - `ALTER TABLE <name> ADD [COLUMN] <coldef>` (sin reescritura de filas previas)
 - `ALTER TABLE <name> DROP COLUMN [IF EXISTS] <col>` (K1; bloqueado sobre PK / indexada / FK)
 - `ALTER TABLE <name> RENAME COLUMN <old> TO <new>` (K1; arrastra PK + índices + FKs entrantes)
 - `ALTER TABLE <name> RENAME TO <new>` / `RENAME TABLE <old> TO <new>` (K1)
+- `ALTER TABLE <name> ADD [CONSTRAINT <cname>] CHECK (<expr>)` con re-validación O(n) full-scan (L3)
+- `ALTER TABLE <name> DROP CONSTRAINT [IF EXISTS] <cname>` (residual #2/V11; resuelve CHECK / UNIQUE / FK por nombre; PK rechazada con `[GBY-4072]`, no encontrado con `[GBY-4071]`)
+- `CREATE VIEW [IF NOT EXISTS] <name> [(col_aliases)] AS <select>` y `DROP VIEW [IF EXISTS] <name>` (bloque V/V13; read-only, source debe ser SELECT simple, cycle guard `MAX_VIEW_DEPTH = 32`)
 - `INSERT INTO ... VALUES (...)`
 - `SELECT ... FROM ... [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n]`
 - `WHERE` con la siguiente gramática (idéntica en `SELECT`, `UPDATE`, `DELETE` desde el bloque E3, extendida por G2/G3/H):
@@ -263,8 +268,9 @@ Enforcement en runtime:
 - Optimización indexada para operadores no-`=`/no-`BETWEEN` (`<`, `>`, `LIKE`, `IN literal`) — hoy cae a FullScan aunque la columna tenga índice
 - Subqueries `ALL` / `ANY` / `SOME`, correlated `col = outer.col` puro fuera de `EXISTS`, `LATERAL`
 - `JOIN` con predicados no-equi en `ON` (`<`, `>`, multi-cond con `AND`), `USING` multi-columna, `NATURAL` con >1 columna común
-- PK / índices compuestos con columnas no-INT o nullables (K2 sólo all-INT NOT NULL); range scan sobre claves compuestas; partial indexes; `ALTER COLUMN TYPE`; ALTER PK sobre tabla existente; FK multi-col
-- `UPDATE ... FROM otra_tabla` (UPDATE con JOIN), `DELETE ... JOIN`, `EXCLUDED.col` en UPSERT
+- PK / índices compuestos con columnas no-INT o nullables (K2 sólo all-INT NOT NULL); range scan sobre claves compuestas; partial indexes; `ALTER COLUMN TYPE`; ALTER PK sobre tabla existente
+- `UPDATE ... FROM otra_tabla` (UPDATE con JOIN), `DELETE ... JOIN`, `EXCLUDED.col` en UPSERT (UPSERT DO UPDATE sigue rechazando mutar la PK; el UPDATE regular sí la permite desde residual #4)
+- Subqueries dentro de `CHECK (expr)` — rechazadas con `[GBY-4069]`
 - Unary `-` / `+` prefix sobre expresiones; `SAVEPOINT` / isolation levels / read-only tx / cross-request tx
 
 ---

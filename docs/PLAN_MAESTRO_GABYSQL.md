@@ -141,7 +141,7 @@ Corromper compatibilidad de archivos o recovery.
 
 ## Fase 2 — Correctitud funcional básica
 
-> **Estado**: superficie SQL relacional clásica cerrada el 2026-05-25. Bloques entregados en esta sesión: E1+E2+E3 (`WHERE` compuesto + comparadores E2 + `UPDATE`/`DELETE` multi-fila), F (agregados + `GROUP BY`/`HAVING`/`DISTINCT`), T (`BEGIN`/`COMMIT`/`ROLLBACK` explícito batch-local), J+J2 (multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, UPSERT, `REPLACE INTO`, `RETURNING`). Pendientes priorizados: bloques G (funciones escalares), H (subqueries restantes), I (set ops), K (DDL faltante incluyendo índices compuestos), L (constraints CHECK/SET NULL).
+> **Estado**: superficie SQL relacional clásica cerrada el 2026-05-25, completada el 2026-05-27. Bloques entregados 2026-05-25: E1+E2+E3, F, T, J+J2. 2026-05-26: G1+G2+G3, H, I, K1+K2 (VERSION 8). 2026-05-27 (5 pushes, VERSION 8→13): L1 (FK actions + UNIQUE multi-col, V9), L2 (CHECK column/table-level, V10), L3 (`ALTER TABLE ADD CHECK`), residual #2 (named constraints + `DROP CONSTRAINT`, V11), residual #3 (FK multi-col, V12), residual #4 (`ON UPDATE` activo + UPDATE de PK), bloque V (vistas lógicas, V13). Pendientes priorizados: bloque W (CTE + window functions).
 
 ### Objetivo
 Completar las operaciones esenciales del motor y dejar reglas de datos más serias.

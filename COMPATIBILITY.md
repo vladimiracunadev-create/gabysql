@@ -48,7 +48,12 @@
 
 | `VERSION` del header | Estado | Notas |
 | :--- | :--- | :--- |
-| `8` | 🟢 Actual | Extiende `TableMeta.primary_key` y `IndexMeta.column` a múltiples columnas: `PRIMARY KEY (a, b, ...)` table-level y `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)` (K2, all-INT NOT NULL, equality-only via fingerprint FNV-1a-64, ADR-0019). |
+| `13` | 🟢 Actual | Bloque V (2026-05-27). Catalog gana un **discriminator byte por record** (table vs view) y persiste `ViewMeta { name, source_sql, column_aliases }`. Habilita `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v` (ADR-0025). Rechaza VERSION 12 con `[GBY-1003]`. |
+| `12` | 🔴 Rechazado | Residual #3 (2026-05-27). `ForeignKeyMeta` gana `extra_source_columns` + `extra_target_columns` para FK multi-col `FOREIGN KEY (a, b) REFERENCES p (x, y)`; lookup O(log n) via fingerprint K2 (ADR-0023). Migrar via backup + dump + recreate. |
+| `11` | 🔴 Rechazado | Residual #2 (2026-05-27). Persiste nombres opcionales para PK/UNIQUE/FK/CHECK (`pk_name`, `fk_name`, etc.) y habilita `ALTER TABLE DROP CONSTRAINT [IF EXISTS] <name>` (ADR-0022). Migrar via backup + dump + recreate. |
+| `10` | 🔴 Rechazado | Bloque L2 (2026-05-27). Agregaba `CHECK (expr)` column-level y table-level, persistido como texto canónico vía `format_expr` (ADR-0021). Migrar via backup + dump + recreate. |
+| `9` | 🔴 Rechazado | Bloque L1 (2026-05-27). Extendía `ForeignKeyMeta` con `on_delete` ampliado (`SET NULL` / `SET DEFAULT` / `NO ACTION`) y nuevo campo `on_update` con las cinco acciones referenciales (ADR-0020). Migrar via backup + dump + recreate. |
+| `8` | 🔴 Rechazado | Extendía `TableMeta.primary_key` y `IndexMeta.column` a múltiples columnas: `PRIMARY KEY (a, b, ...)` table-level y `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)` (K2, all-INT NOT NULL, equality-only via fingerprint FNV-1a-64, ADR-0019). |
 | `7` | 🔴 Rechazado | Agregaba `kind: IndexKind` (`Hash` \| `OrderedInt`) a `IndexMeta`: índices sobre columnas `INT` ordenados con `BETWEEN` por índice (ADR-0017). Migrar via backup + dump + recreate. |
 | `6` | 🔴 Rechazado | Agregaba `FOREIGN KEY` por columna (target table + column + ON DELETE RESTRICT/CASCADE). Recrear DB con binario actual. |
 | `5` | 🔴 Rechazado | Agregaba `NOT NULL` + `DEFAULT` por columna y `unique` por índice. Recrear DB con binario actual. |

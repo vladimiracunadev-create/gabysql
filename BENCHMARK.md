@@ -2,7 +2,7 @@
 
 > **Evaluación profesional de desempeño** sobre `main`. Tres escenarios sintéticos representativos (OLTP-like, analítica mediana, K2 PK compuesta) corridos en una sola máquina, con metodología reproducible y caveats honestos.
 >
-> 📌 **Corrida vigente**: sesión **2026-05-27**, commit `87583a8` (post bloques G/H/I/K1/K2).
+> 📌 **Corrida vigente**: sesión **2026-05-27**, commit `87583a8` (post bloques G/H/I/K1/K2; previa a L1+L2+L3 + residuales + V de la misma fecha que llevaron VERSION 8 → 13).
 >
 > 📂 **Convención**: este archivo se actualiza in-place a medida que el motor mejora. Corridas previas se archivan en `docs/benchmarks/BENCHMARK-YYYY-MM-DD.md` solo cuando hay un cambio de fondo que justifica mantener el snapshot histórico para comparar (e.g. fix de un issue importante, bump de VERSION en disco, cambio de hardware del runner). Mientras tanto, este es el único reporte.
 

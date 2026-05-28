@@ -37,10 +37,10 @@ cargo run --release --bin gabysql -- init demo.db
 
 ---
 
-## 🔢 `unsupported gabysql file format: version=N (expected 8)`
+## 🔢 `unsupported gabysql file format: version=N (expected 13)`
 
 ### Causa
-Intentas abrir un archivo con una versión de formato anterior. La versión actual es `8`. Las versiones `1` a `7` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`, `7` agregó `IndexKind` para índices INT-ordenados, `8` agregó PK e índices compuestos all-INT — K2, ADR-0019). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
+Intentas abrir un archivo con una versión de formato anterior. La versión actual es `13`. Las versiones `1` a `12` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`, `7` agregó `IndexKind` para índices INT-ordenados, `8` agregó PK e índices compuestos all-INT — K2, ADR-0019, `9` agregó FK actions extendidas + `ON UPDATE` — L1/ADR-0020, `10` agregó `CHECK` — L2/ADR-0021, `11` agregó nombres de constraint + `DROP CONSTRAINT` — residual #2/ADR-0022, `12` agregó FK multi-col — residual #3/ADR-0023, `13` agregó vistas lógicas + discriminator byte — bloque V/ADR-0025). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
 
 ### Solución
 - Re-crear la base con el binario actual: `gabysql init <file.db>`.
@@ -402,6 +402,70 @@ php -S localhost:8000 -t web
 ```powershell
 docker compose up -d --build
 ```
+
+---
+
+## 🧱 Errores de CHECK constraints (L2 / L3)
+
+### `[GBY-3008] CHECK_VIOLATED`
+La fila viola un `CHECK (expr)` declarado en `CREATE TABLE`, agregado por `ALTER TABLE ADD CHECK`, o evaluado durante UPSERT/cascade.
+
+**Resolución**:
+- Ajustar el valor para que satisfaga la expresión, o
+- Si el CHECK ya no aplica al negocio, removerlo con `ALTER TABLE <t> DROP CONSTRAINT <name>` (requiere nombre — re-declarar el CHECK con `CONSTRAINT <name> CHECK (...)` si fue creado anónimo).
+
+### `[GBY-3009] FK_SET_NULL_VIOLATES_NOT_NULL`
+La cascada `ON DELETE SET NULL` / `ON UPDATE SET NULL` intentaría poner NULL en la columna FK del hijo, pero esa columna está declarada `NOT NULL`. Borrar los hijos primero, o redeclarar la columna del hijo como nullable, o cambiar la acción a `CASCADE` / `SET DEFAULT`.
+
+### `[GBY-3010] FK_SET_DEFAULT_MISSING`
+La cascada `SET DEFAULT` no encuentra un `DEFAULT` declarado en la columna FK del hijo (o el DEFAULT es NULL con `NOT NULL`). Declarar un DEFAULT compatible o cambiar la acción.
+
+### `[GBY-4069]` subquery dentro de CHECK
+El AST del CHECK no admite subqueries (ANSI tampoco las exige). Reescribir como FK o trigger lógico desde la aplicación.
+
+### `[GBY-4070]` CHECK fuera de contexto soportado
+Aparece si el parser ve un `CHECK` en una forma sintáctica no contemplada.
+
+---
+
+## 🏷️ Errores de constraints nombradas (residual #2)
+
+### `[GBY-4071] CONSTRAINT_NOT_FOUND`
+`ALTER TABLE <t> DROP CONSTRAINT <name>` con un nombre que no existe.
+
+**Resolución**: usar `DROP CONSTRAINT IF EXISTS <name>` para volverlo no-op, o consultar `INTEGRITY CHECK` / `phpgabyadmin` → Structure para ver los nombres reales.
+
+### `[GBY-4072] CANNOT_DROP_PRIMARY_KEY_CONSTRAINT`
+No se puede dropear la PK de una tabla. Crear una tabla nueva, copiar las filas y reemplazar (workaround manual; `ALTER PK` está en backlog).
+
+---
+
+## 🔁 Errores de UPDATE de PK con cascade (residual #4)
+
+### `[GBY-4073] FK_RESTRICT_BLOCKS_UPDATE`
+El UPDATE quiere cambiar la PK pero hay hijos con FK `ON UPDATE RESTRICT` o `NO ACTION`. Borrar primero los hijos, o redeclarar la FK con `ON UPDATE CASCADE` / `SET NULL` / `SET DEFAULT` (requiere recrear la tabla en esta versión).
+
+### `[GBY-4074] FK_UPDATE_CASCADE_AFFECTS_CHILD_PK`
+La cascada `ON UPDATE CASCADE` propagaría el cambio a una columna que es PK del hijo. Como el motor evita corrupción de PKs por efecto colateral, se aborta. Romper la cadena: usar `SET NULL` en la FK del hijo o resolver la actualización manualmente en dos pasos.
+
+### `[GBY-4008] UPDATE_PK_NOT_ALLOWED`
+Vivo únicamente en el path `UPSERT ... DO UPDATE SET pk = ...`. El UPDATE regular permite cambiar la PK desde residual #4; mover el `SET pk = ...` a una sentencia `UPDATE` plana.
+
+---
+
+## 👁️ Errores de vistas (bloque V)
+
+### `[GBY-4075] VIEWS_ARE_READONLY`
+Se intentó `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` sobre una vista. Las vistas son read-only en esta versión. Mutar la tabla base.
+
+### `[GBY-4076] VIEW_DEPTH_EXCEEDED`
+La expansión de una vista referenció otra vista que referenció otra... más allá de `MAX_VIEW_DEPTH = 32`. Suele indicar un ciclo (`A` usa `B`, `B` usa `A`). Romper el ciclo con `DROP VIEW`.
+
+### `[GBY-4077] NAME_ALREADY_EXISTS`
+`CREATE VIEW v` con `v` ya tomado por una tabla (o viceversa). Renombrar la nueva vista o `DROP` el objeto previo.
+
+### `[GBY-4078] VIEW_SOURCE_NOT_SIMPLE_SELECT`
+La fuente de `CREATE VIEW v AS ...` no es un SELECT simple (e.g. `UNION`, `VALUES`). Reescribir como SELECT plano; si se necesita combinar, hacerlo en el SELECT que consulta la vista.
 
 ---
 

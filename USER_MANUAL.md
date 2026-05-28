@@ -68,12 +68,15 @@ CREATE TABLE orders (
 );
 ```
 
-Constraints disponibles por columna (gabysql `VERSION 8+`):
-- `PRIMARY KEY` — escalar `INT` inline, o compuesta `PRIMARY KEY (a, b, ...)` table-level (K2, all-INT NOT NULL, equality-only via fingerprint FNV-1a-64). Implícitamente `NOT NULL`.
+Constraints disponibles (gabysql `VERSION 13+`):
+- `PRIMARY KEY` — escalar `INT` inline, o compuesta `PRIMARY KEY (a, b, ...)` table-level (K2, all-INT NOT NULL, equality-only via fingerprint FNV-1a-64). Implícitamente `NOT NULL`. `CONSTRAINT <name> PRIMARY KEY (...)` con nombre explícito desde residual #2.
 - `NOT NULL` — rechaza `NULL` literal y omisión sin DEFAULT.
-- `UNIQUE` — auto-genera índice unique `uq_<tabla>_<col>`. Múltiples NULL permitidos.
+- `UNIQUE` — inline o table-level `UNIQUE (a, b, ...)` (L1, multi-col reusa el encoder K2). `CONSTRAINT <name> UNIQUE (...)` con nombre explícito desde residual #2.
 - `DEFAULT <literal>` — INT/FLOAT/BOOL/TEXT/DATE/DATETIME/JSON o `NULL`. Tipo validado al CREATE.
-- `REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]` — single-column FK; el target debe ser la PK del parent.
+- `REFERENCES <tabla>(<col>)` — single-col FK inline en una columna. Para FK multi-col usar la forma table-level `FOREIGN KEY (a, b) REFERENCES p (x, y)` (residual #3). Acciones admitidas: `ON DELETE RESTRICT|CASCADE|SET NULL|SET DEFAULT|NO ACTION` (L1) y `ON UPDATE RESTRICT|CASCADE|SET NULL|SET DEFAULT|NO ACTION` (L1 + residual #4 activación real). Target debe ser la PK del parent (single o compuesta). `CONSTRAINT <name> FOREIGN KEY ...` con nombre explícito desde residual #2.
+- `CHECK (expr)` — column-level y table-level (L2). 3VL ANSI: NULL pasa, sólo FALSE rebota (`[GBY-3008]`). Sin subqueries (`[GBY-4069]`). Soporta cualquier `Expr` re-parseable (escalares G1+G2+G3, aritméticos, CASE, etc.). `CONSTRAINT <name> CHECK (...)` con nombre explícito.
+- `ALTER TABLE <t> ADD [CONSTRAINT name] CHECK (expr)` (L3) — agregar CHECK a una tabla existente con re-validación full-scan O(n).
+- `ALTER TABLE <t> DROP CONSTRAINT [IF EXISTS] <name>` (residual #2) — borra CHECK, UNIQUE, o FK con nombre. PK rechazada con `[GBY-4072]`.
 
 ### DDL — `CREATE TABLE AS SELECT`, `DROP TABLE`, `ALTER TABLE`, `RENAME TABLE`
 ```sql
@@ -250,7 +253,7 @@ Devuelve un JSON con `started_unix`, `uptime_s`, `requests_total`, `requests_by_
 
 ## 5. 📐 `gabymodeler v2` — modelador web (PowerDesigner-style)
 
-`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 8`.
+`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 13`.
 
 ### Levantarlo
 ```bash
