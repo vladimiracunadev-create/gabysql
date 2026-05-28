@@ -7357,6 +7357,262 @@ fn k2_index_composite_drop() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque L1 (2026-05-27): FK ON DELETE SET NULL/SET DEFAULT,
+// ON UPDATE parser + multi-col UNIQUE table-level. -----
+
+fn l1_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("l1-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn l1_fk_on_delete_set_null_sets_child_to_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("setnull-ok")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent(id) ON DELETE SET NULL
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id,name) VALUES (1,'p');")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (11,1);")?;
+
+    run_sql(&db, "DELETE FROM parent WHERE id = 1;")?;
+
+    let res = run_sql(&db, "SELECT id, parent_id FROM child ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    for row in &res[0].rows {
+        assert!(
+            matches!(row[1], Value::Null),
+            "parent_id debería ser NULL, got {:?}",
+            row[1]
+        );
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_fk_on_delete_set_null_rejects_when_child_col_not_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("setnull-notnull")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT NOT NULL REFERENCES parent(id) ON DELETE SET NULL
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+
+    let err = run_sql(&db, "DELETE FROM parent WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3009"),
+        "esperaba GBY-3009, got: {}",
+        err
+    );
+    // Y la fila del child sigue intacta (no hubo write parcial).
+    let res = run_sql(&db, "SELECT parent_id FROM child WHERE id = 10;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_fk_on_delete_set_default_uses_declared_default() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("setdefault-ok")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (99);")?; // el "huérfano" default
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT NOT NULL DEFAULT 99
+                REFERENCES parent(id) ON DELETE SET DEFAULT
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+    run_sql(&db, "DELETE FROM parent WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT parent_id FROM child WHERE id = 10;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_fk_on_delete_set_default_rejects_when_no_default() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("setdefault-missing")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent(id) ON DELETE SET DEFAULT
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+    let err = run_sql(&db, "DELETE FROM parent WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3010"),
+        "esperaba GBY-3010, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_fk_no_action_is_alias_of_restrict() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("noaction")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent(id) ON DELETE NO ACTION
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+    let err = run_sql(&db, "DELETE FROM parent WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("RESTRICT"),
+        "NO ACTION debe comportarse como RESTRICT, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_fk_on_update_parsed_and_roundtrips() -> Result<(), Box<dyn Error>> {
+    // Bloque L1: ON UPDATE se acepta sintácticamente y persiste en
+    // catálogo. Como gabysql prohíbe UPDATE de la PK, no se dispara,
+    // pero el round-trip por close+open valida que el byte sobrevive.
+    let (db, wal) = l1_setup("onupdate")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent(id)
+                ON DELETE CASCADE ON UPDATE SET NULL
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    run_sql(&db, "INSERT INTO child (id,parent_id) VALUES (10,1);")?;
+    // Reopen → si el byte on_update se hubiera perdido, deserializar
+    // habría errored. Hacemos un SELECT como smoke check.
+    let res = run_sql(&db, "SELECT id FROM child;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_fk_on_update_after_on_delete_in_any_order() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("order-fk-actions")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    // ON UPDATE antes que ON DELETE: el parser tiene que aceptar ambos.
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES parent(id)
+                ON UPDATE CASCADE ON DELETE CASCADE
+         );",
+    )?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_unique_multi_column_table_level_rejects_duplicate_combo() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("unique-multi")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id INT PRIMARY KEY,
+            a INT NOT NULL,
+            b INT NOT NULL,
+            UNIQUE (a, b)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO t (id,a,b) VALUES (1,10,20);")?;
+    // Misma combinación (10, 20) → debe rebotar.
+    let err = run_sql(&db, "INSERT INTO t (id,a,b) VALUES (2,10,20);").unwrap_err();
+    assert!(
+        err.to_string().contains("UNIQUE") || err.to_string().contains("GBY-3003"),
+        "esperaba violación UNIQUE, got: {}",
+        err
+    );
+    // Una de las dos columnas distinta sí se admite.
+    run_sql(&db, "INSERT INTO t (id,a,b) VALUES (3,10,21);")?;
+    run_sql(&db, "INSERT INTO t (id,a,b) VALUES (4,11,20);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_unique_single_column_table_level_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l1_setup("unique-single-table-level")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, email TEXT, UNIQUE (email));",
+    )?;
+    run_sql(&db, "INSERT INTO t (id,email) VALUES (1,'a@b.com');")?;
+    let err = run_sql(&db, "INSERT INTO t (id,email) VALUES (2,'a@b.com');").unwrap_err();
+    assert!(
+        err.to_string().contains("UNIQUE") || err.to_string().contains("GBY-3003"),
+        "esperaba violación UNIQUE, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l1_v8_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
+    // Smoke check del bump 8→9: bajar el byte de version en el header
+    // a 8 a mano y reabrir → rechazo (checksum o version).
+    let db = temp_db_path("l1-v9-bump");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY);")?;
+
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&8u32.to_le_bytes())?;
+    drop(f);
+
+    let err = match Pager::open(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::open to refuse v8 file post-L1"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
+        "expected refusal, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

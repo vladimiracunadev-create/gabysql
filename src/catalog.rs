@@ -178,9 +178,12 @@ const COLUMN_FLAG_HAS_DEFAULT: u8 = 0x02;
 const COLUMN_FLAG_HAS_FK: u8 = 0x04;
 
 /// Action to take when the parent row a `FOREIGN KEY` points at is
-/// deleted. SQL standard offers more (SET NULL / SET DEFAULT / NO
-/// ACTION); this version supports the two that cover the vast majority
-/// of real schemas.
+/// deleted.
+///
+/// Bloque L (VERSION 9): extendido con `SetNull` y `SetDefault`. El
+/// código binario en disco es estable (0=Restrict, 1=Cascade, 2=SetNull,
+/// 3=SetDefault). `NO ACTION` del estándar se acepta como sinónimo de
+/// `Restrict` (no hay constraint mode diferido todavía).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnDelete {
     /// Refuse the parent DELETE if any child row still references it.
@@ -190,22 +193,35 @@ pub enum OnDelete {
     /// deletes can chain through several tables; the engine guards
     /// against cycles using a visited set on `(table, pk)`.
     Cascade,
+    /// Bloque L: poner NULL en la columna FK de cada fila hija. Falla
+    /// con `[GBY-3009] FK_SET_NULL_VIOLATES_NOT_NULL` si la columna del
+    /// child está declarada `NOT NULL`.
+    SetNull,
+    /// Bloque L: reasignar la columna FK de cada fila hija a su DEFAULT
+    /// declarado. Falla con `[GBY-3010] FK_SET_DEFAULT_MISSING` si no
+    /// hay DEFAULT en esa columna.
+    SetDefault,
 }
 
 impl OnDelete {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Self::Restrict => 0,
             Self::Cascade => 1,
+            Self::SetNull => 2,
+            Self::SetDefault => 3,
         }
     }
 
-    fn from_code(code: u8) -> DbResult<Self> {
+    pub(crate) fn from_code(code: u8) -> DbResult<Self> {
         match code {
             0 => Ok(Self::Restrict),
             1 => Ok(Self::Cascade),
+            2 => Ok(Self::SetNull),
+            3 => Ok(Self::SetDefault),
             other => Err(DbError::new(format!(
-                "FOREIGN KEY on_delete code desconocido en disco: {} (esperaba 0=RESTRICT o 1=CASCADE)",
+                "FOREIGN KEY on_delete code desconocido en disco: {} \
+                 (esperaba 0=RESTRICT, 1=CASCADE, 2=SET NULL, 3=SET DEFAULT)",
                 other
             ))),
         }
@@ -215,6 +231,59 @@ impl OnDelete {
         match self {
             Self::Restrict => "RESTRICT",
             Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+        }
+    }
+}
+
+/// Bloque L (VERSION 9): acción a aplicar cuando se actualiza la PK del
+/// padre referenciado por una FK. Como gabysql prohíbe UPDATE sobre la
+/// PRIMARY KEY (`[GBY-4008] UPDATE_PK_NOT_ALLOWED`), hoy el motor sólo
+/// persiste el byte para que el catálogo roundtrippee y un release
+/// futuro lo pueda activar sin otro bump de formato. `NoAction` es el
+/// default cuando se omite `ON UPDATE`, igual que en ANSI/PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUpdate {
+    NoAction,
+    Cascade,
+    SetNull,
+    SetDefault,
+    Restrict,
+}
+
+impl OnUpdate {
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::NoAction => 0,
+            Self::Cascade => 1,
+            Self::SetNull => 2,
+            Self::SetDefault => 3,
+            Self::Restrict => 4,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> DbResult<Self> {
+        match code {
+            0 => Ok(Self::NoAction),
+            1 => Ok(Self::Cascade),
+            2 => Ok(Self::SetNull),
+            3 => Ok(Self::SetDefault),
+            4 => Ok(Self::Restrict),
+            other => Err(DbError::new(format!(
+                "FOREIGN KEY on_update code desconocido en disco: {} (esperaba 0..=4)",
+                other
+            ))),
+        }
+    }
+
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::NoAction => "NO ACTION",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+            Self::Restrict => "RESTRICT",
         }
     }
 }
@@ -229,6 +298,11 @@ pub struct ForeignKeyMeta {
     pub table: String,
     pub column: String,
     pub on_delete: OnDelete,
+    /// Bloque L (VERSION 9): acción al actualizar la PK del padre.
+    /// `NoAction` para FKs creadas pre-L (default cuando se omite
+    /// `ON UPDATE`). Se persiste como byte a continuación del
+    /// `on_delete` en el record on-disk.
+    pub on_update: OnUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,7 +475,7 @@ impl TableMeta {
             .any(|c| c.eq_ignore_ascii_case(column))
     }
 
-    /// VERSION = 8 on-disk layout for a TableMeta record:
+    /// VERSION = 9 on-disk layout for a TableMeta record:
     ///
     ///     [name]
     ///     [pk_count:u8] · pk_count × [pk_col_name]   (pk_count >= 1)
@@ -409,19 +483,21 @@ impl TableMeta {
     ///     [col_count:u16] · col_count × {
     ///         [name][type_code:u8][flags:u8]
     ///         flags & 0x02 ? DefaultLiteral payload : ∅
-    ///         flags & 0x04 ? [target_table][target_column][on_delete:u8] : ∅
+    ///         flags & 0x04 ? [target_table][target_column]
+    ///                        [on_delete:u8][on_update:u8] : ∅
     ///     }
     ///     [idx_count:u16] · idx_count × {
     ///         [name][column][root_page:u32][unique:u8][kind:u8]
     ///         [extra_cols_count:u8] · extra × [extra_col_name]   (>= 0)
     ///     }
     ///
-    /// Cambios vs VERSION 7:
-    ///   - La PK pasa de `[string]` a `[u8:count][string × count]`
-    ///     (count siempre >= 1; el caso 1 mapea exactamente al pre-K2).
-    ///   - Cada `IndexMeta` añade al final `[u8:extra_count][string × extra]`
-    ///     para soportar índices compuestos (extra = 0 → equivalente al
-    ///     formato pre-K2).
+    /// Cambios vs VERSION 8 (Bloque L1):
+    ///   - Cada FK record añade un byte `[on_update:u8]` después de
+    ///     `[on_delete:u8]`. Las FKs creadas pre-L se materializan con
+    ///     `OnUpdate::NoAction` (byte 0).
+    ///   - El catálogo de `OnDelete` admite ahora códigos 2=SET NULL y
+    ///     3=SET DEFAULT. V8 sólo persistía 0/1 — el upgrade es
+    ///     forward-compatible en lectura para esos códigos.
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
         push_string(&mut out, &self.name)?;
@@ -463,6 +539,7 @@ impl TableMeta {
                 push_string(&mut out, &fk.table)?;
                 push_string(&mut out, &fk.column)?;
                 out.push(fk.on_delete.code());
+                out.push(fk.on_update.code());
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -555,10 +632,20 @@ impl TableMeta {
                 }
                 let on_delete = OnDelete::from_code(data[offset])?;
                 offset += 1;
+                // Bloque L1 (VERSION 9): byte `on_update` a continuación.
+                if offset >= data.len() {
+                    return Err(DbError::new(format!(
+                        "FOREIGN KEY corrupta en '{}.{}': faltan bytes para on_update en offset {}",
+                        name, col_name, offset
+                    )));
+                }
+                let on_update = OnUpdate::from_code(data[offset])?;
+                offset += 1;
                 Some(ForeignKeyMeta {
                     table: target_table,
                     column: target_column,
                     on_delete,
+                    on_update,
                 })
             } else {
                 None

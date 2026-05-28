@@ -6,6 +6,73 @@
 
 ---
 
+## 2026-05-27 — Bloque L1: FK referential actions + UNIQUE multi-col table-level (VERSION 8 → 9)
+
+> **Un push a `main`** que cierra el sub-bloque L1 del roadmap: extender las acciones referenciales de `FOREIGN KEY` y exponer `UNIQUE (a, b, ...)` table-level. Bump VERSION 8 → 9 con rechazo limpio de DBs V8 vía `[GBY-1003]`. Ver [ADR-0020](docs/adr/0020-fk-referential-actions.md) para la decisión y limitaciones. El sub-bloque L2 (`CHECK (expr)`) queda diferido a una entrega aparte.
+
+### 🆕 Sintaxis
+
+- `FOREIGN KEY` extendido:
+  - `REFERENCES t(c) ON DELETE SET NULL` — pone NULL en el child (`[GBY-3009]` si la columna es NOT NULL).
+  - `REFERENCES t(c) ON DELETE SET DEFAULT` — reasigna al DEFAULT declarado (`[GBY-3010]` si no hay DEFAULT).
+  - `REFERENCES t(c) ON DELETE NO ACTION` — alias de `RESTRICT` en este release.
+  - `REFERENCES t(c) ON UPDATE <action>` — acepta `RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION`; **se persiste pero no se dispara hoy** (la PK del padre es inmutable por `[GBY-4008]`).
+  - `ON DELETE` y `ON UPDATE` en cualquier orden (`ON UPDATE … ON DELETE …` tan válido como el revés).
+- `UNIQUE (a, b, ...)` declarada a nivel de tabla en `CREATE TABLE`:
+  - `CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b));`
+  - Materializa el mismo índice UNIQUE compuesto que `CREATE UNIQUE INDEX … ON t (a, b)` (K2). Single-col `UNIQUE (col)` también admitido como alias de UNIQUE inline.
+
+### 🛡️ Enforcement composite UNIQUE (parche K2)
+
+K2 entregó composite UNIQUE INDEX pero el INSERT/UPDATE/DELETE chequeaba sólo el bucket de la primera columna. L1 cierra el hueco: el path de write usa el fingerprint FNV-1a-64 completo. Helpers nuevos en `sql.rs`:
+
+- `composite_fp_for_values(meta, idx, values) -> i64`
+- `composite_unique_check(pager, idx, fp, exclude_pk)`
+- `composite_index_upsert(pager, root, fp, pk)`
+- `composite_index_remove(pager, root, fp, pk)`
+
+### 🚧 Limitaciones L1 (explícitas)
+
+- `ON UPDATE` se persiste pero **nunca dispara** — `UPDATE` sobre la PK del padre sigue rebotando con `[GBY-4008]`. El byte queda en disco para que un release futuro lo active sin otro bump.
+- `SET NULL` requiere que la columna FK del child admita NULL. Con `NOT NULL` se aborta con `[GBY-3009]` (sin rollback parcial: la validación es pre-write).
+- `SET DEFAULT` exige DEFAULT declarado. Sin él, `[GBY-3010]`. Con DEFAULT NULL y columna NOT NULL, `[GBY-3002]`.
+- `CHECK (expr)` queda diferido al **sub-bloque L2** (CHECK column-level y table-level, eval en INSERT/UPDATE/UPSERT).
+- Multi-column FK sigue fuera de scope (K2 limitation).
+- Migración V8 → V9 es manual: dump SELECT + recreate con binario L1.
+
+### 🔧 Catálogo
+
+- `OnDelete` extiende su rango de códigos: `0=Restrict, 1=Cascade, 2=SetNull, 3=SetDefault`.
+- `OnUpdate` nuevo enum: `0=NoAction, 1=Cascade, 2=SetNull, 3=SetDefault, 4=Restrict`.
+- `ForeignKeyMeta` añade `pub on_update: OnUpdate`.
+- En disco: cada FK record gana un byte `[on_update:u8]` a continuación de `[on_delete:u8]`.
+
+### 🆕 Errores
+
+- `[GBY-3009] FK_SET_NULL_VIOLATES_NOT_NULL`
+- `[GBY-3010] FK_SET_DEFAULT_MISSING`
+- (Reservado para L2) `[GBY-3008] CHECK_VIOLATED` — el código entra al catálogo en L1 para no romper la numeración cuando L2 cierre.
+
+### 🗄️ Formato en disco — VERSION 9
+
+```
+[name][pk_count:u8] · pk_count × [pk_col]
+[root_page:u32]
+[col_count:u16] · col × {
+    [name][type:u8][flags:u8]
+    flags & 0x02 ? DefaultLiteral : ∅
+    flags & 0x04 ? [target_table][target_column]
+                   [on_delete:u8][on_update:u8] : ∅       ← L1 añade on_update
+}
+[idx_count:u16] · idx × { … }
+```
+
+### 🧪 Tests nuevos (10)
+
+`l1_fk_on_delete_set_null_sets_child_to_null`, `l1_fk_on_delete_set_null_rejects_when_child_col_not_null`, `l1_fk_on_delete_set_default_uses_declared_default`, `l1_fk_on_delete_set_default_rejects_when_no_default`, `l1_fk_no_action_is_alias_of_restrict`, `l1_fk_on_update_parsed_and_roundtrips`, `l1_fk_on_update_after_on_delete_in_any_order`, `l1_unique_multi_column_table_level_rejects_duplicate_combo`, `l1_unique_single_column_table_level_works`, `l1_v8_db_rejected_with_unsupported_version`.
+
+---
+
 ## 2026-05-26 — Bloque K2: PK compuesta + índices compuestos (VERSION 7 → 8)
 
 > **Un push a `main`** que cierra el sub-bloque K2 del roadmap: el DDL que **sí** cambia el formato en disco. Habilita `PRIMARY KEY (a, b, ...)` (table-level) y `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`. Bump VERSION 7 → 8 con rechazo limpio de DBs viejas vía `[GBY-1003]`. Ver [ADR-0019](docs/adr/0019-composite-pk-and-index.md) para la decisión y limitaciones.

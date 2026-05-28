@@ -1,7 +1,7 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
-    ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, TableMeta,
+    ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate, TableMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -301,6 +301,11 @@ pub struct CreateTableStmt {
     /// (caso histórico). El validator (`validate_create_table`) exige
     /// que toda columna PK sea INT NOT NULL cuando hay más de una.
     pub primary_key_extra: Vec<String>,
+    /// Bloque L1 (2026-05-27): listas de columnas declaradas como
+    /// `UNIQUE (a, b, ...)` a nivel de tabla. Cada entrada se materializa
+    /// como un índice UNIQUE en `CREATE TABLE`. Vacío para tablas que
+    /// sólo usan UNIQUE inline en una columna o no usan UNIQUE.
+    pub unique_constraints: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,14 +319,21 @@ pub struct ColumnDef {
     pub references: Option<ForeignKeyDef>,
 }
 
-/// Parser-level representation of `REFERENCES <table>(<column>) [ON
-/// DELETE RESTRICT|CASCADE]`. Translated into a catalog
-/// [`ForeignKeyMeta`] inside the executor (see `value_to_fk`).
+/// Parser-level representation of
+/// `REFERENCES <table>(<column>) [ON DELETE ...] [ON UPDATE ...]`.
+/// Translated into a catalog [`ForeignKeyMeta`] inside the executor
+/// (see `fk_def_to_meta`).
+///
+/// Bloque L1 (2026-05-27): `on_delete` admite ahora `SET NULL` y
+/// `SET DEFAULT` además de los originales `RESTRICT`/`CASCADE`. Se
+/// agrega `on_update` (default `NoAction`); el motor lo persiste pero
+/// no lo dispara hoy porque la PK es inmutable (`[GBY-4008]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForeignKeyDef {
     pub table: String,
     pub column: String,
     pub on_delete: OnDelete,
+    pub on_update: OnUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1313,6 +1325,82 @@ impl<'a> Engine<'a> {
                 unique: true,
                 kind: IndexKind::for_column(col_type),
                 extra_columns: Vec::new(),
+            });
+        }
+
+        // Bloque L1 (2026-05-27): table-level `UNIQUE (a, b, ...)`.
+        // Single-col → mismo path que inline UNIQUE (Hash/OrderedInt
+        // según tipo). Multi-col → reusa el camino de K2 (fingerprint
+        // FNV-1a-64 vía `IndexKind::OrderedInt`, all-INT NOT NULL).
+        for cols in &stmt.unique_constraints {
+            if cols.is_empty() {
+                return Err(DbError::new(format!(
+                    "UNIQUE () vacío declarado en CREATE TABLE '{}'",
+                    meta.name
+                )));
+            }
+            // Validar que cada columna existe en la tabla.
+            for col_name in cols {
+                if meta.column(col_name).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!(
+                            "UNIQUE (...) referencia columna '{}' que no existe en '{}'",
+                            col_name, meta.name
+                        ),
+                    ));
+                }
+            }
+            let is_composite = cols.len() > 1;
+            // Para compuestos, K2 exige all-INT NOT NULL.
+            if is_composite {
+                for col_name in cols {
+                    let column = meta
+                        .column(col_name)
+                        .expect("ya validado arriba que existe");
+                    if column.column_type != ColumnType::Int || !column.not_null {
+                        return Err(coded(
+                            codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
+                            format!(
+                                "UNIQUE ({}): todas las columnas de un UNIQUE compuesto deben \
+                                 ser INT NOT NULL en este release (columna '{}' rompe la regla)",
+                                cols.join(", "),
+                                col_name
+                            ),
+                        ));
+                    }
+                }
+            }
+            let idx_root = self.pager.new_page()?;
+            let mut leaf = vec![0; self.pager.page_size()];
+            init_leaf_page(&mut leaf);
+            self.pager.write_page(idx_root, &leaf, true)?;
+            let first = cols[0].clone();
+            let extra: Vec<String> = cols.iter().skip(1).cloned().collect();
+            let first_col_type = meta
+                .column(&first)
+                .map(|c| c.column_type)
+                .expect("validado arriba");
+            let kind = if is_composite {
+                IndexKind::OrderedInt
+            } else {
+                IndexKind::for_column(first_col_type)
+            };
+            let idx_name = format!(
+                "uq_{}_{}",
+                meta.name.to_ascii_lowercase(),
+                cols.iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("_")
+            );
+            meta.indexes.push(IndexMeta {
+                name: idx_name,
+                column: first,
+                root_page: idx_root,
+                unique: true,
+                kind,
+                extra_columns: extra,
             });
         }
 
@@ -2554,22 +2642,33 @@ impl<'a> Engine<'a> {
 
         enforce_not_null_on_insert(meta, &values)?;
 
+        // Bloque L1 (2026-05-27): el UNIQUE pre-check distingue índices
+        // single-column (value bytes de la columna) de compuestos (FNV-1a-64
+        // fingerprint sobre todas las columnas, mismo encoder que K2). Sin
+        // esta separación, un UNIQUE (a, b) se chequeaba contra el bucket
+        // de la primera columna y rechazaba INSERTs legítimos por colisión
+        // del primer componente.
         for idx in &meta.indexes {
             if !idx.unique {
                 continue;
             }
-            let column = meta.column(&idx.column).ok_or_else(|| {
-                DbError::new(format!(
-                    "índice apunta a columna inexistente: {}",
-                    idx.column
-                ))
-            })?;
-            let value = values
-                .get(&normalize_ident(&column.name))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let value_bytes = encode_column_value(column, &value)?;
-            check_unique_conflict(self.pager, idx, &value_bytes, None)?;
+            if idx.is_composite() {
+                let fp = composite_fp_for_values(meta, idx, &values)?;
+                composite_unique_check(self.pager, idx, fp, None)?;
+            } else {
+                let column = meta.column(&idx.column).ok_or_else(|| {
+                    DbError::new(format!(
+                        "índice apunta a columna inexistente: {}",
+                        idx.column
+                    ))
+                })?;
+                let value = values
+                    .get(&normalize_ident(&column.name))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = encode_column_value(column, &value)?;
+                check_unique_conflict(self.pager, idx, &value_bytes, None)?;
+            }
         }
 
         let (pk, row_bytes) = encode_row(meta, &values)?;
@@ -2580,18 +2679,23 @@ impl<'a> Engine<'a> {
         }
 
         for idx in &meta.indexes {
-            let column = meta.column(&idx.column).ok_or_else(|| {
-                DbError::new(format!(
-                    "índice apunta a columna inexistente: {}",
-                    idx.column
-                ))
-            })?;
-            let value = values
-                .get(&normalize_ident(&column.name))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let value_bytes = encode_column_value(column, &value)?;
-            index_upsert_pk(self.pager, idx.root_page, idx.kind, &value_bytes, pk)?;
+            if idx.is_composite() {
+                let fp = composite_fp_for_values(meta, idx, &values)?;
+                composite_index_upsert(self.pager, idx.root_page, fp, pk)?;
+            } else {
+                let column = meta.column(&idx.column).ok_or_else(|| {
+                    DbError::new(format!(
+                        "índice apunta a columna inexistente: {}",
+                        idx.column
+                    ))
+                })?;
+                let value = values
+                    .get(&normalize_ident(&column.name))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = encode_column_value(column, &value)?;
+                index_upsert_pk(self.pager, idx.root_page, idx.kind, &value_bytes, pk)?;
+            }
         }
 
         Ok(RowOutcome::Inserted(values))
@@ -4989,19 +5093,32 @@ impl<'a> Engine<'a> {
             if !idx.unique {
                 continue;
             }
-            let normalized = normalize_ident(&idx.column);
-            if !overrides.contains_key(&normalized) {
+            // Bloque L1: distinguir índices compuestos. Pre-check sólo si
+            // el SET toca alguna columna que el índice cubre.
+            let touched = idx
+                .all_columns()
+                .iter()
+                .any(|c| overrides.contains_key(&normalize_ident(c)));
+            if !touched {
                 continue;
             }
-            let column = meta.column(&idx.column).ok_or_else(|| {
-                DbError::new(format!(
-                    "índice apunta a columna inexistente: {}",
-                    idx.column
-                ))
-            })?;
-            let new_value = current.get(&normalized).cloned().unwrap_or(Value::Null);
-            let new_bytes = encode_column_value(column, &new_value)?;
-            check_unique_conflict(self.pager, idx, &new_bytes, Some(pk))?;
+            if idx.is_composite() {
+                let fp = composite_fp_for_values(meta, idx, &current)?;
+                composite_unique_check(self.pager, idx, fp, Some(pk))?;
+            } else {
+                let column = meta.column(&idx.column).ok_or_else(|| {
+                    DbError::new(format!(
+                        "índice apunta a columna inexistente: {}",
+                        idx.column
+                    ))
+                })?;
+                let new_value = current
+                    .get(&normalize_ident(&idx.column))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let new_bytes = encode_column_value(column, &new_value)?;
+                check_unique_conflict(self.pager, idx, &new_bytes, Some(pk))?;
+            }
         }
 
         enforce_fk_on_update(self.pager, meta, &old_row, &current, pk)?;
@@ -5020,25 +5137,41 @@ impl<'a> Engine<'a> {
         }
 
         for idx in &meta.indexes {
-            let normalized = normalize_ident(&idx.column);
-            if !overrides.contains_key(&normalized) {
+            // Bloque L1: mantener composites cuando se toca alguna de
+            // sus columnas (no sólo `idx.column`).
+            let touched = idx
+                .all_columns()
+                .iter()
+                .any(|c| overrides.contains_key(&normalize_ident(c)));
+            if !touched {
                 continue;
             }
-            let column = meta.column(&idx.column).ok_or_else(|| {
-                DbError::new(format!(
-                    "índice apunta a columna inexistente: {}",
-                    idx.column
-                ))
-            })?;
-            let old_value = old_row.get(&normalized).cloned().unwrap_or(Value::Null);
-            let new_value = current.get(&normalized).cloned().unwrap_or(Value::Null);
-            if old_value == new_value {
-                continue;
+            if idx.is_composite() {
+                let old_fp = composite_fp_for_values(meta, idx, &old_row)?;
+                let new_fp = composite_fp_for_values(meta, idx, &current)?;
+                if old_fp == new_fp {
+                    continue;
+                }
+                composite_index_remove(self.pager, idx.root_page, old_fp, encoded_pk)?;
+                composite_index_upsert(self.pager, idx.root_page, new_fp, encoded_pk)?;
+            } else {
+                let normalized = normalize_ident(&idx.column);
+                let column = meta.column(&idx.column).ok_or_else(|| {
+                    DbError::new(format!(
+                        "índice apunta a columna inexistente: {}",
+                        idx.column
+                    ))
+                })?;
+                let old_value = old_row.get(&normalized).cloned().unwrap_or(Value::Null);
+                let new_value = current.get(&normalized).cloned().unwrap_or(Value::Null);
+                if old_value == new_value {
+                    continue;
+                }
+                let old_bytes = encode_column_value(column, &old_value)?;
+                let new_bytes = encode_column_value(column, &new_value)?;
+                index_remove_pk(self.pager, idx.root_page, idx.kind, &old_bytes, encoded_pk)?;
+                index_upsert_pk(self.pager, idx.root_page, idx.kind, &new_bytes, encoded_pk)?;
             }
-            let old_bytes = encode_column_value(column, &old_value)?;
-            let new_bytes = encode_column_value(column, &new_value)?;
-            index_remove_pk(self.pager, idx.root_page, idx.kind, &old_bytes, encoded_pk)?;
-            index_upsert_pk(self.pager, idx.root_page, idx.kind, &new_bytes, encoded_pk)?;
         }
 
         Ok(())
@@ -6846,6 +6979,7 @@ fn fk_def_to_meta(def: &ForeignKeyDef) -> ForeignKeyMeta {
         table: def.table.clone(),
         column: def.column.clone(),
         on_delete: def.on_delete,
+        on_update: def.on_update,
     }
 }
 
@@ -7138,6 +7272,71 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
                             }
                         }
                     }
+                    OnDelete::SetNull => {
+                        // Bloque L1: NOT NULL en la columna FK del child
+                        // hace imposible la cascade. Falla antes de tocar
+                        // disco — no hay rollback parcial.
+                        if child_col.not_null {
+                            return Err(coded(
+                                codes::FK_SET_NULL_VIOLATES_NOT_NULL,
+                                format!(
+                                    "DELETE FROM '{}' bloqueado: '{}.{}' es NOT NULL y la FK \
+                                     declaró ON DELETE SET NULL ({} fila(s) hijas afectarían)",
+                                    parent_name,
+                                    child_table.name,
+                                    child_col.name,
+                                    child_pks.len()
+                                ),
+                            ));
+                        }
+                        for cpk in child_pks {
+                            cascade_set_fk_value(
+                                pager,
+                                child_table,
+                                cpk,
+                                &child_col.name,
+                                Value::Null,
+                            )?;
+                        }
+                    }
+                    OnDelete::SetDefault => {
+                        // Bloque L1: necesita DEFAULT declarado para
+                        // poder reasignar. Si DEFAULT es NULL y la
+                        // columna es NOT NULL, falla con 3002 estándar.
+                        let Some(default) = &child_col.default else {
+                            return Err(coded(
+                                codes::FK_SET_DEFAULT_MISSING,
+                                format!(
+                                    "DELETE FROM '{}' bloqueado: '{}.{}' no tiene DEFAULT y la \
+                                     FK declaró ON DELETE SET DEFAULT ({} fila(s) hijas afectarían)",
+                                    parent_name,
+                                    child_table.name,
+                                    child_col.name,
+                                    child_pks.len()
+                                ),
+                            ));
+                        };
+                        let new_val = default_to_value(default);
+                        if matches!(new_val, Value::Null) && child_col.not_null {
+                            return Err(coded(
+                                codes::NOT_NULL_VIOLATED,
+                                format!(
+                                    "DELETE FROM '{}' bloqueado: ON DELETE SET DEFAULT pondría \
+                                     '{}.{}' (NOT NULL) en NULL — el DEFAULT declarado es NULL",
+                                    parent_name, child_table.name, child_col.name
+                                ),
+                            ));
+                        }
+                        for cpk in child_pks {
+                            cascade_set_fk_value(
+                                pager,
+                                child_table,
+                                cpk,
+                                &child_col.name,
+                                new_val.clone(),
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -7155,22 +7354,285 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
         };
         let row = decode_row(&parent_meta, &bytes)?;
         for idx in &parent_meta.indexes {
-            let column = parent_meta.column(&idx.column).ok_or_else(|| {
+            if idx.is_composite() {
+                // Bloque L1: composites se limpian por fingerprint.
+                let fp = composite_fp_for_values(&parent_meta, idx, &row)?;
+                composite_index_remove(pager, idx.root_page, fp, parent_pk)?;
+            } else {
+                let column = parent_meta.column(&idx.column).ok_or_else(|| {
+                    DbError::new(format!(
+                        "índice apunta a columna inexistente: {}",
+                        idx.column
+                    ))
+                })?;
+                let value = row
+                    .get(&normalize_ident(&column.name))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = encode_column_value(column, &value)?;
+                index_remove_pk(pager, idx.root_page, idx.kind, &value_bytes, parent_pk)?;
+            }
+        }
+        let mut catalog = Catalog::open(pager);
+        catalog.delete_row(parent_meta.root_page, parent_pk)?;
+    }
+    Ok(())
+}
+
+/// Bloque L1 (2026-05-27): calcula el fingerprint FNV-1a-64 de un row
+/// para un índice compuesto. Espera que todas las columnas del índice
+/// existan en `values`; las ausentes caen a `Value::Null` (lo cual el
+/// encoder traduce a un sentinel — no es válido para UNIQUE compuesto
+/// porque K2 exige NOT NULL, pero defendemos en profundidad).
+fn composite_fp_for_values(
+    meta: &TableMeta,
+    idx: &IndexMeta,
+    values: &HashMap<String, Value>,
+) -> DbResult<i64> {
+    let composite_columns: Vec<Column> = idx
+        .all_columns()
+        .iter()
+        .map(|name| {
+            meta.column(name).cloned().ok_or_else(|| {
+                DbError::new(format!(
+                    "índice compuesto '{}' apunta a columna inexistente: {}",
+                    idx.name, name
+                ))
+            })
+        })
+        .collect::<DbResult<_>>()?;
+    let vals: Vec<Value> = composite_columns
+        .iter()
+        .map(|c| {
+            values
+                .get(&normalize_ident(&c.name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+    let col_refs: Vec<&Column> = composite_columns.iter().collect();
+    let val_refs: Vec<&Value> = vals.iter().collect();
+    encode_composite_key(&col_refs, &val_refs)
+}
+
+/// Bloque L1: chequea conflicto UNIQUE para un índice compuesto sobre
+/// el fingerprint `fp`. El bucket guarda PKs como un ordered set; si ya
+/// hay alguna PK distinta de `exclude_pk`, la combinación de columnas
+/// está duplicada → error.
+fn composite_unique_check(
+    pager: &mut Pager,
+    idx: &IndexMeta,
+    fp: i64,
+    exclude_pk: Option<i64>,
+) -> DbResult<()> {
+    let mut tree = Tree::new(pager);
+    let bucket = match tree.get(idx.root_page, fp)? {
+        Some(bytes) => decode_ordered_bucket(&bytes)?,
+        None => return Ok(()),
+    };
+    let conflict = bucket.iter().any(|pk| Some(*pk) != exclude_pk);
+    if conflict {
+        let cols = idx.all_columns().join(", ");
+        return Err(coded(
+            codes::UNIQUE_VIOLATED,
+            format!(
+                "violación de UNIQUE en índice compuesto '{}' sobre ({})",
+                idx.name, cols
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Bloque L1: upsert (`fp` → bucket of PKs) en un índice compuesto. La
+/// clave del B+Tree es el fingerprint i64 directo, no la codificación
+/// OrderedInt (que envuelve con un tag). Vive aparte de `index_upsert_pk`
+/// porque K2 estableció ese contrato y cambiarlo rompería el bucket
+/// existente.
+fn composite_index_upsert(pager: &mut Pager, idx_root: u32, fp: i64, pk: i64) -> DbResult<()> {
+    let mut tree = Tree::new(pager);
+    let mut bucket = match tree.get(idx_root, fp)? {
+        Some(bytes) => decode_ordered_bucket(&bytes)?,
+        None => Vec::new(),
+    };
+    ordered_bucket_insert(&mut bucket, pk);
+    let payload = encode_ordered_bucket(&bucket)?;
+    tree.upsert(idx_root, fp, payload)?;
+    Ok(())
+}
+
+/// Bloque L1: contraparte del upsert — saca `pk` del bucket en
+/// `fp`. Si el bucket queda vacío, borra la entrada.
+fn composite_index_remove(pager: &mut Pager, idx_root: u32, fp: i64, pk: i64) -> DbResult<bool> {
+    let mut tree = Tree::new(pager);
+    let Some(bytes) = tree.get(idx_root, fp)? else {
+        return Ok(false);
+    };
+    let mut bucket = decode_ordered_bucket(&bytes)?;
+    let removed = ordered_bucket_remove(&mut bucket, pk);
+    if !removed {
+        return Ok(false);
+    }
+    if bucket.is_empty() {
+        tree.delete(idx_root, fp)?;
+    } else {
+        let payload = encode_ordered_bucket(&bucket)?;
+        tree.upsert(idx_root, fp, payload)?;
+    }
+    Ok(true)
+}
+
+/// Bloque L1 (2026-05-27): mutate one column of one row in `child_meta`
+/// in place — used by `ON DELETE SET NULL` and `ON DELETE SET DEFAULT`.
+///
+/// Mantiene los índices secundarios que tocan `column_name`:
+///   * single-column → remove old key + insert new key
+///   * composite (`extra_columns` no vacío) → recomputa el fingerprint
+///     viejo y nuevo, remueve el viejo bucket entry e inserta el nuevo.
+///
+/// Si el índice afectado es UNIQUE, se valida que el nuevo valor no
+/// colisione con otra fila (excluyendo la propia `child_pk`). Para
+/// NULL → la regla "muchos NULLs admitidos" se preserva: el encoder
+/// emite [0u8] y el path de unique conflict ya lo ignora.
+fn cascade_set_fk_value(
+    pager: &mut Pager,
+    child_meta: &TableMeta,
+    child_pk: i64,
+    column_name: &str,
+    new_value: Value,
+) -> DbResult<()> {
+    // 1. Leer la fila — puede haber desaparecido si una cascade previa
+    //    la borró por otro camino (ciclos, multi-FK). Tratar como no-op.
+    let bytes = {
+        let mut catalog = Catalog::open(pager);
+        match catalog.get_row(child_meta.root_page, child_pk)? {
+            Some(b) => b,
+            None => return Ok(()),
+        }
+    };
+    let old_row = decode_row(child_meta, &bytes)?;
+    let key_norm = normalize_ident(column_name);
+    let old_value = old_row.get(&key_norm).cloned().unwrap_or(Value::Null);
+    if old_value == new_value {
+        return Ok(());
+    }
+
+    // 2. Preparar la fila nueva.
+    let mut new_row = old_row.clone();
+    new_row.insert(key_norm.clone(), new_value.clone());
+
+    // 3. Validación NOT NULL — ya chequeada por el caller para los dos
+    //    casos relevantes, pero defendemos en profundidad.
+    let column = child_meta.column(column_name).ok_or_else(|| {
+        DbError::new(format!(
+            "cascade_set_fk_value: columna '{}' no existe en '{}'",
+            column_name, child_meta.name
+        ))
+    })?;
+    if column.not_null && matches!(new_value, Value::Null) {
+        return Err(coded(
+            codes::NOT_NULL_VIOLATED,
+            format!(
+                "cascade rechazada: '{}.{}' es NOT NULL y la acción intentó poner NULL",
+                child_meta.name, column.name
+            ),
+        ));
+    }
+
+    // 4. Pre-check UNIQUE para los índices afectados.
+    for idx in &child_meta.indexes {
+        if !idx.unique {
+            continue;
+        }
+        let touches = idx.column.eq_ignore_ascii_case(column_name)
+            || idx
+                .extra_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(column_name));
+        if !touches {
+            continue;
+        }
+        if idx.is_composite() {
+            let new_fp = composite_fp_for_values(child_meta, idx, &new_row)?;
+            composite_unique_check(pager, idx, new_fp, Some(child_pk))?;
+            continue;
+        }
+        let value_bytes = encode_column_value(column, &new_value)?;
+        check_unique_conflict(pager, idx, &value_bytes, Some(child_pk))?;
+    }
+
+    // 5. Sacar las entradas viejas de los índices afectados.
+    for idx in &child_meta.indexes {
+        let touches = idx.column.eq_ignore_ascii_case(column_name)
+            || idx
+                .extra_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(column_name));
+        if !touches {
+            continue;
+        }
+        if idx.is_composite() {
+            let old_fp = composite_fp_for_values(child_meta, idx, &old_row)?;
+            composite_index_remove(pager, idx.root_page, old_fp, child_pk)?;
+        } else {
+            let idx_col = child_meta.column(&idx.column).ok_or_else(|| {
                 DbError::new(format!(
                     "índice apunta a columna inexistente: {}",
                     idx.column
                 ))
             })?;
-            let value = row
-                .get(&normalize_ident(&column.name))
+            let old_col_value = old_row
+                .get(&normalize_ident(&idx.column))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let value_bytes = encode_column_value(column, &value)?;
-            index_remove_pk(pager, idx.root_page, idx.kind, &value_bytes, parent_pk)?;
+            let old_bytes = encode_column_value(idx_col, &old_col_value)?;
+            index_remove_pk(pager, idx.root_page, idx.kind, &old_bytes, child_pk)?;
         }
-        let mut catalog = Catalog::open(pager);
-        catalog.delete_row(parent_meta.root_page, parent_pk)?;
     }
+
+    // 6. Re-encodear y escribir la fila.
+    let (encoded_pk, row_bytes) = encode_row(child_meta, &new_row)?;
+    if encoded_pk != child_pk {
+        return Err(DbError::new(format!(
+            "inconsistencia interna en cascade_set_fk_value sobre '{}': la PK reconstruida \
+             del row es {} pero la cascade apuntaba a pk={}",
+            child_meta.name, encoded_pk, child_pk
+        )));
+    }
+    {
+        let mut catalog = Catalog::open(pager);
+        catalog.upsert_row(child_meta.root_page, encoded_pk, row_bytes)?;
+    }
+
+    // 7. Re-insertar en cada índice afectado con el valor nuevo.
+    for idx in &child_meta.indexes {
+        let touches = idx.column.eq_ignore_ascii_case(column_name)
+            || idx
+                .extra_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(column_name));
+        if !touches {
+            continue;
+        }
+        if idx.is_composite() {
+            let new_fp = composite_fp_for_values(child_meta, idx, &new_row)?;
+            composite_index_upsert(pager, idx.root_page, new_fp, child_pk)?;
+        } else {
+            let idx_col = child_meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let new_col_value = new_row
+                .get(&normalize_ident(&idx.column))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let new_bytes = encode_column_value(idx_col, &new_col_value)?;
+            index_upsert_pk(pager, idx.root_page, idx.kind, &new_bytes, child_pk)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -10019,11 +10481,12 @@ impl Parser {
                 self.expect_symbol("(")?;
                 let target_column = self.expect_ident()?;
                 self.expect_symbol(")")?;
-                let on_delete = self.parse_on_delete()?;
+                let (on_delete, on_update) = self.parse_fk_actions()?;
                 references = Some(ForeignKeyDef {
                     table: target_table,
                     column: target_column,
                     on_delete,
+                    on_update,
                 });
             } else {
                 break;
@@ -10040,23 +10503,115 @@ impl Parser {
         })
     }
 
-    /// Optional `ON DELETE RESTRICT|CASCADE` tail of a `REFERENCES`
-    /// clause. Defaults to `RESTRICT` when omitted — that matches
-    /// PostgreSQL's implicit behaviour and is the safest choice (refuses
-    /// the parent DELETE rather than silently dropping children).
-    fn parse_on_delete(&mut self) -> DbResult<OnDelete> {
-        if !self.match_keyword("ON") {
-            return Ok(OnDelete::Restrict);
+    /// Parse the optional `ON DELETE …` / `ON UPDATE …` tail of a
+    /// `REFERENCES` clause, in any order, and at most one of each.
+    ///
+    /// Acciones admitidas (Bloque L1, 2026-05-27):
+    /// `RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION`.
+    /// `NO ACTION` se acepta como sinónimo de `RESTRICT` (no hay modo
+    /// diferido todavía). Defaults: `ON DELETE` → `RESTRICT` (más
+    /// seguro: refuse antes que drop silencioso); `ON UPDATE` →
+    /// `NO ACTION` (compatible con ANSI/PostgreSQL).
+    fn parse_fk_actions(&mut self) -> DbResult<(OnDelete, OnUpdate)> {
+        let mut on_delete: Option<OnDelete> = None;
+        let mut on_update: Option<OnUpdate> = None;
+        loop {
+            if !self.match_keyword("ON") {
+                break;
+            }
+            if self.match_keyword("DELETE") {
+                if on_delete.is_some() {
+                    return Err(DbError::new("ON DELETE declarado dos veces en la misma FK"));
+                }
+                on_delete = Some(self.parse_referential_action_on_delete()?);
+            } else if self.match_keyword("UPDATE") {
+                if on_update.is_some() {
+                    return Err(DbError::new("ON UPDATE declarado dos veces en la misma FK"));
+                }
+                on_update = Some(self.parse_referential_action_on_update()?);
+            } else {
+                return Err(DbError::new(
+                    "después de ON se espera DELETE o UPDATE en la cláusula REFERENCES",
+                ));
+            }
         }
-        self.expect_keyword("DELETE")?;
+        Ok((
+            on_delete.unwrap_or(OnDelete::Restrict),
+            on_update.unwrap_or(OnUpdate::NoAction),
+        ))
+    }
+
+    /// Match one referential action token sequence for `ON DELETE`:
+    /// `RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION`.
+    fn parse_referential_action_on_delete(&mut self) -> DbResult<OnDelete> {
         if self.match_keyword("CASCADE") {
             Ok(OnDelete::Cascade)
         } else if self.match_keyword("RESTRICT") {
             Ok(OnDelete::Restrict)
+        } else if self.match_keyword("NO") {
+            self.expect_keyword("ACTION")?;
+            // NO ACTION ≡ RESTRICT en este release (sin deferred mode).
+            Ok(OnDelete::Restrict)
+        } else if self.match_keyword("SET") {
+            if self.match_keyword("NULL") {
+                Ok(OnDelete::SetNull)
+            } else if self.match_keyword("DEFAULT") {
+                Ok(OnDelete::SetDefault)
+            } else {
+                Err(DbError::new("ON DELETE SET requiere NULL o DEFAULT"))
+            }
         } else {
             Err(DbError::new(
-                "ON DELETE solo admite RESTRICT o CASCADE en esta versión",
+                "ON DELETE admite RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION",
             ))
+        }
+    }
+
+    /// Match one referential action token sequence for `ON UPDATE`. Las
+    /// acciones se aceptan sintácticamente y se persisten; el motor
+    /// nunca las dispara hoy porque la PK del padre es inmutable
+    /// (`[GBY-4008]`).
+    fn parse_referential_action_on_update(&mut self) -> DbResult<OnUpdate> {
+        if self.match_keyword("CASCADE") {
+            Ok(OnUpdate::Cascade)
+        } else if self.match_keyword("RESTRICT") {
+            Ok(OnUpdate::Restrict)
+        } else if self.match_keyword("NO") {
+            self.expect_keyword("ACTION")?;
+            Ok(OnUpdate::NoAction)
+        } else if self.match_keyword("SET") {
+            if self.match_keyword("NULL") {
+                Ok(OnUpdate::SetNull)
+            } else if self.match_keyword("DEFAULT") {
+                Ok(OnUpdate::SetDefault)
+            } else {
+                Err(DbError::new("ON UPDATE SET requiere NULL o DEFAULT"))
+            }
+        } else {
+            Err(DbError::new(
+                "ON UPDATE admite RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION",
+            ))
+        }
+    }
+
+    /// Bloque L1 (2026-05-27): lookahead para distinguir un constraint
+    /// `UNIQUE (a, b, ...)` a nivel de tabla del UNIQUE inline en una
+    /// columna. Devuelve `true` y consume `UNIQUE` cuando lo siguiente
+    /// es `(`; deja `self.pos` intacto si no es el caso.
+    ///
+    /// Vive aparte para esquivar `clippy::blocks-in-conditions` y dejar
+    /// el `else if` del CREATE TABLE legible como una sola línea.
+    fn try_match_table_unique_head(&mut self) -> bool {
+        let snap = self.pos;
+        if !self.match_keyword("UNIQUE") {
+            return false;
+        }
+        let tok = self.peek();
+        if tok.kind == TokenKind::Symbol && tok.text == "(" {
+            true
+        } else {
+            self.pos = snap;
+            false
         }
     }
 
@@ -10152,6 +10707,11 @@ impl Parser {
         // primer ítem se copia a `primary_key` para mantener el shape del
         // AST. Las adicionales viajan en `primary_key_extra` del Stmt.
         let mut table_level_pk: Option<Vec<String>> = None;
+        // Bloque L1 (2026-05-27): table-level `UNIQUE (a, b, ...)`. Cada
+        // declaración se materializa en el executor como un índice
+        // UNIQUE (compuesto si len > 1, simple si len == 1) reutilizando
+        // el camino que ya armó K2 para `CREATE UNIQUE INDEX`.
+        let mut table_level_unique: Vec<Vec<String>> = Vec::new();
         loop {
             // Detectar table constraint `PRIMARY KEY (a, b, ...)` antes
             // de delegar a `parse_column_def` — sin ambigüedad porque
@@ -10172,6 +10732,15 @@ impl Parser {
                     ));
                 }
                 table_level_pk = Some(pk_cols);
+            } else if self.try_match_table_unique_head() {
+                // Aquí ya consumimos `UNIQUE`; resta `(col, col, ...)`.
+                self.expect_symbol("(")?;
+                let mut cols: Vec<String> = vec![self.expect_ident()?];
+                while self.match_symbol(",") {
+                    cols.push(self.expect_ident()?);
+                }
+                self.expect_symbol(")")?;
+                table_level_unique.push(cols);
             } else {
                 let column = self.parse_column_def()?;
                 if column.primary_key {
@@ -10218,6 +10787,7 @@ impl Parser {
             columns,
             primary_key,
             primary_key_extra,
+            unique_constraints: table_level_unique,
         }))
     }
 

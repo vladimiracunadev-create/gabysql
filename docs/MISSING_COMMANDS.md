@@ -39,7 +39,8 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **J** ✅ | DML masivo: multi-row `INSERT`, `INSERT...SELECT`, `TRUNCATE`, `UPSERT`/`ON CONFLICT`, `REPLACE INTO`, `RETURNING` | Medio | E3 (**cerrado 2026-05-25**; `EXCLUDED.col` y `UPDATE ... FROM` pendientes) |
 | **K1** ✅ | DDL safe sin cambios on-disk: `CREATE TABLE AS SELECT`, `RENAME TABLE`, `ALTER TABLE RENAME TO`, `ALTER TABLE DROP COLUMN [IF EXISTS]`, `ALTER TABLE RENAME COLUMN` (**cerrado 2026-05-26**) | Medio | — |
 | **K2** ✅ | DDL con cambios on-disk: PK compuesta `PRIMARY KEY (a, b, ...)` y índices compuestos `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`. Bump VERSION 7→8 (**cerrado 2026-05-26**, ver ADR-0019). Restringido a all-INT NOT NULL; partial indexes y `ALTER COLUMN TYPE` siguen pendientes (futuro K3). | Alto | K1 |
-| **L** | Constraints: `CHECK`, `ON DELETE SET NULL/SET DEFAULT`, `ON UPDATE ...`, multi-column UNIQUE | Medio | K |
+| **L1** ✅ | Referential actions: `ON DELETE SET NULL`, `ON DELETE SET DEFAULT`, `ON DELETE NO ACTION`, `ON UPDATE ...` (parsea + persiste; no se dispara hoy), `UNIQUE (a, b, ...)` table-level + parche al composite UNIQUE de K2. Bump VERSION 8→9. **Cerrado 2026-05-27** ([ADR-0020](adr/0020-fk-referential-actions.md)). | Medio | K |
+| **L2** | Constraints: `CHECK (expr)` column-level y table-level, evaluación en INSERT/UPDATE/UPSERT, NULL pasa via 3VL ANSI | Medio-Alto | L1, G3 |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
 | **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
@@ -278,13 +279,15 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `UNIQUE` (inline + standalone) | ✅ | — |
 | `DEFAULT <literal>` | ✅ | — |
 | `FOREIGN KEY ... ON DELETE RESTRICT|CASCADE` | ✅ | — |
-| `FOREIGN KEY ... ON DELETE SET NULL` | ❌ | P1 |
-| `FOREIGN KEY ... ON DELETE SET DEFAULT` | ❌ | P2 |
-| `FOREIGN KEY ... ON UPDATE ...` | ❌ | P2 |
-| `CHECK (cond)` | ❌ | P1 |
+| `FOREIGN KEY ... ON DELETE SET NULL` | ✅ (L1, 2026-05-27; `[GBY-3009]` si la columna del child es NOT NULL) | — |
+| `FOREIGN KEY ... ON DELETE SET DEFAULT` | ✅ (L1, 2026-05-27; `[GBY-3010]` si no hay DEFAULT) | — |
+| `FOREIGN KEY ... ON DELETE NO ACTION` | ✅ (L1, 2026-05-27; alias de RESTRICT en este release) | — |
+| `FOREIGN KEY ... ON UPDATE ...` | ✅ parser+persistencia (L1, 2026-05-27); **no se dispara** todavía (PK inmutable, `[GBY-4008]`) | — |
+| `CHECK (cond)` | ❌ | P1 (sub-bloque **L2**) |
 | `EXCLUDE USING ...` (Postgres-style) | ❌ | P3 |
 | Constraints diferidas (`DEFERRABLE INITIALLY DEFERRED`) | ❌ | P3 |
-| Multi-column `PRIMARY KEY` o `UNIQUE` standalone | ❌ | P1 |
+| Multi-column `PRIMARY KEY` standalone | ✅ (K2, 2026-05-26; all-INT NOT NULL) | — |
+| Multi-column `UNIQUE` standalone table-level | ✅ (L1, 2026-05-27; all-INT NOT NULL, mismo encoder que K2) | — |
 
 ---
 

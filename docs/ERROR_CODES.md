@@ -84,6 +84,9 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `3005` | `FK_RESTRICT_BLOCKS_DELETE` | `DELETE` sobre una fila que tiene hijos referenciándola con `ON DELETE RESTRICT`. El mensaje incluye cuántos hijos hay. | Borrar primero los hijos o redefinir la FK con `ON DELETE CASCADE`. |
 | `3006` | `ROW_NOT_FOUND_FOR_PK` | `UPDATE` o `DELETE` sobre una PK que no existe. | Verificar la PK con un `SELECT` previo. |
 | `3007` | `PRIMARY_KEY_NULL` | `INSERT`/`UPDATE` pasa `NULL` para la PK. | La PK no puede ser `NULL` por definición — pasar un entero. |
+| `3008` | `CHECK_VIOLATED` | (Reservado para L2.) `INSERT`/`UPDATE`/`UPSERT` viola un constraint `CHECK (expr)`. NULL pasa según 3VL ANSI. | Revisar el predicado declarado o pasar un valor que lo satisfaga. |
+| `3009` | `FK_SET_NULL_VIOLATES_NOT_NULL` | `ON DELETE SET NULL` intentó poner `NULL` en una columna FK declarada `NOT NULL`. La cascade aborta sin rollback parcial. | Quitar `NOT NULL` de la columna del child o redefinir la FK con `CASCADE`/`SET DEFAULT`. |
+| `3010` | `FK_SET_DEFAULT_MISSING` | `ON DELETE SET DEFAULT` no encontró un `DEFAULT` declarado para la columna FK del child. | Declarar un `DEFAULT <valor>` en la columna o cambiar la acción a `CASCADE`/`SET NULL`. |
 
 ---
 
