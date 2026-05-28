@@ -23,6 +23,10 @@ pub enum Statement {
     /// Disparar un full-scan O(n) sobre la tabla para validar cada fila
     /// contra el nuevo predicado antes de persistirlo.
     AlterTableAddCheck(AlterAddCheckStmt),
+    /// Residual #2 (2026-05-27): `ALTER TABLE <t> DROP CONSTRAINT <name>`.
+    /// Lookup case-insensitive del nombre a través de: CHECKs, índices
+    /// UNIQUE nombrados, FKs nombradas. PK rejected.
+    AlterTableDropConstraint(AlterDropConstraintStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -196,6 +200,14 @@ pub struct AlterAddCheckStmt {
     pub source: String,
 }
 
+/// Residual #2 (2026-05-27): `ALTER TABLE <t> DROP CONSTRAINT <name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterDropConstraintStmt {
+    pub table: String,
+    pub name: String,
+    pub if_exists: bool,
+}
+
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
 /// [ (col_alias, ...) ] AS <select_query>`. La fuente reusa el árbol del
 /// bloque I (`SelectQuery`), por lo que admite SELECT puro, operaciones
@@ -332,6 +344,48 @@ pub struct CreateTableStmt {
     /// texto canónico (y no haya drift entre el SQL original y el
     /// re-parse).
     pub check_constraints: Vec<CheckConstraint>,
+    /// Residual #2 (2026-05-27): nombre opcional para la PRIMARY KEY
+    /// (declarado vía `CONSTRAINT <name> PRIMARY KEY (...)`). Si la PK
+    /// se declaró inline o sin `CONSTRAINT`, queda `None`.
+    pub primary_key_name: Option<String>,
+    /// Residual #2 (2026-05-27): listas de columnas declaradas como
+    /// `CONSTRAINT <name> UNIQUE (a, b, ...)` a nivel de tabla. Igual
+    /// que `unique_constraints` pero con nombre explícito. Cada entrada
+    /// se materializa como un índice UNIQUE con `IndexMeta.name = name`.
+    pub named_unique_constraints: Vec<(String, Vec<String>)>,
+    /// Residual #2 (2026-05-27): FKs declaradas table-level con nombre
+    /// (`CONSTRAINT <name> FOREIGN KEY (col) REFERENCES t (col) [ON ...]`).
+    /// Se aplican sobre la columna correspondiente del `columns` Vec
+    /// durante la construcción del `TableMeta`. Single-col only por
+    /// ahora (multi-col es residual #3).
+    pub named_foreign_keys: Vec<NamedForeignKey>,
+}
+
+/// Residual #2 (2026-05-27): tipo discriminado para
+/// `try_match_named_table_constraint_head`. CHECK no aparece — su
+/// path es distinto porque el cuerpo es un `Expr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedConstraintKind {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+}
+
+#[derive(Debug, Clone)]
+struct NamedConstraintHead {
+    name: String,
+    kind: NamedConstraintKind,
+}
+
+/// Residual #2 (2026-05-27): FK table-level con nombre explícito.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedForeignKey {
+    pub name: String,
+    pub column: String,
+    pub target_table: String,
+    pub target_column: String,
+    pub on_delete: OnDelete,
+    pub on_update: OnUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -360,6 +414,10 @@ pub struct ForeignKeyDef {
     pub column: String,
     pub on_delete: OnDelete,
     pub on_update: OnUpdate,
+    /// Residual #2 (2026-05-27): nombre del constraint si fue declarado
+    /// con `CONSTRAINT <name> FOREIGN KEY (col) REFERENCES …`. `None`
+    /// para FKs declaradas inline en la columna sin nombre.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1168,6 +1226,7 @@ impl<'a> Engine<'a> {
             Statement::DropTable(stmt) => self.exec_drop_table(stmt),
             Statement::AlterTableAddColumn(stmt) => self.exec_alter_add_column(stmt),
             Statement::AlterTableAddCheck(stmt) => self.exec_alter_add_check(stmt),
+            Statement::AlterTableDropConstraint(stmt) => self.exec_alter_drop_constraint(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -1308,6 +1367,7 @@ impl<'a> Engine<'a> {
             name: stmt.name,
             primary_key,
             primary_key_extra,
+            primary_key_name: stmt.primary_key_name.clone(),
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -1436,6 +1496,130 @@ impl<'a> Engine<'a> {
                 extra_columns: extra,
             });
         }
+
+        // Residual #2 (2026-05-27): named UNIQUE table-level. Mismo
+        // materializado que la rama anterior pero con `name = supplied`.
+        // Validamos también que no haya colisión de nombre contra los
+        // índices ya creados (inline UNIQUE + table-level sin nombre).
+        for (idx_name, cols) in &stmt.named_unique_constraints {
+            if cols.is_empty() {
+                return Err(DbError::new(format!(
+                    "UNIQUE () vacío declarado en CREATE TABLE '{}'",
+                    meta.name
+                )));
+            }
+            for col_name in cols {
+                if meta.column(col_name).is_none() {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!(
+                            "UNIQUE (...) referencia columna '{}' que no existe en '{}'",
+                            col_name, meta.name
+                        ),
+                    ));
+                }
+            }
+            if meta.index_by_name(idx_name).is_some() {
+                return Err(coded(
+                    codes::INDEX_ALREADY_EXISTS,
+                    format!(
+                        "CONSTRAINT '{}' ya existe en '{}' (colisiona con un índice previo)",
+                        idx_name, meta.name
+                    ),
+                ));
+            }
+            let is_composite = cols.len() > 1;
+            if is_composite {
+                for col_name in cols {
+                    let column = meta.column(col_name).expect("validado arriba");
+                    if column.column_type != ColumnType::Int || !column.not_null {
+                        return Err(coded(
+                            codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
+                            format!(
+                                "CONSTRAINT '{}' UNIQUE ({}): todas las columnas deben ser \
+                                 INT NOT NULL (columna '{}' rompe la regla)",
+                                idx_name,
+                                cols.join(", "),
+                                col_name
+                            ),
+                        ));
+                    }
+                }
+            }
+            let idx_root = self.pager.new_page()?;
+            let mut leaf = vec![0; self.pager.page_size()];
+            init_leaf_page(&mut leaf);
+            self.pager.write_page(idx_root, &leaf, true)?;
+            let first = cols[0].clone();
+            let extra: Vec<String> = cols.iter().skip(1).cloned().collect();
+            let first_col_type = meta
+                .column(&first)
+                .map(|c| c.column_type)
+                .expect("validado arriba");
+            let kind = if is_composite {
+                IndexKind::OrderedInt
+            } else {
+                IndexKind::for_column(first_col_type)
+            };
+            meta.indexes.push(IndexMeta {
+                name: idx_name.clone(),
+                column: first,
+                root_page: idx_root,
+                unique: true,
+                kind,
+                extra_columns: extra,
+            });
+        }
+
+        // Residual #2 (2026-05-27): FKs table-level con nombre. La FK
+        // se adjunta a la columna correspondiente del child, igual que
+        // si hubiera venido inline — la diferencia es que `name` tiene
+        // valor explícito y permite `ALTER TABLE DROP CONSTRAINT <name>`.
+        for nfk in &stmt.named_foreign_keys {
+            let col_idx = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&nfk.column))
+                .ok_or_else(|| {
+                    coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!(
+                            "CONSTRAINT '{}' FOREIGN KEY referencia columna '{}' que no existe en '{}'",
+                            nfk.name, nfk.column, meta.name
+                        ),
+                    )
+                })?;
+            if meta.columns[col_idx].references.is_some() {
+                return Err(DbError::new(format!(
+                    "columna '{}' ya tiene una FK declarada inline; remover el inline o \
+                     no declarar también CONSTRAINT '{}' sobre la misma columna",
+                    nfk.column, nfk.name
+                )));
+            }
+            // Chequear que el nombre no colisione con otra FK ya nombrada.
+            let dup = meta.columns.iter().any(|c| {
+                c.references
+                    .as_ref()
+                    .and_then(|r| r.name.as_ref())
+                    .map(|n| n.eq_ignore_ascii_case(&nfk.name))
+                    .unwrap_or(false)
+            });
+            if dup {
+                return Err(DbError::new(format!(
+                    "CONSTRAINT '{}' ya existe en '{}' (otra FK con el mismo nombre)",
+                    nfk.name, meta.name
+                )));
+            }
+            meta.columns[col_idx].references = Some(ForeignKeyMeta {
+                table: nfk.target_table.clone(),
+                column: nfk.target_column.clone(),
+                on_delete: nfk.on_delete,
+                on_update: nfk.on_update,
+                name: Some(nfk.name.clone()),
+            });
+        }
+        // Re-validar FK targets ahora que las table-level fueron adjuntadas.
+        validate_fk_targets(self.pager, &meta)?;
 
         let mut catalog = Catalog::open(self.pager);
         catalog.put_table(&meta)?;
@@ -2016,6 +2200,7 @@ impl<'a> Engine<'a> {
             name: stmt.name.clone(),
             primary_key: pk_name.clone(),
             primary_key_extra: Vec::new(),
+            primary_key_name: None,
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -2286,6 +2471,167 @@ impl<'a> Engine<'a> {
                 rows.len()
             )),
         })
+    }
+
+    /// Residual #2 (2026-05-27): `ALTER TABLE <t> DROP CONSTRAINT [IF EXISTS] <name>`.
+    /// Lookup case-insensitive del `name` a través de:
+    ///
+    ///   1. `check_constraints` — drop la entry.
+    ///   2. `indexes` (sólo UNIQUE con nombre explícito o auto-generado)
+    ///      — invocar el mismo path que `DROP INDEX` (libera root y
+    ///      saca el `IndexMeta`).
+    ///   3. `columns[*].references.name` — limpiar el `references` de
+    ///      la columna afectada (la columna sigue, pero deja de ser FK).
+    ///
+    /// La PK no se puede borrar con `DROP CONSTRAINT` — el motor rebota
+    /// con `[GBY-4072]`. Nombre desconocido → `[GBY-4071]` (a menos que
+    /// `IF EXISTS` lo silencie).
+    fn exec_alter_drop_constraint(&mut self, stmt: AlterDropConstraintStmt) -> DbResult<ResultSet> {
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("tabla no existe: {}", stmt.table),
+                )
+            })?
+        };
+        let target = stmt.name.to_ascii_lowercase();
+
+        // PK rejection — antes que cualquier otra rama.
+        if meta
+            .primary_key_name
+            .as_ref()
+            .map(|n| n.eq_ignore_ascii_case(&target))
+            .unwrap_or(false)
+        {
+            return Err(coded(
+                codes::CANNOT_DROP_PRIMARY_KEY_CONSTRAINT,
+                format!(
+                    "DROP CONSTRAINT '{}': es la PRIMARY KEY de '{}' y la PK es inmutable; \
+                     usar DROP TABLE si la intención es rehacer el esquema",
+                    stmt.name, meta.name
+                ),
+            ));
+        }
+
+        // 1. CHECK constraints.
+        if let Some(pos) = meta
+            .check_constraints
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&target))
+        {
+            let removed = meta.check_constraints.remove(pos);
+            {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.put_table(&meta)?;
+            }
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!(
+                    "OK · CHECK constraint '{}' eliminado de '{}'",
+                    removed.name, meta.name
+                )),
+            });
+        }
+
+        // 2. UNIQUE index (named) — buscar por nombre del IndexMeta. El
+        //    motor no distingue índices "auto" de "named" — la ÚNICA
+        //    regla es que UNIQUE indexes sí se pueden DROP, mientras
+        //    que un índice no-UNIQUE creado por CREATE INDEX necesita
+        //    DROP INDEX. (DROP CONSTRAINT no debe borrar índices
+        //    "técnicos" sin UNIQUE; rebotamos en ese caso.)
+        if let Some(idx_pos) = meta
+            .indexes
+            .iter()
+            .position(|i| i.name.eq_ignore_ascii_case(&target))
+        {
+            let idx_meta = meta.indexes[idx_pos].clone();
+            if !idx_meta.unique {
+                return Err(coded(
+                    codes::CONSTRAINT_NOT_FOUND,
+                    format!(
+                        "DROP CONSTRAINT '{}': existe un índice con ese nombre en '{}' pero \
+                         NO es UNIQUE — usar DROP INDEX para borrarlo",
+                        stmt.name, meta.name
+                    ),
+                ));
+            }
+            // Libera la root page del índice (no hay free-list — page leak
+            // aceptable, mismo contrato que DROP INDEX).
+            meta.indexes.remove(idx_pos);
+            {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.put_table(&meta)?;
+            }
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!(
+                    "OK · UNIQUE constraint '{}' eliminado de '{}'",
+                    idx_meta.name, meta.name
+                )),
+            });
+        }
+
+        // 3. FK con nombre — buscar en columns[*].references.name.
+        let mut fk_hit: Option<(usize, String)> = None;
+        for (i, col) in meta.columns.iter().enumerate() {
+            if let Some(fk) = &col.references {
+                if let Some(n) = &fk.name {
+                    if n.eq_ignore_ascii_case(&target) {
+                        fk_hit = Some((i, n.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((col_idx, fk_name)) = fk_hit {
+            meta.columns[col_idx].references = None;
+            {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.put_table(&meta)?;
+            }
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!(
+                    "OK · FOREIGN KEY constraint '{}' eliminado de '{}'",
+                    fk_name, meta.name
+                )),
+            });
+        }
+
+        if stmt.if_exists {
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!(
+                    "OK · CONSTRAINT '{}' no existía en '{}' (IF EXISTS)",
+                    stmt.name, meta.name
+                )),
+            });
+        }
+        Err(coded(
+            codes::CONSTRAINT_NOT_FOUND,
+            format!(
+                "DROP CONSTRAINT '{}': no existe en '{}'. Constraints visibles: \
+                 {} CHECK, {} UNIQUE indexes, {} FK nombradas",
+                stmt.name,
+                meta.name,
+                meta.check_constraints.len(),
+                meta.indexes.iter().filter(|i| i.unique).count(),
+                meta.columns
+                    .iter()
+                    .filter(|c| c
+                        .references
+                        .as_ref()
+                        .and_then(|r| r.name.as_ref())
+                        .is_some())
+                    .count(),
+            ),
+        ))
     }
 
     /// Bloque K1 (2026-05-26): `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <col>`.
@@ -3242,6 +3588,7 @@ impl<'a> Engine<'a> {
             name: alias.to_string(),
             primary_key,
             primary_key_extra: Vec::new(),
+            primary_key_name: None,
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -3484,6 +3831,7 @@ impl<'a> Engine<'a> {
             name: alias.to_string(),
             primary_key,
             primary_key_extra: Vec::new(),
+            primary_key_name: None,
             columns,
             root_page: 0,
             indexes: Vec::new(),
@@ -7163,6 +7511,7 @@ fn fk_def_to_meta(def: &ForeignKeyDef) -> ForeignKeyMeta {
         column: def.column.clone(),
         on_delete: def.on_delete,
         on_update: def.on_update,
+        name: def.name.clone(),
     }
 }
 
@@ -10984,9 +11333,19 @@ impl Parser {
             }));
         }
         // Bloque K1: `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <col>`.
-        // La palabra `COLUMN` es obligatoria para no colisionar con
-        // futuros `DROP CONSTRAINT` / `DROP INDEX`.
+        // Residual #2: también `DROP CONSTRAINT [IF EXISTS] <name>`.
         if self.match_keyword("DROP") {
+            if self.match_keyword("CONSTRAINT") {
+                let if_exists = self.parse_if_exists()?;
+                let name = self.expect_ident()?;
+                return Ok(Statement::AlterTableDropConstraint(
+                    AlterDropConstraintStmt {
+                        table,
+                        name,
+                        if_exists,
+                    },
+                ));
+            }
             self.expect_keyword("COLUMN")?;
             let if_exists = self.parse_if_exists()?;
             let column = self.expect_ident()?;
@@ -11090,6 +11449,7 @@ impl Parser {
                     column: target_column,
                     on_delete,
                     on_update,
+                    name: None,
                 });
             } else if self.match_keyword("CONSTRAINT") {
                 // Bloque L2: `CONSTRAINT <name> CHECK (...)` inline en
@@ -11219,8 +11579,10 @@ impl Parser {
     /// matchea, consume los 3 tokens (CONSTRAINT, ident, CHECK), stashea
     /// el nombre en `self.pending_check_name` y devuelve `Ok(true)`. Si
     /// la palabra después de CONSTRAINT no es un ident seguido de CHECK,
-    /// hace rollback y devuelve `Ok(false)` (otros tipos de constraint
-    /// nombrado se podrían soportar después; hoy sólo CHECK).
+    /// hace rollback y devuelve `Ok(false)`.
+    ///
+    /// Residual #2 (2026-05-27): los otros tipos (PRIMARY KEY / UNIQUE /
+    /// FOREIGN KEY) se manejan vía `try_match_named_table_constraint_head`.
     fn try_match_table_constraint_check_head(&mut self) -> DbResult<bool> {
         let snap = self.pos;
         if !self.match_keyword("CONSTRAINT") {
@@ -11233,14 +11595,57 @@ impl Parser {
         }
         self.pos += 1;
         if !self.match_keyword("CHECK") {
-            // CONSTRAINT name PRIMARY KEY / UNIQUE / FOREIGN KEY no
-            // soportado hoy a nivel de tabla — rollback y dejar que
-            // otra rama (o el error genérico) lo capture.
             self.pos = snap;
             return Ok(false);
         }
         self.pending_check_name = Some(name_tok.text);
         Ok(true)
+    }
+
+    /// Residual #2 (2026-05-27): detecta el inicio de
+    /// `CONSTRAINT <name> PRIMARY KEY | UNIQUE | FOREIGN KEY` a nivel de
+    /// tabla. Si matchea, consume los 3 tokens iniciales (CONSTRAINT +
+    /// ident + keyword del kind) y devuelve `Some(NamedConstraintHead)`
+    /// con `name` y `kind`; el caller parsea el cuerpo (`(cols)` o
+    /// `(col) REFERENCES t (col) …`).
+    ///
+    /// CHECK no se incluye acá — sigue por `try_match_table_constraint_check_head`
+    /// porque su cuerpo es un `Expr`, no una lista de columnas.
+    fn try_match_named_table_constraint_head(&mut self) -> DbResult<Option<NamedConstraintHead>> {
+        let snap = self.pos;
+        if !self.match_keyword("CONSTRAINT") {
+            return Ok(None);
+        }
+        let name_tok = self.peek().clone();
+        if name_tok.kind != TokenKind::Ident {
+            self.pos = snap;
+            return Ok(None);
+        }
+        self.pos += 1;
+        if self.match_keyword("PRIMARY") {
+            self.expect_keyword("KEY")?;
+            return Ok(Some(NamedConstraintHead {
+                name: name_tok.text,
+                kind: NamedConstraintKind::PrimaryKey,
+            }));
+        }
+        if self.match_keyword("UNIQUE") {
+            return Ok(Some(NamedConstraintHead {
+                name: name_tok.text,
+                kind: NamedConstraintKind::Unique,
+            }));
+        }
+        if self.match_keyword("FOREIGN") {
+            self.expect_keyword("KEY")?;
+            return Ok(Some(NamedConstraintHead {
+                name: name_tok.text,
+                kind: NamedConstraintKind::ForeignKey,
+            }));
+        }
+        // No es ninguno de los tres → rollback y dejar que el handler
+        // de CHECK (o el error genérico) capture.
+        self.pos = snap;
+        Ok(None)
     }
 
     /// Bloque L1 (2026-05-27): lookahead para distinguir un constraint
@@ -11356,11 +11761,22 @@ impl Parser {
         // primer ítem se copia a `primary_key` para mantener el shape del
         // AST. Las adicionales viajan en `primary_key_extra` del Stmt.
         let mut table_level_pk: Option<Vec<String>> = None;
+        // Residual #2 (2026-05-27): nombre opcional para la PK
+        // (`CONSTRAINT <name> PRIMARY KEY (...)`). Sólo se permite con
+        // la forma table-level — la inline `id INT PRIMARY KEY` no
+        // acepta nombre (ANSI tampoco lo admite ahí).
+        let mut table_level_pk_name: Option<String> = None;
         // Bloque L1 (2026-05-27): table-level `UNIQUE (a, b, ...)`. Cada
         // declaración se materializa en el executor como un índice
         // UNIQUE (compuesto si len > 1, simple si len == 1) reutilizando
         // el camino que ya armó K2 para `CREATE UNIQUE INDEX`.
         let mut table_level_unique: Vec<Vec<String>> = Vec::new();
+        // Residual #2 (2026-05-27): UNIQUE table-level con nombre
+        // (`CONSTRAINT <name> UNIQUE (a, b, ...)`). Mismo materializado
+        // que `table_level_unique` pero con `IndexMeta.name = name`.
+        let mut table_level_named_unique: Vec<(String, Vec<String>)> = Vec::new();
+        // Residual #2 (2026-05-27): FK table-level con nombre.
+        let mut table_level_named_fks: Vec<NamedForeignKey> = Vec::new();
         // Bloque L2 (2026-05-27): CHECKs recogidos del column-level y
         // del table-level. Cada entrada es `(nombre opcional, Expr)`.
         // El nombre se materializa después (synthetic
@@ -11403,8 +11819,6 @@ impl Parser {
                 raw_checks.push((None, expr));
             } else if self.try_match_table_constraint_check_head()? {
                 // Bloque L2: `CONSTRAINT name CHECK (...)` table-level.
-                // El helper ya consumió `CONSTRAINT <name> CHECK`.
-                // Stashea el nombre en `pending_check_name` y limpia.
                 let name = self
                     .pending_check_name
                     .take()
@@ -11413,6 +11827,73 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect_symbol(")")?;
                 raw_checks.push((Some(name), expr));
+            } else if let Some(named) = self.try_match_named_table_constraint_head()? {
+                // Residual #2: `CONSTRAINT <name> PRIMARY KEY | UNIQUE | FOREIGN KEY`.
+                // El helper consumió 3 tokens (CONSTRAINT + ident + kind);
+                // ahora parseamos el cuerpo según `kind`.
+                match named.kind {
+                    NamedConstraintKind::PrimaryKey => {
+                        self.expect_symbol("(")?;
+                        let mut pk_cols: Vec<String> = vec![self.expect_ident()?];
+                        while self.match_symbol(",") {
+                            pk_cols.push(self.expect_ident()?);
+                        }
+                        self.expect_symbol(")")?;
+                        if table_level_pk.is_some() {
+                            return Err(coded(
+                                codes::PRIMARY_KEY_DUPLICATED,
+                                "PRIMARY KEY declarada dos veces a nivel de tabla",
+                            ));
+                        }
+                        table_level_pk = Some(pk_cols);
+                        table_level_pk_name = Some(named.name);
+                    }
+                    NamedConstraintKind::Unique => {
+                        self.expect_symbol("(")?;
+                        let mut cols: Vec<String> = vec![self.expect_ident()?];
+                        while self.match_symbol(",") {
+                            cols.push(self.expect_ident()?);
+                        }
+                        self.expect_symbol(")")?;
+                        table_level_named_unique.push((named.name, cols));
+                    }
+                    NamedConstraintKind::ForeignKey => {
+                        self.expect_symbol("(")?;
+                        let col = self.expect_ident()?;
+                        // Single-col only en este release — multi-col es
+                        // residual #3 del bloque L. Si el usuario pone
+                        // más de una columna, rebotamos explícito.
+                        if self.match_symbol(",") {
+                            return Err(DbError::new(
+                                "FOREIGN KEY multi-columna no soportada en este release \
+                                 (residual #3 del bloque L). Usar surrogate INT + \
+                                 CONSTRAINT UNIQUE (col_a, col_b) como workaround.",
+                            ));
+                        }
+                        self.expect_symbol(")")?;
+                        self.expect_keyword("REFERENCES")?;
+                        let target_table = self.expect_ident()?;
+                        self.expect_symbol("(")?;
+                        let target_column = self.expect_ident()?;
+                        // Mismo bloqueo multi-col del lado del padre.
+                        if self.match_symbol(",") {
+                            return Err(DbError::new(
+                                "FOREIGN KEY ... REFERENCES (...) multi-columna no soportada \
+                                 (residual #3 del bloque L).",
+                            ));
+                        }
+                        self.expect_symbol(")")?;
+                        let (on_delete, on_update) = self.parse_fk_actions()?;
+                        table_level_named_fks.push(NamedForeignKey {
+                            name: named.name,
+                            column: col,
+                            target_table,
+                            target_column,
+                            on_delete,
+                            on_update,
+                        });
+                    }
+                }
             } else {
                 let column = self.parse_column_def(&mut raw_checks)?;
                 if column.primary_key {
@@ -11493,7 +11974,10 @@ impl Parser {
             columns,
             primary_key,
             primary_key_extra,
+            primary_key_name: table_level_pk_name,
             unique_constraints: table_level_unique,
+            named_unique_constraints: table_level_named_unique,
+            named_foreign_keys: table_level_named_fks,
             check_constraints,
         }))
     }

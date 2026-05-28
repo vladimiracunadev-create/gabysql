@@ -89,9 +89,16 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        CHECK declarados a nivel de columna o de tabla. La expresión
 //        se serializa como SQL canónico (`format_expr`) y se re-parsea
 //        en cada write. V9 files son rechazados al abrir con
-//        `[GBY-1003]` — migración manual: dump SELECT + recreate con
-//        binario V10.
-pub const VERSION: u32 = 10;
+//        `[GBY-1003]`.
+//  11 -> Residual #2 de L: nombres explícitos en PK y FK
+//        (`CONSTRAINT <name> PRIMARY KEY (...)` y
+//        `CONSTRAINT <name> FOREIGN KEY (...)`). Cada `TableMeta`
+//        añade un byte `pk_name_present:u8` + string opcional tras la
+//        lista de columnas PK; cada FK record añade
+//        `fk_name_present:u8` + string opcional al final. V10 rechazados
+//        con `[GBY-1003]` — migración manual: dump SELECT + recreate
+//        con binario V11.
+pub const VERSION: u32 = 11;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

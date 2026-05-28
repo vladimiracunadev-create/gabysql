@@ -303,6 +303,12 @@ pub struct ForeignKeyMeta {
     /// `ON UPDATE`). Se persiste como byte a continuación del
     /// `on_delete` en el record on-disk.
     pub on_update: OnUpdate,
+    /// Residual #2 (VERSION 11, 2026-05-27): nombre explícito de la FK
+    /// declarado con `CONSTRAINT <name> FOREIGN KEY (...) REFERENCES ...`.
+    /// `None` si la FK vino inline en la columna sin nombre. Se usa
+    /// para `ALTER TABLE DROP CONSTRAINT <name>` y para mensajes de
+    /// error legibles.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -452,6 +458,12 @@ pub struct TableMeta {
     /// NOT NULL — la PK compuesta se representa internamente como un
     /// fingerprint FNV-1a-64 i64 (ver ADR-0019).
     pub primary_key_extra: Vec<String>,
+    /// Residual #2 (VERSION 11, 2026-05-27): nombre explícito de la PK
+    /// declarado con `CONSTRAINT <name> PRIMARY KEY (...)`. `None` si la
+    /// PK se declaró inline (`id INT PRIMARY KEY`) o table-level sin
+    /// nombre. La PK NO se puede borrar con `DROP CONSTRAINT`; el campo
+    /// sirve para mensajes de error y futuro `INFORMATION_SCHEMA`.
+    pub primary_key_name: Option<String>,
     pub columns: Vec<Column>,
     pub root_page: u32,
     pub indexes: Vec<IndexMeta>,
@@ -505,29 +517,35 @@ impl TableMeta {
             .any(|c| c.eq_ignore_ascii_case(column))
     }
 
-    /// VERSION = 10 on-disk layout for a TableMeta record:
+    /// VERSION = 11 on-disk layout for a TableMeta record:
     ///
     ///     [name]
     ///     [pk_count:u8] · pk_count × [pk_col_name]   (pk_count >= 1)
+    ///     [pk_name_present:u8] · pk_name_present ? [pk_name] : ∅   ← V11
     ///     [root_page:u32]
     ///     [col_count:u16] · col_count × {
     ///         [name][type_code:u8][flags:u8]
     ///         flags & 0x02 ? DefaultLiteral payload : ∅
     ///         flags & 0x04 ? [target_table][target_column]
-    ///                        [on_delete:u8][on_update:u8] : ∅
+    ///                        [on_delete:u8][on_update:u8]
+    ///                        [fk_name_present:u8] · fk_name_present ?
+    ///                              [fk_name] : ∅                    ← V11
+    ///                        : ∅
     ///     }
     ///     [idx_count:u16] · idx_count × {
     ///         [name][column][root_page:u32][unique:u8][kind:u8]
     ///         [extra_cols_count:u8] · extra × [extra_col_name]   (>= 0)
     ///     }
-    ///     [check_count:u16] · check_count × {              ← L2
-    ///         [name][source]
-    ///     }
+    ///     [check_count:u16] · check_count × { [name][source] }
     ///
-    /// Cambios vs VERSION 9 (Bloque L2):
-    ///   - Trailer nuevo `[check_count:u16] · check × {name, source}`
-    ///     después del bloque de índices. Las tablas pre-L2 escriben
-    ///     `check_count = 0` y son indistinguibles del caso "sin CHECK".
+    /// Cambios vs VERSION 10 (Residual #2):
+    ///   - Tras `pk_count + cols`, se añade `[pk_name_present:u8]` y
+    ///     opcionalmente `[pk_name]`. Soporta
+    ///     `CONSTRAINT <name> PRIMARY KEY (...)`.
+    ///   - Cada FK record añade al final `[fk_name_present:u8]` y
+    ///     opcionalmente `[fk_name]`. Soporta
+    ///     `CONSTRAINT <name> FOREIGN KEY (col) REFERENCES ...`.
+    ///   - V10 files se rechazan al abrir con `[GBY-1003]`.
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
         push_string(&mut out, &self.name)?;
@@ -545,6 +563,16 @@ impl TableMeta {
         push_string(&mut out, &self.primary_key)?;
         for col in &self.primary_key_extra {
             push_string(&mut out, col)?;
+        }
+        // V11: pk_name optional. Byte 1 = presente seguido de string,
+        // byte 0 = ausente. Pre-V11 no había nada acá; la diferencia se
+        // detecta por el bump de VERSION (V10 ya está rechazado).
+        match &self.primary_key_name {
+            Some(name) => {
+                out.push(1);
+                push_string(&mut out, name)?;
+            }
+            None => out.push(0),
         }
         out.extend_from_slice(&self.root_page.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
@@ -570,6 +598,14 @@ impl TableMeta {
                 push_string(&mut out, &fk.column)?;
                 out.push(fk.on_delete.code());
                 out.push(fk.on_update.code());
+                // V11: fk_name optional. Mismo esquema present-byte.
+                match &fk.name {
+                    Some(n) => {
+                        out.push(1);
+                        push_string(&mut out, n)?;
+                    }
+                    None => out.push(0),
+                }
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -633,6 +669,20 @@ impl TableMeta {
         for _ in 1..pk_count {
             primary_key_extra.push(take_string(data, &mut offset)?);
         }
+        // V11: pk_name optional byte.
+        if offset >= data.len() {
+            return Err(DbError::new(format!(
+                "TableMeta '{}' corrupta: falta el byte pk_name_present en offset {}",
+                name, offset
+            )));
+        }
+        let pk_name_present = data[offset];
+        offset += 1;
+        let primary_key_name = if pk_name_present != 0 {
+            Some(take_string(data, &mut offset)?)
+        } else {
+            None
+        };
         if offset + 6 > data.len() {
             return Err(DbError::new(format!(
                 "TableMeta corrupta para tabla '{}': necesito 6 bytes en offset {} \
@@ -685,11 +735,26 @@ impl TableMeta {
                 }
                 let on_update = OnUpdate::from_code(data[offset])?;
                 offset += 1;
+                // V11: fk_name optional byte.
+                if offset >= data.len() {
+                    return Err(DbError::new(format!(
+                        "FOREIGN KEY corrupta en '{}.{}': falta byte fk_name_present en offset {}",
+                        name, col_name, offset
+                    )));
+                }
+                let fk_name_present = data[offset];
+                offset += 1;
+                let fk_name = if fk_name_present != 0 {
+                    Some(take_string(data, &mut offset)?)
+                } else {
+                    None
+                };
                 Some(ForeignKeyMeta {
                     table: target_table,
                     column: target_column,
                     on_delete,
                     on_update,
+                    name: fk_name,
                 })
             } else {
                 None
@@ -781,6 +846,7 @@ impl TableMeta {
             name,
             primary_key,
             primary_key_extra,
+            primary_key_name,
             columns,
             root_page,
             indexes,

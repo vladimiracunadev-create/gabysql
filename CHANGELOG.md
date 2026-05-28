@@ -6,6 +6,72 @@
 
 ---
 
+## 2026-05-27 — Residual #2 de L: nombres en PK/UNIQUE/FK + `ALTER TABLE DROP CONSTRAINT` (VERSION 10 → 11)
+
+> **Un push a `main`** que cierra el residual #2 listado tras L3: poder nombrar PK/UNIQUE/FK con `CONSTRAINT <name>` y borrarlos por nombre con `ALTER TABLE DROP CONSTRAINT`. Bump VERSION 10→11 con rechazo limpio de V10 vía `[GBY-1003]`. Ver [ADR-0022](docs/adr/0022-named-constraints-and-drop.md).
+
+### 🆕 Sintaxis
+
+- `CREATE TABLE t (..., CONSTRAINT pk_t PRIMARY KEY (id));`
+- `CREATE TABLE t (..., CONSTRAINT uq_email UNIQUE (email));`
+- `CREATE TABLE t (..., CONSTRAINT fk_t_parent FOREIGN KEY (parent_id) REFERENCES parent (id) ON DELETE CASCADE);` — single-col, multi-col rebota apuntando al residual #3.
+- `ALTER TABLE t DROP CONSTRAINT <name>;`
+- `ALTER TABLE t DROP CONSTRAINT IF EXISTS <name>;` — no-op silencioso si no existe.
+
+### 🛡️ Semántica del DROP CONSTRAINT
+
+Lookup case-insensitive en este orden:
+
+1. **PK** → rechazo con `[GBY-4072] CANNOT_DROP_PRIMARY_KEY_CONSTRAINT` (PK inmutable).
+2. **CHECK** → drop la entry del Vec.
+3. **UNIQUE index** → si el índice existe pero NO es UNIQUE, rechazo con sugerencia de `DROP INDEX`.
+4. **FK con nombre** → limpia `column.references` (la columna queda; deja de ser FK).
+5. Sin match → `[GBY-4071] CONSTRAINT_NOT_FOUND` con breakdown de constraints visibles. Con `IF EXISTS`, no-op.
+
+### 🚧 Limitaciones
+
+- `CONSTRAINT <name> FOREIGN KEY (a, b) REFERENCES p (x, y)` rechazado con mensaje claro → diferido al residual #3.
+- Nombrado inline en columna (`email TEXT CONSTRAINT uq_email UNIQUE`) no soportado todavía — sólo `CONSTRAINT name CHECK` inline desde L2.
+- Migración V10 → V11 manual: dump SELECT + recreate.
+
+### 🔧 Catálogo
+
+- `TableMeta` añade `pub primary_key_name: Option<String>`.
+- `ForeignKeyMeta` añade `pub name: Option<String>`.
+- `IndexMeta.name` ya existía (V5+); ahora puede venir del usuario o del auto-naming (`uq_<table>_<cols>`).
+
+### 🆕 Errores
+
+- `[GBY-4071] CONSTRAINT_NOT_FOUND` — DROP CONSTRAINT con nombre desconocido.
+- `[GBY-4072] CANNOT_DROP_PRIMARY_KEY_CONSTRAINT` — DROP CONSTRAINT sobre la PK.
+
+### 🗄️ Formato en disco — VERSION 11
+
+```
+[name][pk_count:u8] · pk_count × [pk_col]
+[pk_name_present:u8] · pk_name_present ? [pk_name] : ∅            ← NUEVO
+[root_page:u32]
+[col_count:u16] · col × {
+    [name][type:u8][flags:u8]
+    flags & 0x02 ? DefaultLiteral : ∅
+    flags & 0x04 ? [target_table][target_column]
+                   [on_delete:u8][on_update:u8]
+                   [fk_name_present:u8] · fk_name_present ?
+                         [fk_name] : ∅                            ← NUEVO
+                   : ∅
+}
+[idx_count:u16] · idx × { … }
+[check_count:u16] · check × { [name][source] }
+```
+
+### 🧪 Tests nuevos (10)
+
+`r2_constraint_name_primary_key`, `r2_constraint_name_unique_and_drop`, `r2_constraint_name_foreign_key_and_drop`, `r2_drop_constraint_check`, `r2_drop_constraint_unknown_name_rejected`, `r2_drop_constraint_if_exists_no_op`, `r2_drop_constraint_non_unique_index_rejected`, `r2_named_constraints_persist_across_reopen`, `r2_multi_col_fk_rejected_with_clear_message`, `r2_v10_db_rejected_with_unsupported_version`.
+
+Total integration tests: 339 (329 pre-residual-#2 + 10 nuevos), todos verdes.
+
+---
+
 ## 2026-05-27 — L3 (residual de L): `ALTER TABLE ADD CHECK` con re-validación de filas
 
 > **Un push a `main`** que cierra el sub-pendiente #1 listado tras L2: agregar un `CHECK (expr)` a una tabla **ya cargada con datos**. Sin bump de formato (V10 ya tiene el slot). Pequeño y autocontenido: ~280 líneas en `src/sql.rs` + 9 tests + docs.

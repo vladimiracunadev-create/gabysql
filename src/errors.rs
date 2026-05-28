@@ -394,6 +394,16 @@ pub mod codes {
     /// comparación. Igual que `WHERE_EXPR_NOT_BOOLEAN` pero localizado
     /// para mensajes de error claros al usuario de CREATE TABLE.
     pub const CHECK_EXPR_NOT_BOOLEAN: u32 = 4070;
+    /// Residual #2 de L (2026-05-27): `ALTER TABLE DROP CONSTRAINT <name>`
+    /// no encontró ningún constraint con ese nombre (CHECK, UNIQUE
+    /// nombrado, o FK nombrada). El mensaje incluye las opciones
+    /// disponibles cuando hay constraints en la tabla.
+    pub const CONSTRAINT_NOT_FOUND: u32 = 4071;
+    /// Residual #2 de L: intento de borrar la PRIMARY KEY con
+    /// `DROP CONSTRAINT <name>`. La PK es inmutable durante la vida
+    /// de la tabla; rehacer el esquema con `DROP TABLE` + recreate si
+    /// la intención es cambiarla.
+    pub const CANNOT_DROP_PRIMARY_KEY_CONSTRAINT: u32 = 4072;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

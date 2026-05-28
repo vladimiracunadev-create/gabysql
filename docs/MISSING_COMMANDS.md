@@ -259,8 +259,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `ALTER TABLE RENAME COLUMN` | ✅ (K1, 2026-05-26; arrastra PK + índices + FKs entrantes) | — |
 | `ALTER TABLE RENAME TO` | ✅ (K1, 2026-05-26; alias `RENAME TABLE`; arrastra FKs entrantes) | — |
 | `ALTER TABLE ADD [CONSTRAINT name] CHECK (expr)` | ✅ (L3, 2026-05-27; re-valida filas existentes con full-scan, aborta con `[GBY-3008]` sin estado parcial) | — |
+| `CREATE TABLE (..., CONSTRAINT name PRIMARY KEY/UNIQUE/FOREIGN KEY ...)` | ✅ (residual #2, 2026-05-27; FK single-col únicamente) | — |
 | `ALTER TABLE ADD CONSTRAINT name PRIMARY KEY/UNIQUE/FOREIGN KEY` | ❌ | P2 |
-| `ALTER TABLE DROP CONSTRAINT <name>` | ❌ | P2 |
+| `ALTER TABLE DROP CONSTRAINT [IF EXISTS] <name>` | ✅ (residual #2, 2026-05-27; lookup CHECK/UNIQUE/FK; PK rechazada con `[GBY-4072]`) | — |
 | `ALTER TABLE ALTER COLUMN ... TYPE ...` | ❌ | P2 (K2 — requiere rewrite tipado) |
 | `DROP TABLE ... CASCADE` | ❌ | P2 |
 

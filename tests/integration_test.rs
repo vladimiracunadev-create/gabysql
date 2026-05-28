@@ -7984,6 +7984,246 @@ fn l2_v9_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Residual #2 de L (2026-05-27): nombres en PK/UNIQUE/FK +
+//        ALTER TABLE DROP CONSTRAINT. -----
+
+fn r2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("r2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn r2_constraint_name_primary_key() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("pk-name")?;
+    // PK table-level con nombre.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT, CONSTRAINT pk_t PRIMARY KEY (id));",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, name) VALUES (1, 'a');")?;
+    // DROP CONSTRAINT sobre la PK → rechazo con [GBY-4072].
+    let err = run_sql(&db, "ALTER TABLE t DROP CONSTRAINT pk_t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4072"),
+        "esperaba GBY-4072 al borrar PK, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_constraint_name_unique_and_drop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("uq-name-drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id INT PRIMARY KEY,
+            email TEXT,
+            CONSTRAINT uq_email UNIQUE (email)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, email) VALUES (1, 'a@b.com');")?;
+    // Pre-drop: duplicado rebotado por UNIQUE.
+    let err = run_sql(&db, "INSERT INTO t (id, email) VALUES (2, 'a@b.com');").unwrap_err();
+    assert!(
+        err.to_string().contains("UNIQUE") || err.to_string().contains("GBY-3003"),
+        "pre-drop esperaba UNIQUE violation, got: {}",
+        err
+    );
+    // Drop UNIQUE → ahora el duplicado se acepta.
+    run_sql(&db, "ALTER TABLE t DROP CONSTRAINT uq_email;")?;
+    run_sql(&db, "INSERT INTO t (id, email) VALUES (2, 'a@b.com');")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_constraint_name_foreign_key_and_drop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("fk-name-drop")?;
+    run_sql(&db, "CREATE TABLE parent (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent (id)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    // Pre-drop: FK válida — insertar parent_id inexistente debe rebotar.
+    let err = run_sql(&db, "INSERT INTO child (id, parent_id) VALUES (10, 99);").unwrap_err();
+    assert!(
+        err.to_string().contains("FK") || err.to_string().contains("GBY-3004"),
+        "pre-drop esperaba FK violation, got: {}",
+        err
+    );
+    // Drop la FK → ahora podemos insertar cualquier parent_id.
+    run_sql(&db, "ALTER TABLE child DROP CONSTRAINT fk_child_parent;")?;
+    run_sql(&db, "INSERT INTO child (id, parent_id) VALUES (10, 99);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_drop_constraint_check() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("check-drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, qty INT, CONSTRAINT qty_pos CHECK (qty > 0));",
+    )?;
+    // Pre-drop: qty <= 0 rebota.
+    let err = run_sql(&db, "INSERT INTO t (id, qty) VALUES (1, -1);").unwrap_err();
+    assert!(err.to_string().contains("GBY-3008"));
+    // Drop → ahora se acepta.
+    run_sql(&db, "ALTER TABLE t DROP CONSTRAINT qty_pos;")?;
+    run_sql(&db, "INSERT INTO t (id, qty) VALUES (1, -1);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_drop_constraint_unknown_name_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("unknown")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "ALTER TABLE t DROP CONSTRAINT nope;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4071"),
+        "esperaba GBY-4071, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_drop_constraint_if_exists_no_op() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("if-exists")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    // Sin IF EXISTS rebota; con IF EXISTS es no-op.
+    run_sql(&db, "ALTER TABLE t DROP CONSTRAINT IF EXISTS nope;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_drop_constraint_non_unique_index_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("idx-not-unique")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, k INT);
+         CREATE INDEX idx_k ON t (k);",
+    )?;
+    // DROP CONSTRAINT sobre un índice no-UNIQUE → rechazo claro
+    // (sugiere DROP INDEX). idx_k existe pero no es constraint.
+    let err = run_sql(&db, "ALTER TABLE t DROP CONSTRAINT idx_k;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4071") && err.to_string().to_lowercase().contains("unique"),
+        "esperaba mensaje sobre DROP INDEX, got: {}",
+        err
+    );
+    // DROP INDEX sí funciona.
+    run_sql(&db, "DROP INDEX idx_k;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_named_constraints_persist_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY);
+         CREATE TABLE t (
+            id INT PRIMARY KEY,
+            email TEXT,
+            parent_id INT,
+            CONSTRAINT uq_email UNIQUE (email),
+            CONSTRAINT fk_t_parent FOREIGN KEY (parent_id) REFERENCES parent (id),
+            CONSTRAINT chk_email_len CHECK (LENGTH(email) > 0)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (id) VALUES (1);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, email, parent_id) VALUES (1, 'a@b', 1);",
+    )?;
+    // Reopen + drop CHECK → INSERT con email vacío ahora se acepta.
+    run_sql(&db, "ALTER TABLE t DROP CONSTRAINT chk_email_len;")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, email, parent_id) VALUES (2, '', 1);",
+    )?;
+    // FK sigue activa: parent_id=99 debe rebotar.
+    let err = run_sql(
+        &db,
+        "INSERT INTO t (id, email, parent_id) VALUES (3, 'x', 99);",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("GBY-3004") || err.to_string().contains("FK"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_multi_col_fk_rejected_with_clear_message() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r2_setup("multi-col-fk")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));",
+    )?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT, pb INT,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )
+    .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("multi") && msg.contains("residual #3"),
+        "esperaba mensaje sobre residual #3, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r2_v10_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
+    // Bump 10→11: poner el byte del header en 10 y reabrir → refuse.
+    let db = temp_db_path("r2-v11-bump");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY);")?;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&10u32.to_le_bytes())?;
+    drop(f);
+    let err = match Pager::open(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::open to refuse v10 file post-residual #2"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
+        "expected refusal, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
