@@ -40,7 +40,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **K1** ✅ | DDL safe sin cambios on-disk: `CREATE TABLE AS SELECT`, `RENAME TABLE`, `ALTER TABLE RENAME TO`, `ALTER TABLE DROP COLUMN [IF EXISTS]`, `ALTER TABLE RENAME COLUMN` (**cerrado 2026-05-26**) | Medio | — |
 | **K2** ✅ | DDL con cambios on-disk: PK compuesta `PRIMARY KEY (a, b, ...)` y índices compuestos `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`. Bump VERSION 7→8 (**cerrado 2026-05-26**, ver ADR-0019). Restringido a all-INT NOT NULL; partial indexes y `ALTER COLUMN TYPE` siguen pendientes (futuro K3). | Alto | K1 |
 | **L1** ✅ | Referential actions: `ON DELETE SET NULL`, `ON DELETE SET DEFAULT`, `ON DELETE NO ACTION`, `ON UPDATE ...` (parsea + persiste; no se dispara hoy), `UNIQUE (a, b, ...)` table-level + parche al composite UNIQUE de K2. Bump VERSION 8→9. **Cerrado 2026-05-27** ([ADR-0020](adr/0020-fk-referential-actions.md)). | Medio | K |
-| **L2** | Constraints: `CHECK (expr)` column-level y table-level, evaluación en INSERT/UPDATE/UPSERT, NULL pasa via 3VL ANSI | Medio-Alto | L1, G3 |
+| **L2** ✅ | Constraints: `CHECK (expr)` column-level y table-level (con/sin `CONSTRAINT name`), evaluación en INSERT/UPDATE/UPSERT/DO UPDATE/cascade, 3VL ANSI, subqueries rechazadas en DDL. Bump VERSION 9→10. **Cerrado 2026-05-27** ([ADR-0021](adr/0021-check-constraints.md)). | Medio-Alto | L1, G3 |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
 | **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
@@ -283,7 +283,7 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `FOREIGN KEY ... ON DELETE SET DEFAULT` | ✅ (L1, 2026-05-27; `[GBY-3010]` si no hay DEFAULT) | — |
 | `FOREIGN KEY ... ON DELETE NO ACTION` | ✅ (L1, 2026-05-27; alias de RESTRICT en este release) | — |
 | `FOREIGN KEY ... ON UPDATE ...` | ✅ parser+persistencia (L1, 2026-05-27); **no se dispara** todavía (PK inmutable, `[GBY-4008]`) | — |
-| `CHECK (cond)` | ❌ | P1 (sub-bloque **L2**) |
+| `CHECK (cond)` | ✅ (L2, 2026-05-27) — column-level + table-level, con/sin nombre, 3VL ANSI, sin subqueries (`[GBY-4069]`) | — |
 | `EXCLUDE USING ...` (Postgres-style) | ❌ | P3 |
 | Constraints diferidas (`DEFERRABLE INITIALLY DEFERRED`) | ❌ | P3 |
 | Multi-column `PRIMARY KEY` standalone | ✅ (K2, 2026-05-26; all-INT NOT NULL) | — |

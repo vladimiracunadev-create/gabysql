@@ -81,7 +81,17 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        range scan sobre claves compuestas. V7 files son rechazados
 //        al abrir con `[GBY-1003]` — la migración es manual: hacer
 //        backup, recrear con binario V8 y volver a cargar los datos.
-pub const VERSION: u32 = 9;
+//   9 -> Bloque L1: cada FK añade un byte `on_update`, `OnDelete`
+//        admite códigos 2=SET NULL y 3=SET DEFAULT. V8 rechazados con
+//        `[GBY-1003]`.
+//  10 -> Bloque L2: `TableMeta` añade un trailer
+//        `check_count:u16 + (name, source)*` con los constraints
+//        CHECK declarados a nivel de columna o de tabla. La expresión
+//        se serializa como SQL canónico (`format_expr`) y se re-parsea
+//        en cada write. V9 files son rechazados al abrir con
+//        `[GBY-1003]` — migración manual: dump SELECT + recreate con
+//        binario V10.
+pub const VERSION: u32 = 10;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

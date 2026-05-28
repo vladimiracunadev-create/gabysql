@@ -1,7 +1,7 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
-    validate_create_table, validate_identifier, Catalog, Column, ColumnType, DefaultLiteral,
-    ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate, TableMeta,
+    validate_create_table, validate_identifier, Catalog, CheckConstraint, Column, ColumnType,
+    DefaultLiteral, ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate, TableMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -306,6 +306,13 @@ pub struct CreateTableStmt {
     /// como un índice UNIQUE en `CREATE TABLE`. Vacío para tablas que
     /// sólo usan UNIQUE inline en una columna o no usan UNIQUE.
     pub unique_constraints: Vec<Vec<String>>,
+    /// Bloque L2 (2026-05-27): `CHECK (expr)` declarados a nivel de
+    /// columna o de tabla, junto con su nombre opcional
+    /// (`CONSTRAINT name CHECK (...)`). El parser ya re-formatea cada
+    /// expresión con `format_expr` para que el catálogo persista el
+    /// texto canónico (y no haya drift entre el SQL original y el
+    /// re-parse).
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1273,6 +1280,10 @@ impl<'a> Engine<'a> {
         // K2: el parser puede entregar columnas PK adicionales por
         // table-level `PRIMARY KEY (a, b, ...)`.
         let primary_key_extra = stmt.primary_key_extra.clone();
+        // Bloque L2 (2026-05-27): heredar los CHECKs del parser. Cada
+        // entrada ya viene con `name` definitivo y `source` canónico
+        // (re-serializado vía `format_expr`).
+        let check_constraints = stmt.check_constraints.clone();
         let mut meta = TableMeta {
             name: stmt.name,
             primary_key,
@@ -1280,9 +1291,11 @@ impl<'a> Engine<'a> {
             columns,
             root_page: 0,
             indexes: Vec::new(),
+            check_constraints,
         };
         validate_create_table(&meta)?;
         validate_fk_targets(self.pager, &meta)?;
+        validate_check_constraints(&meta)?;
 
         {
             let mut catalog = Catalog::open(self.pager);
@@ -1986,6 +1999,7 @@ impl<'a> Engine<'a> {
             columns,
             root_page: 0,
             indexes: Vec::new(),
+            check_constraints: Vec::new(),
         };
         validate_create_table(&meta)?;
 
@@ -2641,6 +2655,10 @@ impl<'a> Engine<'a> {
         }
 
         enforce_not_null_on_insert(meta, &values)?;
+        // Bloque L2 (2026-05-27): CHECK eval contra la fila propuesta.
+        // Aplica defaults antes — el `values` que llega ya pasó por
+        // `apply_defaults` aguas arriba (mismo lugar que NOT NULL).
+        enforce_check_constraints(meta, &values)?;
 
         // Bloque L1 (2026-05-27): el UNIQUE pre-check distingue índices
         // single-column (value bytes de la columna) de compuestos (FNV-1a-64
@@ -3070,6 +3088,7 @@ impl<'a> Engine<'a> {
             columns,
             root_page: 0,
             indexes: Vec::new(),
+            check_constraints: Vec::new(),
         };
         // Decodificar filas a HashMap<colname-normalizado, Value>.
         let rows: Vec<HashMap<String, Value>> = result
@@ -3311,6 +3330,7 @@ impl<'a> Engine<'a> {
             columns,
             root_page: 0,
             indexes: Vec::new(),
+            check_constraints: Vec::new(),
         };
         let rows: Vec<HashMap<String, Value>> = rs
             .rows
@@ -5121,6 +5141,11 @@ impl<'a> Engine<'a> {
             }
         }
 
+        // Bloque L2 (2026-05-27): CHECK eval contra la fila MERGED
+        // (`current` ya tiene los overrides aplicados). Cubre UPDATE y
+        // UPSERT DO UPDATE (los dos van por este código path).
+        enforce_check_constraints(meta, &current)?;
+
         enforce_fk_on_update(self.pager, meta, &old_row, &current, pk)?;
 
         let (encoded_pk, row_bytes) = encode_row(meta, &current)?;
@@ -6299,6 +6324,7 @@ pub fn parse(sql_text: &str) -> DbResult<Vec<Statement>> {
             pos: 0,
             where_depth: 0,
             in_having: false,
+            pending_check_name: None,
         };
         let statement = parser.parse_statement()?;
         if !parser.is_eof() {
@@ -7050,6 +7076,162 @@ fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
     Ok(())
 }
 
+/// Bloque L2 (2026-05-27): evalúa todos los `CHECK (expr)` de la
+/// tabla contra la fila propuesta y rebota con `[GBY-3008]` si alguno
+/// resulta FALSE (ANSI 3VL: NULL pasa). Para usar en el path de write
+/// (INSERT, UPDATE, UPSERT DO UPDATE, ON CONFLICT DO UPDATE).
+///
+/// Re-parsea el `source` canónico en cada llamada. El costo extra
+/// (~lex+parse de cada CHECK por row) es aceptable porque (a) el
+/// catálogo guarda texto y no AST, (b) la lista típica es < 5 CHECKs
+/// por tabla.
+fn enforce_check_constraints(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult<()> {
+    for ck in &meta.check_constraints {
+        let expr = parse_expr_str(&ck.source).map_err(|e| {
+            DbError::new(format!(
+                "CHECK '{}' en '{}': re-parse falló — {}",
+                ck.name, meta.name, e
+            ))
+        })?;
+        // Las claves del row vienen normalizadas (`normalize_ident`)
+        // — eval_expr ya las resuelve case-insensitive.
+        match eval_expr_as_predicate(&expr, values) {
+            Ok(Some(true)) => continue,
+            Ok(None) => continue, // NULL → pass (3VL ANSI)
+            Ok(Some(false)) => {
+                return Err(coded(
+                    codes::CHECK_VIOLATED,
+                    format!(
+                        "CHECK '{}' en tabla '{}' violado por la fila propuesta: predicado `{}` evaluó a FALSE",
+                        ck.name, meta.name, ck.source
+                    ),
+                ));
+            }
+            Err(e) => {
+                // Errores del evaluador (división por cero, etc.) — los
+                // re-emitimos con contexto del CHECK afectado.
+                return Err(DbError::new(format!(
+                    "CHECK '{}' en '{}': error al evaluar — {}",
+                    ck.name, meta.name, e
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bloque L2 (2026-05-27): valida en DDL que cada `CHECK (expr)` de
+/// `meta`:
+///
+/// 1. Re-parsea limpio desde su `source` canónico (smoke check del
+///    round-trip `format_expr` → `parse_expr_str`).
+/// 2. Sólo referencia columnas que existen en la tabla. La verificación
+///    es por nombre (case-insensitive); columnas qualified
+///    (`t.col`) se permiten siempre que el qualifier matchee el nombre
+///    de la tabla.
+/// 3. No contiene `ScalarSubquery` — `format_expr` ya lo habría
+///    rechazado, pero re-chequeamos por defensa en profundidad.
+fn validate_check_constraints(meta: &TableMeta) -> DbResult<()> {
+    for ck in &meta.check_constraints {
+        let expr = parse_expr_str(&ck.source).map_err(|e| {
+            DbError::new(format!(
+                "CHECK '{}' en tabla '{}': re-parse falló — {}",
+                ck.name, meta.name, e
+            ))
+        })?;
+        check_expr_no_subquery(&expr).map_err(|e| {
+            DbError::new(format!(
+                "CHECK '{}' en tabla '{}': {}",
+                ck.name, meta.name, e
+            ))
+        })?;
+        collect_check_columns(&expr, &mut |col| {
+            let key = strip_qualifier(col, &meta.name);
+            if meta.column(&key).is_none() {
+                Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "CHECK '{}' en tabla '{}': la columna '{}' no existe",
+                        ck.name, meta.name, col
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Bloque L2: extrae sólo el nombre de columna (lower) de un eventual
+/// `t.col` cuando `t` matchea el nombre de la tabla; si el qualifier
+/// es otra tabla, devuelve el ident completo (que el validador
+/// rechazará — CHECK no admite refs cross-table).
+fn strip_qualifier(name: &str, table: &str) -> String {
+    if let Some((qual, col)) = name.split_once('.') {
+        if qual.eq_ignore_ascii_case(table) {
+            return col.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Bloque L2: walker del AST que invoca `cb(name)` por cada
+/// `Expr::Column(name)` encontrado. Permite reusar el árbol para
+/// validar columns y para detectar ScalarSubquery sin re-implementar
+/// el recorrido.
+fn collect_check_columns(expr: &Expr, cb: &mut dyn FnMut(&str) -> DbResult<()>) -> DbResult<()> {
+    match expr {
+        Expr::Literal(_) => Ok(()),
+        Expr::Column(name) => cb(name),
+        Expr::Func(_, args) => {
+            for a in args {
+                collect_check_columns(a, cb)?;
+            }
+            Ok(())
+        }
+        Expr::Cast(inner, _) => collect_check_columns(inner, cb),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                collect_check_columns(op, cb)?;
+            }
+            for (c, v) in branches {
+                collect_check_columns(c, cb)?;
+                collect_check_columns(v, cb)?;
+            }
+            if let Some(e) = else_branch {
+                collect_check_columns(e, cb)?;
+            }
+            Ok(())
+        }
+        Expr::Compare(l, _, r) | Expr::Arith(l, _, r) => {
+            collect_check_columns(l, cb)?;
+            collect_check_columns(r, cb)
+        }
+        Expr::IsNull(inner, _) | Expr::Like(inner, _, _) | Expr::InList(inner, _, _) => {
+            collect_check_columns(inner, cb)
+        }
+        Expr::Between(lhs, lo, hi, _) => {
+            collect_check_columns(lhs, cb)?;
+            collect_check_columns(lo, cb)?;
+            collect_check_columns(hi, cb)
+        }
+        Expr::ScalarSubquery(_) => Err(coded(
+            codes::CHECK_CONTAINS_SUBQUERY,
+            "CHECK no admite subqueries",
+        )),
+    }
+}
+
+/// Bloque L2: valida que `expr` no contenga subqueries en ningún nivel.
+fn check_expr_no_subquery(expr: &Expr) -> DbResult<()> {
+    collect_check_columns(expr, &mut |_| Ok(()))
+}
+
 /// Verify that the given `target_pk` exists in the FK's parent table.
 /// `self_ref_allowed_pk` lets INSERT/UPDATE accept a self-FK that points
 /// at the very row being written (the row will exist as soon as the
@@ -7538,6 +7720,11 @@ fn cascade_set_fk_value(
             ),
         ));
     }
+
+    // Bloque L2 (2026-05-27): CHECK eval contra la fila resultante de
+    // la cascade. Si el valor seteado por SET NULL/SET DEFAULT viola un
+    // CHECK del child, abortamos antes de tocar disco.
+    enforce_check_constraints(child_meta, &new_row)?;
 
     // 4. Pre-check UNIQUE para los índices afectados.
     for idx in &child_meta.indexes {
@@ -8669,6 +8856,200 @@ fn validate_scalar_arity(f: ScalarFunc, n: usize) -> DbResult<()> {
             if n == 1 { "" } else { "s" }
         ),
     ))
+}
+
+/// Bloque L2 (2026-05-27): serializa un `Expr` de vuelta a SQL
+/// canónico re-parseable por [`parse_expr_str`].
+///
+/// Usado por el catálogo para persistir el `source` de un
+/// [`CheckConstraint`] como texto en vez del AST — evita acoplar el
+/// formato on-disk al AST que cambia con cada bloque G/H/I. La salida
+/// envuelve sub-expresiones binarias en paréntesis para no depender de
+/// la precedencia (el round-trip queda estable).
+///
+/// `ScalarSubquery` no se admite: `CHECK` no puede usar subqueries en
+/// ANSI ni en gabysql (el evaluador `eval_expr` lo rechaza
+/// activamente).
+pub fn format_expr(expr: &Expr) -> DbResult<String> {
+    match expr {
+        Expr::Literal(v) => Ok(format_value_literal(v)),
+        Expr::Column(name) => Ok(name.clone()),
+        Expr::Func(f, args) => format_func_call(*f, args),
+        Expr::Cast(inner, ty) => {
+            Ok(format!("CAST({} AS {})", format_expr(inner)?, ty.as_sql()))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            let mut out = String::from("CASE");
+            if let Some(op) = operand {
+                out.push(' ');
+                out.push_str(&format_expr(op)?);
+            }
+            for (cond, val) in branches {
+                out.push_str(" WHEN ");
+                out.push_str(&format_expr(cond)?);
+                out.push_str(" THEN ");
+                out.push_str(&format_expr(val)?);
+            }
+            if let Some(el) = else_branch {
+                out.push_str(" ELSE ");
+                out.push_str(&format_expr(el)?);
+            }
+            out.push_str(" END");
+            Ok(out)
+        }
+        Expr::Compare(lhs, op, rhs) => Ok(format!(
+            "({} {} {})",
+            format_expr(lhs)?,
+            cmp_op_sql(*op),
+            format_expr(rhs)?
+        )),
+        Expr::IsNull(inner, negated) => Ok(format!(
+            "({} IS {}NULL)",
+            format_expr(inner)?,
+            if *negated { "NOT " } else { "" }
+        )),
+        Expr::Arith(lhs, op, rhs) => Ok(format!(
+            "({} {} {})",
+            format_expr(lhs)?,
+            op.lexeme(),
+            format_expr(rhs)?
+        )),
+        Expr::Like(lhs, pattern, negated) => Ok(format!(
+            "({} {}LIKE {})",
+            format_expr(lhs)?,
+            if *negated { "NOT " } else { "" },
+            quote_string(pattern)
+        )),
+        Expr::InList(lhs, values, negated) => {
+            let items: Vec<String> = values.iter().map(format_value_literal).collect();
+            Ok(format!(
+                "({} {}IN ({}))",
+                format_expr(lhs)?,
+                if *negated { "NOT " } else { "" },
+                items.join(", ")
+            ))
+        }
+        Expr::Between(lhs, lo, hi, negated) => Ok(format!(
+            "({} {}BETWEEN {} AND {})",
+            format_expr(lhs)?,
+            if *negated { "NOT " } else { "" },
+            format_expr(lo)?,
+            format_expr(hi)?
+        )),
+        Expr::ScalarSubquery(_) => Err(coded(
+            codes::CHECK_CONTAINS_SUBQUERY,
+            "CHECK no admite subqueries (ANSI; gabysql sigue la regla por consistencia con el evaluador).",
+        )),
+    }
+}
+
+/// Bloque L2: helper para serializar literales SQL. Strings van con
+/// comillas simples y escapean `'` doblándola (estilo ANSI). Floats
+/// usan la representación de Rust (estable round-trip vía f64 parser).
+fn format_value_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(true) => "TRUE".to_string(),
+        Value::Bool(false) => "FALSE".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Float(n) => {
+            // Aseguramos punto decimal para que el parser detecte float
+            // (e.g. `1` vs `1.0`).
+            let s = format!("{}", n);
+            if s.contains('.')
+                || s.contains('e')
+                || s.contains('E')
+                || s == "inf"
+                || s == "-inf"
+                || s == "NaN"
+            {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        }
+        Value::String(s) => quote_string(s),
+    }
+}
+
+fn quote_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push('\'');
+            out.push('\'');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn cmp_op_sql(op: ExprCmpOp) -> &'static str {
+    match op {
+        ExprCmpOp::Eq => "=",
+        ExprCmpOp::Ne => "<>",
+        ExprCmpOp::Lt => "<",
+        ExprCmpOp::Le => "<=",
+        ExprCmpOp::Gt => ">",
+        ExprCmpOp::Ge => ">=",
+    }
+}
+
+fn format_func_call(f: ScalarFunc, args: &[Expr]) -> DbResult<String> {
+    // EXTRACT(<field> FROM <date>) tiene sintaxis especial: args[0] es
+    // un Literal(String) con el field name, args[1] la fecha.
+    if matches!(f, ScalarFunc::Extract) {
+        if args.len() != 2 {
+            return Err(DbError::new(format!(
+                "EXTRACT esperaba 2 args internos, recibí {}",
+                args.len()
+            )));
+        }
+        let field = match &args[0] {
+            Expr::Literal(Value::String(s)) => s.clone(),
+            other => {
+                return Err(DbError::new(format!(
+                    "EXTRACT: arg field interno debe ser literal STRING, recibí {:?}",
+                    other
+                )))
+            }
+        };
+        return Ok(format!(
+            "EXTRACT({} FROM {})",
+            field,
+            format_expr(&args[1])?
+        ));
+    }
+    let rendered: Vec<String> = args.iter().map(format_expr).collect::<DbResult<_>>()?;
+    Ok(format!("{}({})", f.keyword(), rendered.join(", ")))
+}
+
+/// Bloque L2: parsea una expresión standalone (sin SELECT) — útil para
+/// re-cargar el `source` de un `CheckConstraint` desde catálogo.
+pub fn parse_expr_str(source: &str) -> DbResult<Expr> {
+    let tokens = tokenize(source)?;
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        where_depth: 0,
+        in_having: false,
+        pending_check_name: None,
+    };
+    let expr = parser.parse_expr()?;
+    if !parser.is_eof() {
+        return Err(DbError::new(format!(
+            "parse_expr_str: tokens sobrantes después de la expresión: '{}'",
+            source
+        )));
+    }
+    Ok(expr)
 }
 
 /// Bloque G1: evaluador de `Expr` sobre una fila ya decodificada. Las
@@ -10165,6 +10546,11 @@ struct Parser {
     /// cada entrada a `parse_where_or/and/not/primary` y se decrementa
     /// al salir; si supera `MAX_PARSE_DEPTH` devuelve `[GBY-4033]`.
     where_depth: usize,
+    /// Bloque L2 (2026-05-27): stash temporal del nombre cuando
+    /// `CONSTRAINT <name> CHECK ...` se detecta a nivel de tabla. Lo
+    /// llena `try_match_table_constraint_check_head` y lo consume el
+    /// caller en la misma iteración del loop de CREATE TABLE.
+    pending_check_name: Option<String>,
 }
 
 /// Sec3: profundidad máxima permitida en el árbol de expresiones del
@@ -10396,7 +10782,19 @@ impl Parser {
         if self.match_keyword("ADD") {
             // The COLUMN keyword is optional, matching most other dialects.
             let _ = self.match_keyword("COLUMN");
-            let column = self.parse_column_def()?;
+            // Bloque L2: ALTER TABLE ADD COLUMN no admite CHECKs por
+            // ahora — el column-level CHECK requeriría re-validar todas
+            // las filas existentes, scope que queda fuera de L2. El
+            // buffer se descarta; si el parser empuja algo,
+            // devolvemos un error explícito.
+            let mut dropped: Vec<(Option<String>, Expr)> = Vec::new();
+            let column = self.parse_column_def(&mut dropped)?;
+            if !dropped.is_empty() {
+                return Err(DbError::new(
+                    "ALTER TABLE ADD COLUMN no admite CHECK en este release \
+                     (requeriría re-validar las filas existentes)",
+                ));
+            }
             return Ok(Statement::AlterTableAddColumn(AlterAddColumnStmt {
                 table,
                 column,
@@ -10445,7 +10843,10 @@ impl Parser {
     /// `ColumnDef`. The constraint loop is intentionally permissive about
     /// order — semantic validation (e.g. "DEFAULT NULL incompatible con
     /// NOT NULL") happens later in `validate_create_table`.
-    fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
+    fn parse_column_def(
+        &mut self,
+        column_checks: &mut Vec<(Option<String>, Expr)>,
+    ) -> DbResult<ColumnDef> {
         let name = self.expect_ident()?;
         let type_name = self.expect_ident()?;
         let mut primary_key = false;
@@ -10488,6 +10889,23 @@ impl Parser {
                     on_delete,
                     on_update,
                 });
+            } else if self.match_keyword("CONSTRAINT") {
+                // Bloque L2: `CONSTRAINT <name> CHECK (...)` inline en
+                // una columna. El `CONSTRAINT name` aplica sólo al
+                // siguiente constraint; sólo soportamos CHECK por ahora
+                // (PK/UNIQUE/FK con nombre quedan para otra entrega).
+                let cname = self.expect_ident()?;
+                self.expect_keyword("CHECK")?;
+                self.expect_symbol("(")?;
+                let expr = self.parse_expr()?;
+                self.expect_symbol(")")?;
+                column_checks.push((Some(cname), expr));
+            } else if self.match_keyword("CHECK") {
+                // Bloque L2: `CHECK (expr)` column-level sin nombre.
+                self.expect_symbol("(")?;
+                let expr = self.parse_expr()?;
+                self.expect_symbol(")")?;
+                column_checks.push((None, expr));
             } else {
                 break;
             }
@@ -10592,6 +11010,35 @@ impl Parser {
                 "ON UPDATE admite RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION",
             ))
         }
+    }
+
+    /// Bloque L2 (2026-05-27): lookahead para detectar
+    /// `CONSTRAINT <name> CHECK (…)` a nivel de tabla. Cuando
+    /// matchea, consume los 3 tokens (CONSTRAINT, ident, CHECK), stashea
+    /// el nombre en `self.pending_check_name` y devuelve `Ok(true)`. Si
+    /// la palabra después de CONSTRAINT no es un ident seguido de CHECK,
+    /// hace rollback y devuelve `Ok(false)` (otros tipos de constraint
+    /// nombrado se podrían soportar después; hoy sólo CHECK).
+    fn try_match_table_constraint_check_head(&mut self) -> DbResult<bool> {
+        let snap = self.pos;
+        if !self.match_keyword("CONSTRAINT") {
+            return Ok(false);
+        }
+        let name_tok = self.peek().clone();
+        if name_tok.kind != TokenKind::Ident {
+            self.pos = snap;
+            return Ok(false);
+        }
+        self.pos += 1;
+        if !self.match_keyword("CHECK") {
+            // CONSTRAINT name PRIMARY KEY / UNIQUE / FOREIGN KEY no
+            // soportado hoy a nivel de tabla — rollback y dejar que
+            // otra rama (o el error genérico) lo capture.
+            self.pos = snap;
+            return Ok(false);
+        }
+        self.pending_check_name = Some(name_tok.text);
+        Ok(true)
     }
 
     /// Bloque L1 (2026-05-27): lookahead para distinguir un constraint
@@ -10712,6 +11159,11 @@ impl Parser {
         // UNIQUE (compuesto si len > 1, simple si len == 1) reutilizando
         // el camino que ya armó K2 para `CREATE UNIQUE INDEX`.
         let mut table_level_unique: Vec<Vec<String>> = Vec::new();
+        // Bloque L2 (2026-05-27): CHECKs recogidos del column-level y
+        // del table-level. Cada entrada es `(nombre opcional, Expr)`.
+        // El nombre se materializa después (synthetic
+        // `<table>_check_<N>` si no se declaró `CONSTRAINT name`).
+        let mut raw_checks: Vec<(Option<String>, Expr)> = Vec::new();
         loop {
             // Detectar table constraint `PRIMARY KEY (a, b, ...)` antes
             // de delegar a `parse_column_def` — sin ambigüedad porque
@@ -10741,8 +11193,26 @@ impl Parser {
                 }
                 self.expect_symbol(")")?;
                 table_level_unique.push(cols);
+            } else if self.match_keyword("CHECK") {
+                // Bloque L2: table-level `CHECK (expr)` sin nombre.
+                self.expect_symbol("(")?;
+                let expr = self.parse_expr()?;
+                self.expect_symbol(")")?;
+                raw_checks.push((None, expr));
+            } else if self.try_match_table_constraint_check_head()? {
+                // Bloque L2: `CONSTRAINT name CHECK (...)` table-level.
+                // El helper ya consumió `CONSTRAINT <name> CHECK`.
+                // Stashea el nombre en `pending_check_name` y limpia.
+                let name = self
+                    .pending_check_name
+                    .take()
+                    .expect("try_match_table_constraint_check_head sets pending_check_name");
+                self.expect_symbol("(")?;
+                let expr = self.parse_expr()?;
+                self.expect_symbol(")")?;
+                raw_checks.push((Some(name), expr));
             } else {
-                let column = self.parse_column_def()?;
+                let column = self.parse_column_def(&mut raw_checks)?;
                 if column.primary_key {
                     if !primary_key.is_empty() {
                         return Err(coded(
@@ -10761,6 +11231,40 @@ impl Parser {
                 break;
             }
             self.expect_symbol(",")?;
+        }
+        // Bloque L2: materializar nombres definitivos y serializar el
+        // `source` canónico. Si dos CHECKs explícitamente nombrados
+        // colisionan, rebotamos con `[GBY-2004]` (duplicate) reciclado
+        // como mensaje claro.
+        let mut check_constraints: Vec<CheckConstraint> = Vec::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
+        let mut synth_counter = 1usize;
+        for (maybe_name, expr) in raw_checks {
+            let final_name = match maybe_name {
+                Some(n) => {
+                    let lower = n.to_ascii_lowercase();
+                    if !seen_names.insert(lower) {
+                        return Err(DbError::new(format!(
+                            "CHECK constraint '{}' declarada dos veces en la misma tabla",
+                            n
+                        )));
+                    }
+                    n
+                }
+                None => loop {
+                    let candidate =
+                        format!("{}_check_{}", name.to_ascii_lowercase(), synth_counter);
+                    synth_counter += 1;
+                    if seen_names.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                },
+            };
+            let source = format_expr(&expr)?;
+            check_constraints.push(CheckConstraint {
+                name: final_name,
+                source,
+            });
         }
         // Reconciliar table-level PK contra inline PK.
         let primary_key_extra = if let Some(pk_cols) = table_level_pk {
@@ -10788,6 +11292,7 @@ impl Parser {
             primary_key,
             primary_key_extra,
             unique_constraints: table_level_unique,
+            check_constraints,
         }))
     }
 

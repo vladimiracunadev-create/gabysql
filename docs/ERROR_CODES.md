@@ -84,7 +84,7 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `3005` | `FK_RESTRICT_BLOCKS_DELETE` | `DELETE` sobre una fila que tiene hijos referenciándola con `ON DELETE RESTRICT`. El mensaje incluye cuántos hijos hay. | Borrar primero los hijos o redefinir la FK con `ON DELETE CASCADE`. |
 | `3006` | `ROW_NOT_FOUND_FOR_PK` | `UPDATE` o `DELETE` sobre una PK que no existe. | Verificar la PK con un `SELECT` previo. |
 | `3007` | `PRIMARY_KEY_NULL` | `INSERT`/`UPDATE` pasa `NULL` para la PK. | La PK no puede ser `NULL` por definición — pasar un entero. |
-| `3008` | `CHECK_VIOLATED` | (Reservado para L2.) `INSERT`/`UPDATE`/`UPSERT` viola un constraint `CHECK (expr)`. NULL pasa según 3VL ANSI. | Revisar el predicado declarado o pasar un valor que lo satisfaga. |
+| `3008` | `CHECK_VIOLATED` | `INSERT`/`UPDATE`/`UPSERT` viola un constraint `CHECK (expr)`. NULL pasa según 3VL ANSI; sólo FALSE rebota. El mensaje incluye el nombre del CHECK y su expresión canónica. | Revisar el predicado declarado o pasar un valor que lo satisfaga. |
 | `3009` | `FK_SET_NULL_VIOLATES_NOT_NULL` | `ON DELETE SET NULL` intentó poner `NULL` en una columna FK declarada `NOT NULL`. La cascade aborta sin rollback parcial. | Quitar `NOT NULL` de la columna del child o redefinir la FK con `CASCADE`/`SET DEFAULT`. |
 | `3010` | `FK_SET_DEFAULT_MISSING` | `ON DELETE SET DEFAULT` no encontró un `DEFAULT` declarado para la columna FK del child. | Declarar un `DEFAULT <valor>` en la columna o cambiar la acción a `CASCADE`/`SET NULL`. |
 
@@ -162,6 +162,8 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4066` | `FK_TARGET_NOT_INDEXED` | K2 (reservado): una FOREIGN KEY apunta a columna del padre que no es ni PK ni UNIQUE. Hoy se reusa `3004` para los casos prácticos. | Hacer la columna padre PK o UNIQUE. |
 | `4067` | `COMPOSITE_INDEX_REQUIRES_ALL_INT` | K2: `CREATE INDEX idx ON t (a, b, ...)` con alguna columna no-INT. Mismo motivo que 4064. | Indexar solo columnas INT, o crear índices single-column individuales. |
 | `4068` | `PARTIAL_KEY_LOOKUP_UNSUPPORTED` | K2 (reservado): `WHERE a = 1` contra PK compuesta `(a, b)` — el motor cae a full-scan correctamente, sin emitir error. Reservado para un futuro warning explícito. | (no usado hoy). |
+| `4069` | `CHECK_CONTAINS_SUBQUERY` | L2 (2026-05-27): `CHECK (expr)` contiene una subquery `(SELECT ...)`. ANSI lo prohíbe y el evaluador no lo soporta. | Reescribir el predicado sin subquery, o validar desde el cliente. |
+| `4070` | `CHECK_EXPR_NOT_BOOLEAN` | L2 (reservado): predicado declarado en `CHECK` no evalúa a BOOL (ni NULL). Hoy el evaluador rebota con el error genérico del eval; el código queda para una validación DDL estricta futura. | Comparar la expresión contra algo (`CHECK (LENGTH(x) > 0)` en vez de `CHECK (LENGTH(x))`). |
 
 ---
 

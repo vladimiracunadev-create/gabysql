@@ -7613,6 +7613,218 @@ fn l1_v8_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque L2 (2026-05-27): CHECK (expr) column-level y table-level. -----
+
+fn l2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("l2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn l2_check_column_level_rejects_violation_on_insert() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("col-insert")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, age INT CHECK (age >= 0));",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (1, 30);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, age) VALUES (2, -5);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_column_level_allows_null_via_3vl() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("col-null-pass")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, age INT CHECK (age >= 0));",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (1, NULL);")?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_table_level_multi_col() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("table-multicol")?;
+    run_sql(
+        &db,
+        "CREATE TABLE rangos (
+            id INT PRIMARY KEY,
+            lo INT NOT NULL,
+            hi INT NOT NULL,
+            CHECK (lo <= hi)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO rangos (id,lo,hi) VALUES (1, 5, 10);")?;
+    let err = run_sql(&db, "INSERT INTO rangos (id,lo,hi) VALUES (2, 99, 1);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_with_scalar_function() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("scalar-fn")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT, CHECK (LENGTH(name) <= 5));",
+    )?;
+    run_sql(&db, "INSERT INTO u (id, name) VALUES (1, 'abc');")?;
+    let err = run_sql(
+        &db,
+        "INSERT INTO u (id, name) VALUES (2, 'demasiado largo');",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_violated_on_update() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("update")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, qty INT NOT NULL CHECK (qty > 0));",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, qty) VALUES (1, 5);")?;
+    let err = run_sql(&db, "UPDATE t SET qty = -1 WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008, got: {}",
+        err
+    );
+    let res = run_sql(&db, "SELECT qty FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(5));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_named_check_constraint_roundtrips() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("named")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id INT PRIMARY KEY,
+            edad INT,
+            CONSTRAINT edad_no_negativa CHECK (edad >= 0)
+         );",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, edad) VALUES (1, -3);").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("GBY-3008"), "esperaba GBY-3008, got: {}", msg);
+    assert!(
+        msg.contains("edad_no_negativa"),
+        "esperaba el nombre del CHECK en el mensaje, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_rejects_unknown_column_at_ddl() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("unknown-col")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, CHECK (nope > 0));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-2002") || err.to_string().contains("nope"),
+        "esperaba COLUMN_NOT_FOUND o referencia explícita a 'nope', got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_rejects_subquery_at_ddl() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("subquery")?;
+    run_sql(&db, "CREATE TABLE ref_t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, x INT CHECK (x > (SELECT MAX(id) FROM ref_t)));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4069") || err.to_string().to_lowercase().contains("subquer"),
+        "esperaba GBY-4069 / mensaje sobre subquery, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_check_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, q INT CHECK (q BETWEEN 1 AND 10));",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, q) VALUES (1, 5);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, q) VALUES (2, 100);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008 tras reopen, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l2_v9_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("l2-v10-bump");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY);")?;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&9u32.to_le_bytes())?;
+    drop(f);
+    let err = match Pager::open(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::open to refuse v9 file post-L2"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
+        "expected refusal, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

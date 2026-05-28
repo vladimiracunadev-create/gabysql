@@ -414,6 +414,31 @@ impl IndexMeta {
     }
 }
 
+/// Bloque L2 (VERSION 10): un `CHECK (expr)` declarado en una tabla.
+///
+/// Persistimos el **texto SQL canónico** de la expresión (re-formateado
+/// por `format_expr`) en vez del AST. Razones:
+///
+/// 1. Desacopla el formato on-disk del AST de `Expr`, que evoluciona
+///    con cada bloque G/H/I. Cualquier feature de Expr que
+///    `format_expr` no sepa serializar falla en el `CREATE TABLE` (un
+///    sólo punto), no en cada `INSERT` posterior contra un AST corrupto.
+/// 2. Round-trip estable: el lexer/parser ya existen como API pública,
+///    así que la conversión texto → AST en cada write es barata
+///    relativa al I/O.
+/// 3. Catálogo legible — `INTEGRITY CHECK` y futuras vistas
+///    `INFORMATION_SCHEMA` ven el SQL literal del usuario.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    /// Nombre del constraint. Si el usuario no declaró
+    /// `CONSTRAINT name CHECK (...)`, el parser sintetiza
+    /// `<table>_check_<N>` (N empezando en 1) para reportes legibles.
+    pub name: String,
+    /// Texto SQL canónico de la expresión (`x > 0`, `LENGTH(name) <= 50`,
+    /// etc.). Re-parseable por `gabysql::sql::parse_expr_str`.
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
     pub name: String,
@@ -430,6 +455,11 @@ pub struct TableMeta {
     pub columns: Vec<Column>,
     pub root_page: u32,
     pub indexes: Vec<IndexMeta>,
+    /// Bloque L2 (VERSION 10): constraints `CHECK (expr)` declarados a
+    /// nivel de columna o de tabla. Vacío para tablas pre-L2. Se evalúan
+    /// en cada INSERT/UPDATE/UPSERT (DO UPDATE); NULL pasa (3VL ANSI),
+    /// FALSE rebota con `[GBY-3008]`.
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 impl TableMeta {
@@ -475,7 +505,7 @@ impl TableMeta {
             .any(|c| c.eq_ignore_ascii_case(column))
     }
 
-    /// VERSION = 9 on-disk layout for a TableMeta record:
+    /// VERSION = 10 on-disk layout for a TableMeta record:
     ///
     ///     [name]
     ///     [pk_count:u8] · pk_count × [pk_col_name]   (pk_count >= 1)
@@ -490,14 +520,14 @@ impl TableMeta {
     ///         [name][column][root_page:u32][unique:u8][kind:u8]
     ///         [extra_cols_count:u8] · extra × [extra_col_name]   (>= 0)
     ///     }
+    ///     [check_count:u16] · check_count × {              ← L2
+    ///         [name][source]
+    ///     }
     ///
-    /// Cambios vs VERSION 8 (Bloque L1):
-    ///   - Cada FK record añade un byte `[on_update:u8]` después de
-    ///     `[on_delete:u8]`. Las FKs creadas pre-L se materializan con
-    ///     `OnUpdate::NoAction` (byte 0).
-    ///   - El catálogo de `OnDelete` admite ahora códigos 2=SET NULL y
-    ///     3=SET DEFAULT. V8 sólo persistía 0/1 — el upgrade es
-    ///     forward-compatible en lectura para esos códigos.
+    /// Cambios vs VERSION 9 (Bloque L2):
+    ///   - Trailer nuevo `[check_count:u16] · check × {name, source}`
+    ///     después del bloque de índices. Las tablas pre-L2 escriben
+    ///     `check_count = 0` y son indistinguibles del caso "sin CHECK".
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
         push_string(&mut out, &self.name)?;
@@ -562,6 +592,20 @@ impl TableMeta {
             for col in &idx.extra_columns {
                 push_string(&mut out, col)?;
             }
+        }
+        // Bloque L2 (VERSION 10): trailer de CHECK constraints.
+        if self.check_constraints.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "tabla '{}' tiene {} CHECK constraints, máximo soportado es {}",
+                self.name,
+                self.check_constraints.len(),
+                u16::MAX
+            )));
+        }
+        out.extend_from_slice(&(self.check_constraints.len() as u16).to_le_bytes());
+        for ck in &self.check_constraints {
+            push_string(&mut out, &ck.name)?;
+            push_string(&mut out, &ck.source)?;
         }
         Ok(out)
     }
@@ -711,6 +755,28 @@ impl TableMeta {
                 extra_columns,
             });
         }
+        // Bloque L2 (VERSION 10): trailer de CHECK constraints. Tablas
+        // pre-L2 escriben check_count=0; el `take_string` agotaría buffer
+        // sólo si el catálogo está corrupto.
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "TableMeta '{}' corrupta: faltan 2 bytes para check_count en offset {} (len={})",
+                name,
+                offset,
+                data.len()
+            )));
+        }
+        let check_count = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let mut check_constraints = Vec::with_capacity(check_count);
+        for _ in 0..check_count {
+            let ck_name = take_string(data, &mut offset)?;
+            let source = take_string(data, &mut offset)?;
+            check_constraints.push(CheckConstraint {
+                name: ck_name,
+                source,
+            });
+        }
         Ok(Self {
             name,
             primary_key,
@@ -718,6 +784,7 @@ impl TableMeta {
             columns,
             root_page,
             indexes,
+            check_constraints,
         })
     }
 }

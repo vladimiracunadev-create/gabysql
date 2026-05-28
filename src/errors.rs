@@ -384,6 +384,16 @@ pub mod codes {
     /// el código queda reservado para un release futuro que ofrezca
     /// `PARTIAL_KEY_LOOKUP_UNSUPPORTED` como warning explícito.
     pub const PARTIAL_KEY_LOOKUP_UNSUPPORTED: u32 = 4068;
+    /// Bloque L2 (2026-05-27): `CHECK (expr)` contiene una subquery
+    /// (`(SELECT …)` dentro del predicado). ANSI prohíbe esto y el
+    /// evaluador `eval_expr` lo rechaza activamente. Reescribir como
+    /// constraint relacional o validarlo desde el cliente.
+    pub const CHECK_CONTAINS_SUBQUERY: u32 = 4069;
+    /// Bloque L2: el predicado declarado en `CHECK (expr)` no evalúa a
+    /// BOOL (ni NULL en 3VL). Caso típico: `CHECK (LENGTH(name))` sin
+    /// comparación. Igual que `WHERE_EXPR_NOT_BOOLEAN` pero localizado
+    /// para mensajes de error claros al usuario de CREATE TABLE.
+    pub const CHECK_EXPR_NOT_BOOLEAN: u32 = 4070;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

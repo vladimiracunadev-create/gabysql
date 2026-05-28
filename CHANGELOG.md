@@ -6,6 +6,68 @@
 
 ---
 
+## 2026-05-27 — Bloque L2: CHECK (expr) constraints (VERSION 9 → 10)
+
+> **Un push a `main`** que cierra el sub-bloque L2 del roadmap: constraints `CHECK (expr)` column-level y table-level con evaluación real en cada `INSERT`/`UPDATE`/`UPSERT DO UPDATE`. Bump VERSION 9 → 10 con rechazo limpio de DBs V9 vía `[GBY-1003]`. Ver [ADR-0021](docs/adr/0021-check-constraints.md). Con L2 cierra el bloque **L** completo del roadmap.
+
+### 🆕 Sintaxis
+
+- Column-level: `CREATE TABLE t (id INT PRIMARY KEY, age INT CHECK (age >= 0));`
+- Table-level: `CREATE TABLE r (id INT PRIMARY KEY, lo INT, hi INT, CHECK (lo <= hi));`
+- Con nombre: `CONSTRAINT edad_positiva CHECK (edad > 0)` — el nombre aparece en `[GBY-3008]` para diagnóstico claro.
+- CHECKs sin nombre se materializan como `<tabla>_check_<N>` (N empieza en 1, monotónico).
+- Soporta cualquier `Expr` re-parseable: comparadores, `AND`/`OR`/`NOT`, `BETWEEN`, `IN (...)`, `LIKE`, `IS NULL`, escalares (`LENGTH`, `UPPER`, fecha, aritméticos, `CAST`, `CASE WHEN`).
+
+### 🛡️ Semántica
+
+- **3VL ANSI**: si el predicado evalúa a `NULL`, la fila pasa. Sólo `FALSE` rebota con `[GBY-3008]`. Mismo comportamiento que PostgreSQL y SQLite.
+- Se evalúa **en cada write**: `INSERT`, `UPDATE`, `UPSERT DO UPDATE`, `ON CONFLICT DO UPDATE`, y también dentro de `cascade_set_fk_value` (SET NULL/SET DEFAULT pueden no satisfacer un CHECK del child).
+- Sin rollback parcial: si el CHECK falla, la operación entera rebota antes de tocar disco.
+
+### 🚧 Limitaciones L2 (explícitas)
+
+- **Subqueries prohibidas** dentro de CHECK (`(SELECT ...)`). Falla en DDL con `[GBY-4069]`. Es la regla ANSI y simplifica la cosecha de stats.
+- **Sin `ALTER TABLE ADD CHECK`**: agregar un CHECK a una tabla existente requeriría re-validar todas las filas. Se difiere.
+- **Sin column-level CHECK en `ALTER TABLE ADD COLUMN`**: misma razón (el `parse_column_def` lo rechaza explícitamente).
+- Sólo CHECKs con nombre en table-level y column-level. **PK/UNIQUE/FK con nombre** (`CONSTRAINT name PRIMARY KEY (...)`) no soportado todavía — el parser sólo entiende `CONSTRAINT name CHECK (...)`.
+- Migración V9 → V10 es manual: dump SELECT + recreate con binario L2.
+
+### 🔧 Catálogo
+
+- Nuevo `CheckConstraint { name: String, source: String }` con el SQL canónico del predicado (re-formateado por `format_expr`).
+- `TableMeta` añade `pub check_constraints: Vec<CheckConstraint>`.
+- Decisión de diseño: persistimos **texto canónico** (no AST). Razones en ADR-0021 § Decisión.
+
+### 🔤 Round-trip Expr ↔ texto
+
+- `gabysql::sql::format_expr(&Expr) -> DbResult<String>`: serializa el AST a SQL canónico, envuelve binarios en paréntesis para precedencia neutra, rechaza `ScalarSubquery`.
+- `gabysql::sql::parse_expr_str(&str) -> DbResult<Expr>`: contraparte — re-construye el AST desde catálogo.
+- DDL pre-validación: cada CHECK roundtrip-tea (parse → format → parse) y se rechazan refs a columnas inexistentes con `[GBY-2002]`.
+
+### 🆕 Errores
+
+- `[GBY-3008] CHECK_VIOLATED` (estaba reservado en L1; ahora live).
+- `[GBY-4069] CHECK_CONTAINS_SUBQUERY`
+- `[GBY-4070] CHECK_EXPR_NOT_BOOLEAN` (reservado para el caso `CHECK (LENGTH(x))` sin comparar; hoy el evaluador rebota con el código genérico del eval, pero el código del catálogo está disponible para futuras validaciones DDL).
+
+### 🗄️ Formato en disco — VERSION 10
+
+```
+[name][pk_count:u8] · pk_count × [pk_col]
+[root_page:u32]
+[col_count:u16] · col × { … }
+[idx_count:u16] · idx × { … }
+[check_count:u16] · check × { [name][source] }       ← L2 añade trailer
+```
+
+### 🧪 Tests nuevos (10)
+
+`l2_check_column_level_rejects_violation_on_insert`, `l2_check_column_level_allows_null_via_3vl`, `l2_check_table_level_multi_col`, `l2_check_with_scalar_function`, `l2_check_violated_on_update`, `l2_named_check_constraint_roundtrips`, `l2_check_rejects_unknown_column_at_ddl`, `l2_check_rejects_subquery_at_ddl`, `l2_check_persists_across_reopen`, `l2_v9_db_rejected_with_unsupported_version`.
+
+Total integration tests: 320 (310 pre-L2 + 10 nuevos), todos verdes.
+
+---
+
 ## 2026-05-27 — Bloque L1: FK referential actions + UNIQUE multi-col table-level (VERSION 8 → 9)
 
 > **Un push a `main`** que cierra el sub-bloque L1 del roadmap: extender las acciones referenciales de `FOREIGN KEY` y exponer `UNIQUE (a, b, ...)` table-level. Bump VERSION 8 → 9 con rechazo limpio de DBs V8 vía `[GBY-1003]`. Ver [ADR-0020](docs/adr/0020-fk-referential-actions.md) para la decisión y limitaciones. El sub-bloque L2 (`CHECK (expr)`) queda diferido a una entrega aparte.
