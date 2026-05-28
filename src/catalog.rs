@@ -954,6 +954,159 @@ impl TableMeta {
     }
 }
 
+/// Bloque V (VERSION 13, 2026-05-27): vista lógica persistida en el
+/// catálogo. Sólo guardamos el texto SQL original del `SELECT` que la
+/// define; cada `SELECT FROM v` re-parsea ese texto y lo embebe como
+/// subquery del FROM. No hay materialización ni caché — la vista
+/// computa al vuelo.
+///
+/// `column_aliases` corresponde a la sintaxis opcional
+/// `CREATE VIEW v (a, b, ...) AS SELECT ...` y permite renombrar las
+/// columnas del result-set sin tocar el SELECT subyacente.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewMeta {
+    pub name: String,
+    /// Texto SQL del query que define la vista, tal cual lo escribió
+    /// el usuario después de `AS`. El motor lo re-tokeniza/parsea en
+    /// cada SELECT que la referencia. Sin canonicalización (a
+    /// diferencia de CHECK constraints) porque el SELECT es mucho más
+    /// rico que un Expr y un round-trip exact-formatter es out of scope.
+    pub source: String,
+    /// Aliases opcionales del result-set. `None` si la vista no los
+    /// declara — en ese caso el SELECT subyacente provee los nombres.
+    pub column_aliases: Option<Vec<String>>,
+}
+
+impl ViewMeta {
+    /// V13 payload encoding for a `ViewMeta`. Vive aparte del
+    /// discriminator byte (que lo escribe el `Catalog::put_view`).
+    ///
+    ///     [name][source][alias_present:u8] · alias_present ?
+    ///         [alias_count:u16] · alias_count × [alias_name]
+    ///       : ∅
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::new();
+        push_string(&mut out, &self.name)?;
+        push_string(&mut out, &self.source)?;
+        match &self.column_aliases {
+            Some(aliases) => {
+                out.push(1);
+                if aliases.len() > u16::MAX as usize {
+                    return Err(DbError::new(format!(
+                        "vista '{}' tiene {} aliases de columna, máximo {}",
+                        self.name,
+                        aliases.len(),
+                        u16::MAX
+                    )));
+                }
+                out.extend_from_slice(&(aliases.len() as u16).to_le_bytes());
+                for a in aliases {
+                    push_string(&mut out, a)?;
+                }
+            }
+            None => out.push(0),
+        }
+        Ok(out)
+    }
+
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        let source = take_string(data, &mut offset)?;
+        if offset >= data.len() {
+            return Err(DbError::new(format!(
+                "ViewMeta '{}' corrupta: falta byte alias_present",
+                name
+            )));
+        }
+        let alias_present = data[offset];
+        offset += 1;
+        let column_aliases = if alias_present != 0 {
+            if offset + 2 > data.len() {
+                return Err(DbError::new(format!(
+                    "ViewMeta '{}' corrupta: faltan 2 bytes para alias_count",
+                    name
+                )));
+            }
+            let n = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let mut aliases = Vec::with_capacity(n);
+            for _ in 0..n {
+                aliases.push(take_string(data, &mut offset)?);
+            }
+            Some(aliases)
+        } else {
+            None
+        };
+        Ok(Self {
+            name,
+            source,
+            column_aliases,
+        })
+    }
+}
+
+/// Bloque V (VERSION 13): discriminator byte que arranca cada record
+/// del catálogo. Permite tener tablas y vistas conviviendo en el mismo
+/// B+Tree del catálogo sin colisiones de schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Table,
+    View,
+}
+
+impl ObjectKind {
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::Table => 0,
+            Self::View => 1,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> DbResult<Self> {
+        match code {
+            0 => Ok(Self::Table),
+            1 => Ok(Self::View),
+            other => Err(DbError::new(format!(
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View)",
+                other
+            ))),
+        }
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla o vista.
+#[derive(Debug, Clone)]
+pub enum CatalogObject {
+    Table(TableMeta),
+    View(ViewMeta),
+}
+
+impl CatalogObject {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Table(t) => &t.name,
+            Self::View(v) => &v.name,
+        }
+    }
+}
+
+/// Bloque V (VERSION 13): decodifica un payload del catálogo
+/// dispatcheando por el byte discriminator inicial.
+fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
+    if data.is_empty() {
+        return Err(DbError::new(
+            "record del catálogo vacío: falta el byte discriminator de ObjectKind",
+        ));
+    }
+    let kind = ObjectKind::from_code(data[0])?;
+    let rest = &data[1..];
+    Ok(match kind {
+        ObjectKind::Table => CatalogObject::Table(TableMeta::deserialize(rest)?),
+        ObjectKind::View => CatalogObject::View(ViewMeta::deserialize(rest)?),
+    })
+}
+
 pub struct Catalog<'a> {
     pager: &'a mut Pager,
 }
@@ -963,7 +1116,10 @@ impl<'a> Catalog<'a> {
         Self { pager }
     }
 
-    pub fn list_tables(&mut self) -> DbResult<Vec<TableMeta>> {
+    /// Bloque V (VERSION 13): los records del catálogo arrancan con un
+    /// byte discriminator (`ObjectKind`). `list_objects` devuelve todos,
+    /// `list_tables` filtra Tables, `list_views` filtra Views.
+    pub fn list_objects(&mut self) -> DbResult<Vec<CatalogObject>> {
         let header = self.pager.header();
         if header.catalog_root_page == 0 {
             return Ok(Vec::new());
@@ -971,11 +1127,36 @@ impl<'a> Catalog<'a> {
         let mut tree = Tree::new(self.pager);
         let kvs = tree.all(header.catalog_root_page)?;
         kvs.into_iter()
-            .map(|kv| TableMeta::deserialize(&kv.value))
+            .map(|kv| decode_catalog_object(&kv.value))
             .collect()
     }
 
-    pub fn get_table(&mut self, name: &str) -> DbResult<Option<TableMeta>> {
+    pub fn list_tables(&mut self) -> DbResult<Vec<TableMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Table(t) => Some(t),
+                CatalogObject::View(_) => None,
+            })
+            .collect())
+    }
+
+    pub fn list_views(&mut self) -> DbResult<Vec<ViewMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Table(_) => None,
+                CatalogObject::View(v) => Some(v),
+            })
+            .collect())
+    }
+
+    /// Lookup case-insensitive por nombre. Devuelve el objeto sea
+    /// table o view; se usa cuando el caller no sabe (e.g. resolver
+    /// de FROM, ALTER TABLE rechazando colisión con vista).
+    pub fn get_object(&mut self, name: &str) -> DbResult<Option<CatalogObject>> {
         let header = self.pager.header();
         if header.catalog_root_page == 0 {
             return Ok(None);
@@ -983,36 +1164,64 @@ impl<'a> Catalog<'a> {
         let key = hash_name(name);
         let mut tree = Tree::new(self.pager);
         if let Some(bytes) = tree.get(header.catalog_root_page, key)? {
-            let meta = TableMeta::deserialize(&bytes)?;
-            if meta.name.eq_ignore_ascii_case(name) {
-                return Ok(Some(meta));
+            let obj = decode_catalog_object(&bytes)?;
+            if obj.name().eq_ignore_ascii_case(name) {
+                return Ok(Some(obj));
             }
             return Err(DbError::new(format!(
                 "colisión de hash FNV-1a-64 en el catálogo: \
                  se buscó '{}' pero el bucket contiene '{}'. Reporte este caso \
-                 como bug: los nombres tienen el mismo hash y el motor no \
-                 implementa todavía resolución por igualdad de nombre.",
-                name, meta.name
+                 como bug.",
+                name,
+                obj.name()
             )));
         }
         Ok(None)
     }
 
+    pub fn get_table(&mut self, name: &str) -> DbResult<Option<TableMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::Table(t)) => Ok(Some(t)),
+            // Una vista con el mismo nombre NO es una tabla — devolvemos
+            // None y el caller decide cómo reportarlo.
+            Some(CatalogObject::View(_)) | None => Ok(None),
+        }
+    }
+
+    pub fn get_view(&mut self, name: &str) -> DbResult<Option<ViewMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::View(v)) => Ok(Some(v)),
+            Some(CatalogObject::Table(_)) | None => Ok(None),
+        }
+    }
+
     pub fn put_table(&mut self, meta: &TableMeta) -> DbResult<()> {
         let root = self.ensure_root()?;
         let key = hash_name(&meta.name);
-        let payload = meta.serialize()?;
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(ObjectKind::Table.code());
+        payload.extend_from_slice(&meta.serialize()?);
         let mut tree = Tree::new(self.pager);
         tree.upsert(root, key, payload)?;
         Ok(())
     }
 
-    /// Remove the catalog entry for the named table. Returns whether an
-    /// entry was actually removed. The pages backing the table's data and
-    /// secondary indexes are intentionally NOT freed — the page allocator
-    /// has no free-list yet, so reclaim is left to a future `vacuum`. This
-    /// matches the existing `DROP INDEX` policy.
-    pub fn remove_table(&mut self, name: &str) -> DbResult<bool> {
+    pub fn put_view(&mut self, meta: &ViewMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key = hash_name(&meta.name);
+        let mut payload = Vec::with_capacity(1 + 32);
+        payload.push(ObjectKind::View.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    /// Remove the catalog entry for the named object (table or view).
+    /// Las páginas que respaldan la tabla y sus índices NO se liberan
+    /// (mismo contrato pre-V de `remove_table`); para vistas no hay
+    /// páginas asociadas — sólo se borra la entrada del catálogo.
+    pub fn remove_object(&mut self, name: &str) -> DbResult<bool> {
         let header = self.pager.header();
         if header.catalog_root_page == 0 {
             return Ok(false);
@@ -1020,6 +1229,12 @@ impl<'a> Catalog<'a> {
         let key = hash_name(name);
         let mut tree = Tree::new(self.pager);
         tree.delete(header.catalog_root_page, key)
+    }
+
+    /// Alias histórico de `remove_object`. Pre-V era el único path de
+    /// borrado del catálogo.
+    pub fn remove_table(&mut self, name: &str) -> DbResult<bool> {
+        self.remove_object(name)
     }
 
     pub fn scan_rows(

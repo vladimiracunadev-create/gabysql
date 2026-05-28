@@ -103,9 +103,16 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        source extra + N strings de columnas target extra. Single-col
 //        FKs escriben count=0. El motor exige que las target columns
 //        sean exactamente la PK compuesta del padre (single-col PK
-//        sigue igual que pre-#3). V11 rechazados con `[GBY-1003]` —
-//        migración manual: dump SELECT + recreate con binario V12.
-pub const VERSION: u32 = 12;
+//        sigue igual que pre-#3). V11 rechazados con `[GBY-1003]`.
+//  13 -> Bloque V: vistas lógicas (`CREATE VIEW v AS SELECT ...`,
+//        `DROP VIEW v`). Cada record del catálogo arranca con un byte
+//        discriminator `[kind:u8]` (0=Table, 1=View) seguido del
+//        payload específico. Las vistas guardan sólo el texto SQL del
+//        SELECT que las define; se re-parsean al vuelo y se expanden
+//        como subquery en cualquier FROM que las referencia. V12
+//        rechazados con `[GBY-1003]` — migración manual: dump SELECT
+//        + recreate con binario V13.
+pub const VERSION: u32 = 13;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

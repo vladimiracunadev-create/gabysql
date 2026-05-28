@@ -43,7 +43,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **L2** ✅ | Constraints: `CHECK (expr)` column-level y table-level (con/sin `CONSTRAINT name`), evaluación en INSERT/UPDATE/UPSERT/DO UPDATE/cascade, 3VL ANSI, subqueries rechazadas en DDL. Bump VERSION 9→10. **Cerrado 2026-05-27** ([ADR-0021](adr/0021-check-constraints.md)). | Medio-Alto | L1, G3 |
 | **L3** ✅ | `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)` con re-validación O(n) de las filas existentes antes de persistir. Sin estado parcial. Sin bump de formato. **Cerrado 2026-05-27.** | Bajo | L2 |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
-| **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
+| **V** ✅ | Vistas lógicas: `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS &lt;select_query&gt;`, `DROP VIEW [IF EXISTS] v`. Expansion como derived table en cualquier FROM. Read-only (`[GBY-4075]`). Bump VERSION 12→13 con discriminator byte tabla/vista. **Cerrado 2026-05-27** ([ADR-0025](adr/0025-views.md)). | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
 | **X** | Stored procedures + triggers: `CREATE FUNCTION`, `CREATE TRIGGER`, lenguaje procedural | Muy alto | T, F |
 | **Y** | Tipos faltantes: `DECIMAL`/`NUMERIC`, `BLOB`/`BYTEA`, `UUID`, `ARRAY[]`, `INTERVAL`, `ENUM` | Alto (toca formato disco) | — |
@@ -300,7 +300,7 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 
 | Objeto | Soportado | Prioridad |
 |---|:---:|:---:|
-| `CREATE VIEW` / `DROP VIEW` | ❌ | P1 |
+| `CREATE VIEW` / `DROP VIEW` | ✅ (V, 2026-05-27; read-only, source debe ser SELECT simple — set ops `[GBY-4078]`, INSERT/UPDATE/DELETE rechazados con `[GBY-4075]`) | — |
 | `CREATE MATERIALIZED VIEW` | ❌ | P3 |
 | `CREATE SEQUENCE` / `nextval` | ❌ | P1 |
 | `AUTO_INCREMENT` / `SERIAL` / `IDENTITY` (PK auto) | ❌ | P0 |

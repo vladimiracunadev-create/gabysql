@@ -417,6 +417,25 @@ pub mod codes {
     /// de PK encadenadas. Solución: rediseñar la FK o reescribir el
     /// UPDATE como DELETE + INSERT con una transacción explícita.
     pub const FK_UPDATE_CASCADE_AFFECTS_CHILD_PK: u32 = 4074;
+    /// Bloque V (2026-05-27): `INSERT`/`UPDATE`/`DELETE` apuntando a un
+    /// nombre que existe en el catálogo pero es una **vista**. Las
+    /// vistas son read-only en este release — no hay rewrites de
+    /// modificación a la tabla base. El INSERT/UPDATE/DELETE debe
+    /// dirigirse a la tabla base directamente.
+    pub const VIEW_NOT_WRITABLE: u32 = 4075;
+    /// Bloque V: la expansión de vistas excedió `MAX_VIEW_DEPTH`
+    /// (vistas mutuamente referenciadas, ciclo directo, o anidamiento
+    /// patológico). Solución: simplificar el grafo de vistas o
+    /// materializar en una tabla.
+    pub const VIEW_EXPANSION_DEPTH_EXCEEDED: u32 = 4076;
+    /// Bloque V: `CREATE VIEW` cuyo nombre colisiona con una tabla o
+    /// vista ya existente. Mismo namespace para los tres.
+    pub const VIEW_NAME_COLLIDES_WITH_OBJECT: u32 = 4077;
+    /// Bloque V: el SELECT subyacente de la vista resultó en una set
+    /// operation (UNION/INTERSECT/EXCEPT) o VALUES. Este release sólo
+    /// expande vistas cuyo source es un `SELECT` simple — set ops
+    /// como source quedan diferidos.
+    pub const VIEW_SOURCE_NOT_SIMPLE_SELECT: u32 = 4078;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

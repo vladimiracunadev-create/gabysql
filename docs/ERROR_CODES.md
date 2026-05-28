@@ -168,6 +168,10 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4072` | `CANNOT_DROP_PRIMARY_KEY_CONSTRAINT` | Residual #2: `DROP CONSTRAINT <name>` apuntando a la PK. La PK es inmutable durante la vida de la tabla. | Usar `DROP TABLE` si la intención es rehacer el esquema. |
 | `4073` | `FK_RESTRICT_BLOCKS_UPDATE` | Residual #4 (2026-05-27): `UPDATE` que cambió un PK tiene children con `ON UPDATE RESTRICT` (o `NO ACTION`, alias). Sin estado parcial. | Borrar/actualizar primero los children, o declarar la FK con `ON UPDATE CASCADE`/`SET NULL`/`SET DEFAULT`. |
 | `4074` | `FK_UPDATE_CASCADE_AFFECTS_CHILD_PK` | Residual #4: `ON UPDATE CASCADE` mutaría una columna que también participa en la PK del child. No soportado en este release. | Rediseñar la FK o reescribir como DELETE + INSERT en una transacción explícita. |
+| `4075` | `VIEW_NOT_WRITABLE` | Bloque V (2026-05-27): `INSERT`/`UPDATE`/`DELETE` apuntando a una vista. Las vistas son read-only en este release. | Modificar la tabla base directamente. |
+| `4076` | `VIEW_EXPANSION_DEPTH_EXCEEDED` | Bloque V: la cadena de vistas anidadas excedió `MAX_VIEW_DEPTH` (32). Típicamente un ciclo. | Romper el ciclo o materializar en una tabla. |
+| `4077` | `VIEW_NAME_COLLIDES_WITH_OBJECT` | Bloque V: `CREATE VIEW` con un nombre ya tomado por una tabla o vista. | Elegir otro nombre o usar `IF NOT EXISTS` (sólo aplica si la colisión es con otra vista). |
+| `4078` | `VIEW_SOURCE_NOT_SIMPLE_SELECT` | Bloque V: el source de la vista es un set op (UNION/INTERSECT/EXCEPT) o VALUES; sólo SELECT simple en este release. | Refactorizar la vista como SELECT plano o esperar al soporte futuro. |
 
 ---
 

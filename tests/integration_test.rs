@@ -8828,6 +8828,269 @@ fn r4_update_pk_in_upsert_still_blocked() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque V (2026-05-27): CREATE VIEW / DROP VIEW + expansion. -----
+
+fn v_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("v-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn v_create_view_and_select() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("create-select")?;
+    run_sql(
+        &db,
+        "CREATE TABLE empleados (id INT PRIMARY KEY, nombre TEXT, salario INT);
+         INSERT INTO empleados (id, nombre, salario) VALUES (1, 'Ana', 100);
+         INSERT INTO empleados (id, nombre, salario) VALUES (2, 'Bob', 200);
+         INSERT INTO empleados (id, nombre, salario) VALUES (3, 'Cee', 50);
+         CREATE VIEW empleados_seniors AS SELECT id, nombre FROM empleados WHERE salario >= 100;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM empleados_seniors ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[1][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_view_reflects_base_table_changes() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("dynamic")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         CREATE VIEW only_high AS SELECT id, v FROM t WHERE v >= 50;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM only_high;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (2, 100);")?;
+    let res = run_sql(&db, "SELECT id FROM only_high;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_drop_view() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )?;
+    run_sql(&db, "DROP VIEW v;")?;
+    let err = run_sql(&db, "SELECT id FROM v;").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("no existe")
+            || err.to_string().to_lowercase().contains("not found")
+            || err.to_string().contains("GBY-2001"),
+        "esperaba mensaje de tabla no existe tras DROP VIEW, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_drop_view_if_exists_noop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("drop-if-exists")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    run_sql(&db, "DROP VIEW IF EXISTS nope;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_view_name_collides_with_table() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("name-collision")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "CREATE VIEW t AS SELECT id FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4077"),
+        "esperaba VIEW_NAME_COLLIDES_WITH_OBJECT, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_view_if_not_exists_idempotent() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("if-not-exists")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )?;
+    let err = run_sql(&db, "CREATE VIEW v AS SELECT id FROM t;").unwrap_err();
+    assert!(err.to_string().contains("GBY-4077"));
+    run_sql(&db, "CREATE VIEW IF NOT EXISTS v AS SELECT id FROM t;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_insert_on_view_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("insert-rejected")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )?;
+    let err = run_sql(&db, "INSERT INTO v (id) VALUES (1);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4075"),
+        "esperaba VIEW_NOT_WRITABLE, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_update_on_view_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("update-rejected")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, x INT);
+         INSERT INTO t (id, x) VALUES (1, 10);
+         CREATE VIEW v AS SELECT id, x FROM t;",
+    )?;
+    let err = run_sql(&db, "UPDATE v SET x = 20 WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("GBY-4075"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_delete_on_view_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("delete-rejected")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )?;
+    let err = run_sql(&db, "DELETE FROM v WHERE id = 1;").unwrap_err();
+    assert!(err.to_string().contains("GBY-4075"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_view_with_aggregation() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("aggregation")?;
+    run_sql(
+        &db,
+        "CREATE TABLE ventas (id INT PRIMARY KEY, dept INT, monto INT);
+         INSERT INTO ventas (id, dept, monto) VALUES (1, 10, 100);
+         INSERT INTO ventas (id, dept, monto) VALUES (2, 10, 200);
+         INSERT INTO ventas (id, dept, monto) VALUES (3, 20, 50);
+         CREATE VIEW totales AS
+            SELECT dept, SUM(monto) AS total FROM ventas GROUP BY dept;",
+    )?;
+    let res = run_sql(&db, "SELECT dept, total FROM totales ORDER BY dept;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(10));
+    assert_eq!(res[0].rows[0][1], Value::Integer(300));
+    assert_eq!(res[0].rows[1][0], Value::Integer(20));
+    assert_eq!(res[0].rows[1][1], Value::Integer(50));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_view_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 100);
+         CREATE VIEW high AS SELECT id, v FROM t WHERE v >= 50;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM high;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_view_referencing_view() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("view-of-view")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 100);
+         INSERT INTO t (id, v) VALUES (2, 50);
+         INSERT INTO t (id, v) VALUES (3, 200);
+         CREATE VIEW v1 AS SELECT id, v FROM t WHERE v >= 50;
+         CREATE VIEW v2 AS SELECT id FROM v1 WHERE v >= 100;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM v2 ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[1][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_create_view_with_set_op_source_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = v_setup("set-op-rejected")?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY);
+         CREATE TABLE b (id INT PRIMARY KEY);",
+    )?;
+    let err = run_sql(
+        &db,
+        "CREATE VIEW combined AS SELECT id FROM a UNION SELECT id FROM b;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4078"),
+        "esperaba VIEW_SOURCE_NOT_SIMPLE_SELECT, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn v_v12_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("v-v13-bump");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY);")?;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&12u32.to_le_bytes())?;
+    drop(f);
+    let err = match Pager::open(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::open to refuse v12 file post-V"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
+        "expected refusal, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;

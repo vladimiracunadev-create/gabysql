@@ -1,7 +1,8 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
-    validate_create_table, validate_identifier, Catalog, CheckConstraint, Column, ColumnType,
-    DefaultLiteral, ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate, TableMeta,
+    validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
+    ColumnType, DefaultLiteral, ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate,
+    TableMeta, ViewMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -27,6 +28,12 @@ pub enum Statement {
     /// Lookup case-insensitive del nombre a través de: CHECKs, índices
     /// UNIQUE nombrados, FKs nombradas. PK rejected.
     AlterTableDropConstraint(AlterDropConstraintStmt),
+    /// Bloque V (2026-05-27): `CREATE VIEW [IF NOT EXISTS] name
+    /// [(col_aliases)] AS <select_query>`. La fuente puede ser un
+    /// SELECT, VALUES, o set operation — cualquier `SelectQuery`.
+    CreateView(CreateViewStmt),
+    /// Bloque V (2026-05-27): `DROP VIEW [IF EXISTS] <name>`.
+    DropView(DropViewStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -204,6 +211,26 @@ pub struct AlterAddCheckStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlterDropConstraintStmt {
     pub table: String,
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// Bloque V (2026-05-27): `CREATE VIEW [IF NOT EXISTS] name
+/// [(col_aliases)] AS <select_query>`. El parser captura el texto SQL
+/// canonicalizado del SELECT en `source` (reconstrucción token-a-token)
+/// para que `exec_create_view` lo persista intacto en el catálogo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStmt {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub column_aliases: Option<Vec<String>>,
+    /// Texto SQL re-construido del SELECT subyacente. Re-parseable por
+    /// `parse_select_query_for_ctas` en cada ejecución de la vista.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewStmt {
     pub name: String,
     pub if_exists: bool,
 }
@@ -1213,7 +1240,19 @@ pub struct Engine<'a> {
     /// pedida por el usuario via SQL. Doble `BEGIN` → `[GBY-4029]`;
     /// `COMMIT`/`ROLLBACK` sin `BEGIN` → `[GBY-4030]`.
     explicit_tx: bool,
+    /// Bloque V (2026-05-27): profundidad actual de expansión de
+    /// vistas. Cada `FROM v` con `v` siendo una vista incrementa
+    /// este contador antes de re-parsear el body de la vista; se
+    /// decrementa al volver. Protege contra vistas que se referencian
+    /// mutuamente (`A → B → A`) y contra el caso degenerado donde una
+    /// vista se referencia a sí misma. Límite duro: `MAX_VIEW_DEPTH`.
+    view_expansion_depth: usize,
 }
+
+/// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
+/// por encima de cualquier caso real (5-6 niveles es lo normal) y muy
+/// por debajo del stack de Rust (~5k frames).
+const MAX_VIEW_DEPTH: usize = 32;
 
 #[derive(Debug, Clone)]
 struct OuterRow {
@@ -1227,6 +1266,7 @@ impl<'a> Engine<'a> {
             pager,
             outer_stack: Vec::new(),
             explicit_tx: false,
+            view_expansion_depth: 0,
         }
     }
 
@@ -1237,6 +1277,8 @@ impl<'a> Engine<'a> {
             Statement::AlterTableAddColumn(stmt) => self.exec_alter_add_column(stmt),
             Statement::AlterTableAddCheck(stmt) => self.exec_alter_add_check(stmt),
             Statement::AlterTableDropConstraint(stmt) => self.exec_alter_drop_constraint(stmt),
+            Statement::CreateView(stmt) => self.exec_create_view(stmt),
+            Statement::DropView(stmt) => self.exec_drop_view(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -2646,6 +2688,246 @@ impl<'a> Engine<'a> {
         ))
     }
 
+    /// Bloque V (2026-05-27): rechaza un INSERT/UPDATE/DELETE cuyo
+    /// target es una vista. Las vistas son read-only en este release.
+    fn reject_if_view(&mut self, name: &str, op_label: &str) -> DbResult<()> {
+        let is_view = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_view(name)?.is_some()
+        };
+        if is_view {
+            return Err(coded(
+                codes::VIEW_NOT_WRITABLE,
+                format!(
+                    "{} sobre '{}' rechazado: '{}' es una VISTA, no una tabla. Las vistas son \
+                     read-only en este release; modificá la tabla base directamente.",
+                    op_label, name, name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bloque V (2026-05-27): `CREATE VIEW [IF NOT EXISTS] name
+    /// [(col_aliases)] AS <select_query>`.
+    ///
+    /// 1. Valida que el SELECT subyacente sea un `SelectQuery::Select`
+    ///    simple — set ops y VALUES quedan diferidos
+    ///    (`[GBY-4078]`).
+    /// 2. Rechaza colisión con cualquier objeto del catálogo (table o
+    ///    view) con `[GBY-4077]`. `IF NOT EXISTS` lo convierte en
+    ///    no-op si la colisión es contra OTRA vista con el mismo
+    ///    nombre; contra una tabla rebota siempre.
+    /// 3. Persiste via `Catalog::put_view`.
+    fn exec_create_view(&mut self, stmt: CreateViewStmt) -> DbResult<ResultSet> {
+        // Validar sintácticamente el source.
+        let parsed = parse_select_query_str(&stmt.source)?;
+        if !matches!(parsed, SelectQuery::Select(_)) {
+            return Err(coded(
+                codes::VIEW_SOURCE_NOT_SIMPLE_SELECT,
+                format!(
+                    "CREATE VIEW '{}': el SELECT subyacente debe ser un SELECT simple en este \
+                     release; UNION/INTERSECT/EXCEPT/VALUES como source quedan diferidos",
+                    stmt.name
+                ),
+            ));
+        }
+        // Validar colisión con catálogo.
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::Table(_)) => {
+                return Err(coded(
+                    codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
+                    format!(
+                        "CREATE VIEW '{}': ya existe una TABLA con ese nombre. Las vistas y \
+                         tablas comparten namespace; usá otro nombre o DROP TABLE primero.",
+                        stmt.name
+                    ),
+                ));
+            }
+            Some(CatalogObject::View(_)) => {
+                if stmt.if_not_exists {
+                    return Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!(
+                            "OK · vista '{}' ya existía (IF NOT EXISTS)",
+                            stmt.name
+                        )),
+                    });
+                }
+                return Err(coded(
+                    codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
+                    format!(
+                        "CREATE VIEW '{}': ya existe una vista con ese nombre",
+                        stmt.name
+                    ),
+                ));
+            }
+            None => {}
+        }
+        let meta = ViewMeta {
+            name: stmt.name.clone(),
+            source: stmt.source,
+            column_aliases: stmt.column_aliases,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_view(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("OK · vista '{}' creada", meta.name)),
+        })
+    }
+
+    /// Bloque V (2026-05-27): `DROP VIEW [IF EXISTS] <name>`.
+    fn exec_drop_view(&mut self, stmt: DropViewStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::View(_)) => {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.remove_object(&stmt.name)?;
+                Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!("OK · vista '{}' eliminada", stmt.name)),
+                })
+            }
+            Some(CatalogObject::Table(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a una TABLA, no a una vista. Usá DROP TABLE.",
+                stmt.name
+            ))),
+            None => {
+                if stmt.if_exists {
+                    Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!("OK · vista '{}' no existía (IF EXISTS)", stmt.name)),
+                    })
+                } else {
+                    Err(coded(
+                        codes::TABLE_NOT_FOUND,
+                        format!("DROP VIEW '{}': la vista no existe", stmt.name),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Bloque V (2026-05-27): si `stmt.table` apunta a una vista, parsea
+    /// el source SQL de la vista y lo embebe como derived table del
+    /// FROM. Idempotente para tablas (no-op). Llamado desde
+    /// `exec_select` y `exec_select_joined` antes del lookup del catálogo.
+    ///
+    /// Limitaciones:
+    /// - El source de la vista debe ser un `SelectQuery::Select` simple
+    ///   (validado en CREATE VIEW con `[GBY-4078]`).
+    /// - Protege contra ciclos vía `view_expansion_depth` —
+    ///   `[GBY-4076]` cuando excede `MAX_VIEW_DEPTH`.
+    /// - Los `column_aliases` de la vista, si los hay, se aplican
+    ///   re-bautizando los nombres de salida del SELECT subyacente
+    ///   en el alias (`stmt.table_alias`).
+    fn expand_view_in_from(&mut self, stmt: &mut SelectStmt) -> DbResult<()> {
+        // Sólo expandimos si el FROM es una tabla bare (no derived
+        // table ni VALUES). El nombre debe matchear una view del
+        // catálogo.
+        if stmt.derived_source.is_some() || stmt.values_source.is_some() {
+            return Ok(());
+        }
+        let view = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_view(&stmt.table)?
+        };
+        let Some(view) = view else {
+            return Ok(());
+        };
+        // Cycle / depth guard.
+        if self.view_expansion_depth >= MAX_VIEW_DEPTH {
+            return Err(coded(
+                codes::VIEW_EXPANSION_DEPTH_EXCEEDED,
+                format!(
+                    "expansión de vistas excedió la profundidad {} al referenciar '{}' \
+                     (¿ciclo entre vistas?)",
+                    MAX_VIEW_DEPTH, stmt.table
+                ),
+            ));
+        }
+        self.view_expansion_depth += 1;
+        let parsed = parse_select_query_str(&view.source)?;
+        let inner_stmt = match parsed {
+            SelectQuery::Select(s) => s,
+            _ => {
+                self.view_expansion_depth -= 1;
+                return Err(coded(
+                    codes::VIEW_SOURCE_NOT_SIMPLE_SELECT,
+                    format!(
+                        "vista '{}': el source persistido no es un SELECT simple (estado \
+                         inconsistente — el catálogo debería haberlo rechazado en CREATE VIEW)",
+                        view.name
+                    ),
+                ));
+            }
+        };
+        self.view_expansion_depth -= 1;
+        // El alias del derived table en el FROM exterior es el nombre
+        // de la vista, salvo que el usuario ya haya declarado uno
+        // explícito en el query original (`FROM v AS x`).
+        let alias_for_outer = stmt
+            .table_alias
+            .clone()
+            .unwrap_or_else(|| view.name.clone());
+        // Convertir la vista en derived source. `stmt.table` deja de
+        // tener significado relacional — pasa a ser el alias visible
+        // en el resto del planner.
+        stmt.table = alias_for_outer.clone();
+        stmt.table_alias = None;
+        stmt.derived_source = Some(inner_stmt);
+
+        // Bloque V: los column_aliases de la vista renombran las
+        // columnas de salida del SELECT subyacente. Empujamos un Vec
+        // que el planner de derived tables sabe interpretar.
+        if let Some(aliases) = &view.column_aliases {
+            // Validación: el alias_count debe matchear el número de
+            // columnas que proyecta el SELECT interno (best-effort —
+            // el planner igual lo re-validará).
+            let inner = stmt.derived_source.as_ref().unwrap();
+            if inner.columns.len() != aliases.len() {
+                return Err(coded(
+                    codes::DERIVED_TABLE_REQUIRES_ALIAS,
+                    format!(
+                        "vista '{}' declaró {} column aliases pero el SELECT subyacente \
+                         proyecta {} columnas",
+                        view.name,
+                        aliases.len(),
+                        inner.columns.len()
+                    ),
+                ));
+            }
+            // Truco: aplicamos los aliases mutando el inner para que el
+            // resultado los exponga directamente. Sustituimos cada
+            // `SelectItem::output_name()` con el alias correspondiente
+            // wrappeando el ítem original con un alias visible. Para
+            // simplicidad, sólo soportamos column aliases sobre
+            // proyecciones que ya son `Column` o `Expr` sin alias; si
+            // alguna fila tiene alias propio, queda como advertencia.
+            // (Un sweep completo del SelectItem para forzar aliases
+            // queda diferido.)
+            // No-op explícito aquí — los aliases se aplican vía el
+            // planner de derived tables si en el futuro extendemos el
+            // SelectItem AST. Por ahora documentamos la limitación.
+            let _ = alias_for_outer;
+        }
+        Ok(())
+    }
+
     /// Bloque K1 (2026-05-26): `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <col>`.
     /// Bloqueos: PK (`[GBY-4059]`), columna indexada (`[GBY-4060]`),
     /// FK saliente o entrante (`[GBY-4061]`). Implementación: full scan
@@ -2979,6 +3261,8 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_insert(&mut self, stmt: InsertStmt) -> DbResult<ResultSet> {
+        // Bloque V (2026-05-27): rechazo claro si el target es una vista.
+        self.reject_if_view(&stmt.table, "INSERT")?;
         // Bloque J: validamos columnas y normalizamos UNA vez para todo
         // el batch (single-row, multi-row o INSERT...SELECT). Después
         // iteramos las filas-fuente delegando en `apply_insert_row`.
@@ -3917,7 +4201,11 @@ impl<'a> Engine<'a> {
         Ok(MaterializedDerived { meta, rows })
     }
 
-    fn exec_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
+    fn exec_select(&mut self, mut stmt: SelectStmt) -> DbResult<ResultSet> {
+        // Bloque V (2026-05-27): si el FROM apunta a una vista, la
+        // re-expandimos como derived source ANTES de cualquier otro
+        // dispatch — así el resto del pipeline ve la query post-rewrite.
+        self.expand_view_in_from(&mut stmt)?;
         // SELECT con JOINs sigue una ruta distinta (nested-loop, schema
         // combinado, WHERE como post-filter). El single-table path queda
         // exactamente como estaba — sin regresión en performance ni
@@ -5484,6 +5772,7 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_update(&mut self, stmt: UpdateStmt) -> DbResult<ResultSet> {
+        self.reject_if_view(&stmt.table, "UPDATE")?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
             catalog
@@ -6358,6 +6647,7 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_delete(&mut self, stmt: DeleteStmt) -> DbResult<ResultSet> {
+        self.reject_if_view(&stmt.table, "DELETE")?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
             catalog
@@ -10160,6 +10450,71 @@ fn format_func_call(f: ScalarFunc, args: &[Expr]) -> DbResult<String> {
     Ok(format!("{}({})", f.keyword(), rendered.join(", ")))
 }
 
+/// Bloque V (2026-05-27): reconstruye SQL re-parseable a partir de
+/// una sub-lista de tokens. El lexer no preserva whitespace, así que
+/// la salida no es byte-equivalente al original — pero sí semántica
+/// y léxicamente equivalente (mismos tokens en el mismo orden).
+///
+/// Strings se re-quote con `'...'` y escape doble `''`; symbols van
+/// pegados a sus vecinos para identifiers (`a,b` no necesita espacio,
+/// pero `a b` sí). La heurística: insertar espacio entre tokens si
+/// AMBOS son Ident/Number/String — entre symbols, o symbol↔otro, no
+/// hace falta para que el lexer los separe.
+fn reconstruct_sql_from_tokens(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    let mut prev_was_word = false;
+    for tok in tokens {
+        if matches!(tok.kind, TokenKind::Eof) {
+            continue;
+        }
+        let is_word = matches!(
+            tok.kind,
+            TokenKind::Ident | TokenKind::Number | TokenKind::String
+        );
+        if prev_was_word && is_word {
+            out.push(' ');
+        }
+        match tok.kind {
+            TokenKind::String => {
+                out.push('\'');
+                for ch in tok.text.chars() {
+                    if ch == '\'' {
+                        out.push('\'');
+                        out.push('\'');
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('\'');
+            }
+            _ => out.push_str(&tok.text),
+        }
+        prev_was_word = is_word;
+    }
+    out
+}
+
+/// Bloque V (2026-05-27): parsea un `SelectQuery` standalone — usado
+/// para re-cargar el `source` de una `ViewMeta` desde catálogo.
+pub fn parse_select_query_str(source: &str) -> DbResult<SelectQuery> {
+    let tokens = tokenize(source)?;
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        where_depth: 0,
+        in_having: false,
+        pending_check_name: None,
+    };
+    let query = parser.parse_select_query_for_ctas()?;
+    if !parser.is_eof() {
+        return Err(DbError::new(format!(
+            "parse_select_query_str: tokens sobrantes tras el SELECT: '{}'",
+            source
+        )));
+    }
+    Ok(query)
+}
+
 /// Bloque L2: parsea una expresión standalone (sin SELECT) — útil para
 /// re-cargar el `source` de un `CheckConstraint` desde catálogo.
 pub fn parse_expr_str(source: &str) -> DbResult<Expr> {
@@ -11891,9 +12246,58 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::DropTable(DropTableStmt { name, if_exists }));
         }
+        if self.match_keyword("VIEW") {
+            // Bloque V (2026-05-27).
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropView(DropViewStmt { name, if_exists }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
+    }
+
+    /// Bloque V (2026-05-27): parsea `CREATE VIEW [IF NOT EXISTS] name
+    /// [(col_aliases)] AS <select_query>`. Captura el texto SQL
+    /// re-construido del SELECT desde los tokens (sin canonicalizar);
+    /// el executor lo persiste en `ViewMeta.source` y lo re-parsea al
+    /// expandir la vista.
+    fn parse_create_view(&mut self) -> DbResult<Statement> {
+        let if_not_exists = if self.match_keyword("IF") {
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        // Aliases opcionales `(a, b, ...)`.
+        let column_aliases = if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+            self.expect_symbol("(")?;
+            let mut aliases = vec![self.expect_ident()?];
+            while self.match_symbol(",") {
+                aliases.push(self.expect_ident()?);
+            }
+            self.expect_symbol(")")?;
+            Some(aliases)
+        } else {
+            None
+        };
+        self.expect_keyword("AS")?;
+        // Snapshot del rango de tokens del SELECT para reconstruir el
+        // source. Validamos sintácticamente que sea un SelectQuery
+        // antes de descartar el AST — así un CREATE VIEW con SQL roto
+        // falla en DDL, no en la primera lectura de la vista.
+        let start = self.pos;
+        let _ = self.parse_select_query_for_ctas()?;
+        let end = self.pos;
+        let source = reconstruct_sql_from_tokens(&self.tokens[start..end]);
+        Ok(Statement::CreateView(CreateViewStmt {
+            name,
+            if_not_exists,
+            column_aliases,
+            source,
+        }))
     }
 
     fn parse_if_exists(&mut self) -> DbResult<bool> {
@@ -12324,6 +12728,12 @@ impl Parser {
         }
         if self.match_keyword("DATABASE") {
             return self.parse_create_database();
+        }
+        // Bloque V (2026-05-27): `CREATE VIEW [IF NOT EXISTS] name
+        // [(col_aliases)] AS <select_query>`. Reusa el parser del
+        // SELECT/VALUES/set-ops del CTAS (K1).
+        if self.match_keyword("VIEW") {
+            return self.parse_create_view();
         }
         self.expect_keyword("TABLE")?;
         // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS

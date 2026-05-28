@@ -6,6 +6,67 @@
 
 ---
 
+## 2026-05-27 — Bloque V: vistas lógicas (`CREATE VIEW` / `DROP VIEW`) (VERSION 12 → 13)
+
+> **Un push a `main`** que abre el bloque V del roadmap (vistas) — primer mecanismo de abstracción semántica del motor. Bump VERSION 12→13 con discriminator byte para que tablas y vistas convivan en el catálogo. Ver [ADR-0025](docs/adr/0025-views.md).
+
+### 🆕 Sintaxis
+
+- `CREATE VIEW v AS SELECT ...`
+- `CREATE VIEW IF NOT EXISTS v AS SELECT ...`
+- `CREATE VIEW v (a, b) AS SELECT x, y FROM t` — aliases de columna (persistidos; aplicación efectiva queda como mejora futura).
+- `DROP VIEW v`
+- `DROP VIEW IF EXISTS v`
+
+### 🛡️ Semántica
+
+- **Vistas no son materializadas**: cada `SELECT FROM v` re-evalúa el SELECT subyacente contra el estado actual de la tabla base. Lo que ven los queries refleja inmediatamente cualquier INSERT/UPDATE/DELETE en la tabla base.
+- **Read-only**: `INSERT`/`UPDATE`/`DELETE` sobre una vista rebota con `[GBY-4075] VIEW_NOT_WRITABLE`. Las vistas updatable (con `INSTEAD OF` triggers o auto-rewrite) quedan diferidas a un bloque dedicado.
+- **Expansion via derived table**: en cualquier `FROM v` donde `v` sea una vista, el motor parsea el source SQL y lo embebe como derived source del FROM (reusando el path de H, `FROM (SELECT ...) AS d`).
+- **Cycle guard**: `MAX_VIEW_DEPTH = 32`. Vistas mutuamente referenciadas (`A → B → A`) rebotan con `[GBY-4076]`.
+- **Namespace compartido** con tablas: una vista no puede llamarse igual que una tabla (y viceversa) — `[GBY-4077] VIEW_NAME_COLLIDES_WITH_OBJECT`.
+
+### 🚧 Limitaciones
+
+- **Source del SELECT debe ser un SELECT simple**. Set operations (`UNION`/`INTERSECT`/`EXCEPT`) o `VALUES` como source rebotan con `[GBY-4078] VIEW_SOURCE_NOT_SIMPLE_SELECT`. Limitación del AST `derived_source: Option<Box<SelectStmt>>` — soportar set ops requiere extender el shape.
+- **Vistas read-only**. Auto-updatable y `INSTEAD OF` triggers difieridos.
+- **Materialized views**: no soportadas.
+- **Aliases de columna**: la persistencia y validación de arity están; la sustitución efectiva de nombres queda como mejora futura.
+- Migración V12 → V13: manual (dump SELECT + recreate).
+
+### 🔧 Catálogo
+
+- Cada record del catálogo arranca con `[kind:u8]` discriminator (`0=Table`, `1=View`).
+- Nuevo `ViewMeta { name, source, column_aliases }`.
+- API nueva: `Catalog::get_view`, `Catalog::put_view`, `Catalog::list_views`, `Catalog::list_objects`, `Catalog::get_object`, `Catalog::remove_object`. `list_tables` ahora filtra Views automáticamente.
+- `parse_select_query_str(s) -> DbResult<SelectQuery>` expuesto en `gabysql::sql` para clientes que necesiten re-parsear el source de una vista.
+
+### 🆕 Errores
+
+- `[GBY-4075] VIEW_NOT_WRITABLE`
+- `[GBY-4076] VIEW_EXPANSION_DEPTH_EXCEEDED`
+- `[GBY-4077] VIEW_NAME_COLLIDES_WITH_OBJECT`
+- `[GBY-4078] VIEW_SOURCE_NOT_SIMPLE_SELECT`
+
+### 🗄️ Formato en disco — VERSION 13
+
+```
+Cada record del catálogo:
+[kind:u8] · {
+  kind == 0 (Table) → TableMeta serialize (V12 layout)
+  kind == 1 (View)  → [name][source][alias_present:u8] · alias_present ?
+                          [alias_count:u16] · alias × [alias_name] : ∅
+}
+```
+
+### 🧪 Tests nuevos (14)
+
+`v_create_view_and_select`, `v_view_reflects_base_table_changes`, `v_drop_view`, `v_drop_view_if_exists_noop`, `v_view_name_collides_with_table`, `v_view_if_not_exists_idempotent`, `v_insert_on_view_rejected`, `v_update_on_view_rejected`, `v_delete_on_view_rejected`, `v_view_with_aggregation`, `v_view_persists_across_reopen`, `v_view_referencing_view`, `v_create_view_with_set_op_source_rejected`, `v_v12_db_rejected_with_unsupported_version`.
+
+Total integration tests: 377 (363 pre-V + 14 nuevos), todos verdes.
+
+---
+
 ## 2026-05-27 — Residual #4 de L: activación real de `ON UPDATE` + UPDATE sobre PK
 
 > **Un push a `main`** que cierra el residual #4 — el último listado tras #2/#3. Con este push, el **bloque L completo** (constraints) queda 100% entregado: CHECK, referential actions, naming, multi-col FK y ahora ON UPDATE activo. Sin bump de formato: el byte `on_update` ya estaba persistido desde L1.
