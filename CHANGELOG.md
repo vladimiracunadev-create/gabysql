@@ -6,6 +6,37 @@
 
 ---
 
+## 2026-05-27 — L3 (residual de L): `ALTER TABLE ADD CHECK` con re-validación de filas
+
+> **Un push a `main`** que cierra el sub-pendiente #1 listado tras L2: agregar un `CHECK (expr)` a una tabla **ya cargada con datos**. Sin bump de formato (V10 ya tiene el slot). Pequeño y autocontenido: ~280 líneas en `src/sql.rs` + 9 tests + docs.
+
+### 🆕 Sintaxis
+
+- `ALTER TABLE t ADD CHECK (qty > 0);`
+- `ALTER TABLE t ADD CONSTRAINT qty_positiva CHECK (qty > 0);`
+- El nombre, si se omite, se sintetiza como `<tabla>_check_<N>` con N empezando donde quedó el último CHECK declarado.
+
+### 🛡️ Semántica
+
+- **Re-valida todas las filas existentes** con un full-scan O(n) antes de tocar el catálogo. Cualquier fila que evalúe a `FALSE` aborta el ALTER entero con `[GBY-3008]` y la PK ofensiva en el mensaje — sin rollback parcial.
+- 3VL ANSI: filas con NULL en alguna columna del predicado pasan (mismo contrato que CHECK en CREATE TABLE).
+- Subqueries dentro del predicado se rechazan con `[GBY-4069]`.
+- Columnas referenciadas inexistentes se rechazan con `[GBY-2002]`.
+- Nombres duplicados (otro CHECK ya declarado con ese nombre) se rechazan al validar, antes del full-scan.
+
+### 🚧 Limitaciones residuales
+
+- `ALTER TABLE ADD COLUMN ... CHECK (...)` sigue rechazado (el CHECK inline en una columna nueva tendría que re-validar todas las filas para esa columna — `ALTER TABLE t ADD COLUMN x INT; ALTER TABLE t ADD CHECK (x > 0);` es el path soportado).
+- `ALTER TABLE DROP CONSTRAINT <name>` no implementado todavía (queda en el residual #2 junto con nombres en PK/UNIQUE/FK).
+
+### 🧪 Tests nuevos (9)
+
+`l3_alter_add_check_validates_existing_rows_and_persists`, `l3_alter_add_check_rejects_when_existing_row_violates`, `l3_alter_add_constraint_name_check_persists_name`, `l3_alter_add_check_null_passes_via_3vl`, `l3_alter_add_check_rejects_unknown_column`, `l3_alter_add_check_rejects_subquery`, `l3_alter_add_check_duplicate_name_rejected`, `l3_alter_add_check_persists_across_reopen`, `l3_alter_add_column_with_inline_check_rejected_with_clear_message`.
+
+Total integration tests: 329 (320 pre-L3 + 9 nuevos), todos verdes.
+
+---
+
 ## 2026-05-27 — Bloque L2: CHECK (expr) constraints (VERSION 9 → 10)
 
 > **Un push a `main`** que cierra el sub-bloque L2 del roadmap: constraints `CHECK (expr)` column-level y table-level con evaluación real en cada `INSERT`/`UPDATE`/`UPSERT DO UPDATE`. Bump VERSION 9 → 10 con rechazo limpio de DBs V9 vía `[GBY-1003]`. Ver [ADR-0021](docs/adr/0021-check-constraints.md). Con L2 cierra el bloque **L** completo del roadmap.

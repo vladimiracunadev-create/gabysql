@@ -41,6 +41,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **K2** ✅ | DDL con cambios on-disk: PK compuesta `PRIMARY KEY (a, b, ...)` y índices compuestos `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`. Bump VERSION 7→8 (**cerrado 2026-05-26**, ver ADR-0019). Restringido a all-INT NOT NULL; partial indexes y `ALTER COLUMN TYPE` siguen pendientes (futuro K3). | Alto | K1 |
 | **L1** ✅ | Referential actions: `ON DELETE SET NULL`, `ON DELETE SET DEFAULT`, `ON DELETE NO ACTION`, `ON UPDATE ...` (parsea + persiste; no se dispara hoy), `UNIQUE (a, b, ...)` table-level + parche al composite UNIQUE de K2. Bump VERSION 8→9. **Cerrado 2026-05-27** ([ADR-0020](adr/0020-fk-referential-actions.md)). | Medio | K |
 | **L2** ✅ | Constraints: `CHECK (expr)` column-level y table-level (con/sin `CONSTRAINT name`), evaluación en INSERT/UPDATE/UPSERT/DO UPDATE/cascade, 3VL ANSI, subqueries rechazadas en DDL. Bump VERSION 9→10. **Cerrado 2026-05-27** ([ADR-0021](adr/0021-check-constraints.md)). | Medio-Alto | L1, G3 |
+| **L3** ✅ | `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)` con re-validación O(n) de las filas existentes antes de persistir. Sin estado parcial. Sin bump de formato. **Cerrado 2026-05-27.** | Bajo | L2 |
 | **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
 | **V** | Vistas: `CREATE VIEW`/`DROP VIEW`, expansion en parser | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
@@ -257,7 +258,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `ALTER TABLE DROP COLUMN` | ✅ (K1, 2026-05-26; con `IF EXISTS`; bloqueado sobre PK / indexada / FK) | — |
 | `ALTER TABLE RENAME COLUMN` | ✅ (K1, 2026-05-26; arrastra PK + índices + FKs entrantes) | — |
 | `ALTER TABLE RENAME TO` | ✅ (K1, 2026-05-26; alias `RENAME TABLE`; arrastra FKs entrantes) | — |
-| `ALTER TABLE ADD CONSTRAINT` | ❌ | P2 |
+| `ALTER TABLE ADD [CONSTRAINT name] CHECK (expr)` | ✅ (L3, 2026-05-27; re-valida filas existentes con full-scan, aborta con `[GBY-3008]` sin estado parcial) | — |
+| `ALTER TABLE ADD CONSTRAINT name PRIMARY KEY/UNIQUE/FOREIGN KEY` | ❌ | P2 |
+| `ALTER TABLE DROP CONSTRAINT <name>` | ❌ | P2 |
 | `ALTER TABLE ALTER COLUMN ... TYPE ...` | ❌ | P2 (K2 — requiere rewrite tipado) |
 | `DROP TABLE ... CASCADE` | ❌ | P2 |
 

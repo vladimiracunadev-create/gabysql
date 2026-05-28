@@ -19,6 +19,10 @@ pub enum Statement {
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
     AlterTableAddColumn(AlterAddColumnStmt),
+    /// L3 (2026-05-27): `ALTER TABLE <t> ADD [CONSTRAINT name] CHECK (<expr>)`.
+    /// Disparar un full-scan O(n) sobre la tabla para validar cada fila
+    /// contra el nuevo predicado antes de persistirlo.
+    AlterTableAddCheck(AlterAddCheckStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -175,6 +179,21 @@ pub struct DropTableStmt {
 pub struct AlterAddColumnStmt {
     pub table: String,
     pub column: ColumnDef,
+}
+
+/// L3 (2026-05-27): `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)`.
+/// El `source` ya está canonicalizado por `format_expr` para garantizar
+/// que el round-trip catálogo ↔ disco sea estable, mismo contrato que
+/// los CHECKs declarados en `CREATE TABLE` (Bloque L2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterAddCheckStmt {
+    pub table: String,
+    /// Nombre explícito si vino con `CONSTRAINT name CHECK (...)`. Si es
+    /// `None`, el executor sintetiza `<tabla>_check_<N>` con N empezando
+    /// donde quedó el último check declarado.
+    pub name: Option<String>,
+    /// Texto SQL canónico re-parseable por `parse_expr_str`.
+    pub source: String,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1148,6 +1167,7 @@ impl<'a> Engine<'a> {
             Statement::CreateTable(stmt) => self.exec_create(stmt),
             Statement::DropTable(stmt) => self.exec_drop_table(stmt),
             Statement::AlterTableAddColumn(stmt) => self.exec_alter_add_column(stmt),
+            Statement::AlterTableAddCheck(stmt) => self.exec_alter_add_check(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -2127,6 +2147,143 @@ impl<'a> Engine<'a> {
             message: Some(format!(
                 "OK · tabla renombrada de '{}' a '{}'",
                 old_name, meta.name
+            )),
+        })
+    }
+
+    /// L3 (2026-05-27): `ALTER TABLE <t> ADD [CONSTRAINT <n>] CHECK (<expr>)`.
+    /// Re-valida todas las filas existentes contra el nuevo predicado.
+    /// Si alguna evalúa a FALSE, la operación entera rebota con
+    /// `[GBY-3008]` sin tocar el catálogo — sin estado parcial. NULL
+    /// pasa por 3VL ANSI (mismo contrato que CHECK en CREATE TABLE).
+    fn exec_alter_add_check(&mut self, stmt: AlterAddCheckStmt) -> DbResult<ResultSet> {
+        let mut meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&stmt.table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("tabla no existe: {}", stmt.table),
+                )
+            })?
+        };
+
+        // 1. Re-parsear el source canónico ya producido por el parser.
+        //    El round-trip format_expr → parse_expr_str cubre la regla
+        //    de "rechazo de subqueries" via [GBY-4069].
+        let expr = parse_expr_str(&stmt.source).map_err(|e| {
+            DbError::new(format!(
+                "ALTER TABLE ADD CHECK en '{}': re-parse del predicado falló — {}",
+                stmt.table, e
+            ))
+        })?;
+
+        // 2. Validar que cada columna referenciada existe en la tabla,
+        //    y que el expr no contiene subqueries. Reusa los walkers
+        //    que ya usa `validate_check_constraints` para CREATE TABLE.
+        check_expr_no_subquery(&expr).map_err(|e| {
+            DbError::new(format!("ALTER TABLE ADD CHECK en '{}': {}", stmt.table, e))
+        })?;
+        collect_check_columns(&expr, &mut |col| {
+            let key = strip_qualifier(col, &meta.name);
+            if meta.column(&key).is_none() {
+                Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "ALTER TABLE ADD CHECK en '{}': la columna '{}' no existe",
+                        meta.name, col
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
+
+        // 3. Resolver el nombre definitivo. Si vino explícito, validar
+        //    que no colisione con un CHECK ya declarado. Si no, sintetizar
+        //    `<tabla>_check_<N>` con N empezando donde quedaron los
+        //    anteriores (mismo esquema que el parser de CREATE TABLE).
+        let final_name = match stmt.name {
+            Some(n) => {
+                let lower = n.to_ascii_lowercase();
+                if meta
+                    .check_constraints
+                    .iter()
+                    .any(|c| c.name.to_ascii_lowercase() == lower)
+                {
+                    return Err(DbError::new(format!(
+                        "CHECK constraint '{}' ya existe en '{}'",
+                        n, meta.name
+                    )));
+                }
+                n
+            }
+            None => {
+                let mut n = meta.check_constraints.len() + 1;
+                loop {
+                    let candidate = format!("{}_check_{}", meta.name.to_ascii_lowercase(), n);
+                    let taken = meta
+                        .check_constraints
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&candidate));
+                    if !taken {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        };
+
+        // 4. Full-scan: re-validar cada fila contra el predicado nuevo.
+        //    Cualquier FALSE aborta antes de tocar catálogo — el catálogo
+        //    sigue exactamente como estaba.
+        let rows = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(meta.root_page, 0, None)?
+        };
+        for kv in &rows {
+            let row = decode_row(&meta, &kv.value)?;
+            match eval_expr_as_predicate(&expr, &row) {
+                Ok(Some(true)) | Ok(None) => continue,
+                Ok(Some(false)) => {
+                    return Err(coded(
+                        codes::CHECK_VIOLATED,
+                        format!(
+                            "ALTER TABLE ADD CHECK '{}' en '{}' rechazado: la fila con PK={} \
+                             ya viola el predicado `{}` (no se puede agregar el constraint sobre \
+                             datos preexistentes que no lo cumplen)",
+                            final_name, meta.name, kv.key, stmt.source
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    return Err(DbError::new(format!(
+                        "ALTER TABLE ADD CHECK '{}' en '{}': error al evaluar fila PK={} — {}",
+                        final_name, meta.name, kv.key, e
+                    )));
+                }
+            }
+        }
+
+        // 5. Persistir. El bloque L2 ya dejó el slot en TableMeta y el
+        //    trailer en disco (VERSION 10), así que sólo es un put_table
+        //    con un Vec extendido.
+        meta.check_constraints.push(CheckConstraint {
+            name: final_name.clone(),
+            source: stmt.source.clone(),
+        });
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_table(&meta)?;
+        }
+
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · CHECK '{}' agregado a '{}' tras validar {} fila(s) existentes",
+                final_name,
+                meta.name,
+                rows.len()
             )),
         })
     }
@@ -10780,19 +10937,45 @@ impl Parser {
         self.expect_keyword("TABLE")?;
         let table = self.expect_ident()?;
         if self.match_keyword("ADD") {
+            // L3 (2026-05-27): `ADD CHECK (...)` y `ADD CONSTRAINT name CHECK (...)`
+            // se discriminan ANTES de delegar a `parse_column_def`. La
+            // pista es la keyword inmediatamente después de ADD:
+            //   - `ADD CHECK`           → ADD CHECK sin nombre
+            //   - `ADD CONSTRAINT n CHECK` → ADD CHECK con nombre
+            //   - cualquier otra cosa  → ADD [COLUMN] <coldef>
+            if self.match_keyword("CHECK") {
+                return self.parse_alter_add_check(table, None);
+            }
+            // Snapshot para CONSTRAINT name CHECK — si tras `CONSTRAINT`
+            // no viene un ident+CHECK, hacemos rollback y dejamos que
+            // el path de ADD COLUMN falle con su error normal.
+            let snap = self.pos;
+            if self.match_keyword("CONSTRAINT") {
+                let name_tok = self.peek().clone();
+                if name_tok.kind == TokenKind::Ident {
+                    let saved_after_name = self.pos + 1;
+                    self.pos += 1;
+                    if self.match_keyword("CHECK") {
+                        return self.parse_alter_add_check(table, Some(name_tok.text));
+                    }
+                    // ROllback: `CONSTRAINT name X` con X != CHECK aún
+                    // no soportado. Caer al error genérico.
+                    self.pos = saved_after_name - 1;
+                }
+                self.pos = snap;
+            }
             // The COLUMN keyword is optional, matching most other dialects.
             let _ = self.match_keyword("COLUMN");
             // Bloque L2: ALTER TABLE ADD COLUMN no admite CHECKs por
             // ahora — el column-level CHECK requeriría re-validar todas
-            // las filas existentes, scope que queda fuera de L2. El
-            // buffer se descarta; si el parser empuja algo,
-            // devolvemos un error explícito.
+            // las filas existentes para esa columna nueva. Hoy sólo
+            // ALTER ADD CHECK (top-level) re-valida.
             let mut dropped: Vec<(Option<String>, Expr)> = Vec::new();
             let column = self.parse_column_def(&mut dropped)?;
             if !dropped.is_empty() {
                 return Err(DbError::new(
                     "ALTER TABLE ADD COLUMN no admite CHECK en este release \
-                     (requeriría re-validar las filas existentes)",
+                     (usar `ALTER TABLE <t> ADD CHECK (...)` por separado)",
                 ));
             }
             return Ok(Statement::AlterTableAddColumn(AlterAddColumnStmt {
@@ -10836,6 +11019,25 @@ impl Parser {
         Err(DbError::new(
             "ALTER TABLE: se esperaba ADD [COLUMN], DROP COLUMN, o RENAME [TO|COLUMN]",
         ))
+    }
+
+    /// L3 (2026-05-27): después de consumir `ALTER TABLE <t> ADD [CONSTRAINT n] CHECK`,
+    /// parsea el cuerpo `(<expr>)` y canonicaliza el source con
+    /// `format_expr` para que el executor lo persista round-trip-estable.
+    fn parse_alter_add_check(
+        &mut self,
+        table: String,
+        name: Option<String>,
+    ) -> DbResult<Statement> {
+        self.expect_symbol("(")?;
+        let expr = self.parse_expr()?;
+        self.expect_symbol(")")?;
+        let source = format_expr(&expr)?;
+        Ok(Statement::AlterTableAddCheck(AlterAddCheckStmt {
+            table,
+            name,
+            source,
+        }))
     }
 
     /// Shared between `CREATE TABLE` and `ALTER TABLE ADD COLUMN`. Reads

@@ -7797,6 +7797,165 @@ fn l2_check_persists_across_reopen() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- L3 (2026-05-27): ALTER TABLE ... ADD [CONSTRAINT name] CHECK (expr). -----
+
+#[test]
+fn l3_alter_add_check_validates_existing_rows_and_persists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-check-ok")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, age INT);")?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (1, 30);")?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (2, 20);")?;
+    run_sql(&db, "ALTER TABLE t ADD CHECK (age >= 18);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, age) VALUES (3, 10);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008 tras ALTER ADD CHECK, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_check_rejects_when_existing_row_violates() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-check-violating-row")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, age INT);")?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (1, 30);")?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (2, -5);")?;
+    let err = run_sql(&db, "ALTER TABLE t ADD CHECK (age >= 0);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008, got: {}",
+        err
+    );
+    // El catálogo no debe haberse modificado: un INSERT que "violaría"
+    // el check rechazado sigue funcionando.
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (3, -100);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_constraint_name_check_persists_name() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-named")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, qty INT);")?;
+    run_sql(&db, "INSERT INTO t (id, qty) VALUES (1, 10);")?;
+    run_sql(
+        &db,
+        "ALTER TABLE t ADD CONSTRAINT qty_positiva CHECK (qty > 0);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, qty) VALUES (2, 0);").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("GBY-3008"), "esperaba GBY-3008, got: {}", msg);
+    assert!(
+        msg.contains("qty_positiva"),
+        "esperaba el nombre del CHECK en el error, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_check_null_passes_via_3vl() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-check-null")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, age INT);")?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (1, NULL);")?;
+    run_sql(&db, "INSERT INTO t (id, age) VALUES (2, 30);")?;
+    // NULL >= 0 = NULL → pasa (ANSI 3VL).
+    run_sql(&db, "ALTER TABLE t ADD CHECK (age >= 0);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_check_rejects_unknown_column() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-check-unknown-col")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, qty INT);")?;
+    let err = run_sql(&db, "ALTER TABLE t ADD CHECK (nope > 0);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-2002") || err.to_string().contains("nope"),
+        "esperaba COLUMN_NOT_FOUND o referencia explícita a 'nope', got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_check_rejects_subquery() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-check-subquery")?;
+    run_sql(&db, "CREATE TABLE other (id INT PRIMARY KEY);")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, x INT);")?;
+    let err = run_sql(
+        &db,
+        "ALTER TABLE t ADD CHECK (x > (SELECT MAX(id) FROM other));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4069") || err.to_string().to_lowercase().contains("subquer"),
+        "esperaba GBY-4069 / mensaje sobre subquery, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_check_duplicate_name_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-dup-name")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, qty INT, CONSTRAINT qty_pos CHECK (qty >= 0));",
+    )?;
+    let err = run_sql(
+        &db,
+        "ALTER TABLE t ADD CONSTRAINT qty_pos CHECK (qty <= 100);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("ya existe") || err.to_string().contains("qty_pos"),
+        "esperaba mensaje de duplicado, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_check_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = l2_setup("alter-add-reopen")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, qty INT);")?;
+    run_sql(&db, "INSERT INTO t (id, qty) VALUES (1, 5);")?;
+    run_sql(&db, "ALTER TABLE t ADD CHECK (qty BETWEEN 1 AND 100);")?;
+    // Cada run_sql abre/cierra → el siguiente INSERT valida que el
+    // catálogo persistió y se re-parsea bien tras reopen.
+    let err = run_sql(&db, "INSERT INTO t (id, qty) VALUES (2, 500);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3008"),
+        "esperaba GBY-3008 tras reopen, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn l3_alter_add_column_with_inline_check_rejected_with_clear_message() -> Result<(), Box<dyn Error>>
+{
+    let (db, wal) = l2_setup("alter-add-col-with-check")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "ALTER TABLE t ADD COLUMN age INT CHECK (age >= 0);").unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") && (msg.contains("alter") || msg.contains("add column")),
+        "esperaba mensaje claro sobre ADD COLUMN sin CHECK, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 #[test]
 fn l2_v9_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("l2-v10-bump");
