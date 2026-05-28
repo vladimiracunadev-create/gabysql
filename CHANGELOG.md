@@ -6,6 +6,62 @@
 
 ---
 
+## 2026-05-27 — Residual #3 de L: multi-column FOREIGN KEY (VERSION 11 → 12)
+
+> **Un push a `main`** que cierra el residual #3 listado tras #2: `FOREIGN KEY (a, b) REFERENCES p (x, y)` con todos los `ON DELETE` (CASCADE, SET NULL, SET DEFAULT, RESTRICT, NO ACTION) y `ON UPDATE` persistido. Bump VERSION 11→12 con rechazo limpio de V11 vía `[GBY-1003]`. Ver [ADR-0023](docs/adr/0023-multi-col-foreign-key.md).
+
+### 🆕 Sintaxis
+
+- `CREATE TABLE child (..., CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b) ON DELETE CASCADE);`
+- También sin nombre: `CREATE TABLE child (..., FOREIGN KEY (pa, pb) REFERENCES parent (a, b));`
+- Mismo soporte `ON DELETE` / `ON UPDATE` del bloque L1 (RESTRICT, CASCADE, SET NULL, SET DEFAULT, NO ACTION).
+- Multi-col FK column-inline **no** se soporta (ANSI tampoco lo permite — usar table-level).
+
+### 🛡️ Semántica
+
+- **Target = PK compuesta del parent**: las `target_columns` declaradas en `REFERENCES p (x, y)` deben matchear exactamente la PK del parent en el mismo orden. Otro UNIQUE arbitrario rebota al validar (limitación documentada).
+- **Lookup O(log n) via fingerprint**: el motor computa `fp = encode_composite_key(parent_pk_cols, source_values)` (mismo encoder de K2) y hace `parent.get_row(fp)`. NULL en cualquier source → ANSI 3VL pasa sin chequear.
+- **Cascade SET NULL / SET DEFAULT mutan todas las source cols atómicamente**: si cualquier source es NOT NULL bajo SET NULL → `[GBY-3009]`; si falta DEFAULT en alguna → `[GBY-3010]`. Sin rollback parcial.
+- **Búsqueda de hijos en cascade**: single-col mantiene el fast-path por índice secundario (Hash/OrderedInt). Multi-col cae a full-scan comparando tuplas (igual que PostgreSQL cuando no hay índice por las source cols).
+
+### 🚧 Limitaciones
+
+- FK multi-col target **debe** ser la PK del parent (no UNIQUE arbitrario). Único caso práctico hoy.
+- Sin fast-path indexado para cascade multi-col — `CREATE INDEX child (pa, pb)` no se usa automáticamente para acelerar el find del cascade. Mejora futura.
+- `ALTER TABLE ADD FOREIGN KEY ... (a, b) REFERENCES ...` no implementado (igual que L3 con CHECK, requiere re-validar filas existentes). Diferido.
+- Activación real de `ON UPDATE` sigue diferida al residual #4.
+- Migración V11 → V12 manual: dump SELECT + recreate.
+
+### 🔧 Catálogo
+
+- `ForeignKeyMeta` añade `pub extra_source_columns: Vec<String>` y `pub extra_target_columns: Vec<String>`. Single-col → ambos vacíos.
+- Helpers nuevos: `ForeignKeyMeta::source_columns(anchor)`, `::target_columns()`, `::is_composite()`.
+- Helpers runtime: `fk_lookup_parent_pk`, `collect_fk_source_values`, `cascade_set_fk_tuple` (reemplaza el single-col `cascade_set_fk_value` como wrapper).
+
+### 🗄️ Formato en disco — VERSION 12
+
+```
+[col_count:u16] · col × {
+    [name][type:u8][flags:u8]
+    flags & 0x02 ? DefaultLiteral : ∅
+    flags & 0x04 ? [target_table][target_column]
+                   [on_delete:u8][on_update:u8]
+                   [fk_name_present:u8] · fk_name_present ? [fk_name] : ∅
+                   [fk_extra_count:u8] · extra ×              ← NUEVO
+                         [extra_source_col] · extra ×
+                         [extra_target_col]
+                   : ∅
+}
+```
+
+### 🧪 Tests nuevos (12)
+
+`r3_multi_col_fk_happy_path`, `r3_multi_col_fk_parent_missing_rejected`, `r3_multi_col_fk_delete_cascade`, `r3_multi_col_fk_delete_set_null`, `r3_multi_col_fk_set_null_rejected_when_any_col_not_null`, `r3_multi_col_fk_arity_mismatch_at_ddl`, `r3_multi_col_fk_target_must_be_pk`, `r3_multi_col_fk_null_source_passes_via_3vl`, `r3_multi_col_fk_drop_via_drop_constraint`, `r3_multi_col_fk_persists_across_reopen`, `r3_drop_column_blocked_by_multi_col_fk`, `r3_v11_db_rejected_with_unsupported_version`.
+
+Total integration tests: 351 (339 pre-residual-#3 + 12 nuevos), todos verdes. El test `r2_multi_col_fk_rejected_with_clear_message` se actualizó a `r2_multi_col_fk_now_supported_post_r3` como smoke check.
+
+---
+
 ## 2026-05-27 — Residual #2 de L: nombres en PK/UNIQUE/FK + `ALTER TABLE DROP CONSTRAINT` (VERSION 10 → 11)
 
 > **Un push a `main`** que cierra el residual #2 listado tras L3: poder nombrar PK/UNIQUE/FK con `CONSTRAINT <name>` y borrarlos por nombre con `ALTER TABLE DROP CONSTRAINT`. Bump VERSION 10→11 con rechazo limpio de V10 vía `[GBY-1003]`. Ver [ADR-0022](docs/adr/0022-named-constraints-and-drop.md).

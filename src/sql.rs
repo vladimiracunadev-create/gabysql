@@ -378,6 +378,9 @@ struct NamedConstraintHead {
 }
 
 /// Residual #2 (2026-05-27): FK table-level con nombre explícito.
+/// Residual #3 (2026-05-27): admite multi-col mediante
+/// `extra_source_columns` y `extra_target_columns` (mismo orden,
+/// misma arity). Single-col los deja vacíos.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamedForeignKey {
     pub name: String,
@@ -386,6 +389,8 @@ pub struct NamedForeignKey {
     pub target_column: String,
     pub on_delete: OnDelete,
     pub on_update: OnUpdate,
+    pub extra_source_columns: Vec<String>,
+    pub extra_target_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -418,6 +423,11 @@ pub struct ForeignKeyDef {
     /// con `CONSTRAINT <name> FOREIGN KEY (col) REFERENCES …`. `None`
     /// para FKs declaradas inline en la columna sin nombre.
     pub name: Option<String>,
+    /// Residual #3 (2026-05-27): columnas adicionales para FK multi-col
+    /// (`FOREIGN KEY (a, b) REFERENCES p (x, y)`). El parser column-inline
+    /// las deja vacías; sólo la rama table-level las llena.
+    pub extra_source_columns: Vec<String>,
+    pub extra_target_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1616,6 +1626,8 @@ impl<'a> Engine<'a> {
                 on_delete: nfk.on_delete,
                 on_update: nfk.on_update,
                 name: Some(nfk.name.clone()),
+                extra_source_columns: nfk.extra_source_columns.clone(),
+                extra_target_columns: nfk.extra_target_columns.clone(),
             });
         }
         // Re-validar FK targets ahora que las table-level fueron adjuntadas.
@@ -2706,17 +2718,39 @@ impl<'a> Engine<'a> {
             ));
         }
 
-        // Bloqueo: FK saliente desde esta columna.
+        // Bloqueo: FK saliente desde esta columna — caso anchor (la
+        // columna es la primera del set source de la FK).
         if column.references.is_some() {
             return Err(coded(
                 codes::CANNOT_DROP_REFERENCED_COLUMN,
                 format!(
                     "DROP COLUMN '{}': la columna declara una FOREIGN KEY hacia otra tabla. \
-                     Hay que recrear la tabla sin esa FK o esperar al soporte de \
-                     ALTER ... DROP CONSTRAINT (no implementado en este release)",
+                     Usar ALTER TABLE DROP CONSTRAINT <name> sobre la FK antes (residual #2).",
                     stmt.column
                 ),
             ));
+        }
+        // Residual #3 (2026-05-27): FK saliente multi-col donde esta
+        // columna está en `extra_source_columns` de otra. La FK está
+        // anchored en otra columna pero esta también participa.
+        for c in &meta.columns {
+            if let Some(fk) = &c.references {
+                if fk
+                    .extra_source_columns
+                    .iter()
+                    .any(|s| normalize_ident(s) == col_norm)
+                {
+                    return Err(coded(
+                        codes::CANNOT_DROP_REFERENCED_COLUMN,
+                        format!(
+                            "DROP COLUMN '{}': participa en una FOREIGN KEY multi-col anclada \
+                             en '{}' (target table '{}'). Usar ALTER TABLE DROP CONSTRAINT \
+                             antes.",
+                            stmt.column, c.name, fk.table
+                        ),
+                    ));
+                }
+            }
         }
 
         // Bloqueo: FK entrante — otra tabla apunta a esta columna como su
@@ -2734,9 +2768,14 @@ impl<'a> Engine<'a> {
             }
             for c in &other.columns {
                 if let Some(fk) = &c.references {
-                    if fk.table.eq_ignore_ascii_case(&meta.name)
-                        && normalize_ident(&fk.column) == col_norm
-                    {
+                    if !fk.table.eq_ignore_ascii_case(&meta.name) {
+                        continue;
+                    }
+                    // Anchor target o cualquier extra_target apuntando a
+                    // esta columna bloquea el DROP. Residual #3.
+                    let mut all_targets = vec![fk.column.clone()];
+                    all_targets.extend(fk.extra_target_columns.iter().cloned());
+                    if all_targets.iter().any(|t| normalize_ident(t) == col_norm) {
                         return Err(coded(
                             codes::CANNOT_DROP_REFERENCED_COLUMN,
                             format!(
@@ -2861,10 +2900,28 @@ impl<'a> Engine<'a> {
             if normalize_ident(&ix.column) == old_norm {
                 ix.column = stmt.new_name.clone();
             }
+            // K2: índices compuestos también renombran extra_columns.
+            for ec in ix.extra_columns.iter_mut() {
+                if normalize_ident(ec) == old_norm {
+                    *ec = stmt.new_name.clone();
+                }
+            }
         }
-        // No tocamos la FK saliente de la propia columna: el `column`
-        // del ForeignKeyMeta apunta a la columna PARENT, no a la
-        // columna local — el rename no afecta a esa referencia.
+        // No tocamos `references.column` ni `references.extra_target_columns`
+        // de la propia tabla: esos apuntan a columnas del PARENT, no
+        // locales. Pero sí debemos actualizar
+        // `references.extra_source_columns` cuando una FK multi-col
+        // declarada en otra columna referencia la columna que estamos
+        // renombrando como source extra (residual #3).
+        for col in meta.columns.iter_mut() {
+            if let Some(fk) = col.references.as_mut() {
+                for ec in fk.extra_source_columns.iter_mut() {
+                    if normalize_ident(ec) == old_norm {
+                        *ec = stmt.new_name.clone();
+                    }
+                }
+            }
+        }
 
         // Validar el resultado y persistirlo.
         validate_create_table(&meta)?;
@@ -2888,11 +2945,20 @@ impl<'a> Engine<'a> {
             let mut changed = false;
             for col in other.columns.iter_mut() {
                 if let Some(fk) = col.references.as_mut() {
-                    if fk.table.eq_ignore_ascii_case(&meta.name)
-                        && normalize_ident(&fk.column) == old_norm
-                    {
+                    if !fk.table.eq_ignore_ascii_case(&meta.name) {
+                        continue;
+                    }
+                    if normalize_ident(&fk.column) == old_norm {
                         fk.column = stmt.new_name.clone();
                         changed = true;
+                    }
+                    // Residual #3: extra_target_columns también deben
+                    // arrastrar el rename para FK multi-col.
+                    for et in fk.extra_target_columns.iter_mut() {
+                        if normalize_ident(et) == old_norm {
+                            *et = stmt.new_name.clone();
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -7512,6 +7578,8 @@ fn fk_def_to_meta(def: &ForeignKeyDef) -> ForeignKeyMeta {
         on_delete: def.on_delete,
         on_update: def.on_update,
         name: def.name.clone(),
+        extra_source_columns: def.extra_source_columns.clone(),
+        extra_target_columns: def.extra_target_columns.clone(),
     }
 }
 
@@ -7531,14 +7599,13 @@ fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
         let Some(fk) = &column.references else {
             continue;
         };
+        // Snapshot del padre para chequear nombres y tipos.
         let is_self_ref = fk.table.eq_ignore_ascii_case(&meta.name);
-        let (target_pk_name, target_pk_type, target_name) = if is_self_ref {
-            let pk = meta.column(&meta.primary_key).ok_or_else(|| {
-                DbError::new("FK self-ref: tabla sin PK definida (estado inconsistente)")
-            })?;
-            (meta.primary_key.clone(), pk.column_type, meta.name.clone())
+        let target_meta_owned;
+        let target: &TableMeta = if is_self_ref {
+            meta
         } else {
-            let target = {
+            let snap = {
                 let mut catalog = Catalog::open(pager);
                 catalog.get_table(&fk.table)?.ok_or_else(|| {
                     coded(
@@ -7550,33 +7617,76 @@ fn validate_fk_targets(pager: &mut Pager, meta: &TableMeta) -> DbResult<()> {
                     )
                 })?
             };
-            let pk = target.column(&target.primary_key).ok_or_else(|| {
-                DbError::new(format!(
-                    "FK rota: tabla '{}' no expone su PK '{}'",
-                    target.name, target.primary_key
-                ))
-            })?;
-            (
-                target.primary_key.clone(),
-                pk.column_type,
-                target.name.clone(),
-            )
+            target_meta_owned = snap;
+            &target_meta_owned
         };
-        if !target_pk_name.eq_ignore_ascii_case(&fk.column) {
+
+        // Residual #3 (2026-05-27): FK puede ser multi-col. Caso
+        // multi-col: target_columns debe ser exactamente la PK del
+        // padre (en orden) y todas las source/target deben tener
+        // matching types.
+        let source_cols = fk.source_columns(&column.name);
+        let target_cols = fk.target_columns();
+        if source_cols.len() != target_cols.len() {
             return Err(DbError::new(format!(
-                "FOREIGN KEY '{}.{}' debe referenciar la PK de '{}' (es '{}'); \
-                 esta versión no admite REFERENCES contra columnas no-PK",
-                meta.name, column.name, target_name, target_pk_name
-            )));
-        }
-        if column.column_type != target_pk_type {
-            return Err(DbError::new(format!(
-                "FOREIGN KEY '{}.{}' debe ser {} para coincidir con la PK de '{}'",
+                "FOREIGN KEY '{}.{}' tiene arity inconsistente: {} source vs {} target",
                 meta.name,
                 column.name,
-                target_pk_type.as_sql(),
-                target_name
+                source_cols.len(),
+                target_cols.len()
             )));
+        }
+        let target_pk_cols = target.pk_columns();
+        // ANSI permite FK contra UNIQUE arbitrarios, pero gabysql sólo
+        // contra PK (la regla histórica pre-#3). Single-col PK + FK
+        // sigue funcionando idéntico al pre-#3 (mismo error si el
+        // target column no coincide con la PK).
+        let pk_set_lc: Vec<String> = target_pk_cols
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let target_set_lc: Vec<String> =
+            target_cols.iter().map(|s| s.to_ascii_lowercase()).collect();
+        if pk_set_lc != target_set_lc {
+            return Err(DbError::new(format!(
+                "FOREIGN KEY '{}.{}' debe referenciar exactamente la PRIMARY KEY de '{}' \
+                 en el mismo orden (PK = ({}), FK target = ({})); esta versión no admite \
+                 REFERENCES contra columnas no-PK ni contra subconjuntos / reorderings",
+                meta.name,
+                column.name,
+                target.name,
+                target_pk_cols.join(", "),
+                target_cols.join(", ")
+            )));
+        }
+        // Tipos de cada par (source[i], target[i]) deben matchear.
+        for (src, tgt) in source_cols.iter().zip(target_cols.iter()) {
+            let src_col = meta.column(src).ok_or_else(|| {
+                coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "FOREIGN KEY '{}': columna source '{}' no existe",
+                        meta.name, src
+                    ),
+                )
+            })?;
+            let tgt_col = target.column(tgt).ok_or_else(|| {
+                DbError::new(format!(
+                    "FK rota: tabla '{}' no expone columna '{}'",
+                    target.name, tgt
+                ))
+            })?;
+            if src_col.column_type != tgt_col.column_type {
+                return Err(DbError::new(format!(
+                    "FOREIGN KEY '{}.{}' → '{}.{}' tipos inconsistentes: {} vs {}",
+                    meta.name,
+                    src,
+                    target.name,
+                    tgt,
+                    src_col.column_type.as_sql(),
+                    tgt_col.column_type.as_sql()
+                )));
+            }
         }
     }
     Ok(())
@@ -7743,18 +7853,71 @@ fn check_expr_no_subquery(expr: &Expr) -> DbResult<()> {
 /// at the very row being written (the row will exist as soon as the
 /// statement commits — refusing it would make self-managed entities
 /// impossible to insert in the first place).
+/// Residual #3 (2026-05-27): calcula la PK del parent (fingerprint o
+/// i64 directo) a partir de los valores source de la FK en el orden
+/// declarado. Devuelve `None` si algún valor source es NULL — en ese
+/// caso ANSI dice "FK no se chequea" (filas con NULL en FK col se
+/// admiten libremente, igual que pre-#3).
+///
+/// Para FK single-col target = single-col PK: devuelve el INT
+/// directamente (compatible con el contrato pre-#3 del B+Tree).
+/// Para FK multi-col target = PK compuesta: devuelve el fingerprint
+/// FNV-1a-64 i64 (mismo encoder que K2 usa para insertar la PK).
+fn fk_lookup_parent_pk(
+    fk: &ForeignKeyMeta,
+    source_values: &[Value],
+    parent_meta: &TableMeta,
+) -> DbResult<Option<i64>> {
+    if source_values.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(None);
+    }
+    if !parent_meta.has_composite_pk() && !fk.is_composite() {
+        // Caso histórico pre-#3: single-col INT FK.
+        match &source_values[0] {
+            Value::Integer(n) => Ok(Some(*n)),
+            other => Err(DbError::new(format!(
+                "FK '{}': valor source no-INT ({:?}) contra PK single-col",
+                fk.name.as_deref().unwrap_or("(sin nombre)"),
+                other
+            ))),
+        }
+    } else {
+        // Multi-col o single-col contra PK compuesta. Construir el
+        // fingerprint en el orden EXACTO de la PK del parent
+        // (`pk_columns()`), que el validator DDL exige sea idéntico
+        // al orden `fk.target_columns()`.
+        let pk_col_names = parent_meta.pk_columns();
+        let parent_pk_cols: Vec<Column> = pk_col_names
+            .iter()
+            .map(|n| {
+                parent_meta.column(n).cloned().ok_or_else(|| {
+                    DbError::new(format!(
+                        "FK rota: tabla padre '{}' no expone columna PK '{}'",
+                        parent_meta.name, n
+                    ))
+                })
+            })
+            .collect::<DbResult<_>>()?;
+        let col_refs: Vec<&Column> = parent_pk_cols.iter().collect();
+        let val_refs: Vec<&Value> = source_values.iter().collect();
+        Ok(Some(encode_composite_key(&col_refs, &val_refs)?))
+    }
+}
+
+/// Verify that the parent row identified by the FK source values
+/// exists. NULL en cualquier source column → no-op (ANSI). Self-ref a
+/// la fila que se está insertando (mismo PK) → no-op.
 fn check_fk_value(
     pager: &mut Pager,
     meta: &TableMeta,
     column_name: &str,
     fk: &ForeignKeyMeta,
-    target_pk: i64,
+    source_values: &[Value],
     self_ref_allowed_pk: i64,
 ) -> DbResult<()> {
-    if fk.table.eq_ignore_ascii_case(&meta.name) && target_pk == self_ref_allowed_pk {
-        return Ok(());
-    }
-    let parent_meta = {
+    let parent_meta = if fk.table.eq_ignore_ascii_case(&meta.name) {
+        meta.clone()
+    } else {
         let mut catalog = Catalog::open(pager);
         catalog.get_table(&fk.table)?.ok_or_else(|| {
             DbError::new(format!(
@@ -7763,24 +7926,67 @@ fn check_fk_value(
             ))
         })?
     };
+    let Some(target_pk) = fk_lookup_parent_pk(fk, source_values, &parent_meta)? else {
+        return Ok(()); // NULL en source → ANSI lo deja pasar.
+    };
+    if fk.table.eq_ignore_ascii_case(&meta.name) && target_pk == self_ref_allowed_pk {
+        return Ok(());
+    }
     let exists = {
         let mut catalog = Catalog::open(pager);
         catalog.get_row(parent_meta.root_page, target_pk)?.is_some()
     };
     if !exists {
+        let src_names = fk.source_columns(column_name).join(", ");
+        let val_repr = source_values
+            .iter()
+            .map(value_repr_compact)
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(coded(
             codes::FK_PARENT_MISSING,
             format!(
-                "violación de FOREIGN KEY: '{}.{}' = {} no existe en la tabla padre '{}'",
-                meta.name, column_name, target_pk, fk.table
+                "violación de FOREIGN KEY{}: ({}) = ({}) no existe en la tabla padre '{}'",
+                fk.name
+                    .as_ref()
+                    .map(|n| format!(" '{}'", n))
+                    .unwrap_or_default(),
+                src_names,
+                val_repr,
+                fk.table
             ),
         ));
     }
     Ok(())
 }
 
-/// Walk every column with a FK and call [`check_fk_value`] when the
-/// final value (after defaults) is non-NULL. INSERT-time entry point.
+/// Helper para mensaje de FK_PARENT_MISSING: representación compacta
+/// de un `Value` sin las decoraciones del Debug.
+fn value_repr_compact(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Value::String(s) => format!("'{}'", s),
+    }
+}
+
+/// Helper: collect source values for an FK from a row HashMap, in the
+/// order declared (anchor col first, then `extra_source_columns`).
+fn collect_fk_source_values(
+    fk: &ForeignKeyMeta,
+    anchor_col: &str,
+    row: &HashMap<String, Value>,
+) -> Vec<Value> {
+    fk.source_columns(anchor_col)
+        .iter()
+        .map(|c| row.get(&normalize_ident(c)).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+/// Walk every FK and call [`check_fk_value`] when the source tuple is
+/// non-NULL. INSERT-time entry point.
 fn enforce_fk_on_insert(
     pager: &mut Pager,
     meta: &TableMeta,
@@ -7791,21 +7997,15 @@ fn enforce_fk_on_insert(
         let Some(fk) = &column.references else {
             continue;
         };
-        let value = values
-            .get(&normalize_ident(&column.name))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let Value::Integer(target_pk) = value else {
-            continue;
-        };
-        check_fk_value(pager, meta, &column.name, fk, target_pk, new_pk)?;
+        let source_values = collect_fk_source_values(fk, &column.name, values);
+        check_fk_value(pager, meta, &column.name, fk, &source_values, new_pk)?;
     }
     Ok(())
 }
 
-/// UPDATE-time entry point. Same as INSERT but only revalidates FK
-/// columns whose value actually changed — leaving an FK column
-/// untouched can never break referential integrity.
+/// UPDATE-time entry point. Re-valida la FK sólo si CAMBIÓ alguna de
+/// las columnas source — leaving the tuple unchanged can never break
+/// referential integrity.
 fn enforce_fk_on_update(
     pager: &mut Pager,
     meta: &TableMeta,
@@ -7817,73 +8017,119 @@ fn enforce_fk_on_update(
         let Some(fk) = &column.references else {
             continue;
         };
-        let normalized = normalize_ident(&column.name);
-        let old_val = old_row.get(&normalized).cloned().unwrap_or(Value::Null);
-        let new_val = current.get(&normalized).cloned().unwrap_or(Value::Null);
-        if old_val == new_val {
+        let old_vals = collect_fk_source_values(fk, &column.name, old_row);
+        let new_vals = collect_fk_source_values(fk, &column.name, current);
+        if old_vals == new_vals {
             continue;
         }
-        let Value::Integer(target_pk) = new_val else {
-            continue;
-        };
-        check_fk_value(pager, meta, &column.name, fk, target_pk, pk)?;
+        check_fk_value(pager, meta, &column.name, fk, &new_vals, pk)?;
     }
     Ok(())
 }
 
-/// Find every child PK whose FK column equals `parent_pk`. Uses the
-/// secondary index on the child column when it exists; falls back to a
-/// full scan otherwise (with the documented O(n) cost — see
-/// `docs/SQL_REFERENCE.md`).
+/// Find every child PK whose FK source tuple matches the parent row
+/// being deleted. Residual #3 (2026-05-27): generalizado para FK
+/// multi-col. La función recibe los **valores target** del parent
+/// (en el orden `fk.target_columns()`) y compara contra los valores
+/// source del child fila por fila.
+///
+/// Para FK single-col el path usa la index lookup rápida (Hash u
+/// OrderedInt) que K2 ya tenía. Para multi-col cae a full-scan; un
+/// fast-path por composite UNIQUE index sobre los source cols
+/// (que K2/L1 ya saben construir) queda como mejora futura.
 fn find_child_pks_with_fk_value(
     pager: &mut Pager,
     child_table: &TableMeta,
-    fk_column: &str,
-    parent_pk: i64,
+    fk: &ForeignKeyMeta,
+    anchor_col: &str,
+    target_values: &[Value],
 ) -> DbResult<Vec<i64>> {
-    let column = child_table.column(fk_column).ok_or_else(|| {
-        DbError::new(format!(
-            "FK incoherente: columna '{}' no existe en '{}'",
-            fk_column, child_table.name
-        ))
-    })?;
-    let value = Value::Integer(parent_pk);
-    let value_bytes = encode_column_value(column, &value)?;
-
-    if let Some(idx) = child_table.index_for_column(fk_column) {
-        let mut tree = Tree::new(pager);
-        match idx.kind {
-            IndexKind::Hash => {
-                let key = hash_value(&value_bytes);
-                let bucket_bytes = match tree.get(idx.root_page, key)? {
-                    Some(b) => b,
-                    None => return Ok(Vec::new()),
-                };
-                let bucket = decode_bucket(&bucket_bytes)?;
-                return Ok(bucket_lookup(&bucket, &value_bytes));
-            }
-            IndexKind::OrderedInt => {
-                let Some(key) = ordered_int_key_from_value_bytes(&value_bytes)? else {
-                    return Ok(Vec::new());
-                };
-                let bucket_bytes = match tree.get(idx.root_page, key)? {
-                    Some(b) => b,
-                    None => return Ok(Vec::new()),
-                };
-                return decode_ordered_bucket(&bucket_bytes);
-            }
-        }
+    let source_col_names = fk.source_columns(anchor_col);
+    if source_col_names.len() != target_values.len() {
+        return Err(DbError::new(format!(
+            "FK incoherente: arity {} source vs {} target en '{}'",
+            source_col_names.len(),
+            target_values.len(),
+            child_table.name
+        )));
     }
 
+    // Fast-path single-col: usa índice secundario por la columna FK.
+    if !fk.is_composite() {
+        let parent_pk = match &target_values[0] {
+            Value::Integer(n) => *n,
+            _ => return Ok(Vec::new()),
+        };
+        let column = child_table.column(anchor_col).ok_or_else(|| {
+            DbError::new(format!(
+                "FK incoherente: columna '{}' no existe en '{}'",
+                anchor_col, child_table.name
+            ))
+        })?;
+        let value = Value::Integer(parent_pk);
+        let value_bytes = encode_column_value(column, &value)?;
+
+        if let Some(idx) = child_table.index_for_column(anchor_col) {
+            let mut tree = Tree::new(pager);
+            match idx.kind {
+                IndexKind::Hash => {
+                    let key = hash_value(&value_bytes);
+                    let bucket_bytes = match tree.get(idx.root_page, key)? {
+                        Some(b) => b,
+                        None => return Ok(Vec::new()),
+                    };
+                    let bucket = decode_bucket(&bucket_bytes)?;
+                    return Ok(bucket_lookup(&bucket, &value_bytes));
+                }
+                IndexKind::OrderedInt => {
+                    let Some(key) = ordered_int_key_from_value_bytes(&value_bytes)? else {
+                        return Ok(Vec::new());
+                    };
+                    let bucket_bytes = match tree.get(idx.root_page, key)? {
+                        Some(b) => b,
+                        None => return Ok(Vec::new()),
+                    };
+                    return decode_ordered_bucket(&bucket_bytes);
+                }
+            }
+        }
+        // Fallback full-scan.
+        let mut catalog = Catalog::open(pager);
+        let rows = catalog.scan_rows(child_table.root_page, 0, None)?;
+        let mut hits = Vec::new();
+        for kv in rows {
+            let row = decode_row(child_table, &kv.value)?;
+            if let Some(Value::Integer(n)) = row.get(&normalize_ident(anchor_col)) {
+                if *n == parent_pk {
+                    hits.push(kv.key);
+                }
+            }
+        }
+        return Ok(hits);
+    }
+
+    // Multi-col path: full-scan comparando tuplas. Cualquier source
+    // value NULL en el row del child hace que no match (igual que
+    // PostgreSQL: NULL ≠ NULL en FK matching).
     let mut catalog = Catalog::open(pager);
     let rows = catalog.scan_rows(child_table.root_page, 0, None)?;
     let mut hits = Vec::new();
     for kv in rows {
         let row = decode_row(child_table, &kv.value)?;
-        if let Some(Value::Integer(n)) = row.get(&normalize_ident(fk_column)) {
-            if *n == parent_pk {
-                hits.push(kv.key);
+        let mut all_match = true;
+        for (i, src) in source_col_names.iter().enumerate() {
+            let got = row
+                .get(&normalize_ident(src))
+                .cloned()
+                .unwrap_or(Value::Null);
+            // NULL en cualquier source → no match.
+            if matches!(got, Value::Null) || got != target_values[i] {
+                all_match = false;
+                break;
             }
+        }
+        if all_match {
+            hits.push(kv.key);
         }
     }
     Ok(hits)
@@ -7922,6 +8168,18 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
             Some(m) => m,
             None => continue,
         };
+        // Residual #3 (2026-05-27): para FK multi-col necesitamos los
+        // VALORES de las columnas PK del parent (no sólo el fingerprint
+        // i64). Decodificamos la fila del padre acá, ANTES de tocar
+        // children, así si el padre ya no existe (cascade que llegó
+        // doblemente) seguimos siendo idempotentes.
+        let parent_row_values: Option<HashMap<String, Value>> = {
+            let mut catalog = Catalog::open(pager);
+            match catalog.get_row(parent_meta.root_page, parent_pk)? {
+                Some(bytes) => Some(decode_row(&parent_meta, &bytes)?),
+                None => None,
+            }
+        };
 
         // 1. Resolve children before touching the parent row, so we can
         //    refuse the whole DELETE on RESTRICT without partial state.
@@ -7933,8 +8191,32 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
                 if !fk.table.eq_ignore_ascii_case(&parent_name) {
                     continue;
                 }
-                let child_pks =
-                    find_child_pks_with_fk_value(pager, child_table, &child_col.name, parent_pk)?;
+                // Construir los valores target del parent en el orden
+                // exacto de `fk.target_columns()` para alimentar el
+                // matcher de children.
+                let Some(parent_row) = parent_row_values.as_ref() else {
+                    // Padre ya borrado en pasada anterior → nada para
+                    // cascadear desde este nodo. Otros pares parent/pk
+                    // del queue siguen.
+                    continue;
+                };
+                let target_values: Vec<Value> = fk
+                    .target_columns()
+                    .iter()
+                    .map(|t| {
+                        parent_row
+                            .get(&normalize_ident(t))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                let child_pks = find_child_pks_with_fk_value(
+                    pager,
+                    child_table,
+                    fk,
+                    &child_col.name,
+                    &target_values,
+                )?;
                 if child_pks.is_empty() {
                     continue;
                 }
@@ -7961,67 +8243,93 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
                         }
                     }
                     OnDelete::SetNull => {
-                        // Bloque L1: NOT NULL en la columna FK del child
-                        // hace imposible la cascade. Falla antes de tocar
-                        // disco — no hay rollback parcial.
-                        if child_col.not_null {
-                            return Err(coded(
-                                codes::FK_SET_NULL_VIOLATES_NOT_NULL,
-                                format!(
-                                    "DELETE FROM '{}' bloqueado: '{}.{}' es NOT NULL y la FK \
-                                     declaró ON DELETE SET NULL ({} fila(s) hijas afectarían)",
-                                    parent_name,
-                                    child_table.name,
-                                    child_col.name,
-                                    child_pks.len()
-                                ),
-                            ));
+                        // Bloque L1 + residual #3: la cascade pone NULL
+                        // en TODAS las columnas source de la FK. Si
+                        // cualquiera de ellas es NOT NULL, falla antes
+                        // de tocar disco — no hay rollback parcial.
+                        let source_col_names = fk.source_columns(&child_col.name);
+                        for src in &source_col_names {
+                            let scol = child_table.column(src).ok_or_else(|| {
+                                DbError::new(format!(
+                                    "FK rota: columna source '{}' no existe en '{}'",
+                                    src, child_table.name
+                                ))
+                            })?;
+                            if scol.not_null {
+                                return Err(coded(
+                                    codes::FK_SET_NULL_VIOLATES_NOT_NULL,
+                                    format!(
+                                        "DELETE FROM '{}' bloqueado: '{}.{}' es NOT NULL y la FK \
+                                         declaró ON DELETE SET NULL ({} fila(s) hijas afectarían)",
+                                        parent_name,
+                                        child_table.name,
+                                        src,
+                                        child_pks.len()
+                                    ),
+                                ));
+                            }
                         }
+                        let new_values: Vec<Value> =
+                            source_col_names.iter().map(|_| Value::Null).collect();
                         for cpk in child_pks {
-                            cascade_set_fk_value(
+                            cascade_set_fk_tuple(
                                 pager,
                                 child_table,
                                 cpk,
-                                &child_col.name,
-                                Value::Null,
+                                &source_col_names,
+                                &new_values,
                             )?;
                         }
                     }
                     OnDelete::SetDefault => {
-                        // Bloque L1: necesita DEFAULT declarado para
-                        // poder reasignar. Si DEFAULT es NULL y la
-                        // columna es NOT NULL, falla con 3002 estándar.
-                        let Some(default) = &child_col.default else {
-                            return Err(coded(
-                                codes::FK_SET_DEFAULT_MISSING,
-                                format!(
-                                    "DELETE FROM '{}' bloqueado: '{}.{}' no tiene DEFAULT y la \
-                                     FK declaró ON DELETE SET DEFAULT ({} fila(s) hijas afectarían)",
-                                    parent_name,
-                                    child_table.name,
-                                    child_col.name,
-                                    child_pks.len()
-                                ),
-                            ));
-                        };
-                        let new_val = default_to_value(default);
-                        if matches!(new_val, Value::Null) && child_col.not_null {
-                            return Err(coded(
-                                codes::NOT_NULL_VIOLATED,
-                                format!(
-                                    "DELETE FROM '{}' bloqueado: ON DELETE SET DEFAULT pondría \
-                                     '{}.{}' (NOT NULL) en NULL — el DEFAULT declarado es NULL",
-                                    parent_name, child_table.name, child_col.name
-                                ),
-                            ));
+                        // Residual #3: SET DEFAULT reasigna CADA source
+                        // column a su DEFAULT declarado. Sin DEFAULT en
+                        // alguna, [GBY-3010]. DEFAULT NULL con NOT NULL,
+                        // [GBY-3002].
+                        let source_col_names = fk.source_columns(&child_col.name);
+                        let mut new_values: Vec<Value> = Vec::with_capacity(source_col_names.len());
+                        for src in &source_col_names {
+                            let scol = child_table.column(src).ok_or_else(|| {
+                                DbError::new(format!(
+                                    "FK rota: columna source '{}' no existe en '{}'",
+                                    src, child_table.name
+                                ))
+                            })?;
+                            let Some(default) = &scol.default else {
+                                return Err(coded(
+                                    codes::FK_SET_DEFAULT_MISSING,
+                                    format!(
+                                        "DELETE FROM '{}' bloqueado: '{}.{}' no tiene DEFAULT y \
+                                         la FK declaró ON DELETE SET DEFAULT ({} fila(s) hijas \
+                                         afectarían)",
+                                        parent_name,
+                                        child_table.name,
+                                        src,
+                                        child_pks.len()
+                                    ),
+                                ));
+                            };
+                            let v = default_to_value(default);
+                            if matches!(v, Value::Null) && scol.not_null {
+                                return Err(coded(
+                                    codes::NOT_NULL_VIOLATED,
+                                    format!(
+                                        "DELETE FROM '{}' bloqueado: ON DELETE SET DEFAULT \
+                                         pondría '{}.{}' (NOT NULL) en NULL — el DEFAULT \
+                                         declarado es NULL",
+                                        parent_name, child_table.name, src
+                                    ),
+                                ));
+                            }
+                            new_values.push(v);
                         }
                         for cpk in child_pks {
-                            cascade_set_fk_value(
+                            cascade_set_fk_tuple(
                                 pager,
                                 child_table,
                                 cpk,
-                                &child_col.name,
-                                new_val.clone(),
+                                &source_col_names,
+                                &new_values,
                             )?;
                         }
                     }
@@ -8171,17 +8479,10 @@ fn composite_index_remove(pager: &mut Pager, idx_root: u32, fp: i64, pk: i64) ->
 }
 
 /// Bloque L1 (2026-05-27): mutate one column of one row in `child_meta`
-/// in place — used by `ON DELETE SET NULL` and `ON DELETE SET DEFAULT`.
-///
-/// Mantiene los índices secundarios que tocan `column_name`:
-///   * single-column → remove old key + insert new key
-///   * composite (`extra_columns` no vacío) → recomputa el fingerprint
-///     viejo y nuevo, remueve el viejo bucket entry e inserta el nuevo.
-///
-/// Si el índice afectado es UNIQUE, se valida que el nuevo valor no
-/// colisione con otra fila (excluyendo la propia `child_pk`). Para
-/// NULL → la regla "muchos NULLs admitidos" se preserva: el encoder
-/// emite [0u8] y el path de unique conflict ya lo ignora.
+/// in place. Wrapper sobre `cascade_set_fk_tuple` para el caso
+/// single-col. Sigue acá por compatibilidad con tests y para mantener
+/// el call-site del cascade SET NULL/SET DEFAULT pre-#3 idéntico.
+#[allow(dead_code)]
 fn cascade_set_fk_value(
     pager: &mut Pager,
     child_meta: &TableMeta,
@@ -8189,6 +8490,51 @@ fn cascade_set_fk_value(
     column_name: &str,
     new_value: Value,
 ) -> DbResult<()> {
+    cascade_set_fk_tuple(
+        pager,
+        child_meta,
+        child_pk,
+        &[column_name],
+        std::slice::from_ref(&new_value),
+    )
+}
+
+/// Residual #3 (2026-05-27): mutate N source columns of one row at
+/// once, used by `ON DELETE SET NULL` / `SET DEFAULT` para FKs
+/// multi-col (single-col también pasa por acá, con `column_names.len()
+/// == 1`). Atómico: o todas las columnas se mutan, o ninguna.
+///
+/// Mantiene los índices secundarios que tocan cualquier source col,
+/// y revalida los CHECK del child contra la fila resultante.
+fn cascade_set_fk_tuple(
+    pager: &mut Pager,
+    child_meta: &TableMeta,
+    child_pk: i64,
+    column_names: &[&str],
+    new_values: &[Value],
+) -> DbResult<()> {
+    if column_names.len() != new_values.len() {
+        return Err(DbError::new(format!(
+            "cascade_set_fk_tuple: arity {} cols vs {} values",
+            column_names.len(),
+            new_values.len()
+        )));
+    }
+    // Helper: ¿este índice toca alguna de las columnas que estamos mutando?
+    let idx_touches_any = |idx: &IndexMeta| -> bool {
+        for cname in column_names {
+            if idx.column.eq_ignore_ascii_case(cname)
+                || idx
+                    .extra_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(cname))
+            {
+                return true;
+            }
+        }
+        false
+    };
+
     // 1. Leer la fila — puede haber desaparecido si una cascade previa
     //    la borró por otro camino (ciclos, multi-FK). Tratar como no-op.
     let bytes = {
@@ -8199,69 +8545,75 @@ fn cascade_set_fk_value(
         }
     };
     let old_row = decode_row(child_meta, &bytes)?;
-    let key_norm = normalize_ident(column_name);
-    let old_value = old_row.get(&key_norm).cloned().unwrap_or(Value::Null);
-    if old_value == new_value {
+    // Si NINGUNA columna cambia, no hacemos nada.
+    let mut anything_changed = false;
+    for (cname, new_val) in column_names.iter().zip(new_values.iter()) {
+        let key = normalize_ident(cname);
+        let old = old_row.get(&key).cloned().unwrap_or(Value::Null);
+        if old != *new_val {
+            anything_changed = true;
+            break;
+        }
+    }
+    if !anything_changed {
         return Ok(());
     }
 
-    // 2. Preparar la fila nueva.
+    // 2. Preparar la fila nueva (todas las columnas a la vez).
     let mut new_row = old_row.clone();
-    new_row.insert(key_norm.clone(), new_value.clone());
-
-    // 3. Validación NOT NULL — ya chequeada por el caller para los dos
-    //    casos relevantes, pero defendemos en profundidad.
-    let column = child_meta.column(column_name).ok_or_else(|| {
-        DbError::new(format!(
-            "cascade_set_fk_value: columna '{}' no existe en '{}'",
-            column_name, child_meta.name
-        ))
-    })?;
-    if column.not_null && matches!(new_value, Value::Null) {
-        return Err(coded(
-            codes::NOT_NULL_VIOLATED,
-            format!(
-                "cascade rechazada: '{}.{}' es NOT NULL y la acción intentó poner NULL",
-                child_meta.name, column.name
-            ),
-        ));
+    for (cname, new_val) in column_names.iter().zip(new_values.iter()) {
+        new_row.insert(normalize_ident(cname), new_val.clone());
     }
 
-    // Bloque L2 (2026-05-27): CHECK eval contra la fila resultante de
-    // la cascade. Si el valor seteado por SET NULL/SET DEFAULT viola un
-    // CHECK del child, abortamos antes de tocar disco.
+    // 3. Validación NOT NULL para CADA columna mutada.
+    for (cname, new_val) in column_names.iter().zip(new_values.iter()) {
+        let column = child_meta.column(cname).ok_or_else(|| {
+            DbError::new(format!(
+                "cascade_set_fk_tuple: columna '{}' no existe en '{}'",
+                cname, child_meta.name
+            ))
+        })?;
+        if column.not_null && matches!(new_val, Value::Null) {
+            return Err(coded(
+                codes::NOT_NULL_VIOLATED,
+                format!(
+                    "cascade rechazada: '{}.{}' es NOT NULL y la acción intentó poner NULL",
+                    child_meta.name, column.name
+                ),
+            ));
+        }
+    }
+
+    // Bloque L2: CHECK eval contra la fila resultante completa.
     enforce_check_constraints(child_meta, &new_row)?;
 
     // 4. Pre-check UNIQUE para los índices afectados.
     for idx in &child_meta.indexes {
-        if !idx.unique {
-            continue;
-        }
-        let touches = idx.column.eq_ignore_ascii_case(column_name)
-            || idx
-                .extra_columns
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(column_name));
-        if !touches {
+        if !idx.unique || !idx_touches_any(idx) {
             continue;
         }
         if idx.is_composite() {
             let new_fp = composite_fp_for_values(child_meta, idx, &new_row)?;
             composite_unique_check(pager, idx, new_fp, Some(child_pk))?;
-            continue;
+        } else {
+            let idx_col = child_meta.column(&idx.column).ok_or_else(|| {
+                DbError::new(format!(
+                    "índice apunta a columna inexistente: {}",
+                    idx.column
+                ))
+            })?;
+            let new_v = new_row
+                .get(&normalize_ident(&idx.column))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let value_bytes = encode_column_value(idx_col, &new_v)?;
+            check_unique_conflict(pager, idx, &value_bytes, Some(child_pk))?;
         }
-        let value_bytes = encode_column_value(column, &new_value)?;
-        check_unique_conflict(pager, idx, &value_bytes, Some(child_pk))?;
     }
 
     // 5. Sacar las entradas viejas de los índices afectados.
     for idx in &child_meta.indexes {
-        let touches = idx.column.eq_ignore_ascii_case(column_name)
-            || idx
-                .extra_columns
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(column_name));
-        if !touches {
+        if !idx_touches_any(idx) {
             continue;
         }
         if idx.is_composite() {
@@ -8287,7 +8639,7 @@ fn cascade_set_fk_value(
     let (encoded_pk, row_bytes) = encode_row(child_meta, &new_row)?;
     if encoded_pk != child_pk {
         return Err(DbError::new(format!(
-            "inconsistencia interna en cascade_set_fk_value sobre '{}': la PK reconstruida \
+            "inconsistencia interna en cascade_set_fk_tuple sobre '{}': la PK reconstruida \
              del row es {} pero la cascade apuntaba a pk={}",
             child_meta.name, encoded_pk, child_pk
         )));
@@ -8297,14 +8649,9 @@ fn cascade_set_fk_value(
         catalog.upsert_row(child_meta.root_page, encoded_pk, row_bytes)?;
     }
 
-    // 7. Re-insertar en cada índice afectado con el valor nuevo.
+    // 7. Re-insertar en cada índice afectado con la fila nueva.
     for idx in &child_meta.indexes {
-        let touches = idx.column.eq_ignore_ascii_case(column_name)
-            || idx
-                .extra_columns
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(column_name));
-        if !touches {
+        if !idx_touches_any(idx) {
             continue;
         }
         if idx.is_composite() {
@@ -11450,6 +11797,8 @@ impl Parser {
                     on_delete,
                     on_update,
                     name: None,
+                    extra_source_columns: Vec::new(),
+                    extra_target_columns: Vec::new(),
                 });
             } else if self.match_keyword("CONSTRAINT") {
                 // Bloque L2: `CONSTRAINT <name> CHECK (...)` inline en
@@ -11858,39 +12207,44 @@ impl Parser {
                         table_level_named_unique.push((named.name, cols));
                     }
                     NamedConstraintKind::ForeignKey => {
+                        // Residual #3 (2026-05-27): admite multi-col en
+                        // source y target. Single-col → extra_* vacíos.
+                        // Arity de source y target debe matchear.
                         self.expect_symbol("(")?;
-                        let col = self.expect_ident()?;
-                        // Single-col only en este release — multi-col es
-                        // residual #3 del bloque L. Si el usuario pone
-                        // más de una columna, rebotamos explícito.
-                        if self.match_symbol(",") {
-                            return Err(DbError::new(
-                                "FOREIGN KEY multi-columna no soportada en este release \
-                                 (residual #3 del bloque L). Usar surrogate INT + \
-                                 CONSTRAINT UNIQUE (col_a, col_b) como workaround.",
-                            ));
+                        let mut source_cols: Vec<String> = vec![self.expect_ident()?];
+                        while self.match_symbol(",") {
+                            source_cols.push(self.expect_ident()?);
                         }
                         self.expect_symbol(")")?;
                         self.expect_keyword("REFERENCES")?;
                         let target_table = self.expect_ident()?;
                         self.expect_symbol("(")?;
-                        let target_column = self.expect_ident()?;
-                        // Mismo bloqueo multi-col del lado del padre.
-                        if self.match_symbol(",") {
-                            return Err(DbError::new(
-                                "FOREIGN KEY ... REFERENCES (...) multi-columna no soportada \
-                                 (residual #3 del bloque L).",
-                            ));
+                        let mut target_cols: Vec<String> = vec![self.expect_ident()?];
+                        while self.match_symbol(",") {
+                            target_cols.push(self.expect_ident()?);
                         }
                         self.expect_symbol(")")?;
+                        if source_cols.len() != target_cols.len() {
+                            return Err(DbError::new(format!(
+                                "FOREIGN KEY '{}' tiene arity inconsistente: {} columnas \
+                                 source vs {} columnas target",
+                                named.name,
+                                source_cols.len(),
+                                target_cols.len()
+                            )));
+                        }
                         let (on_delete, on_update) = self.parse_fk_actions()?;
+                        let anchor_source = source_cols.remove(0);
+                        let anchor_target = target_cols.remove(0);
                         table_level_named_fks.push(NamedForeignKey {
                             name: named.name,
-                            column: col,
+                            column: anchor_source,
                             target_table,
-                            target_column,
+                            target_column: anchor_target,
                             on_delete,
                             on_update,
+                            extra_source_columns: source_cols,
+                            extra_target_columns: target_cols,
                         });
                     }
                 }

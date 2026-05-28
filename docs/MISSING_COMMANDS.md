@@ -287,6 +287,7 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `FOREIGN KEY ... ON DELETE SET DEFAULT` | ✅ (L1, 2026-05-27; `[GBY-3010]` si no hay DEFAULT) | — |
 | `FOREIGN KEY ... ON DELETE NO ACTION` | ✅ (L1, 2026-05-27; alias de RESTRICT en este release) | — |
 | `FOREIGN KEY ... ON UPDATE ...` | ✅ parser+persistencia (L1, 2026-05-27); **no se dispara** todavía (PK inmutable, `[GBY-4008]`) | — |
+| `FOREIGN KEY (a, b) REFERENCES p (x, y)` multi-col | ✅ (residual #3, 2026-05-27; target = PK compuesta del parent vía fingerprint K2) | — |
 | `CHECK (cond)` | ✅ (L2, 2026-05-27) — column-level + table-level, con/sin nombre, 3VL ANSI, sin subqueries (`[GBY-4069]`) | — |
 | `EXCLUDE USING ...` (Postgres-style) | ❌ | P3 |
 | Constraints diferidas (`DEFERRABLE INITIALLY DEFERRED`) | ❌ | P3 |

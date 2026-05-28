@@ -96,9 +96,16 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        añade un byte `pk_name_present:u8` + string opcional tras la
 //        lista de columnas PK; cada FK record añade
 //        `fk_name_present:u8` + string opcional al final. V10 rechazados
-//        con `[GBY-1003]` — migración manual: dump SELECT + recreate
-//        con binario V11.
-pub const VERSION: u32 = 11;
+//        con `[GBY-1003]`.
+//  12 -> Residual #3 de L: multi-col FOREIGN KEY
+//        (`FOREIGN KEY (a, b) REFERENCES p (x, y)`). Cada FK record
+//        añade al final `[fk_extra_count:u8]` + N strings de columnas
+//        source extra + N strings de columnas target extra. Single-col
+//        FKs escriben count=0. El motor exige que las target columns
+//        sean exactamente la PK compuesta del padre (single-col PK
+//        sigue igual que pre-#3). V11 rechazados con `[GBY-1003]` —
+//        migración manual: dump SELECT + recreate con binario V12.
+pub const VERSION: u32 = 12;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

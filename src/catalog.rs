@@ -309,6 +309,54 @@ pub struct ForeignKeyMeta {
     /// para `ALTER TABLE DROP CONSTRAINT <name>` y para mensajes de
     /// error legibles.
     pub name: Option<String>,
+    /// Residual #3 (VERSION 12, 2026-05-27): columnas adicionales del
+    /// child (source) cuando la FK es multi-columna. La FK queda
+    /// anchored en la primera columna del child (`Column.references`
+    /// vive en esa columna); el resto del orden declarado vive acá.
+    /// Vacío para FK single-col (caso histórico). Mismo trato all-INT
+    /// NOT NULL que K2 — el FK target debe ser la PK compuesta del
+    /// padre, que también es all-INT.
+    pub extra_source_columns: Vec<String>,
+    /// Residual #3 (VERSION 12, 2026-05-27): columnas adicionales del
+    /// padre (target) en el mismo orden que `extra_source_columns`.
+    /// Para FK single-col queda vacío y el target completo es
+    /// `column` (campo histórico). Para FK multi-col,
+    /// `[column] + extra_target_columns` es la lista de columnas del
+    /// padre, que el motor exige sea exactamente la PK compuesta del
+    /// padre (single-col PK queda igual que pre-#3).
+    pub extra_target_columns: Vec<String>,
+}
+
+impl ForeignKeyMeta {
+    /// Devuelve la lista completa de columnas source en el orden
+    /// declarado por el usuario. Single-col → tamaño 1; multi-col →
+    /// tamaño ≥ 2.
+    ///
+    /// Necesita el `anchor_col_name` porque la primera columna source
+    /// vive en la `Column` que aloja este `ForeignKeyMeta`, no acá.
+    pub fn source_columns<'a>(&'a self, anchor_col_name: &'a str) -> Vec<&'a str> {
+        let mut out = Vec::with_capacity(1 + self.extra_source_columns.len());
+        out.push(anchor_col_name);
+        for c in &self.extra_source_columns {
+            out.push(c.as_str());
+        }
+        out
+    }
+
+    /// Devuelve la lista completa de columnas target del padre.
+    pub fn target_columns(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(1 + self.extra_target_columns.len());
+        out.push(self.column.as_str());
+        for c in &self.extra_target_columns {
+            out.push(c.as_str());
+        }
+        out
+    }
+
+    /// `true` si la FK abarca más de una columna.
+    pub fn is_composite(&self) -> bool {
+        !self.extra_source_columns.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -517,7 +565,7 @@ impl TableMeta {
             .any(|c| c.eq_ignore_ascii_case(column))
     }
 
-    /// VERSION = 11 on-disk layout for a TableMeta record:
+    /// VERSION = 12 on-disk layout for a TableMeta record:
     ///
     ///     [name]
     ///     [pk_count:u8] · pk_count × [pk_col_name]   (pk_count >= 1)
@@ -529,7 +577,10 @@ impl TableMeta {
     ///         flags & 0x04 ? [target_table][target_column]
     ///                        [on_delete:u8][on_update:u8]
     ///                        [fk_name_present:u8] · fk_name_present ?
-    ///                              [fk_name] : ∅                    ← V11
+    ///                              [fk_name] : ∅
+    ///                        [fk_extra_count:u8] · extra ×             ← V12
+    ///                              [extra_source_col] · extra ×
+    ///                              [extra_target_col]
     ///                        : ∅
     ///     }
     ///     [idx_count:u16] · idx_count × {
@@ -538,14 +589,12 @@ impl TableMeta {
     ///     }
     ///     [check_count:u16] · check_count × { [name][source] }
     ///
-    /// Cambios vs VERSION 10 (Residual #2):
-    ///   - Tras `pk_count + cols`, se añade `[pk_name_present:u8]` y
-    ///     opcionalmente `[pk_name]`. Soporta
-    ///     `CONSTRAINT <name> PRIMARY KEY (...)`.
-    ///   - Cada FK record añade al final `[fk_name_present:u8]` y
-    ///     opcionalmente `[fk_name]`. Soporta
-    ///     `CONSTRAINT <name> FOREIGN KEY (col) REFERENCES ...`.
-    ///   - V10 files se rechazan al abrir con `[GBY-1003]`.
+    /// Cambios vs VERSION 11 (Residual #3):
+    ///   - Cada FK record añade al final
+    ///     `[fk_extra_count:u8]` + N strings source + N strings target,
+    ///     en ese orden. FKs single-col escriben count=0 y son
+    ///     indistinguibles del caso pre-#3.
+    ///   - V11 files se rechazan al abrir con `[GBY-1003]`.
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
         let mut out = Vec::new();
         push_string(&mut out, &self.name)?;
@@ -605,6 +654,35 @@ impl TableMeta {
                         push_string(&mut out, n)?;
                     }
                     None => out.push(0),
+                }
+                // V12 (residual #3): columnas extra de la FK
+                // multi-col, source + target. Single-col FKs escriben
+                // 0 en ambos counts.
+                if fk.extra_source_columns.len() != fk.extra_target_columns.len() {
+                    return Err(DbError::new(format!(
+                        "FOREIGN KEY '{}.{}' tiene arity inconsistente: \
+                         {} columnas source extra vs {} columnas target extra",
+                        self.name,
+                        column.name,
+                        fk.extra_source_columns.len(),
+                        fk.extra_target_columns.len()
+                    )));
+                }
+                if fk.extra_source_columns.len() > u8::MAX as usize {
+                    return Err(DbError::new(format!(
+                        "FOREIGN KEY '{}.{}' tiene {} columnas extra, máximo {}",
+                        self.name,
+                        column.name,
+                        fk.extra_source_columns.len(),
+                        u8::MAX
+                    )));
+                }
+                out.push(fk.extra_source_columns.len() as u8);
+                for c in &fk.extra_source_columns {
+                    push_string(&mut out, c)?;
+                }
+                for c in &fk.extra_target_columns {
+                    push_string(&mut out, c)?;
                 }
             }
         }
@@ -749,12 +827,33 @@ impl TableMeta {
                 } else {
                     None
                 };
+                // V12 (residual #3): extra columnas multi-col. Source
+                // y target tienen el mismo count; el byte se lee una
+                // vez y los strings vienen primero source, después target.
+                if offset >= data.len() {
+                    return Err(DbError::new(format!(
+                        "FOREIGN KEY corrupta en '{}.{}': falta byte fk_extra_count en offset {}",
+                        name, col_name, offset
+                    )));
+                }
+                let fk_extra_count = data[offset] as usize;
+                offset += 1;
+                let mut extra_source_columns = Vec::with_capacity(fk_extra_count);
+                for _ in 0..fk_extra_count {
+                    extra_source_columns.push(take_string(data, &mut offset)?);
+                }
+                let mut extra_target_columns = Vec::with_capacity(fk_extra_count);
+                for _ in 0..fk_extra_count {
+                    extra_target_columns.push(take_string(data, &mut offset)?);
+                }
                 Some(ForeignKeyMeta {
                     table: target_table,
                     column: target_column,
                     on_delete,
                     on_update,
                     name: fk_name,
+                    extra_source_columns,
+                    extra_target_columns,
                 })
             } else {
                 None

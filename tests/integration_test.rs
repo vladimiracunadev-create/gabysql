@@ -8170,27 +8170,24 @@ fn r2_named_constraints_persist_across_reopen() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn r2_multi_col_fk_rejected_with_clear_message() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = r2_setup("multi-col-fk")?;
+fn r2_multi_col_fk_now_supported_post_r3() -> Result<(), Box<dyn Error>> {
+    // Residual #3 (2026-05-27): lo que en residual #2 rebotaba con
+    // "no soportado" ahora funciona. Este test queda como smoke check
+    // de que el path está habilitado; la cobertura completa vive en
+    // los tests `r3_*`.
+    let (db, wal) = r2_setup("multi-col-fk-now-supported")?;
     run_sql(
         &db,
         "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));",
     )?;
-    let err = run_sql(
+    run_sql(
         &db,
         "CREATE TABLE child (
             id INT PRIMARY KEY,
-            pa INT, pb INT,
+            pa INT NOT NULL, pb INT NOT NULL,
             CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
          );",
-    )
-    .unwrap_err();
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("multi") && msg.contains("residual #3"),
-        "esperaba mensaje sobre residual #3, got: {}",
-        err
-    );
+    )?;
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -8213,6 +8210,308 @@ fn r2_v10_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
     let err = match Pager::open(&db) {
         Err(e) => e,
         Ok(_) => panic!("expected Pager::open to refuse v10 file post-residual #2"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("version") || msg.contains("corrupt"),
+        "expected refusal, got: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----- Residual #3 de L (2026-05-27): multi-col FOREIGN KEY. -----
+
+fn r3_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("r3-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn r3_multi_col_fk_happy_path() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("happy")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));",
+    )?;
+    run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 30);")?;
+    // Child apuntando a un par válido del padre → OK.
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (2, 10, 30);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_parent_missing_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("parent-missing")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    // (10, 99) no existe en el padre → rebota.
+    let err = run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 10, 99);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3004"),
+        "esperaba FK_PARENT_MISSING, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_delete_cascade() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("cascade")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b) ON DELETE CASCADE
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 30);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (2, 10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (3, 10, 30);")?;
+    // DELETE de (10, 20) en parent: los children (1) y (2) deben caer
+    // por cascade; el child (3) sigue.
+    run_sql(&db, "DELETE FROM parent WHERE a = 10 AND b = 20;")?;
+    let res = run_sql(&db, "SELECT id FROM child ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_delete_set_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("set-null")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT, pb INT,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b) ON DELETE SET NULL
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (2, 10, 20);")?;
+    run_sql(&db, "DELETE FROM parent WHERE a = 10 AND b = 20;")?;
+    let res = run_sql(&db, "SELECT pa, pb FROM child ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    for row in &res[0].rows {
+        assert!(matches!(row[0], Value::Null), "pa debería ser NULL");
+        assert!(matches!(row[1], Value::Null), "pb debería ser NULL");
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_set_null_rejected_when_any_col_not_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("set-null-rejected")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY,
+            pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b) ON DELETE SET NULL
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 10, 20);")?;
+    let err = run_sql(&db, "DELETE FROM parent WHERE a = 10 AND b = 20;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3009"),
+        "esperaba GBY-3009, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_arity_mismatch_at_ddl() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("arity")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));",
+    )?;
+    // 2 source vs 1 target.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY, pa INT, pb INT,
+            CONSTRAINT fk FOREIGN KEY (pa, pb) REFERENCES parent (a)
+         );",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("arity"),
+        "esperaba mensaje sobre arity, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_target_must_be_pk() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("target-not-pk")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (id INT PRIMARY KEY, a INT, b INT);",
+    )?;
+    // El padre tiene PK single (id), pero queremos referenciar (a, b).
+    // No es la PK → rechazo claro.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE child (
+            id INT PRIMARY KEY, pa INT, pb INT,
+            CONSTRAINT fk FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )
+    .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("primary key") || msg.contains("pk"),
+        "esperaba mensaje sobre PK, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_null_source_passes_via_3vl() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("null-source")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY, pa INT, pb INT,
+            CONSTRAINT fk FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )?;
+    // ANSI: si CUALQUIER source es NULL, no se chequea la FK.
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, NULL, 99);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (2, 99, NULL);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_drop_via_drop_constraint() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("drop-named")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY, pa INT, pb INT,
+            CONSTRAINT fk_multi FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    let err = run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 99, 99);").unwrap_err();
+    assert!(err.to_string().contains("GBY-3004"));
+    // Drop la FK multi-col → ahora cualquier (pa, pb) entra.
+    run_sql(&db, "ALTER TABLE child DROP CONSTRAINT fk_multi;")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 99, 99);")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_multi_col_fk_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY, pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )?;
+    run_sql(&db, "INSERT INTO parent (a, b) VALUES (10, 20);")?;
+    run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (1, 10, 20);")?;
+    // Reopen → la FK multi-col debe seguir activa.
+    let err = run_sql(&db, "INSERT INTO child (id, pa, pb) VALUES (2, 99, 99);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-3004"),
+        "esperaba GBY-3004 tras reopen, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_drop_column_blocked_by_multi_col_fk() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = r3_setup("drop-col-extra")?;
+    run_sql(
+        &db,
+        "CREATE TABLE parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE child (
+            id INT PRIMARY KEY, pa INT NOT NULL, pb INT NOT NULL,
+            CONSTRAINT fk FOREIGN KEY (pa, pb) REFERENCES parent (a, b)
+         );",
+    )?;
+    // DROP COLUMN sobre `pb` debe rebotar porque participa en una FK
+    // multi-col anchored en `pa`. Este es el camino extra_source_columns.
+    let err = run_sql(&db, "ALTER TABLE child DROP COLUMN pb;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4061"),
+        "esperaba CANNOT_DROP_REFERENCED_COLUMN, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r3_v11_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("r3-v12-bump");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE u (id INT PRIMARY KEY);")?;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new().read(true).write(true).open(&db)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&11u32.to_le_bytes())?;
+    drop(f);
+    let err = match Pager::open(&db) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Pager::open to refuse v11 file post-r3"),
     };
     let msg = err.to_string();
     assert!(
