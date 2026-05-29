@@ -5,7 +5,7 @@
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-30-2d7a66)](TECHNICAL_SPECS.md)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-31-2d7a66)](TECHNICAL_SPECS.md)
 [![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-693%2F693-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 

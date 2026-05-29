@@ -6,6 +6,46 @@
 
 ---
 
+## 2026-05-29 — Bloque Z1f: fix `same_slice_extra` inversion en Argon2id ⚠️ (parcial)
+
+> **Un push a `main`**. Bump on-disk **VERSION 30 → 31** (corte semántico). Z1f corrige un bug específico identificado en Z1e: la condición edge para cross-lane reference area estaba invertida. El output del Argon2id cambia significativamente pero **aún no matchea RFC §A.3** — al menos un bug adicional remaining. Detalle en [`docs/adr/0061-z1f-argon2id-partial-fix.md`](docs/adr/0061-z1f-argon2id-partial-fix.md).
+
+### 🐛 Bug fix
+
+Per libargon2 reference impl (`src/ref.c::index_alpha`), la convención cross-lane es:
+- `position->index == 0` (j == slice_start): W = X − 1
+- `position->index > 0`: W = X
+
+Z1e tenía esta condición **invertida**. Z1f la corrige.
+
+### 📊 Efecto medido
+
+| Estado | Primer byte | Output (32 bytes) |
+|---|---|---|
+| Esperado RFC | `0a` | `0aa4c4248e30e06eff5ee38e71b1ffc7c789e87ea4336fafcda4a34dcb894da5` |
+| Z1e (pre-fix) | `a6` | `a6d06b41464b6e79c1a2454cfb08644d922670fefe160615d69c5c6787ad0de8` |
+| Z1f (post-fix) | `0d` | `0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659` |
+
+El fix se confirma como correcto (output cambia → afecta indexación cross-lane). Pero queda al menos un bug adicional — el primer byte pasó de `a6` a `0d`, esperado `0a`.
+
+### 🚫 Diferido (Z1g)
+
+Bugs candidates remaining:
+- Off-by-one en init del address block para pass 0 slice 0 con segment_length > 2.
+- Posible discrepancia subtle en column phase del compress.
+- Posible byte-ordering issue.
+- Posible bug en propagación XOR para pass > 0.
+
+Z1g debe aislar el bug remaining (probablemente con trazas paso-a-paso vs una reference impl Rust).
+
+### 🧪 Validación
+
+- Suite: **693 passing + 1 ignored**. Test `z1e_argon2id_rfc9106_test_vector_pending_z1f` sigue `#[ignore]`.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+- Default sigue siendo scrypt (Z1c) — sin regresión de seguridad.
+
+---
+
 ## 2026-05-29 — Bloque Z1e: Argon2id RFC 9106 estructura (vector match pendiente Z1f) ⚠️
 
 > **Un push a `main`**. Bump on-disk **VERSION 29 → 30**. Z1e shippea la estructura completa de Argon2id sobre Blake2b de Z1d, pero **NO matchea el test vector RFC 9106 §A.3** — bug pendiente de debug. Default sigue siendo scrypt (Z1c). Detalle en [`docs/adr/0060-z1e-argon2id-structural.md`](docs/adr/0060-z1e-argon2id-structural.md).

@@ -18087,14 +18087,18 @@ fn argon2_process_segment(
                 3 * sl as u64 + (j as u64 - slice_start as u64) - 1
             }
         } else {
-            // Lane distinto: en pass 0, los slices 0..slice-1 completos
-            // (sin contar el slice actual, salvo j > slice_start).
-            // En pass > 0, todos los slices excepto el slice actual.
-            let same_slice_extra: u64 = if j == slice_start { 0 } else { 1 };
+            // Bloque Z1f (2026-05-29): Lane distinto. Per libargon2
+            // reference impl, la convención es:
+            //   - position->index == 0 (j == slice_start): W = X - 1
+            //   - position->index > 0  (j > slice_start):  W = X
+            // donde X = slice*sl (pass 0) o 3*sl (pass > 0). Z1e tenía
+            // este boolean invertido — bug que afectaba toda la indexación
+            // cross-lane y propagaba al output final.
+            let edge_sub: u64 = if j == slice_start { 1 } else { 0 };
             if pass == 0 {
-                slice as u64 * sl as u64 - same_slice_extra
+                slice as u64 * sl as u64 - edge_sub
             } else {
-                3 * sl as u64 - same_slice_extra
+                3 * sl as u64 - edge_sub
             }
         };
 
