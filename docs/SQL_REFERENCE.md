@@ -47,7 +47,8 @@
 | FK multi-col (`FOREIGN KEY (a, b) REFERENCES p (x, y)`) | DDL | 🟢 (residual #3/VERSION 12) |
 | `UPDATE` de PK con re-encode + cascade `ON UPDATE` (regular UPDATE; UPSERT DO UPDATE sigue restringido) | DML | 🟢 (residual #4) |
 | `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v`, `SELECT ... FROM v` | DDL+DML | 🟢 (bloque V/VERSION 13) |
-| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, window functions, CTE | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| [`WITH name AS (SELECT ...)` (CTEs no-recursivas)](#ctes-no-recursivas-with-bloque-w1) — encadenables, en JOIN/subquery/set-ops, shadowing ANSI | DML | 🟢 (bloque W1) |
+| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, window functions, `WITH RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -1548,10 +1549,70 @@ VALUES (1), (2) UNION VALUES (3), (4) INTERSECT VALUES (4), (5);
 
 ### ⚠️ No soportado todavía
 
-- `WITH ... AS (...)` / CTE — bloque W (planificado aparte).
 - `ORDER BY 1` posicional sobre el output de un set op (usar nombre).
 - Set ops dentro de `UPDATE` / `DELETE` (no es ANSI estándar).
 - `ALL` / `ANY` / `SOME` sobre subqueries (backlog H-P2).
+
+---
+
+## CTEs no-recursivas (`WITH`, bloque W1)
+
+> **Common Table Expressions**: dar nombre a una subquery para reusarla en `FROM` / `JOIN` / subqueries (`IN`, `EXISTS`, scalar) y en cualquiera de las ramas de un set op. Múltiples CTEs encadenables — `b` puede referenciar `a` declarada antes.
+
+### 📜 EBNF
+
+```
+with_query    ::= "WITH" cte_def { "," cte_def }* select_query
+cte_def       ::= ident "AS" "(" select_stmt ")"
+```
+
+### 🧠 Semántica
+
+- **Shadowing ANSI**: el nombre de la CTE prevalece sobre cualquier tabla real homónima del catálogo.
+- **Orden de declaración estricto**: `WITH a AS (...), b AS (SELECT FROM a)` está OK; al revés (`b` antes que `a`) rompe con "tabla no existe" al parsear `b`.
+- **Visible desde set ops**: `WITH x AS (...) SELECT FROM x UNION SELECT FROM x` resuelve `x` en ambas ramas.
+- **Re-ejecución**: si la CTE se referencia N veces, el body se materializa N veces (deuda explícita — futura optimización por memoización, ver [ADR-0026 §1](adr/0026-cte-non-recursive.md)).
+
+### ✅ Ejemplos
+
+```sql
+-- CTE simple
+WITH seniors AS (SELECT id, nombre FROM empleados WHERE salario >= 100)
+SELECT nombre FROM seniors ORDER BY nombre;
+
+-- Encadenamiento
+WITH ventas_2025 AS (SELECT * FROM ventas WHERE anio = 2025),
+     top_clientes AS (SELECT cliente_id, SUM(monto) AS total
+                      FROM ventas_2025 GROUP BY cliente_id)
+SELECT cliente_id FROM top_clientes WHERE total >= 10000;
+
+-- CTE en JOIN
+WITH big AS (SELECT uid FROM orders WHERE total >= 100)
+SELECT u.name FROM users u INNER JOIN big ON u.id = big.uid;
+
+-- CTE en subquery
+WITH high AS (SELECT id FROM t WHERE v >= 20)
+SELECT id FROM t WHERE id IN (SELECT id FROM high);
+
+-- CTE visible desde ambas ramas de un UNION
+WITH x AS (SELECT id FROM t WHERE id = 1)
+SELECT id FROM x UNION SELECT id FROM t WHERE id = 2 ORDER BY id;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4079] WITH: el nombre 'X' aparece más de una vez` | Dos CTEs con el mismo nombre en el mismo `WITH` (case-insensitive). |
+| `[GBY-4080] WITH RECURSIVE no está soportado en este release` | `WITH RECURSIVE` — diferido al bloque W2 (fixpoint base+step). |
+| `[GBY-4081] WITH cte(...) AS (...): los column aliases en la cabecera están diferidos` | Column aliases en la cabecera de la CTE. Workaround: aliasar dentro del body (`SELECT x AS c1, y AS c2 FROM ...`). |
+
+### ⚠️ No soportado todavía
+
+- `WITH RECURSIVE` — bloque **W2** (fixpoint base+step sobre `UNION ALL`).
+- Column aliases en la cabecera (`WITH cte(c1, c2) AS (...)`) — workaround inline disponible.
+- Window functions (`ROW_NUMBER`, `RANK`, `SUM() OVER (...)`) — bloque **W3**.
+- CTEs sobre `UPDATE` / `DELETE` — sólo `SELECT` por ahora.
 
 ---
 

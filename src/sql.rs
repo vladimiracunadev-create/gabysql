@@ -4440,8 +4440,21 @@ impl<'a> Engine<'a> {
                             // planner cae a FullScan (no puede calcular
                             // el fingerprint) y el post-filter genérico
                             // se ocupa del WHERE.
-                            WhereClause::Eq { column, .. }
-                            | WhereClause::Between { column, .. } => {
+                            //
+                            // Residual Issue #3 (2026-05-28): tras lifteo
+                            // de [GBY-4001], `Eq` sobre una columna que
+                            // NO es PK simple y NO está indexada cae a
+                            // FullScan en el dispatch. Sin post-filter,
+                            // el scan devuelve todas las filas. Forzamos
+                            // post-filter cuando la fast-path no aplica.
+                            WhereClause::Eq { column, .. } => {
+                                let n = normalize_ident(column);
+                                let is_simple_pk = !meta.has_composite_pk()
+                                    && n == normalize_ident(&meta.primary_key);
+                                let is_indexed = meta.index_for_column(&n).is_some();
+                                !is_simple_pk && !is_indexed
+                            }
+                            WhereClause::Between { column, .. } => {
                                 meta.has_composite_pk() && meta.is_pk_column(column)
                             }
                             _ => false,
@@ -12446,6 +12459,158 @@ struct Parser {
 /// frames con frames promedio).
 const MAX_PARSE_DEPTH: usize = 100;
 
+// ---------------------------------------------------------------------
+// Bloque W1 (2026-05-28): inlining de CTEs no-recursivas como derived
+// tables en el AST post-parse. Las funciones recorren cada `SelectStmt`
+// alcanzable desde un `SelectQuery` y substituyen toda referencia bare
+// al nombre de la CTE por un `derived_source` clonado del body de la
+// CTE. Trade-off: si la CTE se referencia N veces, su body se
+// materializa N veces (re-ejecución). Documentado en ADR-0025.
+// ---------------------------------------------------------------------
+
+fn inline_cte_into_query(query: &mut SelectQuery, cte_name: &str, cte_body: &SelectStmt) {
+    match query {
+        SelectQuery::Select(s) => inline_cte_into_select(s, cte_name, cte_body),
+        SelectQuery::SetOp { lhs, rhs, .. } => {
+            inline_cte_into_query(lhs, cte_name, cte_body);
+            inline_cte_into_query(rhs, cte_name, cte_body);
+        }
+        SelectQuery::Values(_) => {}
+    }
+}
+
+fn inline_cte_into_select(stmt: &mut SelectStmt, cte_name: &str, cte_body: &SelectStmt) {
+    // IMPORTANTE: el orden es deliberado — recursamos en cualquier
+    // `derived_source` PRE-EXISTENTE antes de instalar uno nuevo desde
+    // la CTE. Si reescribimos primero y recursamos después, el clone
+    // recién instalado del body de la CTE entra en loop si el body
+    // referenció el mismo nombre (caso clásico: `WITH t AS (SELECT ...
+    // FROM t)` — donde el `FROM t` interior es la tabla real, no la
+    // CTE). Por la misma razón, una vez instalado el derived, no
+    // volvemos a recursar dentro: el body ya fue procesado en su
+    // momento contra las CTEs declaradas antes.
+    if let Some(src) = &mut stmt.derived_source {
+        inline_cte_into_select(src, cte_name, cte_body);
+    }
+    if stmt.derived_source.is_none()
+        && stmt.values_source.is_none()
+        && stmt.table.eq_ignore_ascii_case(cte_name)
+    {
+        let alias = stmt
+            .table_alias
+            .clone()
+            .unwrap_or_else(|| stmt.table.clone());
+        stmt.table = alias;
+        stmt.table_alias = None;
+        stmt.derived_source = Some(Box::new(cte_body.clone()));
+    }
+    // JOINs — mismo orden: recursamos en `derived` pre-existente y
+    // sólo después instalamos si el nombre matchea.
+    for join in &mut stmt.joins {
+        if let Some(src) = &mut join.right.derived {
+            inline_cte_into_select(src, cte_name, cte_body);
+        }
+        if join.right.derived.is_none()
+            && join.right.values.is_none()
+            && join.right.name.eq_ignore_ascii_case(cte_name)
+        {
+            let alias = join
+                .right
+                .alias
+                .clone()
+                .unwrap_or_else(|| join.right.name.clone());
+            join.right.name = alias;
+            join.right.alias = None;
+            join.right.derived = Some(Box::new(cte_body.clone()));
+        }
+    }
+    // WHERE / HAVING
+    if let Some(w) = &mut stmt.where_clause {
+        inline_cte_into_where(w, cte_name, cte_body);
+    }
+    if let Some(h) = &mut stmt.having {
+        inline_cte_into_where(h, cte_name, cte_body);
+    }
+    // SELECT list: scalar subqueries dentro de Expression / agregados.
+    for item in &mut stmt.columns {
+        match item {
+            SelectItem::Expression { expr, .. } => {
+                inline_cte_into_expr(expr, cte_name, cte_body);
+            }
+            SelectItem::Aggregate {
+                arg: AggArg::Expr(e),
+                ..
+            } => {
+                inline_cte_into_expr(e, cte_name, cte_body);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn inline_cte_into_where(w: &mut WhereExpr, cte_name: &str, cte_body: &SelectStmt) {
+    match w {
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            inline_cte_into_where(a, cte_name, cte_body);
+            inline_cte_into_where(b, cte_name, cte_body);
+        }
+        WhereExpr::Not(a) => inline_cte_into_where(a, cte_name, cte_body),
+        WhereExpr::Atom(c) => inline_cte_into_clause(c, cte_name, cte_body),
+    }
+}
+
+fn inline_cte_into_clause(c: &mut WhereClause, cte_name: &str, cte_body: &SelectStmt) {
+    match c {
+        WhereClause::In { subquery, .. }
+        | WhereClause::EqSubquery { subquery, .. }
+        | WhereClause::Exists { subquery, .. } => {
+            inline_cte_into_select(subquery, cte_name, cte_body);
+        }
+        _ => {}
+    }
+}
+
+fn inline_cte_into_expr(e: &mut Expr, cte_name: &str, cte_body: &SelectStmt) {
+    match e {
+        Expr::ScalarSubquery(s) => inline_cte_into_select(s, cte_name, cte_body),
+        Expr::Func(_, args) => {
+            for a in args {
+                inline_cte_into_expr(a, cte_name, cte_body);
+            }
+        }
+        Expr::Cast(b, _) => inline_cte_into_expr(b, cte_name, cte_body),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                inline_cte_into_expr(op, cte_name, cte_body);
+            }
+            for (cond, val) in branches {
+                inline_cte_into_expr(cond, cte_name, cte_body);
+                inline_cte_into_expr(val, cte_name, cte_body);
+            }
+            if let Some(eb) = else_branch {
+                inline_cte_into_expr(eb, cte_name, cte_body);
+            }
+        }
+        Expr::Compare(a, _, b) | Expr::Arith(a, _, b) => {
+            inline_cte_into_expr(a, cte_name, cte_body);
+            inline_cte_into_expr(b, cte_name, cte_body);
+        }
+        Expr::IsNull(a, _) | Expr::Like(a, _, _) | Expr::InList(a, _, _) => {
+            inline_cte_into_expr(a, cte_name, cte_body);
+        }
+        Expr::Between(a, lo, hi, _) => {
+            inline_cte_into_expr(a, cte_name, cte_body);
+            inline_cte_into_expr(lo, cte_name, cte_body);
+            inline_cte_into_expr(hi, cte_name, cte_body);
+        }
+        Expr::Literal(_) | Expr::Column(_) => {}
+    }
+}
+
 impl Parser {
     fn parse_statement(&mut self) -> DbResult<Statement> {
         if self.match_keyword("CREATE") {
@@ -12467,6 +12632,75 @@ impl Parser {
             let stmt = self.parse_select_stmt()?;
             let lhs = SelectQuery::Select(Box::new(stmt));
             let query = self.parse_set_ops_after(lhs)?;
+            return Ok(Statement::Select(Box::new(query)));
+        }
+        if self.match_keyword("WITH") {
+            // Bloque W1 (2026-05-28): CTEs no-recursivas. Sintaxis:
+            //   WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]* <main>
+            // donde <main> es un SELECT o un árbol de set ops.
+            //
+            // Estrategia: inlining a nivel de AST en tiempo de parse —
+            // cada referencia `FROM cte` se reescribe como derived
+            // table con el body de la CTE clonado. Re-ejecución si la
+            // CTE se referencia N veces: documentada como deuda en
+            // [ADR-0025], futura memoización por nombre similar al fix
+            // #1 del BENCHMARK. No requiere bump de VERSION on-disk.
+            if self.match_keyword("RECURSIVE") {
+                return Err(coded(
+                    codes::CTE_RECURSIVE_NOT_SUPPORTED,
+                    "WITH RECURSIVE no está soportado en este release \
+                     (diferido al bloque W2 — fixpoint base+step sobre UNION ALL). \
+                     Workaround: WITH no-recursivo, o pre-materializar la jerarquía en una tabla auxiliar.",
+                ));
+            }
+            let mut ctes: Vec<(String, SelectStmt)> = Vec::new();
+            loop {
+                let name = self.expect_ident()?;
+                if ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    return Err(coded(
+                        codes::CTE_DUPLICATE_NAME,
+                        format!(
+                            "WITH: el nombre '{}' aparece más de una vez en la misma cláusula WITH; \
+                             cada CTE debe tener nombre único (lookup case-insensitive)",
+                            name
+                        ),
+                    ));
+                }
+                // Column aliases en la cabecera (`WITH cte(c1, c2) AS ...`)
+                // diferidos. Workaround documentado en el mensaje.
+                if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+                    return Err(coded(
+                        codes::CTE_COLUMN_ALIASES_NOT_SUPPORTED,
+                        format!(
+                            "WITH {}(...) AS (...): los column aliases en la cabecera de la CTE están diferidos. \
+                             Workaround: aliasar dentro del body (`SELECT x AS c1, y AS c2 FROM ...`) — efecto equivalente",
+                            name
+                        ),
+                    ));
+                }
+                self.expect_keyword("AS")?;
+                self.expect_symbol("(")?;
+                self.expect_keyword("SELECT")?;
+                let mut body = self.parse_select_stmt()?;
+                self.expect_symbol(")")?;
+                // CTE_N puede referenciar CTE_<N en su body — inlining
+                // de las CTEs previamente declaradas antes de guardar.
+                for (prev_name, prev_body) in &ctes {
+                    inline_cte_into_select(&mut body, prev_name, prev_body);
+                }
+                ctes.push((name, body));
+                if !self.match_symbol(",") {
+                    break;
+                }
+            }
+            // Main query: SELECT (con set ops opcionales encadenados).
+            self.expect_keyword("SELECT")?;
+            let main = self.parse_select_stmt()?;
+            let lhs = SelectQuery::Select(Box::new(main));
+            let mut query = self.parse_set_ops_after(lhs)?;
+            for (name, body) in &ctes {
+                inline_cte_into_query(&mut query, name, body);
+            }
             return Ok(Statement::Select(Box::new(query)));
         }
         if self.match_keyword("VALUES") {

@@ -6,6 +6,44 @@
 
 ---
 
+## 2026-05-28 — Bloque W1: CTEs no-recursivas + fix residual Issue #3
+
+> **Un push a `main`** con dos cambios coherentes y chicos: el bloque W1 (CTEs) y un fix del residual del Issue #3 del benchmark (`WHERE col = val` sobre col no-PK / no-indexada caía a FullScan sin post-filter y devolvía TODAS las filas — bug detectado mientras se escribían los tests de W1). Sin bump de formato.
+>
+> Detalle de la decisión de W1 y trade-offs en [`docs/adr/0026-cte-non-recursive.md`](docs/adr/0026-cte-non-recursive.md).
+
+### 🆕 Sintaxis habilitada
+
+- CTE simple: `WITH seniors AS (SELECT id FROM emp WHERE salario >= 100) SELECT id FROM seniors;`
+- Múltiples CTEs encadenadas (CTE2 puede usar CTE1):
+  - `WITH a AS (SELECT ...), b AS (SELECT FROM a WHERE ...) SELECT FROM b;`
+- CTE en `JOIN`, en subqueries (`IN (SELECT FROM cte)`, `EXISTS (SELECT FROM cte)`, scalar subquery), y visible desde ambas ramas de un `UNION` / `INTERSECT` / `EXCEPT`.
+- Shadowing ANSI: el nombre de la CTE prevalece sobre cualquier tabla real homónima del catálogo.
+
+### 🛠 Implementación
+
+- **Inlining post-parse como derived tables** (sin cambios en el executor): cada `FROM cte_name` se reescribe a `(SELECT ... FROM ...) AS cte_name` en el AST. Reusa `materialize_derived_table` del bloque H. Documentado en [ADR-0026 §1](docs/adr/0026-cte-non-recursive.md).
+- Helpers libres `inline_cte_into_query` / `inline_cte_into_select` / `inline_cte_into_where` / `inline_cte_into_clause` / `inline_cte_into_expr` recorren el AST y substituyen referencias.
+- Orden de recursión deliberado para evitar self-loops: primero descendemos en `derived_source` pre-existente, después instalamos el nuevo derived (que ya no se vuelve a procesar).
+
+### 🚫 Diferido (con código de error explícito)
+
+- `WITH RECURSIVE` → `[GBY-4080]` — bloque W2 (fixpoint base+step).
+- `WITH cte(c1, c2) AS (...)` (column aliases en la cabecera) → `[GBY-4081]` — workaround: aliasar en el body (`SELECT x AS c1, y AS c2`).
+- Nombres duplicados en el mismo `WITH` → `[GBY-4079]`.
+
+### 🐞 Fix residual Issue #3 (`WHERE col = val` sin filtro)
+
+El lifteo de `[GBY-4001]` (commit `49204ee`) hizo que `WHERE col = val` sobre columna no-PK no-indexada cayera a `Plan::FullScan` — pero el `generic_post_filter` no incluía `WhereClause::Eq` en su lista de "force", así que el scan retornaba TODAS las filas sin aplicar el filtro. Detectado escribiendo los tests de W1 (la CTE `WITH x AS (SELECT id FROM t WHERE v = 1)` devolvía 2 filas en vez de 1). Fix: extender el matcher de `generic_post_filter` para activar el post-filter cuando `Eq` cae a FullScan (col que no es PK simple y no está indexada). El test `secondary_index_lookup_and_maintenance` se actualizó para verificar el filtrado correcto (40 Anas exactas en lugar de "id=1 debe aparecer", que dependía del bug).
+
+### 🧪 Validación
+
+- 10 tests `w1_*` en `tests/integration_test.rs` cubriendo cada caso de uso + cada error code.
+- 1 test de regresión `regression_eq_non_indexed_col_filters` para el residual Issue #3.
+- Suite total: **388/388 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-27 — Performance fixes: 5 issues del BENCHMARK resueltos
 
 > **Un push a `main`** que resuelve 5 de los 6 issues identificados en la corrida pre-L+V del benchmark (Issue #2 queda diferido con error claro). Sin bump de formato. Reporte completo en [`BENCHMARK.md`](BENCHMARK.md).

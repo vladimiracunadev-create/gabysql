@@ -436,6 +436,20 @@ pub mod codes {
     /// expande vistas cuyo source es un `SELECT` simple — set ops
     /// como source quedan diferidos.
     pub const VIEW_SOURCE_NOT_SIMPLE_SELECT: u32 = 4078;
+    /// Bloque W1 (2026-05-28): dos `CTE` dentro del mismo `WITH`
+    /// declararon el mismo nombre (case-insensitive). Cada nombre debe
+    /// ser único dentro de la cláusula `WITH`; el lookup posterior es
+    /// case-insensitive.
+    pub const CTE_DUPLICATE_NAME: u32 = 4079;
+    /// Bloque W1: `WITH RECURSIVE` se reconoce pero está diferido al
+    /// bloque W2 (fixpoint sobre `UNION ALL` base+step). Sintaxis no-
+    /// recursiva (`WITH name AS (SELECT ...) ...`) sí está soportada.
+    pub const CTE_RECURSIVE_NOT_SUPPORTED: u32 = 4080;
+    /// Bloque W1: `WITH name(c1, c2, ...) AS (...)` — column aliases en
+    /// la cabecera de la CTE diferidos. Workaround: aliasar dentro del
+    /// SELECT del body (`SELECT x AS c1, y AS c2 FROM ...`), que es
+    /// equivalente en semántica.
+    pub const CTE_COLUMN_ALIASES_NOT_SUPPORTED: u32 = 4081;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

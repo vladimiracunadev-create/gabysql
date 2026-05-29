@@ -271,14 +271,14 @@ fn secondary_index_lookup_and_maintenance() -> Result<(), Box<dyn Error>> {
     // Issue #3 (2026-05-27): tras DROP INDEX, `WHERE name = ...` ya
     // NO rebota con [GBY-4001] — cae a FullScan + post-filter como
     // cualquier otro operador. Verificamos que devuelve correctamente
-    // la(s) fila(s) que matchean.
+    // las 40 filas con name='Ana' (id múltiplos de 5: 0,5,...,195).
+    // Residual Issue #3 (2026-05-28): asegurar que el post-filter
+    // genérico se active para Eq sobre col no-PK / no-indexada — antes
+    // del fix devolvía las 200 filas sin filtrar.
     run_sql(&db, "DROP INDEX idx_u_name;")?;
     let res = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';")?;
-    assert!(
-        res[0].rows.iter().any(|r| r[0] == Value::Integer(1)),
-        "esperaba id=1 (Ana) en el resultset tras DROP INDEX, got: {:?}",
-        res[0].rows
-    );
+    assert_eq!(res[0].rows.len(), 40, "tras DROP INDEX, WHERE name='Ana' debe filtrar a 40 filas; got: {:?}", res[0].rows);
+    assert_eq!(res[0].rows[0][0], Value::Integer(0));
 
     cleanup(&[&db, &wal]);
     Ok(())
@@ -9098,6 +9098,225 @@ fn v_v12_db_rejected_with_unsupported_version() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque W1 (2026-05-28): CTEs no-recursivas (WITH ... AS ...). -----
+
+fn w1_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("w1-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn w1_single_cte_in_from() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("single")?;
+    run_sql(
+        &db,
+        "CREATE TABLE empleados (id INT PRIMARY KEY, salario INT);
+         INSERT INTO empleados (id, salario) VALUES (1, 100);
+         INSERT INTO empleados (id, salario) VALUES (2, 200);
+         INSERT INTO empleados (id, salario) VALUES (3, 50);",
+    )?;
+    let res = run_sql(
+        &db,
+        "WITH seniors AS (SELECT id FROM empleados WHERE salario >= 100) \
+         SELECT id FROM seniors ORDER BY id;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[1][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_referencing_previous_cte() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("chain")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "WITH a AS (SELECT id, v FROM t WHERE v >= 20), \
+              b AS (SELECT id FROM a WHERE v >= 30) \
+         SELECT id FROM b;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_in_join() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("join")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE o (id INT PRIMARY KEY, uid INT, total INT);
+         INSERT INTO u (id, name) VALUES (1, 'Ana');
+         INSERT INTO u (id, name) VALUES (2, 'Bob');
+         INSERT INTO o (id, uid, total) VALUES (10, 1, 500);
+         INSERT INTO o (id, uid, total) VALUES (11, 2, 50);
+         INSERT INTO o (id, uid, total) VALUES (12, 1, 700);",
+    )?;
+    let res = run_sql(
+        &db,
+        "WITH big AS (SELECT uid FROM o WHERE total >= 100) \
+         SELECT u.name FROM u INNER JOIN big ON u.id = big.uid ORDER BY u.name;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::String("Ana".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::String("Ana".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_in_subquery() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("sub")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "WITH high AS (SELECT id FROM t WHERE v >= 20) \
+         SELECT id FROM t WHERE id IN (SELECT id FROM high) ORDER BY id;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    assert_eq!(res[0].rows[1][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_shadows_real_table() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("shadow")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 1);
+         INSERT INTO t (id, v) VALUES (2, 2);",
+    )?;
+    // CTE 'shadow' — sin tabla real homónima. Verifica que `FROM shadow`
+    // resuelva a la CTE (no a un catalog miss). Usa filtro por PK para
+    // no chocar con el residual del Issue #3 (`WHERE col = val` sobre
+    // columna no-PK no filtra; ya flageado como follow-up).
+    let res = run_sql(
+        &db,
+        "WITH shadow AS (SELECT id, v FROM t WHERE id = 1) SELECT id FROM shadow;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_duplicate_name_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("dup")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "WITH a AS (SELECT id FROM t), a AS (SELECT id FROM t) SELECT * FROM a;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4079"),
+        "esperaba GBY-4079, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_recursive_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("recursive")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "WITH RECURSIVE a AS (SELECT id FROM t) SELECT * FROM a;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4080"),
+        "esperaba GBY-4080, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_column_aliases_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("col-aliases")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "WITH a(x) AS (SELECT id FROM t) SELECT x FROM a;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4081"),
+        "esperaba GBY-4081, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_with_aggregate() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("agg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT);
+         INSERT INTO sales (id, region, amount) VALUES (1, 'N', 100);
+         INSERT INTO sales (id, region, amount) VALUES (2, 'N', 200);
+         INSERT INTO sales (id, region, amount) VALUES (3, 'S', 50);",
+    )?;
+    let res = run_sql(
+        &db,
+        "WITH per_region AS (SELECT region, SUM(amount) AS tot FROM sales GROUP BY region) \
+         SELECT region FROM per_region WHERE tot >= 100 ORDER BY region;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::String("N".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w1_cte_in_set_op_branch() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w1_setup("setop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);",
+    )?;
+    // CTE visible desde ambos lados del UNION. Usa filtro por PK para
+    // evitar el residual del Issue #3 (WHERE Eq sobre col no-PK).
+    let res = run_sql(
+        &db,
+        "WITH x AS (SELECT id FROM t WHERE id = 1) \
+         SELECT id FROM x UNION SELECT id FROM t WHERE id = 2 ORDER BY id;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[1][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, Box<dyn Error>> {
     let mut pager = Pager::open(path)?;
     pager.begin()?;
@@ -9119,6 +9338,31 @@ fn run_sql(path: &Path, sql_text: &str) -> Result<Vec<gabysql::sql::ResultSet>, 
             Err(Box::new(err))
         }
     }
+}
+
+// ----- Regresión Issue #3 residual (2026-05-28): `WHERE col = val` sobre
+// columna no-PK / no-indexada debe filtrar (post-filter genérico). Bug
+// introducido al lifteo de [GBY-4001]: caía a FullScan sin post-filter
+// y devolvía TODAS las filas.
+
+#[test]
+fn regression_eq_non_indexed_col_filters() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("reg-eq-nonidx");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 1);
+         INSERT INTO t (id, v) VALUES (2, 2);",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE v = 1;")?;
+    assert_eq!(res[0].rows.len(), 1, "WHERE v = 1 debe devolver exactamente 1 fila");
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
 }
 
 fn temp_db_path(label: &str) -> PathBuf {
