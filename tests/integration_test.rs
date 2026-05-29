@@ -13349,6 +13349,229 @@ fn y6_dec_alias_works() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y7 (2026-05-29): aritmética + comparación DECIMAL exactas.
+// Sin bump on-disk — sólo cambia eval_arith y compare_values.
+// ============================================================
+
+fn y7_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y7-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y7_decimal_add_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("add")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 0.10, 0.20);
+         INSERT INTO t (id, a, b) VALUES (2, 199.99, 0.01);
+         INSERT INTO t (id, a, b) VALUES (3, 100.50, 50.25);",
+    )?;
+    let res = run_sql(&db, "SELECT a + b FROM t ORDER BY id;")?;
+    // 0.10 + 0.20 = 0.30 EXACTO (no 0.30000000004)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 30,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 20000,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        res[0].rows[2][0],
+        Value::Decimal {
+            value: 15075,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_sub_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("sub")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 1.00, 0.99);
+         INSERT INTO t (id, a, b) VALUES (2, 10.00, 0.01);",
+    )?;
+    let res = run_sql(&db, "SELECT a - b FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][0], Value::Decimal { value: 1, scale: 2 });
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 999,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_plus_integer_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("add-int")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 99.50);",
+    )?;
+    let res = run_sql(&db, "SELECT amount + 1 FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 10050,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_diff_scales_align() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("align")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,4));
+         INSERT INTO t (id, a, b) VALUES (1, 1.50, 2.7500);",
+    )?;
+    let res = run_sql(&db, "SELECT a + b FROM t;")?;
+    // 1.50 (scale=2) + 2.7500 (scale=4) → 4.2500 (target scale=4)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 42500,
+            scale: 4
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_equality_with_different_scales() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("eq")?;
+    // WHERE col = col necesita subquery correlacionada (limitación del
+    // parser de gabysql), así que verificamos equality vía diferencia:
+    // a - b == 0 (que sí funciona como Decimal arithmetic con
+    // alineación automática de scales).
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,4));
+         INSERT INTO t (id, a, b) VALUES (1, 3.50, 3.5000);
+         INSERT INTO t (id, a, b) VALUES (2, 1.00, 2.0000);",
+    )?;
+    let res = run_sql(&db, "SELECT a, b, a - b FROM t ORDER BY id;")?;
+    // Row 1: 3.50 - 3.5000 = 0.0000 (scale=4)
+    assert_eq!(res[0].rows[0][2], Value::Decimal { value: 0, scale: 4 });
+    // Row 2: 1.00 - 2.0000 = -1.0000
+    assert_eq!(
+        res[0].rows[1][2],
+        Value::Decimal {
+            value: -10000,
+            scale: 4
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_less_than_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("lt")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 99.99);
+         INSERT INTO t (id, amount) VALUES (2, 100.00);
+         INSERT INTO t (id, amount) VALUES (3, 100.01);",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE amount < 100.00 ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_compared_to_integer() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("cmp-int")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 99.99);
+         INSERT INTO t (id, amount) VALUES (2, 100.00);
+         INSERT INTO t (id, amount) VALUES (3, 100.01);
+         INSERT INTO t (id, amount) VALUES (4, 200.00);",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE amount > 100 ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    assert_eq!(res[0].rows[1][0], Value::Integer(4));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_order_by_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("order")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,4));
+         INSERT INTO t (id, amount) VALUES (1, 100.0001);
+         INSERT INTO t (id, amount) VALUES (2, 100.0010);
+         INSERT INTO t (id, amount) VALUES (3, 100.0000);",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t ORDER BY amount ASC;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    assert_eq!(res[0].rows[1][0], Value::Integer(1));
+    assert_eq!(res[0].rows[2][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y7_decimal_negative_arith() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y7_setup("neg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, -5.00, 3.50);",
+    )?;
+    let res = run_sql(&db, "SELECT a + b, a - b FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: -150,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        res[0].rows[0][1],
+        Value::Decimal {
+            value: -850,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

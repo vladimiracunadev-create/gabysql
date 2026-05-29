@@ -1928,6 +1928,18 @@ pub(crate) fn rescale_decimal(value: i128, from_scale: u8, to_scale: u8) -> Resu
     }
 }
 
+/// Bloque Y7 (2026-05-29): extrae `(value, scale)` para aritmética
+/// decimal exacta. Integer se promueve a `(int as i128, 0)`. Para
+/// otros tipos hace un fallback razonable (no debería llegar acá
+/// si el call site filtró correctamente).
+pub(crate) fn decimal_extract_for_arith(v: &Value) -> (i128, u8) {
+    match v {
+        Value::Decimal { value, scale } => (*value, *scale),
+        Value::Integer(n) => (*n as i128, 0),
+        _ => (0, 0),
+    }
+}
+
 /// Bloque Y6: convierte un Decimal a `f64` (lossy) para
 /// participar en aritmética con Int/Float.
 pub(crate) fn decimal_to_f64(value: i128, scale: u8) -> f64 {
@@ -10312,6 +10324,29 @@ fn compare_values_nulls_last(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::String(x), Value::String(y)) => x.cmp(y),
+        // Bloque Y7: Decimals comparan exacto vía alineación de scales.
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+            },
+        ) => compare_decimals(*x, *sx, *y, *sy),
+        (Value::Decimal { value, scale }, Value::Integer(y)) => {
+            compare_decimals(*value, *scale, *y as i128, 0)
+        }
+        (Value::Integer(x), Value::Decimal { value, scale }) => {
+            compare_decimals(*x as i128, 0, *value, *scale)
+        }
+        (Value::Decimal { value, scale }, Value::Float(y)) => decimal_to_f64(*value, *scale)
+            .partial_cmp(y)
+            .unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Decimal { value, scale }) => x
+            .partial_cmp(&decimal_to_f64(*value, *scale))
+            .unwrap_or(Ordering::Equal),
         (x, y) => format!("{:?}", x).cmp(&format!("{:?}", y)),
     }
 }
@@ -12539,7 +12574,61 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::String(x), Value::String(y)) => x.cmp(y),
+        // Bloque Y7 (2026-05-29): comparaciones exactas entre Decimals
+        // alineando scales en i128. Cross-type Decimal/Int también
+        // exacto (Int se ve como Decimal scale=0).
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+            },
+        ) => compare_decimals(*x, *sx, *y, *sy),
+        (Value::Decimal { value, scale }, Value::Integer(y)) => {
+            compare_decimals(*value, *scale, *y as i128, 0)
+        }
+        (Value::Integer(x), Value::Decimal { value, scale }) => {
+            compare_decimals(*x as i128, 0, *value, *scale)
+        }
+        // Decimal vs Float: promueve a f64 (lossy en el extremo del rango).
+        (Value::Decimal { value, scale }, Value::Float(y)) => decimal_to_f64(*value, *scale)
+            .partial_cmp(y)
+            .unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Decimal { value, scale }) => x
+            .partial_cmp(&decimal_to_f64(*value, *scale))
+            .unwrap_or(Ordering::Equal),
         _ => Ordering::Equal,
+    }
+}
+
+/// Bloque Y7 (2026-05-29): compara dos decimals alineando primero
+/// los scales (escala el más chico al más grande con `checked_mul`;
+/// si overflow, cae al cmp por `decimal_to_f64`). Sin alocaciones.
+pub(crate) fn compare_decimals(av: i128, asc: u8, bv: i128, bsc: u8) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let target = asc.max(bsc);
+    let a_norm = if asc == target {
+        Some(av)
+    } else {
+        10i128
+            .checked_pow((target - asc) as u32)
+            .and_then(|p| av.checked_mul(p))
+    };
+    let b_norm = if bsc == target {
+        Some(bv)
+    } else {
+        10i128
+            .checked_pow((target - bsc) as u32)
+            .and_then(|p| bv.checked_mul(p))
+    };
+    match (a_norm, b_norm) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => decimal_to_f64(av, asc)
+            .partial_cmp(&decimal_to_f64(bv, bsc))
+            .unwrap_or(Ordering::Equal),
     }
 }
 
@@ -13068,6 +13157,29 @@ fn eval_compare(lhs: Option<&Value>, op: CompareOp, rhs: &Value) -> Option<bool>
         (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        // Bloque Y7 (2026-05-29): comparaciones Decimal en eval_compare
+        (
+            Value::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Value::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => Some(compare_decimals(*a, *sa, *b, *sb)),
+        (Value::Decimal { value, scale }, Value::Integer(b)) => {
+            Some(compare_decimals(*value, *scale, *b as i128, 0))
+        }
+        (Value::Integer(a), Value::Decimal { value, scale }) => {
+            Some(compare_decimals(*a as i128, 0, *value, *scale))
+        }
+        (Value::Decimal { value, scale }, Value::Float(b)) => {
+            decimal_to_f64(*value, *scale).partial_cmp(b)
+        }
+        (Value::Float(a), Value::Decimal { value, scale }) => {
+            a.partial_cmp(&decimal_to_f64(*value, *scale))
+        }
         _ => None,
     };
     let ord = match ord {
@@ -13430,6 +13542,7 @@ fn ensure_column_visible(
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
+    use std::cmp::Ordering;
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => false,
         (Value::Integer(x), Value::Integer(y)) => x == y,
@@ -13439,6 +13552,29 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         }
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
+        // Bloque Y7 (2026-05-29): Decimal equality alineando scales.
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+            },
+        ) => compare_decimals(*x, *sx, *y, *sy) == Ordering::Equal,
+        (Value::Decimal { value, scale }, Value::Integer(y)) => {
+            compare_decimals(*value, *scale, *y as i128, 0) == Ordering::Equal
+        }
+        (Value::Integer(x), Value::Decimal { value, scale }) => {
+            compare_decimals(*x as i128, 0, *value, *scale) == Ordering::Equal
+        }
+        (Value::Decimal { value, scale }, Value::Float(y)) => {
+            (decimal_to_f64(*value, *scale) - *y).abs() < f64::EPSILON
+        }
+        (Value::Float(x), Value::Decimal { value, scale }) => {
+            (*x - decimal_to_f64(*value, *scale)).abs() < f64::EPSILON
+        }
         _ => false,
     }
 }
@@ -14211,12 +14347,71 @@ fn eval_arith(a: Value, op: ArithOp, b: Value) -> DbResult<Value> {
             value_to_text(&b)
         )));
     }
+    // Bloque Y7 (2026-05-29): aritmética Decimal exacta para Add/Sub.
+    // Mul/Div/Mod y cualquier mezcla con Float promueven a f64 (lossy,
+    // documentado). El cliente que quiera precisión exacta para mul/div
+    // debe trabajar con scale alineado manualmente.
+    let decimal_exact_path = matches!(op, ArithOp::Add | ArithOp::Sub)
+        && matches!(
+            (&a, &b),
+            (Value::Decimal { .. }, Value::Decimal { .. })
+                | (Value::Decimal { .. }, Value::Integer(_))
+                | (Value::Integer(_), Value::Decimal { .. })
+        );
+    if decimal_exact_path {
+        let (av, ascale) = decimal_extract_for_arith(&a);
+        let (bv, bscale) = decimal_extract_for_arith(&b);
+        let target_scale = ascale.max(bscale);
+        let a_norm = rescale_decimal(av, ascale, target_scale)
+            .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
+        let b_norm = rescale_decimal(bv, bscale, target_scale)
+            .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
+        let r = match op {
+            ArithOp::Add => a_norm.checked_add(b_norm),
+            ArithOp::Sub => a_norm.checked_sub(b_norm),
+            _ => unreachable!(),
+        };
+        return match r {
+            Some(value) => Ok(Value::Decimal {
+                value,
+                scale: target_scale,
+            }),
+            None => Err(coded(
+                codes::ARITH_OVERFLOW,
+                format!("overflow aritmético en DECIMAL ({} {})", a_norm, b_norm),
+            )),
+        };
+    }
     // Promoción numérica.
     let (af, bf, both_int) = match (&a, &b) {
         (Value::Integer(x), Value::Integer(y)) => (*x as f64, *y as f64, Some((*x, *y))),
         (Value::Integer(x), Value::Float(y)) => (*x as f64, *y, None),
         (Value::Float(x), Value::Integer(y)) => (*x, *y as f64, None),
         (Value::Float(x), Value::Float(y)) => (*x, *y, None),
+        // Bloque Y7: cualquier camino con Decimal que NO sea el exact
+        // Add/Sub Decimal/Int cae acá — promueve a f64 (lossy).
+        (Value::Decimal { value, scale }, Value::Integer(y)) => {
+            (decimal_to_f64(*value, *scale), *y as f64, None)
+        }
+        (Value::Integer(x), Value::Decimal { value, scale }) => {
+            (*x as f64, decimal_to_f64(*value, *scale), None)
+        }
+        (Value::Decimal { value, scale }, Value::Float(y)) => {
+            (decimal_to_f64(*value, *scale), *y, None)
+        }
+        (Value::Float(x), Value::Decimal { value, scale }) => {
+            (*x, decimal_to_f64(*value, *scale), None)
+        }
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+            },
+        ) => (decimal_to_f64(*x, *sx), decimal_to_f64(*y, *sy), None),
         _ => {
             return Err(coded(
                 codes::ARITH_TYPE_MISMATCH,

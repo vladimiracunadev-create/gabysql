@@ -6,6 +6,52 @@
 
 ---
 
+## 2026-05-29 — Bloque Y7: aritmética y comparación `DECIMAL` exactas
+
+> **Un push a `main`** sin bump on-disk. Follow-up de Y6: `+`/`-` Decimal-Decimal y Decimal-Int son exactos en i128; comparaciones alinean scales antes de comparar. Mul/Div/Mod siguen promoviendo a f64 (lossy). Detalle en [`docs/adr/0047-decimal-arith-compare-y7.md`](docs/adr/0047-decimal-arith-compare-y7.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+SELECT 0.10 + 0.20;                       -- 0.30 EXACTO (no 0.30000000004)
+SELECT a + b FROM pagos;                  -- exacto, alinea scales automático
+
+SELECT * FROM pagos WHERE amount > 100.00; -- exacto en bordes
+SELECT * FROM pagos WHERE amount BETWEEN 99.00 AND 100.50;
+SELECT * FROM pagos ORDER BY amount ASC;   -- order exacto sin imprecisión f64
+```
+
+### 🛠 Implementación
+
+- **`eval_arith`** detecta `Decimal ± Decimal` y `Decimal ± Int` → camino exacto en i128:
+  1. `target_scale = max(a.scale, b.scale)`
+  2. Rescale ambos al `target_scale` con `checked_mul(10^diff)`
+  3. `checked_add`/`checked_sub` → resultado `Value::Decimal { value, scale: target_scale }`
+- **Mul/Div/Mod Decimal**: caen al camino f64 (lossy). Decimal-pura mul/div diferida a Y8.
+- **Cross-type Decimal/Float**: f64 estándar (lossy, documentado).
+- **`compare_decimals(av, asc, bv, bsc)`** helper público: align scales con `checked_mul`, compara i128 normalizados; fallback a `decimal_to_f64` si rescale overflowea.
+- Actualizado en `compare_values`, `compare_values_nulls_last`, `eval_compare` (operadores `<`/`<=`/`>`/`>=`/`!=`), `values_equal` (`=`/`!=`).
+- **Helper `decimal_extract_for_arith`** para abreviar el dispatch.
+- **Sin bump on-disk** — sólo cambia evaluación in-memory.
+
+### 🚫 Sin nuevos códigos de error
+
+Reusa `[GBY-4042]` ARITH_OVERFLOW para overflow en rescale o checked_add/sub.
+
+### 🚫 Diferido (Y8 y más allá)
+
+- **Mul/Div Decimal-puros exactos** (necesitan política de overflow/rounding explícita).
+- **`WHERE col_a = col_b`** sin subquery (limitación del parser, no de Y7).
+- **SUM/AVG agregados Decimal-puros** (hoy promueven a f64).
+- **DECIMAL indexable** (encoding lex-comparable).
+
+### 🧪 Validación
+
+- 9 tests `y7_*`: Add exact (0.10+0.20=0.30), Sub exact, Decimal+Int exact, diff scales align (10,2)+(10,4)→4, equality via diff, less than borde, Decimal vs Int cross-type, ORDER BY exact, negative arith.
+- Suite total: **589/589 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y6: `DECIMAL(p,s)` exacto — fin de la precisión perdida
 
 > **Un push a `main`** con **bump on-disk 21 → 22**. `DECIMAL`/`NUMERIC` **dejan de ser aliases de FLOAT** y pasan a ser un tipo propio con representación exacta `i128 + scale`. Detalle en [`docs/adr/0046-decimal-exact-y6.md`](docs/adr/0046-decimal-exact-y6.md).
