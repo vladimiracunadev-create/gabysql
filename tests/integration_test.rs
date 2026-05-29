@@ -16460,6 +16460,180 @@ fn p2_explain_analyze_error_capturado() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque P3 (2026-05-29): ANALYZE <table> + EXPLAIN consume stats
+// Session-scoped (sin persistencia). Stats stale tras INSERT.
+// ============================================================
+
+fn p3_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("p3-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+fn extract_scan_detail(rs: &gabysql::sql::ResultSet) -> String {
+    for r in &rs.rows {
+        let s = match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        };
+        if s == "1" {
+            if let Value::String(d) = &r[1] {
+                return d.clone();
+            }
+        }
+    }
+    String::new()
+}
+
+#[test]
+fn p3_analyze_returns_row_count() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("count")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,10),(2,20),(3,30);",
+    )?;
+    let res = run_sql(&db, "ANALYZE TABLE t;")?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows[0][0], Value::String("t".to_string()));
+    assert_eq!(last.rows[0][1], Value::Integer(3));
+    let msg = last.message.clone().unwrap_or_default();
+    assert!(msg.contains("session-scoped") || msg.contains("Cache session-scoped"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_analyze_sin_keyword_table_funciona() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("no-table-kw")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY);
+         INSERT INTO u (id) VALUES (1),(2);",
+    )?;
+    let res = run_sql(&db, "ANALYZE u;")?;
+    assert_eq!(res.last().unwrap().rows[0][1], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_analyze_table_inexistente_falla() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("notfound")?;
+    let err = run_sql(&db, "ANALYZE TABLE nope;").unwrap_err();
+    assert!(
+        err.to_string().contains("ANALYZE") || err.to_string().contains("no existe"),
+        "esperaba mensaje de tabla no existe, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_explain_sin_analyze_previo_no_muestra_est_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("no-stats")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.rows="),
+        "no debería haber est.rows sin ANALYZE previo, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_explain_post_analyze_muestra_est_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("with-stats")?;
+    // ANALYZE y EXPLAIN en el MISMO batch para compartir Engine (stats session-scoped).
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,10),(2,20),(3,30),(4,40),(5,50);
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("[est.rows=5]"),
+        "esperaba [est.rows=5], vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_explain_con_where_pk_lookup_muestra_est_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("pk-est")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1),(2),(3),(4);
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t WHERE id = 2;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("PK lookup") && detail.contains("[est.rows=4]"),
+        "esperaba PK lookup con est.rows=4, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_stats_son_session_scoped_se_pierden_en_reapertura() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("session")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1),(2);
+         ANALYZE TABLE t;",
+    )?;
+    // Re-apertura: nueva sesión, stats vacías.
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.rows="),
+        "post-reapertura no debería haber stats (P3 session-scoped), vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3_drop_table_invalida_stats() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("drop-invalidates")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1),(2),(3);
+         ANALYZE TABLE t;
+         DROP TABLE t;
+         CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         EXPLAIN SELECT * FROM t;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.rows=3"),
+        "DROP debe invalidar stats viejas, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

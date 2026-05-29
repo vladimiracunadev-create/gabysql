@@ -457,7 +457,8 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 |---|:---:|:---:|
 | `EXPLAIN <statement>` (plan textual sin ejecutar) | ✅ (P1, 2026-05-29; cols step/detail; clasifica scan type honestamente: PK lookup / hash-index / ordered-int / full scan + post-filter; soporta SELECT/INSERT/UPDATE/DELETE/JOIN/ORDER/LIMIT/DISTINCT; ver ADR-0063) | — |
 | `EXPLAIN ANALYZE` (timings + row counts reales) | ✅ (P2, 2026-05-29; Instant wall-clock 3 decimales ms + `rs.rows.len()` real + side-effects PERSISTEN + error capturado como step `actual.error`; ver ADR-0064) | — |
-| `EXPLAIN` con cost estimates (rows, pages, total cost) | ❌ (defer P3 — requiere stats del catálogo + planner-as-optimizer) | P3 |
+| `EXPLAIN` con cost estimates (rows, pages, total cost) | 🟡 (P3, 2026-05-29; `ANALYZE TABLE foo` + EXPLAIN anota `[est.rows=N]` por SCAN. Solo row_count, sin NDV/MCV/histogramas — eso es P4. Stats session-scoped, sin persistencia on-disk — eso es P3b. Ver ADR-0065) | P4 (NDV+MCV) / P5 (optimizer real) |
+| `ANALYZE <table>` (colectar stats para optimizador) | ✅ (P3, 2026-05-29; row_count exacto vía scan B+tree, cachea en `Engine.table_stats`, EXPLAIN consume; acepta `ANALYZE TABLE foo` y `ANALYZE foo`; DROP TABLE invalida; session-scoped; ver ADR-0065) | — |
 | `PREPARE` / `EXECUTE` (prepared statements) | ❌ | P2 |
 | Parámetros bind (`?`, `$1`) en API | ❌ | P1 |
 | `COPY FROM` / `COPY TO` (bulk load) | ❌ | P2 |

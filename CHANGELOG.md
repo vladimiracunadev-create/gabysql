@@ -6,6 +6,38 @@
 
 ---
 
+## 2026-05-29 — Bloque P3: `ANALYZE <table>` + EXPLAIN consume stats
+
+> **Un push a `main`** sin bump on-disk. Tercer sub-bloque de Fase 3. Detalle en [`docs/adr/0065-p3-analyze-stats.md`](docs/adr/0065-p3-analyze-stats.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+ANALYZE TABLE t;
+-- columns: ["table", "row_count"], rows: [["t", 5]]
+-- message: "ANALYZE: stats actualizadas para `t` (5 rows). Cache session-scoped..."
+
+EXPLAIN SELECT * FROM t WHERE id = 2;
+-- 1 | SCAN `t` → PK lookup `id` (B+tree get, ~O(log n)) [est.rows=5]
+```
+
+### 🔑 Decisiones clave
+
+- **Stats session-scoped en memoria**: `HashMap<String, TableStats>` en `Engine`. Re-apertura = stats vacías. Persistencia en catálogo es P3b.
+- **Solo row_count**: stats por-columna (NDV/MCV/histogramas) quedan para P4.
+- **Sin auto-invalidación en DML**: INSERT/UPDATE/DELETE dejan stats stale. PostgreSQL hace lo mismo (autovacuum periódico, no per-statement).
+- **DROP TABLE limpia stats** de esa tabla para evitar leak en re-CREATE.
+- **Parser acepta `ANALYZE TABLE foo` y `ANALYZE foo`** (estilos MySQL y Postgres).
+- **EXPLAIN anota `[est.rows=N]`** al final de cada SCAN string cuando hay stats.
+- Sin nuevo error code — reutiliza `[GBY-...]` TABLE_NOT_FOUND.
+
+### 🧪 Tests
+
+- 8 nuevos `p3_*`.
+- Suite: **723 passing + 1 ignored** (715 → +8).
+
+---
+
 ## 2026-05-29 — Bloque P2: `EXPLAIN ANALYZE <statement>`
 
 > **Un push a `main`** sin bump on-disk. Segundo sub-bloque de Fase 3 (Performance/Planeación). Detalle en [`docs/adr/0064-p2-explain-analyze.md`](docs/adr/0064-p2-explain-analyze.md).

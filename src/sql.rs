@@ -134,6 +134,14 @@ pub enum Statement {
         analyze: bool,
         inner: Box<Statement>,
     },
+    /// Bloque P3 (2026-05-29): `ANALYZE <table>` — colecta stats básicas
+    /// de la tabla (row count vía full scan) y las cachea en
+    /// `Engine.table_stats`. EXPLAIN consume esas stats para anotar
+    /// `est.rows=N` en el SCAN step. Session-scoped (sin persistencia
+    /// on-disk; P3b agregará catálogo).
+    AnalyzeTable {
+        table: String,
+    },
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -2256,6 +2264,24 @@ pub struct Engine<'a> {
     /// `SET SESSION AUTHORIZATION 'name'` y se limpia con
     /// `SET SESSION AUTHORIZATION DEFAULT`.
     current_user: Option<String>,
+    /// Bloque P3 (2026-05-29): cache session-scoped de stats por tabla.
+    /// Poblado por `ANALYZE <table>` (exec_analyze_table) y consumido
+    /// por `exec_explain` para anotar `est.rows=N` en el SCAN step.
+    /// **No persiste**: se pierde al cerrar el Engine. Persistencia
+    /// en catálogo es P3b. Drop/truncate de una tabla invalida su entry.
+    table_stats: HashMap<String, TableStats>,
+}
+
+/// Bloque P3 (2026-05-29): stats básicas por tabla, cacheadas en memoria.
+/// `row_count` es exacto al momento de `ANALYZE`, pero queda **stale**
+/// si después la tabla cambia (no hay invalidation automática salvo en
+/// DROP/TRUNCATE explícito). El usuario debe re-ejecutar `ANALYZE <table>`.
+#[derive(Debug, Clone)]
+pub struct TableStats {
+    pub row_count: u64,
+    /// Nanos epoch en que se corrió `ANALYZE`. Útil para detectar
+    /// stats viejas en la salida de EXPLAIN.
+    pub analyzed_at_nanos: u128,
 }
 
 /// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
@@ -2314,6 +2340,7 @@ impl<'a> Engine<'a> {
             var_scope: HashMap::new(),
             pending_return_value: None,
             current_user: None,
+            table_stats: HashMap::new(),
         }
     }
 
@@ -2356,6 +2383,7 @@ impl<'a> Engine<'a> {
             Statement::CreatePolicy(stmt) => self.exec_create_policy(stmt),
             Statement::DropPolicy(stmt) => self.exec_drop_policy(stmt),
             Statement::Explain { analyze, inner } => self.exec_explain(*inner, analyze),
+            Statement::AnalyzeTable { table } => self.exec_analyze_table(table),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -2972,6 +3000,8 @@ impl<'a> Engine<'a> {
         if !removed && !stmt.if_exists {
             return Err(DbError::new(format!("tabla no existe: {}", stmt.name)));
         }
+        // Bloque P3: stats cacheadas pierden referente al borrarse la tabla.
+        self.table_stats.remove(&stmt.name);
         Ok(ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -4983,6 +5013,56 @@ impl<'a> Engine<'a> {
     // como ResultSet sin ejecutar el statement subyacente.
     // ============================================================
 
+    // ============================================================
+    // Bloque P3 (2026-05-29): ANALYZE <table> — colecta stats
+    // session-scoped (row count vía scan exhaustivo) y las cachea
+    // en Engine.table_stats. EXPLAIN luego las muestra como
+    // `est.rows=N` en el SCAN step.
+    // ============================================================
+
+    fn exec_analyze_table(&mut self, table: String) -> DbResult<ResultSet> {
+        // Chequeo de privs: ANALYZE es lectura — basta SELECT.
+        self.check_priv(&table, PRIV_SELECT)?;
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(&table)?.ok_or_else(|| {
+                coded(
+                    codes::TABLE_NOT_FOUND,
+                    format!("ANALYZE: tabla no existe: {}", table),
+                )
+            })?
+        };
+        // Full scan del B+tree: contamos rows reales.
+        let row_count = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.scan_rows(meta.root_page, 0, None)?.len() as u64
+        };
+        let analyzed_at_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.table_stats.insert(
+            table.clone(),
+            TableStats {
+                row_count,
+                analyzed_at_nanos,
+            },
+        );
+        Ok(ResultSet {
+            columns: vec!["table".to_string(), "row_count".to_string()],
+            rows: vec![vec![
+                Value::String(table.clone()),
+                Value::Integer(row_count as i64),
+            ]],
+            message: Some(format!(
+                "ANALYZE: stats actualizadas para `{}` ({} rows). \
+                 Cache session-scoped — se pierde al cerrar el Engine. \
+                 EXPLAIN las mostrará como `est.rows`.",
+                table, row_count
+            )),
+        })
+    }
+
     fn exec_explain(&mut self, inner: Statement, analyze: bool) -> DbResult<ResultSet> {
         let mut steps: Vec<(String, String)> = Vec::new();
         // Bloque P2: para ANALYZE, clonamos el inner ANTES de consumirlo
@@ -5341,6 +5421,18 @@ impl<'a> Engine<'a> {
     /// refleja las fast-path checks que hace `exec_select` / `exec_update`
     /// / `exec_delete` — si vos sabés cómo le pega el engine al WHERE,
     /// EXPLAIN te lo confirma sin tener que leer el código.
+    /// Bloque P3 (2026-05-29): si hay stats cacheadas (ANALYZE corrió en
+    /// la sesión actual), devuelve `" [est.rows=N]"` listo para anexar
+    /// al string del SCAN step. Sin entry → String vacío. No invalida
+    /// nada — un INSERT posterior deja la stat **stale** y el usuario
+    /// debe re-ejecutar ANALYZE para refrescarla (documentado en ADR-0065).
+    fn stats_annotation(&self, table: &str) -> String {
+        match self.table_stats.get(table) {
+            Some(s) => format!(" [est.rows={}]", s.row_count),
+            None => String::new(),
+        }
+    }
+
     fn classify_scan(&mut self, table: &str, where_clause: Option<&WhereExpr>) -> DbResult<String> {
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -5352,18 +5444,19 @@ impl<'a> Engine<'a> {
                 table
             ));
         };
+        let stats = self.stats_annotation(table);
         // Sin WHERE → full scan.
         let Some(where_expr) = where_clause else {
             return Ok(format!(
-                "SCAN `{}` (full scan, sin WHERE; ~todos los rows)",
-                table
+                "SCAN `{}` (full scan, sin WHERE; ~todos los rows){}",
+                table, stats
             ));
         };
         // Solo clasificamos átomos simples. AND/OR/NOT cae a full+filter.
         let Some(atom) = where_expr.as_atom() else {
             return Ok(format!(
-                "SCAN `{}` (full scan + WHERE AND/OR/NOT post-filter)",
-                table
+                "SCAN `{}` (full scan + WHERE AND/OR/NOT post-filter){}",
+                table, stats
             ));
         };
         match atom {
@@ -5371,24 +5464,24 @@ impl<'a> Engine<'a> {
                 let key = normalize_ident(column);
                 if key == normalize_ident(&meta.primary_key) {
                     Ok(format!(
-                        "SCAN `{}` → PK lookup `{}` (B+tree get, ~O(log n))",
-                        table, column
+                        "SCAN `{}` → PK lookup `{}` (B+tree get, ~O(log n)){}",
+                        table, column, stats
                     ))
                 } else {
                     let idx_kind = self.find_index_kind(&meta, &key);
                     match idx_kind {
                         Some(IndexKind::Hash) => Ok(format!(
-                            "SCAN `{}` → hash-index equality `{}` (bucket lookup, ~O(1))",
-                            table, column
+                            "SCAN `{}` → hash-index equality `{}` (bucket lookup, ~O(1)){}",
+                            table, column, stats
                         )),
                         Some(IndexKind::OrderedInt) => Ok(format!(
-                            "SCAN `{}` → ordered-int index equality `{}` (range walk)",
-                            table, column
+                            "SCAN `{}` → ordered-int index equality `{}` (range walk){}",
+                            table, column, stats
                         )),
                         None => Ok(format!(
                             "SCAN `{}` (full scan + WHERE {}=... post-filter; \
-                             considerá `CREATE INDEX` sobre `{}`)",
-                            table, column, column
+                             considerá `CREATE INDEX` sobre `{}`){}",
+                            table, column, column, stats
                         )),
                     }
                 }
@@ -5398,22 +5491,22 @@ impl<'a> Engine<'a> {
                 let idx_kind = self.find_index_kind(&meta, &key);
                 match idx_kind {
                     Some(IndexKind::OrderedInt) => Ok(format!(
-                        "SCAN `{}` → ordered-int index BETWEEN range `{}` (sequential walk)",
-                        table, column
+                        "SCAN `{}` → ordered-int index BETWEEN range `{}` (sequential walk){}",
+                        table, column, stats
                     )),
                     _ => Ok(format!(
-                        "SCAN `{}` (full scan + WHERE {} BETWEEN ... post-filter)",
-                        table, column
+                        "SCAN `{}` (full scan + WHERE {} BETWEEN ... post-filter){}",
+                        table, column, stats
                     )),
                 }
             }
             WhereClause::Compare { column, op, .. } => Ok(format!(
-                "SCAN `{}` (full scan + WHERE {} {:?} ... post-filter)",
-                table, column, op
+                "SCAN `{}` (full scan + WHERE {} {:?} ... post-filter){}",
+                table, column, op, stats
             )),
             _ => Ok(format!(
-                "SCAN `{}` (full scan + WHERE post-filter, predicate complejo)",
-                table
+                "SCAN `{}` (full scan + WHERE post-filter, predicate complejo){}",
+                table, stats
             )),
         }
     }
@@ -20096,6 +20189,15 @@ impl Parser {
                 analyze,
                 inner: Box::new(inner),
             });
+        }
+        // Bloque P3 (2026-05-29): `ANALYZE [TABLE] <name>` standalone.
+        // Distinto de `EXPLAIN ANALYZE <stmt>`: ese ya quedó consumido
+        // arriba. Acá ANALYZE viene sin EXPLAIN previo y refiere a la
+        // colecta de stats para el optimizador.
+        if self.match_keyword("ANALYZE") {
+            let _ = self.match_keyword("TABLE"); // opcional
+            let table = self.expect_ident()?;
+            return Ok(Statement::AnalyzeTable { table });
         }
         if self.match_keyword("CREATE") {
             return self.parse_create();
