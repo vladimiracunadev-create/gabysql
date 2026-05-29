@@ -19,6 +19,12 @@ pub enum ColumnType {
     /// Bloque Y: UUID en forma canónica `8-4-4-4-12` hex. Texto, no
     /// binario. Validación lexical en encode.
     Uuid,
+    /// Bloque Y4 (2026-05-29): bytes crudos length-prefixed. `BLOB`,
+    /// `BYTEA` y `BINARY` mapean acá. **No** `stores_as_text` — usa
+    /// `Value::Bytes(Vec<u8>)` con encoding propio (u32 LE length +
+    /// raw bytes). No indexable (sin semántica de igualdad estable
+    /// para bytes crudos en este release).
+    Blob,
 }
 
 impl ColumnType {
@@ -83,6 +89,8 @@ impl ColumnType {
             // Other text-shaped
             "JSON" => Ok(Self::Json),
             "UUID" => Ok(Self::Uuid),
+            // Bloque Y4: binario crudo
+            "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => Ok(Self::Blob),
             other => Err(DbError::new(format!("tipo no soportado: {}", other))),
         }
     }
@@ -98,6 +106,7 @@ impl ColumnType {
             Self::Json => "JSON",
             Self::Time => "TIME",
             Self::Uuid => "UUID",
+            Self::Blob => "BLOB",
         }
     }
 
@@ -112,6 +121,7 @@ impl ColumnType {
             Self::Json => 7,
             Self::Time => 8,
             Self::Uuid => 9,
+            Self::Blob => 10,
         }
     }
 
@@ -126,8 +136,9 @@ impl ColumnType {
             7 => Ok(Self::Json),
             8 => Ok(Self::Time),
             9 => Ok(Self::Uuid),
+            10 => Ok(Self::Blob),
             other => Err(DbError::new(format!(
-                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON, 8=TIME, 9=UUID)",
+                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON, 8=TIME, 9=UUID, 10=BLOB)",
                 other
             ))),
         }
@@ -138,6 +149,14 @@ impl ColumnType {
             self,
             Self::Text | Self::Date | Self::DateTime | Self::Json | Self::Time | Self::Uuid
         )
+    }
+
+    /// Bloque Y4 (2026-05-29): `true` para `BLOB`/`BYTEA`/`BINARY`.
+    /// Esos tipos viajan como `Value::Bytes(Vec<u8>)` con encoding
+    /// propio (u32 LE length + raw bytes) — no son ni INT, ni Float,
+    /// ni Bool, ni stores_as_text.
+    pub fn is_blob(&self) -> bool {
+        matches!(self, Self::Blob)
     }
 }
 

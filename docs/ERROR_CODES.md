@@ -215,6 +215,7 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4119` | `VALUE_LENGTH_EXCEEDED` | Bloque Y2 (2026-05-29): INSERT/UPDATE de string que excede `VARCHAR(n)`/`CHAR(n)`. La longitud se mide en bytes UTF-8. | Truncar el string o ampliar el `n` con `ALTER TABLE` (no soportado todavía — usar `DROP COLUMN` + `ADD COLUMN`). |
 | `4120` | `RAISE_FORMAT_OR_FOR_STEP_INVALID` | Bloque X5 (2026-05-29): `RAISE 'fmt %', args` con arity mismatch entre `%` y argumentos, **o** `FOR i IN ... STEP 0` (incremento cero → loop infinito). | Igualar el número de `%` y args en el RAISE; o usar `STEP n` con `n != 0`. |
 | `4121` | `INT_RANGE_EXCEEDED` | Bloque Y3 (2026-05-29): INSERT/UPDATE de entero fuera del rango declarado por `TINYINT` ([-128, 127]), `SMALLINT`/`INT2` ([-32768, 32767]), `MEDIUMINT` ([-8388608, 8388607]) o `INT4` (i32). `INT`/`BIGINT` no enforcen. | Truncar el valor, redeclarar la columna a un ancho mayor (no soportado en ALTER — usar DROP+ADD), o filtrar el dato en el cliente. |
+| `4122` | `BLOB_LITERAL_INVALID` | Bloque Y4 (2026-05-29): `X'hex'` con largo impar, char no-hex, o `CAST('s' AS BLOB)` con `s` no hex válido. | Asegurarse que el contenido entre `X'` y `'` tenga largo par y sólo caracteres `[0-9A-Fa-f]`. Para input desde TEXT usar `CAST('0xdeadbeef' AS BLOB)`. |
 
 ---
 

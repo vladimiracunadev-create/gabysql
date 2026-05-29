@@ -6,6 +6,70 @@
 
 ---
 
+## 2026-05-29 — Bloque Y4: `BLOB` / `BYTEA` / `BINARY` — bytes crudos
+
+> **Un push a `main`** con **bump on-disk 19 → 20**. Abre una **nueva familia** de tipos: binario crudo. Detalle en [`docs/adr/0044-blob-bytea-y4.md`](docs/adr/0044-blob-bytea-y4.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+CREATE TABLE archivos (
+    id   INT PRIMARY KEY,
+    data BLOB
+);
+
+INSERT INTO archivos (id, data) VALUES (1, X'deadbeef');
+INSERT INTO archivos (id, data) VALUES (2, X'00ff7f80');
+INSERT INTO archivos (id, data) VALUES (3, x'cafe');           -- lowercase también
+INSERT INTO archivos (id, data) VALUES (4, X'');               -- bytes vacíos OK
+INSERT INTO archivos (id, data) VALUES (5, X'abc');            -- [GBY-4122] largo impar
+
+SELECT CAST('0xdeadbeef' AS BLOB);                              -- desde TEXT hex
+```
+
+### 🛠 Implementación
+
+- **`Value::Bytes(Vec<u8>)`** — nueva variante. Todos los `match Value` exhaustivos del crate (~16 ubicaciones) ampliados con el arm faltante.
+- **`ColumnType::Blob` code=10** — `BLOB`, `BYTEA`, `BINARY`, `VARBINARY` aliases. **No** `stores_as_text()` — usa path de encoding propio.
+- **Disk format**: `[present:u8=1][len:u32 LE][bytes...]`. `len` es u32 (vs u16 para text-family) — los BLOB pueden ser más grandes.
+- **Tokenizer**: nuevo `TokenKind::Blob`. Detecta `X'hex'` / `x'hex'` ANTES de la rama ident (para no confundir con `X` + string). Largo impar / char no-hex → `[GBY-4122]`.
+- **Parser**: `parse_expr_primary` y `expect_value` reconocen `TokenKind::Blob` y emiten `Expr::Literal(Value::Bytes)`.
+- **`CAST(text AS BLOB)`**: acepta string hex con o sin prefijo `0x` vía `parse_hex_to_bytes`.
+- **Display**: `bytes_to_hex_display(b)` → `0xdeadbeef` (lowercase) en `value_to_text`, JSON server output, etc. `format_value_literal` (CHECK canonicalization) emite `X'deadbeef'`.
+- **Bump 19 → 20**: V19 rechazado con `[GBY-1003]` porque un schema V20 puede tener columnas BLOB code=10 que V19 no sabe decodificar.
+
+### 🆕 Código de error
+
+| Código | Nombre | Cuándo |
+|---|---|---|
+| `GBY-4122` | `BLOB_LITERAL_INVALID` | `X'hex'` con largo impar, char no-hex, o `CAST('s' AS BLOB)` con `s` no hex. |
+
+### 🚫 Limitaciones explícitas
+
+- **BLOB no indexable** — no `CREATE INDEX ... ON t (blob_col)`.
+- **BLOB no comparable con `<`/`>`/`BETWEEN`** — solo equality.
+- **DEFAULT BLOB no soportado** — el catálogo `DefaultLiteral` no tiene variante binaria.
+- **BLOB en PK/FK/CHECK no soportado**.
+- Tamaño práctico limitado por la página del B+Tree (~4 KB hoy).
+
+### 🚫 Diferido (Y5 y más allá)
+
+- **`DECIMAL(p,s)` exacto** (`Value::Decimal` con i128+scale).
+- **`UNSIGNED *`** (MySQL-style).
+- **`CHAR(n)` con padding** (ANSI strict).
+- **Conteo por code points** en VARCHAR(n).
+- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**, **TZ types**.
+- **`gen_random_uuid()`**.
+- **BLOB indexable** (overflow chain + bytewise key).
+- **`CONVERT(blob USING utf8)`**.
+
+### 🧪 Validación
+
+- 13 tests `y4_*`: roundtrip deadbeef/00ff7f80, `X''` empty, `x'cafe'` lowercase, BYTEA/BINARY aliases, largo impar (4122), no-hex (4122), `CAST('0xdeadbeef' AS BLOB)`, CAST rechaza basura, NULL en BLOB, 256-byte payload, reopen persiste, GEOMETRY sigue erroreando.
+- Suite total: **557/557 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y3: enforcement de rango `TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT4`
 
 > **Un push a `main`** con **bump on-disk 18 → 19**. Sigue el patrón de Y2 (`max_length` para VARCHAR(n)/CHAR(n)) — ahora un `int_width: Option<u8>` por columna enforce el rango declarado. Detalle en [`docs/adr/0043-int-range-enforcement-y3.md`](docs/adr/0043-int-range-enforcement-y3.md).

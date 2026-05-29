@@ -102,6 +102,8 @@
 
 - ~~Enforcement de rango para `TINYINT` (i8), `SMALLINT`/`INT2` (i16), `MEDIUMINT` (24-bit signed), `INT4` (i32). Persiste `int_width: Option<u8>` por columna (flag `COLUMN_FLAG_HAS_INT_WIDTH = 0x10`, 1 byte tras max_length). Helper `extract_int_width` mapea el `type_name` a 1/2/3/4 bytes. Encoder valida en `(ColumnType::Int, Value::Integer)`. `INT`/`INTEGER`/`BIGINT`/`INT8` no enforcen (i64 nativo). Bump VERSION 18→19. `BLOB`/`BYTEA`, `DECIMAL` exacto, `UNSIGNED *`, `CHAR(n)` padding diferidos a Y4+~~ ✅ entregado (bloque **Y3**, 2026-05-29, [ADR-0043](docs/adr/0043-int-range-enforcement-y3.md)).
 
+- ~~Tipo binario `BLOB` / `BYTEA` / `BINARY` / `VARBINARY` con bytes crudos. Nueva variante `Value::Bytes(Vec<u8>)` (todos los matches exhaustivos del crate ampliados). Nuevo `ColumnType::Blob` (code=10 en disco, NO stores_as_text). Encoding propio (u32 LE length + raw bytes — distinto del u16 que usa la familia text). Literal SQL `X'hex'` (estándar) con nuevo `TokenKind::Blob` para que el tokenizer no confunda con `X` ident + `'hex'` string. `CAST(text AS BLOB)` acepta string hex con o sin prefijo `0x`. Display: hex lowercase `0xdeadbeef`. Sin index/PK/FK/CHECK/DEFAULT sobre BLOB. Bump VERSION 19→20. `DECIMAL` exacto, `UNSIGNED *`, `CHAR(n)` padding, ARRAY, ENUM, INTERVAL, TZ types siguen diferidos~~ ✅ entregado (bloque **Y4**, 2026-05-29, [ADR-0044](docs/adr/0044-blob-bytea-y4.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

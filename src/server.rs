@@ -968,6 +968,18 @@ fn value_json(value: &Value) -> String {
             }
         }
         Value::String(text) => json_string(text),
+        // Bloque Y4: BLOB se serializa como string hex con prefijo `0x`
+        // (compatible con la sintaxis `X'...'` que aceptamos en INSERT).
+        Value::Bytes(bytes) => {
+            let mut s = String::with_capacity(2 + bytes.len() * 2 + 2);
+            s.push('"');
+            s.push_str("0x");
+            for b in bytes {
+                s.push_str(&format!("{:02x}", b));
+            }
+            s.push('"');
+            s
+        }
     }
 }
 

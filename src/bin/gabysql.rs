@@ -291,6 +291,15 @@ fn value_to_string(value: &Value) -> String {
         Value::Float(number) => number.to_string(),
         Value::Bool(flag) => flag.to_string(),
         Value::String(text) => text.clone(),
+        // Bloque Y4: BLOB se renderiza como hex con prefijo 0x.
+        Value::Bytes(b) => {
+            let mut s = String::with_capacity(2 + b.len() * 2);
+            s.push_str("0x");
+            for byte in b {
+                s.push_str(&format!("{:02x}", byte));
+            }
+            s
+        }
     }
 }
 

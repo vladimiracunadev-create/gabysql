@@ -1519,6 +1519,7 @@ fn expr_default_label(expr: &Expr) -> String {
             Value::Float(f) => format!("{}", f),
             Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             Value::String(s) => format!("'{}'", s),
+            Value::Bytes(b) => format!("X'{}'", &bytes_to_hex_display(b)[2..]),
         },
         Expr::Column(name) => name.clone(),
         Expr::Func(f, args) => {
@@ -1742,6 +1743,63 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     String(String),
+    /// Bloque Y4 (2026-05-29): bytes crudos para columnas BLOB.
+    /// Encoding en disco: u32 LE length + raw bytes. Sin
+    /// interpretación de encoding ni text — viajan opacos.
+    Bytes(Vec<u8>),
+}
+
+/// Bloque Y4 (2026-05-29): renderiza un slice de bytes como string hex
+/// con prefijo `0x` (lowercase). Usado por value_to_text, expr_default_label,
+/// server JSON serialization, etc.
+pub(crate) fn bytes_to_hex_display(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("0x");
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Bloque Y4: parsea un string hex (con o sin prefijo `0x`/`0X`) a
+/// `Vec<u8>`. Devuelve error si tiene largo impar o caracteres
+/// no-hex. Acepta también el formato vacío (`""` o `"0x"`) → bytes vacíos.
+pub(crate) fn parse_hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let trimmed = s.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if hex.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!(
+            "BLOB hex literal con largo impar ({} chars)",
+            hex.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16).ok_or_else(|| {
+            format!(
+                "BLOB hex literal con caracter no-hex en posición {}: '{}'",
+                i, bytes[i] as char
+            )
+        })? as u8;
+        let lo = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| {
+            format!(
+                "BLOB hex literal con caracter no-hex en posición {}: '{}'",
+                i + 1,
+                bytes[i + 1] as char
+            )
+        })? as u8;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2778,6 +2836,7 @@ impl<'a> Engine<'a> {
                     Value::Float(_) => ColumnType::Float,
                     Value::Bool(_) => ColumnType::Bool,
                     Value::String(_) => ColumnType::Text,
+                    Value::Bytes(_) => ColumnType::Blob,
                 };
                 match inferred[i] {
                     None => inferred[i] = Some(t),
@@ -5947,6 +6006,7 @@ impl<'a> Engine<'a> {
                     Value::Float(_) => ColumnType::Float,
                     Value::Bool(_) => ColumnType::Bool,
                     Value::String(_) => ColumnType::Text,
+                    Value::Bytes(_) => ColumnType::Blob,
                 };
                 match inferred_types[i] {
                     None => inferred_types[i] = Some(t),
@@ -6456,6 +6516,7 @@ impl<'a> Engine<'a> {
                     Value::Float(_) => ColumnType::Float,
                     Value::Bool(_) => ColumnType::Bool,
                     Value::String(_) => ColumnType::Text,
+                    Value::Bytes(_) => ColumnType::Blob,
                 };
                 match inferred[i] {
                     None => inferred[i] = Some(t),
@@ -9605,6 +9666,12 @@ fn encode_group_key(values: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 out.extend_from_slice(s.as_bytes());
             }
+            // Bloque Y4: BLOB
+            Value::Bytes(b) => {
+                out.push(0x05);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
         }
         out.push(0xFF); // separador
     }
@@ -9945,6 +10012,7 @@ fn infer_column_type(rows: &[Vec<Value>], col: usize) -> Option<ColumnType> {
             Value::Float(_) => ColumnType::Float,
             Value::Bool(_) => ColumnType::Bool,
             Value::String(_) => ColumnType::Text,
+            Value::Bytes(_) => ColumnType::Blob,
         };
         match current {
             None => current = Some(t),
@@ -10337,7 +10405,8 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
             | (ColumnType::DateTime, Value::Null)
             | (ColumnType::Json, Value::Null)
             | (ColumnType::Time, Value::Null)
-            | (ColumnType::Uuid, Value::Null) => out.push(0),
+            | (ColumnType::Uuid, Value::Null)
+            | (ColumnType::Blob, Value::Null) => out.push(0),
             (ColumnType::Float, Value::Float(number)) => {
                 out.push(1);
                 out.extend_from_slice(&number.to_le_bytes());
@@ -10372,6 +10441,37 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
                 out.push(1);
                 out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                 out.extend_from_slice(bytes);
+            }
+            // Bloque Y4: BLOB column con Value::Bytes — encoding propio
+            // (u32 LE length + raw bytes). Si llega un String hex, lo
+            // parseamos a bytes acá (azúcar para INSERT...SELECT desde TEXT).
+            (ColumnType::Blob, Value::Bytes(bytes_in)) => {
+                if bytes_in.len() > u32::MAX as usize {
+                    return Err(DbError::new(format!(
+                        "BLOB '{}' demasiado largo",
+                        column.name
+                    )));
+                }
+                out.push(1);
+                out.extend_from_slice(&(bytes_in.len() as u32).to_le_bytes());
+                out.extend_from_slice(&bytes_in);
+            }
+            (ColumnType::Blob, Value::String(s)) => {
+                let parsed = parse_hex_to_bytes(&s).map_err(|m| {
+                    coded(
+                        codes::BLOB_LITERAL_INVALID,
+                        format!("BLOB column '{}': {}", column.name, m),
+                    )
+                })?;
+                out.push(1);
+                out.extend_from_slice(&(parsed.len() as u32).to_le_bytes());
+                out.extend_from_slice(&parsed);
+            }
+            (ColumnType::Blob, _) => {
+                return Err(DbError::new(format!(
+                    "{} debe ser BLOB (esperado X'...' o CAST AS BLOB)",
+                    column.name
+                )))
             }
             (ColumnType::Int, _) => {
                 return Err(DbError::new(format!("{} debe ser INT", column.name)))
@@ -10541,6 +10641,37 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
                 let text = String::from_utf8(data[offset..offset + len].to_vec())?;
                 offset += len;
                 Value::String(text)
+            }
+            // Bloque Y4: BLOB usa u32 LE para length (no u16) y guarda
+            // los bytes crudos sin interpretación. Justifica el código
+            // 10 en disco separado de text-family.
+            ColumnType::Blob => {
+                if offset + 4 > data.len() {
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' (BLOB) necesita 4 bytes \
+                         para len en offset {}, solo quedan {}",
+                        meta.name,
+                        column.name,
+                        offset,
+                        data.len() - offset
+                    )));
+                }
+                let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + len > data.len() {
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' (BLOB) declara len={} \
+                         en offset {}, solo quedan {} bytes",
+                        meta.name,
+                        column.name,
+                        len,
+                        offset,
+                        data.len() - offset
+                    )));
+                }
+                let bytes = data[offset..offset + len].to_vec();
+                offset += len;
+                Value::Bytes(bytes)
             }
         };
         out.insert(key, value);
@@ -10899,6 +11030,15 @@ fn value_to_default(value: &Value) -> DbResult<DefaultLiteral> {
         Value::Float(n) => DefaultLiteral::Float(*n),
         Value::Bool(b) => DefaultLiteral::Bool(*b),
         Value::String(s) => DefaultLiteral::String(s.clone()),
+        // Bloque Y4: DEFAULT BLOB literal no soportado — el catálogo
+        // sólo persiste DefaultLiteral con variantes scalar/text. Es
+        // raro querer un BLOB hex como DEFAULT; queda como limitación
+        // documentada.
+        Value::Bytes(_) => {
+            return Err(DbError::new(
+                "DEFAULT con valor BLOB (X'...') no soportado en esta versión",
+            ));
+        }
     })
 }
 
@@ -11359,6 +11499,7 @@ fn value_repr_compact(v: &Value) -> String {
         Value::Float(n) => n.to_string(),
         Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         Value::String(s) => format!("'{}'", s),
+        Value::Bytes(b) => format!("X'{}'", &bytes_to_hex_display(b)[2..]),
     }
 }
 
@@ -13247,6 +13388,7 @@ fn format_value_literal(v: &Value) -> String {
             }
         }
         Value::String(s) => quote_string(s),
+        Value::Bytes(b) => format!("X'{}'", &bytes_to_hex_display(b)[2..]),
     }
 }
 
@@ -14494,6 +14636,8 @@ fn value_fits_column_type(v: &Value, ct: ColumnType) -> bool {
         (Value::Float(_), ColumnType::Float) => true,
         (Value::Bool(_), ColumnType::Bool) => true,
         (Value::String(_), t) if t.stores_as_text() => true,
+        // Bloque Y4: Bytes encaja sólo en BLOB
+        (Value::Bytes(_), ColumnType::Blob) => true,
         _ => false,
     }
 }
@@ -14507,6 +14651,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Float(_) => "FLOAT",
         Value::Bool(_) => "BOOL",
         Value::String(_) => "TEXT",
+        Value::Bytes(_) => "BLOB",
     }
 }
 
@@ -14519,6 +14664,8 @@ fn value_to_text(v: &Value) -> String {
         Value::Float(f) => format!("{}", f),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::String(s) => s.clone(),
+        // Bloque Y4: BLOB se serializa como hex `0xdeadbeef` (lowercase).
+        Value::Bytes(b) => bytes_to_hex_display(b),
     }
 }
 
@@ -14540,6 +14687,10 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                     format!("CAST('{}' AS INT): no es un entero válido", s),
                 )
             }),
+            Value::Bytes(_) => Err(coded(
+                codes::CAST_INVALID,
+                "CAST AS INT desde BLOB no soportado".to_string(),
+            )),
             Value::Null => unreachable!(),
         },
         ColumnType::Float => match v {
@@ -14552,6 +14703,10 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                     format!("CAST('{}' AS FLOAT): no es un número válido", s),
                 )
             }),
+            Value::Bytes(_) => Err(coded(
+                codes::CAST_INVALID,
+                "CAST AS FLOAT desde BLOB no soportado".to_string(),
+            )),
             Value::Null => unreachable!(),
         },
         ColumnType::Text => Ok(Value::String(value_to_text(&v))),
@@ -14662,6 +14817,25 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                 codes::CAST_INVALID,
                 format!(
                     "CAST AS UUID desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
+        // Bloque Y4: CAST AS BLOB acepta string hex (`'deadbeef'` o
+        // `'0xdeadbeef'`) o pasa Bytes directamente.
+        ColumnType::Blob => match v {
+            Value::Bytes(b) => Ok(Value::Bytes(b)),
+            Value::String(s) => match parse_hex_to_bytes(&s) {
+                Ok(b) => Ok(Value::Bytes(b)),
+                Err(msg) => Err(coded(
+                    codes::BLOB_LITERAL_INVALID,
+                    format!("CAST('{}' AS BLOB): {}", s, msg),
+                )),
+            },
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS BLOB desde {} no soportado",
                     value_type_name(&other)
                 ),
             )),
@@ -15013,6 +15187,10 @@ enum TokenKind {
     String,
     Symbol,
     Eof,
+    /// Bloque Y4 (2026-05-29): literal binario `X'hex'`. El `text` lleva
+    /// los chars hex ya extraídos (sin las `X'` ni `'`). El parser lo
+    /// convierte a `Value::Bytes` con `parse_hex_to_bytes`.
+    Blob,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15030,6 +15208,29 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
         let ch = chars[index];
         if ch.is_whitespace() {
             index += 1;
+            continue;
+        }
+        // Bloque Y4 (2026-05-29): literal binario `X'hex'` (o `x'hex'`).
+        // Se detecta ANTES de la rama de ident para que la 'X' no se
+        // consuma como inicio de identificador. Acepta hex vacío (`X''`).
+        if (ch == 'X' || ch == 'x') && index + 1 < chars.len() && chars[index + 1] == '\'' {
+            let hex_start = index + 2;
+            let mut j = hex_start;
+            while j < chars.len() && chars[j] != '\'' {
+                j += 1;
+            }
+            if j >= chars.len() {
+                return Err(coded(
+                    codes::BLOB_LITERAL_INVALID,
+                    "literal binario X'...' sin comilla de cierre".to_string(),
+                ));
+            }
+            let hex: String = chars[hex_start..j].iter().collect();
+            tokens.push(Token {
+                kind: TokenKind::Blob,
+                text: hex,
+            });
+            index = j + 1;
             continue;
         }
         if is_ident_start(ch) {
@@ -15054,7 +15255,7 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
         // Sin esta guarda `5-3` se tokenizaba como `5`, `-3` rompiendo la resta.
         let prev_is_operand = match tokens.last() {
             Some(t) => match (&t.kind, t.text.as_str()) {
-                (TokenKind::Number, _) | (TokenKind::String, _) => true,
+                (TokenKind::Number, _) | (TokenKind::String, _) | (TokenKind::Blob, _) => true,
                 (TokenKind::Symbol, ")") => true,
                 (TokenKind::Ident, txt) => {
                     let upper = txt.to_ascii_uppercase();
@@ -19521,6 +19722,19 @@ impl Parser {
             self.pos += 1;
             return Ok(Expr::Literal(Value::String(head.text)));
         }
+        // Bloque Y4 (2026-05-29): literal binario X'hex'.
+        if head.kind == TokenKind::Blob {
+            self.pos += 1;
+            match parse_hex_to_bytes(&head.text) {
+                Ok(b) => return Ok(Expr::Literal(Value::Bytes(b))),
+                Err(msg) => {
+                    return Err(coded(
+                        codes::BLOB_LITERAL_INVALID,
+                        format!("literal binario X'{}': {}", head.text, msg),
+                    ));
+                }
+            }
+        }
         // Paréntesis: o bien expresión anidada, o bien una subquery
         // escalar (Bloque H). Detectamos el caso `(SELECT ...)` por
         // lookahead — el resto sigue siendo una sub-expresión común.
@@ -20278,6 +20492,17 @@ impl Parser {
             TokenKind::String => {
                 self.pos += 1;
                 Ok(Value::String(token.text))
+            }
+            // Bloque Y4: literal binario `X'hex'` → Value::Bytes
+            TokenKind::Blob => {
+                self.pos += 1;
+                match parse_hex_to_bytes(&token.text) {
+                    Ok(b) => Ok(Value::Bytes(b)),
+                    Err(msg) => Err(coded(
+                        codes::BLOB_LITERAL_INVALID,
+                        format!("literal binario X'{}': {}", token.text, msg),
+                    )),
+                }
             }
             TokenKind::Ident => {
                 if token.text.eq_ignore_ascii_case("TRUE") {

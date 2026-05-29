@@ -149,7 +149,13 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        tras `max_length`, indicado por el flag
 //        `COLUMN_FLAG_HAS_INT_WIDTH = 0x10`. V18 rechazados con
 //        `[GBY-1003]` por la misma razón que V17→V18.
-pub const VERSION: u32 = 19;
+//  20 -> Bloque Y4 (2026-05-29): tipo binario `BLOB` / `BYTEA` /
+//        `BINARY` con código en disco `10` y encoding propio (u32
+//        LE length + raw bytes) — no es ni text ni int. `Value`
+//        gana variante `Bytes(Vec<u8>)`. Literales SQL via `X'hex'`.
+//        V19 rechazados con `[GBY-1003]` porque un schema V20 puede
+//        tener columnas BLOB que V19 no sabe leer.
+pub const VERSION: u32 = 20;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

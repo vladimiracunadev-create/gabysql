@@ -623,6 +623,12 @@ pub mod codes {
     /// nativo). El motor internamente sigue usando i64; el chequeo es
     /// en el encoder según el `int_width` persistido por columna.
     pub const INT_RANGE_EXCEEDED: u32 = 4121;
+    /// Bloque Y4 (2026-05-29): literal binario `X'...'` malformado —
+    /// largo impar de hex chars, char no-hex, o `CAST(s AS BLOB)` con
+    /// `s` que no es hex string. Los BLOB se almacenan como bytes
+    /// crudos length-prefixed; el input vía SQL se acepta como `X'hex'`
+    /// (estándar) o convertido vía `CAST(text AS BLOB)`.
+    pub const BLOB_LITERAL_INVALID: u32 = 4122;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -12624,6 +12624,208 @@ fn y3_int_width_survives_reopen() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y4 (2026-05-29): BLOB / BYTEA / BINARY como bytes crudos.
+// Bump VERSION 19→20 — nuevo ColumnType::Blob (code=10), Value::Bytes,
+// literal X'hex', encoding propio (u32 LE length + bytes).
+// ============================================================
+
+fn y4_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y4-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y4_blob_insert_and_select_roundtrip() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("roundtrip")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);
+         INSERT INTO t (id, data) VALUES (1, X'deadbeef');
+         INSERT INTO t (id, data) VALUES (2, X'00ff7f80');",
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    assert_eq!(res[0].rows[1][0], Value::Bytes(vec![0x00, 0xff, 0x7f, 0x80]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_empty_literal_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("empty")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);
+         INSERT INTO t (id, data) VALUES (1, X'');",
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bytes(Vec::new()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_lowercase_x_literal() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("lower")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);
+         INSERT INTO t (id, data) VALUES (1, x'cafe');",
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0xca, 0xfe]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_bytea_alias_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("bytea")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BYTEA);
+         INSERT INTO t (id, data) VALUES (1, X'abcd');",
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0xab, 0xcd]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_binary_alias_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("binary")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BINARY);
+         INSERT INTO t (id, data) VALUES (1, X'01020304');",
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![1, 2, 3, 4]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_odd_hex_length_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("odd")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, data) VALUES (1, X'abc');");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4122"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_non_hex_char_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("nonhex")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, data) VALUES (1, X'zzzz');");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4122"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_cast_text_to_blob() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("cast")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT CAST('0xdeadbeef' AS BLOB) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_cast_to_blob_rejects_bad_hex() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("cast-bad")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )?;
+    let err = run_sql(&db, "SELECT CAST('not-hex' AS BLOB) FROM t;");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_null_value_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("null")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);
+         INSERT INTO t (id, data) VALUES (1, NULL);
+         INSERT INTO t (id, data) VALUES (2, X'aa');",
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    assert_eq!(res[0].rows[1][0], Value::Bytes(vec![0xaa]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_large_payload() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("large")?;
+    // 256 bytes (más que u8 max para forzar el length-prefix de 2+ bytes
+    // — internamente usa u32 LE).
+    let hex: String = (0..256).map(|i| format!("{:02x}", i as u8)).collect();
+    run_sql(
+        &db,
+        &format!(
+            "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);
+             INSERT INTO t (id, data) VALUES (1, X'{}');",
+            hex
+        ),
+    )?;
+    let res = run_sql(&db, "SELECT data FROM t;")?;
+    if let Value::Bytes(b) = &res[0].rows[0][0] {
+        assert_eq!(b.len(), 256);
+        assert_eq!(b[0], 0);
+        assert_eq!(b[255], 255);
+    } else {
+        panic!("esperaba Value::Bytes");
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_blob_survives_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, data BLOB);
+         INSERT INTO t (id, data) VALUES (1, X'1234abcd');",
+    )?;
+    // run_sql cierra entre invocaciones — comprobamos que sigue ahí.
+    let res = run_sql(&db, "SELECT data FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0x12, 0x34, 0xab, 0xcd]));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y4_unsupported_type_geometry_still_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y4_setup("unsupp")?;
+    let res = run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, g GEOMETRY);");
+    assert!(res.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

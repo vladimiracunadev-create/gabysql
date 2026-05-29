@@ -378,7 +378,7 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `NUMERIC[(p,s)]` / `DECIMAL[(p,s)]` / `DEC[(p,s)]` | 🟡 (Y, 2026-05-29; aliases de FLOAT — **no es decimal exacto**, queda diferido a Y2) | P1 (exactitud) |
 | `BOOLEAN` | ✅ (Y, 2026-05-29; alias de BOOL) | — |
 | `TIMESTAMP` | ✅ (Y, 2026-05-29; alias de DATETIME) | — |
-| `BLOB` / `BYTEA` / `BINARY` (binario) | ❌ (requiere `Value::Bytes` + nueva serialización; diferido a Y2) | P1 |
+| `BLOB` / `BYTEA` / `BINARY` / `VARBINARY` (binario crudo) | ✅ (Y4, 2026-05-29; VERSION 19→20; code=10; literal `X'hex'`; CAST AS BLOB; no indexable; no PK/FK/CHECK/DEFAULT) | — |
 | `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ❌ (diferido a Y2 — requiere `Value::Decimal`) | P1 |
 | Enforcement de longitud VARCHAR(n) / CHAR(n) | ✅ (Y2, 2026-05-29; bytes UTF-8) | — |
 | Enforcement de rango SMALLINT / TINYINT / MEDIUMINT / INT4 | ✅ (Y3, 2026-05-29) | — |
