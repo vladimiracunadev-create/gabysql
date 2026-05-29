@@ -635,6 +635,22 @@ pub mod codes {
     /// i128 también dispara este código. La parte decimal se trunca
     /// silenciosamente al `scale` (no es error).
     pub const DECIMAL_OUT_OF_RANGE: u32 = 4123;
+    /// Bloque Z1 (2026-05-29): `CREATE USER` con un nombre que ya existe
+    /// en el catálogo. Los nombres de user/role son case-insensitive
+    /// (lowercase normalizado vía `hash_name`).
+    pub const USER_ALREADY_EXISTS: u32 = 4124;
+    /// Bloque Z1 (2026-05-29): `DROP USER` / `ALTER USER` sobre un nombre
+    /// que no existe.
+    pub const USER_NOT_FOUND: u32 = 4125;
+    /// Bloque Z1 (2026-05-29): `CREATE ROLE` con un nombre que ya existe
+    /// (incluyendo colisión con un user — el catálogo es flat por nombre).
+    pub const ROLE_ALREADY_EXISTS: u32 = 4126;
+    /// Bloque Z1 (2026-05-29): `DROP ROLE` sobre un nombre que no existe.
+    pub const ROLE_NOT_FOUND: u32 = 4127;
+    /// Bloque Z1 (2026-05-29): nombre de user/role inválido — vacío,
+    /// con caracteres no permitidos (sólo `[a-zA-Z_][a-zA-Z0-9_]*`), o
+    /// con longitud > 64 bytes.
+    pub const INVALID_USER_NAME: u32 = 4128;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

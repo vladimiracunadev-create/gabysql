@@ -1269,6 +1269,12 @@ pub enum ObjectKind {
     Trigger,
     Procedure,
     Function,
+    /// Bloque Z1 (VERSION 23): identidad SQL-level (`CREATE USER`).
+    /// Password hash + salt persisten en el record. No es crypto-grade.
+    User,
+    /// Bloque Z1 (VERSION 23): role SQL-level. Por ahora sólo nombre;
+    /// GRANT a role llega en Z2.
+    Role,
 }
 
 impl ObjectKind {
@@ -1279,6 +1285,8 @@ impl ObjectKind {
             Self::Trigger => 2,
             Self::Procedure => 3,
             Self::Function => 4,
+            Self::User => 5,
+            Self::Role => 6,
         }
     }
 
@@ -1289,8 +1297,10 @@ impl ObjectKind {
             2 => Ok(Self::Trigger),
             3 => Ok(Self::Procedure),
             4 => Ok(Self::Function),
+            5 => Ok(Self::User),
+            6 => Ok(Self::Role),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role)",
                 other
             ))),
         }
@@ -1493,7 +1503,70 @@ impl FunctionMeta {
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure o function.
+/// Bloque Z1 (VERSION 23): identidad SQL-level (`CREATE USER`).
+///
+/// `password_hash` se computa con FNV-1a-64 sobre `(salt || password)`
+/// y se serializa como 8 bytes LE. **No es crypto-grade** (no KDF, no
+/// PBKDF2/bcrypt/argon2). El propósito es mantener bookkeeping de
+/// identidad SQL alineado con el estándar; la autenticación real en
+/// el server HTTP sigue siendo via token compartido (`-token`). Para
+/// un KDF de verdad ver el defer en ADR-0050.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMeta {
+    pub name: String,
+    pub password_hash: u64,
+    pub salt: u64,
+}
+
+impl UserMeta {
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(32);
+        push_string(&mut out, &self.name)?;
+        out.extend_from_slice(&self.password_hash.to_le_bytes());
+        out.extend_from_slice(&self.salt.to_le_bytes());
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        if offset + 16 > data.len() {
+            return Err(DbError::new(format!(
+                "UserMeta '{}' corrupta: faltan 16 bytes de hash+salt",
+                name
+            )));
+        }
+        let password_hash = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let salt = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        Ok(Self {
+            name,
+            password_hash,
+            salt,
+        })
+    }
+}
+
+/// Bloque Z1 (VERSION 23): role SQL-level. Por ahora sólo nombre;
+/// GRANT a role llega en Z2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleMeta {
+    pub name: String,
+}
+
+impl RoleMeta {
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(16);
+        push_string(&mut out, &self.name)?;
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        Ok(Self { name })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user o role.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
@@ -1501,6 +1574,8 @@ pub enum CatalogObject {
     Trigger(TriggerMeta),
     Procedure(ProcedureMeta),
     Function(FunctionMeta),
+    User(UserMeta),
+    Role(RoleMeta),
 }
 
 impl CatalogObject {
@@ -1511,6 +1586,8 @@ impl CatalogObject {
             Self::Trigger(t) => &t.name,
             Self::Procedure(p) => &p.name,
             Self::Function(f) => &f.name,
+            Self::User(u) => &u.name,
+            Self::Role(r) => &r.name,
         }
     }
 }
@@ -1531,6 +1608,8 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
         ObjectKind::Trigger => CatalogObject::Trigger(TriggerMeta::deserialize(rest)?),
         ObjectKind::Procedure => CatalogObject::Procedure(ProcedureMeta::deserialize(rest)?),
         ObjectKind::Function => CatalogObject::Function(FunctionMeta::deserialize(rest)?),
+        ObjectKind::User => CatalogObject::User(UserMeta::deserialize(rest)?),
+        ObjectKind::Role => CatalogObject::Role(RoleMeta::deserialize(rest)?),
     })
 }
 
@@ -1678,6 +1757,46 @@ impl<'a> Catalog<'a> {
         }
     }
 
+    /// Bloque Z1: lookup de un user por nombre.
+    pub fn get_user(&mut self, name: &str) -> DbResult<Option<UserMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::User(u)) => Ok(Some(u)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Bloque Z1: lookup de un role por nombre.
+    pub fn get_role(&mut self, name: &str) -> DbResult<Option<RoleMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::Role(r)) => Ok(Some(r)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Bloque Z1: lista todos los users del catálogo.
+    pub fn list_users(&mut self) -> DbResult<Vec<UserMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::User(u) => Some(u),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Bloque Z1: lista todos los roles del catálogo.
+    pub fn list_roles(&mut self) -> DbResult<Vec<RoleMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Role(r) => Some(r),
+                _ => None,
+            })
+            .collect())
+    }
+
     pub fn put_table(&mut self, meta: &TableMeta) -> DbResult<()> {
         let root = self.ensure_root()?;
         let key = hash_name(&meta.name);
@@ -1727,6 +1846,30 @@ impl<'a> Catalog<'a> {
         let key = hash_name(&meta.name);
         let mut payload = Vec::with_capacity(1 + 32);
         payload.push(ObjectKind::Function.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    /// Bloque Z1 (VERSION 23): persiste un `User` en el catálogo.
+    pub fn put_user(&mut self, meta: &UserMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key = hash_name(&meta.name);
+        let mut payload = Vec::with_capacity(1 + 32);
+        payload.push(ObjectKind::User.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    /// Bloque Z1 (VERSION 23): persiste un `Role` en el catálogo.
+    pub fn put_role(&mut self, meta: &RoleMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key = hash_name(&meta.name);
+        let mut payload = Vec::with_capacity(1 + 16);
+        payload.push(ObjectKind::Role.code());
         payload.extend_from_slice(&meta.serialize()?);
         let mut tree = Tree::new(self.pager);
         tree.upsert(root, key, payload)?;

@@ -2,7 +2,7 @@ use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
     ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, IndexKind, IndexMeta, OnDelete,
-    OnUpdate, ProcedureMeta, TableMeta, TriggerMeta, ViewMeta,
+    OnUpdate, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta, ViewMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -89,6 +89,19 @@ pub enum Statement {
     /// body de una function devolviendo `expr` al caller. Sólo válido
     /// dentro de function body multi-stmt; fuera, `[GBY-4118]`.
     Return(ReturnStmt),
+    /// Bloque Z1 (2026-05-29): `CREATE USER name [WITH PASSWORD '...'
+    /// | IDENTIFIED BY '...']`. Persiste un `UserMeta` en el catálogo.
+    /// Password hash NO crypto-grade (ver ADR-0050).
+    CreateUser(CreateUserStmt),
+    /// Bloque Z1: `DROP USER [IF EXISTS] name`.
+    DropUser(DropUserStmt),
+    /// Bloque Z1: `CREATE ROLE name`. Persiste un `RoleMeta`.
+    CreateRole(CreateRoleStmt),
+    /// Bloque Z1: `DROP ROLE [IF EXISTS] name`.
+    DropRole(DropRoleStmt),
+    /// Bloque Z1: `ALTER USER name SET PASSWORD '...'` (también acepta
+    /// `IDENTIFIED BY '...'`). Cambia el hash+salt persistido.
+    AlterUserPassword(AlterUserPasswordStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -419,6 +432,43 @@ pub struct CreateFunctionStmt {
 pub struct DropFunctionStmt {
     pub name: String,
     pub if_exists: bool,
+}
+
+/// Bloque Z1 (2026-05-29): `CREATE USER name [WITH PASSWORD '...']`.
+/// `password` opcional — sin password el user existe pero no puede ser
+/// usado para auth (placeholder válido para escenarios donde el password
+/// se setea después con ALTER USER).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateUserStmt {
+    pub name: String,
+    pub password: Option<String>,
+}
+
+/// Bloque Z1: `DROP USER [IF EXISTS] name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropUserStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// Bloque Z1: `CREATE ROLE name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRoleStmt {
+    pub name: String,
+}
+
+/// Bloque Z1: `DROP ROLE [IF EXISTS] name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropRoleStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// Bloque Z1: `ALTER USER name SET PASSWORD '...'`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterUserPasswordStmt {
+    pub name: String,
+    pub password: String,
 }
 
 /// Bloque X4 (2026-05-28): `IF expr THEN <stmts> [ELSIF expr THEN
@@ -2193,6 +2243,11 @@ impl<'a> Engine<'a> {
             Statement::Loop(stmt) => self.exec_loop(*stmt),
             Statement::Case(stmt) => self.exec_case(*stmt),
             Statement::Return(stmt) => self.exec_return(stmt),
+            Statement::CreateUser(stmt) => self.exec_create_user(stmt),
+            Statement::DropUser(stmt) => self.exec_drop_user(stmt),
+            Statement::CreateRole(stmt) => self.exec_create_role(stmt),
+            Statement::DropRole(stmt) => self.exec_drop_role(stmt),
+            Statement::AlterUserPassword(stmt) => self.exec_alter_user_password(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3733,6 +3788,17 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
+            Some(CatalogObject::User(_)) | Some(CatalogObject::Role(_)) => {
+                // Bloque Z1: namespace flat — user/role tampoco se pueden
+                // re-usar como nombre de vista.
+                return Err(coded(
+                    codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
+                    format!(
+                        "CREATE VIEW '{}': ya existe un USER o ROLE con ese nombre.",
+                        stmt.name
+                    ),
+                ));
+            }
             Some(CatalogObject::View(_)) => {
                 if stmt.if_not_exists {
                     return Ok(ResultSet {
@@ -3802,6 +3868,14 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a una FUNCTION. Usá DROP FUNCTION.",
                 stmt.name
             ))),
+            Some(CatalogObject::User(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a un USER. Usá DROP USER.",
+                stmt.name
+            ))),
+            Some(CatalogObject::Role(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a un ROLE. Usá DROP ROLE.",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -3847,6 +3921,8 @@ impl<'a> Engine<'a> {
                 Some(CatalogObject::Trigger(_))
                 | Some(CatalogObject::Procedure(_))
                 | Some(CatalogObject::Function(_))
+                | Some(CatalogObject::User(_))
+                | Some(CatalogObject::Role(_))
                 | None => {
                     return Err(coded(
                         codes::TABLE_NOT_FOUND,
@@ -3868,6 +3944,8 @@ impl<'a> Engine<'a> {
                     CatalogObject::Trigger(_) => "TRIGGER",
                     CatalogObject::Procedure(_) => "PROCEDURE",
                     CatalogObject::Function(_) => "FUNCTION",
+                    CatalogObject::User(_) => "USER",
+                    CatalogObject::Role(_) => "ROLE",
                 };
                 return Err(coded(
                     codes::TRIGGER_NAME_COLLIDES,
@@ -3977,6 +4055,8 @@ impl<'a> Engine<'a> {
                     CatalogObject::Trigger(_) => "TRIGGER",
                     CatalogObject::Procedure(_) => "PROCEDURE",
                     CatalogObject::Function(_) => "FUNCTION",
+                    CatalogObject::User(_) => "USER",
+                    CatalogObject::Role(_) => "ROLE",
                 };
                 return Err(coded(
                     codes::PROCEDURE_NAME_COLLIDES,
@@ -4136,6 +4216,8 @@ impl<'a> Engine<'a> {
                     CatalogObject::Trigger(_) => "TRIGGER",
                     CatalogObject::Procedure(_) => "PROCEDURE",
                     CatalogObject::Function(_) => "FUNCTION",
+                    CatalogObject::User(_) => "USER",
+                    CatalogObject::Role(_) => "ROLE",
                 };
                 return Err(coded(
                     codes::FUNCTION_NAME_COLLIDES,
@@ -4209,6 +4291,191 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    // ============================================================
+    // Bloque Z1 (2026-05-29): identidad SQL-level — CREATE USER /
+    // CREATE ROLE / DROP / ALTER USER SET PASSWORD. Persistencia en
+    // catálogo via UserMeta + RoleMeta. Hash de password NO crypto-grade
+    // (FNV-1a-64 + salt aleatorio de 64 bits, ver ADR-0050).
+    // ============================================================
+
+    fn exec_create_user(&mut self, stmt: CreateUserStmt) -> DbResult<ResultSet> {
+        validate_user_name(&stmt.name)?;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if let Some(existing) = catalog.get_object(&stmt.name)? {
+                let kind = catalog_object_kind_name(&existing);
+                return Err(coded(
+                    codes::USER_ALREADY_EXISTS,
+                    format!(
+                        "CREATE USER '{}': ya existe un objeto ({}) con ese nombre",
+                        stmt.name, kind
+                    ),
+                ));
+            }
+        }
+        let salt = gen_password_salt();
+        let password_hash = hash_password(stmt.password.as_deref().unwrap_or(""), salt);
+        let meta = UserMeta {
+            name: stmt.name.clone(),
+            password_hash,
+            salt,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_user(&meta)?;
+        }
+        let has_pw = stmt.password.is_some();
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · user '{}' creado ({})",
+                stmt.name,
+                if has_pw {
+                    "con password"
+                } else {
+                    "sin password"
+                }
+            )),
+        })
+    }
+
+    fn exec_drop_user(&mut self, stmt: DropUserStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::User(_)) => {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.remove_object(&stmt.name)?;
+                Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!("OK · user '{}' eliminado", stmt.name)),
+                })
+            }
+            Some(_) => Err(coded(
+                codes::USER_NOT_FOUND,
+                format!(
+                    "DROP USER '{}': el nombre apunta a un objeto que no es un user",
+                    stmt.name
+                ),
+            )),
+            None => {
+                if stmt.if_exists {
+                    Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!("OK · user '{}' no existía (IF EXISTS)", stmt.name)),
+                    })
+                } else {
+                    Err(coded(
+                        codes::USER_NOT_FOUND,
+                        format!("DROP USER '{}': no existe", stmt.name),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn exec_create_role(&mut self, stmt: CreateRoleStmt) -> DbResult<ResultSet> {
+        validate_user_name(&stmt.name)?;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if let Some(existing) = catalog.get_object(&stmt.name)? {
+                let kind = catalog_object_kind_name(&existing);
+                return Err(coded(
+                    codes::ROLE_ALREADY_EXISTS,
+                    format!(
+                        "CREATE ROLE '{}': ya existe un objeto ({}) con ese nombre",
+                        stmt.name, kind
+                    ),
+                ));
+            }
+        }
+        let meta = RoleMeta {
+            name: stmt.name.clone(),
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_role(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("OK · role '{}' creado", stmt.name)),
+        })
+    }
+
+    fn exec_drop_role(&mut self, stmt: DropRoleStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::Role(_)) => {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.remove_object(&stmt.name)?;
+                Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!("OK · role '{}' eliminado", stmt.name)),
+                })
+            }
+            Some(_) => Err(coded(
+                codes::ROLE_NOT_FOUND,
+                format!(
+                    "DROP ROLE '{}': el nombre apunta a un objeto que no es un role",
+                    stmt.name
+                ),
+            )),
+            None => {
+                if stmt.if_exists {
+                    Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!("OK · role '{}' no existía (IF EXISTS)", stmt.name)),
+                    })
+                } else {
+                    Err(coded(
+                        codes::ROLE_NOT_FOUND,
+                        format!("DROP ROLE '{}': no existe", stmt.name),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn exec_alter_user_password(&mut self, stmt: AlterUserPasswordStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_user(&stmt.name)?
+        };
+        let Some(_) = existing else {
+            return Err(coded(
+                codes::USER_NOT_FOUND,
+                format!("ALTER USER '{}': no existe", stmt.name),
+            ));
+        };
+        let salt = gen_password_salt();
+        let password_hash = hash_password(&stmt.password, salt);
+        let meta = UserMeta {
+            name: stmt.name.clone(),
+            password_hash,
+            salt,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_user(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("OK · password de user '{}' actualizado", stmt.name)),
+        })
     }
 
     /// Bloque X4 (2026-05-28): ejecuta un `IF ... THEN ... [ELSIF ...]*
@@ -16018,6 +16285,107 @@ fn gen_uuid_v4() -> String {
 /// bits son version=7, los siguientes 12 bits son random A, los
 /// siguientes 2 bits son variant=10, los últimos 62 bits son random B.
 /// PRNG: mismo xorshift no-cripto de Y5.
+/// Bloque Z1 (2026-05-29): valida un nombre de user/role.
+/// Reglas: `[a-zA-Z_][a-zA-Z0-9_]*`, no vacío, ≤ 64 bytes. El motor
+/// trata los nombres como case-insensitive (lowercase via `hash_name`),
+/// pero acepta cualquier mezcla en input. Limitación: no soporta nombres
+/// quoted (`"foo bar"`) — diferido a un bloque futuro.
+fn validate_user_name(name: &str) -> DbResult<()> {
+    if name.is_empty() {
+        return Err(coded(
+            codes::INVALID_USER_NAME,
+            "nombre de user/role no puede ser vacío",
+        ));
+    }
+    if name.len() > 64 {
+        return Err(coded(
+            codes::INVALID_USER_NAME,
+            format!(
+                "nombre de user/role '{}' demasiado largo ({} bytes, máximo 64)",
+                name,
+                name.len()
+            ),
+        ));
+    }
+    let bytes = name.as_bytes();
+    let head_ok = bytes[0].is_ascii_alphabetic() || bytes[0] == b'_';
+    if !head_ok {
+        return Err(coded(
+            codes::INVALID_USER_NAME,
+            format!(
+                "nombre de user/role '{}' debe empezar con letra ASCII o '_'",
+                name
+            ),
+        ));
+    }
+    for &b in &bytes[1..] {
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(coded(
+                codes::INVALID_USER_NAME,
+                format!(
+                    "nombre de user/role '{}' contiene char inválido ({}); permitido [a-zA-Z0-9_]",
+                    name, b as char
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Bloque Z1: nombre descriptivo del kind para mensajes de error.
+fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
+    match obj {
+        CatalogObject::Table(_) => "TABLA",
+        CatalogObject::View(_) => "VISTA",
+        CatalogObject::Trigger(_) => "TRIGGER",
+        CatalogObject::Procedure(_) => "PROCEDURE",
+        CatalogObject::Function(_) => "FUNCTION",
+        CatalogObject::User(_) => "USER",
+        CatalogObject::Role(_) => "ROLE",
+    }
+}
+
+/// Bloque Z1: genera un salt aleatorio de 64 bits via xorshift64
+/// sembrado por `SystemTime` nanos. **NO crypto-grade** — el propósito
+/// es que dos `CREATE USER name WITH PASSWORD 'same'` produzcan hashes
+/// distintos, no resistir un atacante con acceso al archivo.
+fn gen_password_salt() -> u64 {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ 0xa7a7_a7a7_a7a7_a7a7;
+    let mut state = if seed == 0 {
+        0xdead_beef_cafe_babe
+    } else {
+        seed
+    };
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+}
+
+/// Bloque Z1: hash de password con FNV-1a-64 sobre `(salt || password)`.
+/// **NO es crypto-grade**: no es un KDF, no resiste ataques de
+/// diccionario / GPU. El propósito es bookkeeping SQL-level alineado
+/// con el estándar. Para producción real necesitamos un KDF dedicado
+/// (PBKDF2/bcrypt/argon2) — defer en ADR-0050.
+fn hash_password(password: &str, salt: u64) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in salt.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    for byte in password.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn gen_uuid_v7() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -17861,6 +18229,18 @@ impl Parser {
                 if_exists,
             }));
         }
+        if self.match_keyword("USER") {
+            // Bloque Z1 (2026-05-29).
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropUser(DropUserStmt { name, if_exists }));
+        }
+        if self.match_keyword("ROLE") {
+            // Bloque Z1 (2026-05-29).
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropRole(DropRoleStmt { name, if_exists }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
@@ -18815,6 +19195,11 @@ impl Parser {
     }
 
     fn parse_alter(&mut self) -> DbResult<Statement> {
+        // Bloque Z1 (2026-05-29): `ALTER USER name SET PASSWORD '...'`
+        // (también `IDENTIFIED BY '...'`).
+        if self.match_keyword("USER") {
+            return self.parse_alter_user();
+        }
         self.expect_keyword("TABLE")?;
         let table = self.expect_ident()?;
         if self.match_keyword("ADD") {
@@ -19225,6 +19610,54 @@ impl Parser {
         }
     }
 
+    /// Bloque Z1 (2026-05-29): `CREATE USER name [WITH PASSWORD '...'
+    /// | IDENTIFIED BY '...']`. Password opcional; sin password el user
+    /// existe pero no autentica.
+    fn parse_create_user(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        let mut password: Option<String> = None;
+        // Forma MySQL/PG: `IDENTIFIED BY 'pass'`.
+        if self.match_keyword("IDENTIFIED") {
+            self.expect_keyword("BY")?;
+            password = Some(self.expect_string_literal("CREATE USER PASSWORD")?);
+        } else if self.match_keyword("WITH") {
+            // Forma SQL standard / SQL Server: `WITH PASSWORD 'pass'`.
+            self.expect_keyword("PASSWORD")?;
+            password = Some(self.expect_string_literal("CREATE USER PASSWORD")?);
+        }
+        Ok(Statement::CreateUser(CreateUserStmt { name, password }))
+    }
+
+    /// Bloque Z1: `CREATE ROLE name`.
+    fn parse_create_role(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        Ok(Statement::CreateRole(CreateRoleStmt { name }))
+    }
+
+    /// Bloque Z1: `ALTER USER name SET PASSWORD '...'` (también
+    /// `ALTER USER name IDENTIFIED BY '...'`).
+    fn parse_alter_user(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        let password = if self.match_keyword("SET") {
+            self.expect_keyword("PASSWORD")?;
+            self.expect_string_literal("ALTER USER SET PASSWORD")?
+        } else if self.match_keyword("IDENTIFIED") {
+            self.expect_keyword("BY")?;
+            self.expect_string_literal("ALTER USER IDENTIFIED BY")?
+        } else if self.match_keyword("WITH") {
+            self.expect_keyword("PASSWORD")?;
+            self.expect_string_literal("ALTER USER WITH PASSWORD")?
+        } else {
+            return Err(DbError::new(
+                "ALTER USER: se esperaba SET PASSWORD | IDENTIFIED BY | WITH PASSWORD",
+            ));
+        };
+        Ok(Statement::AlterUserPassword(AlterUserPasswordStmt {
+            name,
+            password,
+        }))
+    }
+
     fn parse_create_database(&mut self) -> DbResult<Statement> {
         let if_not_exists = if self.match_keyword("IF") {
             self.expect_keyword("NOT")?;
@@ -19274,6 +19707,15 @@ impl Parser {
         // Bloque X3b (2026-05-28): `CREATE FUNCTION name(...) RETURNS TYPE AS <expr>`.
         if self.match_keyword("FUNCTION") {
             return self.parse_create_function();
+        }
+        // Bloque Z1 (2026-05-29): `CREATE USER name [WITH PASSWORD '...'
+        // | IDENTIFIED BY '...']`. La cláusula de password es opcional.
+        if self.match_keyword("USER") {
+            return self.parse_create_user();
+        }
+        // Bloque Z1: `CREATE ROLE name`. Sin atributos por ahora.
+        if self.match_keyword("ROLE") {
+            return self.parse_create_role();
         }
         self.expect_keyword("TABLE")?;
         // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS

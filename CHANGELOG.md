@@ -6,6 +6,62 @@
 
 ---
 
+## 2026-05-29 — Bloque Z1: identidad SQL-level (`CREATE USER` / `CREATE ROLE`)
+
+> **Un push a `main`** que abre el bloque Z. Bump on-disk **VERSION 22 → 23**. Z1 entrega la fundación sobre la cual GRANT/REVOKE (Z2) y RLS (Z3) van a apoyarse: un namespace persistente de users y roles, DDL completo y un hash de password no-cripto. Detalle en [`docs/adr/0050-z1-users-roles.md`](docs/adr/0050-z1-users-roles.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE USER alice WITH PASSWORD 'secret';
+CREATE USER bob IDENTIFIED BY 'otra';       -- forma MySQL
+CREATE USER pending;                         -- sin password (placeholder)
+DROP USER [IF EXISTS] alice;
+
+CREATE ROLE auditors;
+DROP ROLE [IF EXISTS] auditors;
+
+ALTER USER alice SET PASSWORD 'rotated';
+ALTER USER bob IDENTIFIED BY 'rotated';
+```
+
+### 🛠 Implementación
+
+- `ObjectKind::User = 5`, `ObjectKind::Role = 6` (extensión del enum del catálogo).
+- `UserMeta { name, password_hash: u64, salt: u64 }` + `RoleMeta { name }` con `serialize`/`deserialize` propios.
+- `Catalog::put_user`/`put_role`/`get_user`/`get_role`/`list_users`/`list_roles`; `decode_catalog_object` y `CatalogObject::name()` extendidos.
+- AST: `Statement::CreateUser/DropUser/CreateRole/DropRole/AlterUserPassword`.
+- Parser: `parse_create_user`, `parse_create_role`, `parse_alter_user`. Dispatch nuevo en `parse_create`, `parse_drop`, `parse_alter`.
+- Engine: `exec_create_user`/`exec_drop_user`/`exec_create_role`/`exec_drop_role`/`exec_alter_user_password`.
+- Helpers nuevos: `validate_user_name` (`[a-zA-Z_][a-zA-Z0-9_]*`, ≤ 64 bytes), `gen_password_salt` (xorshift64), `hash_password` (FNV-1a-64 de `salt || password`).
+- 6 match arms ampliados para cubrir `User`/`Role` exhaustivamente.
+
+### 🆕 Códigos de error
+
+- `[GBY-4124]` `USER_ALREADY_EXISTS`
+- `[GBY-4125]` `USER_NOT_FOUND`
+- `[GBY-4126]` `ROLE_ALREADY_EXISTS`
+- `[GBY-4127]` `ROLE_NOT_FOUND`
+- `[GBY-4128]` `INVALID_USER_NAME`
+
+### ⚠️ Aviso de seguridad
+
+El hash de password es **FNV-1a-64 + salt**, **NO crypto-grade**. No es PBKDF2/bcrypt/argon2. El propósito de Z1 es bookkeeping SQL-level alineado con el estándar; la autenticación real en el servidor HTTP sigue siendo el `-token` compartido. Para producción real necesitamos un KDF dedicado (Z1b — defer).
+
+### 🚫 Diferido (split del bloque Z)
+
+- **Z2**: `GRANT priv ON object TO user|role` y `REVOKE` con bitmask de privilegios; enforcement en exec_select/insert/update/delete.
+- **Z3**: RLS — `CREATE POLICY name ON table FOR action USING (expr)` + inyección de filtros WHERE.
+- **Z1b** (futuro): KDF real reemplazando FNV-1a (argon2/bcrypt con iteraciones configurables).
+- Quoted identifiers (`"foo bar"`), `SET ROLE`, `CURRENT_USER`.
+
+### 🧪 Validación
+
+- Suite: **614 passing** (605 → +9 Z1): `z1_create_user_persists_and_drops`, `z1_create_user_duplicate_errors`, `z1_drop_user_not_found_errors`, `z1_create_role_persists_and_drops`, `z1_create_role_duplicate_errors`, `z1_alter_user_password_changes_hash`, `z1_invalid_user_name_errors`, `z1_user_role_name_collision`, `z1_identified_by_syntax_works`.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Y9: cierre del bloque Y (agregados decimal, UUID v7, sci notation)
 
 > **Un push a `main`** sin bump on-disk. **Cierra el bloque Y al 100%**. Bundle: `SUM`/`AVG` Decimal-exactos (acumulador multi-modo int→decimal→float), `UUID_V7()` (RFC 9562), `GEN_RANDOM_BYTES(n)`, notación científica en literales (`1.5e3`, `2.5E-4`). Diferidos explícitos (ARRAY/ENUM/INTERVAL/TZ, UNSIGNED BIGINT real, DECIMAL/BLOB indexables, CHAR padding, code points, POWER decimal, WHERE col=col relax) documentados en ADR-0049. Detalle en [`docs/adr/0049-y9-closure-y-block.md`](docs/adr/0049-y9-closure-y-block.md).

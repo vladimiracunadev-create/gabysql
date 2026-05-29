@@ -13998,6 +13998,175 @@ fn y9_decimal_scientific_notation() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Z1 (2026-05-29): identidad SQL-level — CREATE USER /
+// CREATE ROLE / DROP / ALTER USER SET PASSWORD. Persistencia en
+// el catálogo. Bump VERSION 22→23.
+// ============================================================
+
+fn z1_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z1-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z1_create_user_persists_and_drops() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("user-roundtrip")?;
+    run_sql(&db, "CREATE USER alice WITH PASSWORD 'secret';")?;
+    // Re-abrir y verificar que sigue ahí.
+    {
+        let mut pager = Pager::open(&db)?;
+        let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+        let u = cat.get_user("alice")?.expect("user alice debería existir");
+        assert_eq!(u.name, "alice");
+        // Password sin password vs con password produce hashes distintos.
+        assert_ne!(u.password_hash, 0);
+        pager.close()?;
+    }
+    run_sql(&db, "DROP USER alice;")?;
+    {
+        let mut pager = Pager::open(&db)?;
+        let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+        assert!(cat.get_user("alice")?.is_none());
+        pager.close()?;
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_create_user_duplicate_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("user-dup")?;
+    run_sql(&db, "CREATE USER bob;")?;
+    let err = run_sql(&db, "CREATE USER bob;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4124"),
+        "esperaba [GBY-4124], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_drop_user_not_found_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("user-not-found")?;
+    let err = run_sql(&db, "DROP USER ghost;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4125"),
+        "esperaba [GBY-4125], vi: {}",
+        err
+    );
+    // IF EXISTS silencia.
+    run_sql(&db, "DROP USER IF EXISTS ghost;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_create_role_persists_and_drops() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("role-roundtrip")?;
+    run_sql(&db, "CREATE ROLE auditors;")?;
+    {
+        let mut pager = Pager::open(&db)?;
+        let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+        let r = cat
+            .get_role("auditors")?
+            .expect("role auditors debería existir");
+        assert_eq!(r.name, "auditors");
+        pager.close()?;
+    }
+    run_sql(&db, "DROP ROLE auditors;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_create_role_duplicate_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("role-dup")?;
+    run_sql(&db, "CREATE ROLE auditors;")?;
+    let err = run_sql(&db, "CREATE ROLE auditors;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4126"),
+        "esperaba [GBY-4126], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_alter_user_password_changes_hash() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("alter-pw")?;
+    run_sql(&db, "CREATE USER carol WITH PASSWORD 'initial';")?;
+    let h0 = {
+        let mut pager = Pager::open(&db)?;
+        let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+        let h = cat.get_user("carol")?.unwrap().password_hash;
+        pager.close()?;
+        h
+    };
+    // Pequeño sleep para que el salt (basado en nanos) cambie.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    run_sql(&db, "ALTER USER carol SET PASSWORD 'new-secret';")?;
+    let h1 = {
+        let mut pager = Pager::open(&db)?;
+        let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+        let h = cat.get_user("carol")?.unwrap().password_hash;
+        pager.close()?;
+        h
+    };
+    assert_ne!(h0, h1, "el hash debería cambiar tras ALTER USER");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_invalid_user_name_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("invalid-name")?;
+    // El parser convierte el nombre en ident — un dígito leading se
+    // detecta en validate_user_name. Probamos con un nombre demasiado
+    // largo, que sí pasa el ident parser.
+    let long = "a".repeat(65);
+    let err = run_sql(&db, &format!("CREATE USER {};", long)).unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4128"),
+        "esperaba [GBY-4128], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_user_role_name_collision() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("collision")?;
+    run_sql(&db, "CREATE USER shared;")?;
+    let err = run_sql(&db, "CREATE ROLE shared;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4126"),
+        "esperaba [GBY-4126] (ROLE colisiona con USER), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1_identified_by_syntax_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1_setup("identified-by")?;
+    // Forma MySQL: CREATE USER ... IDENTIFIED BY '...'
+    run_sql(&db, "CREATE USER dave IDENTIFIED BY 'mysql-style';")?;
+    // Forma alternativa de ALTER: IDENTIFIED BY.
+    run_sql(&db, "ALTER USER dave IDENTIFIED BY 'changed';")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

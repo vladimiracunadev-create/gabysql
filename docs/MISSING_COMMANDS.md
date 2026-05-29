@@ -414,11 +414,14 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 
 | Comando | Soportado | Prioridad |
 |---|:---:|:---:|
-| `CREATE USER` / `CREATE ROLE` | ❌ | P2 |
-| `GRANT` / `REVOKE` | ❌ | P2 |
-| `SET ROLE` | ❌ | P3 |
-| Row-level security (RLS) | ❌ | P3 |
-| `ALTER USER ... SET PASSWORD ...` | ❌ | P2 |
+| `CREATE USER` / `CREATE ROLE` | ✅ (Z1, 2026-05-29; VERSION 22→23; `WITH PASSWORD` o `IDENTIFIED BY`; hash FNV-1a-64 + salt, **NO crypto-grade** — ver ADR-0050) | — |
+| `DROP USER [IF EXISTS]` / `DROP ROLE [IF EXISTS]` | ✅ (Z1, 2026-05-29) | — |
+| `ALTER USER ... SET PASSWORD ...` / `IDENTIFIED BY` / `WITH PASSWORD` | ✅ (Z1, 2026-05-29; rota salt en cada cambio) | — |
+| `GRANT` / `REVOKE` (privilegios sobre tablas/vistas) | ❌ (Z2 — bloque siguiente) | P2 |
+| Row-level security (RLS) `CREATE POLICY` | ❌ (Z3 — bloque siguiente) | P3 |
+| `SET ROLE` / `CURRENT_USER` | ❌ (defer; requiere protocolo extendido server-side) | P3 |
+| KDF real para password (PBKDF2/bcrypt/argon2) | ❌ (Z1 usa FNV-1a no-cripto; Z1b futuro) | P2 |
+| Quoted identifiers para user/role (`"foo bar"`) | ❌ (Z1 sólo `[a-zA-Z_][a-zA-Z0-9_]*`) | P3 |
 
 ---
 
