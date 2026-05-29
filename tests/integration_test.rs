@@ -11060,6 +11060,186 @@ fn x4c_for_loop_bad_range() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X4d (2026-05-28): EXCEPTION handlers + LOOP standalone. -----
+
+fn x4d_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x4d-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x4d_exception_catches_raise() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("catch-raise")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         BEGIN
+            RAISE EXCEPTION 'boom';
+         EXCEPTION WHEN OTHERS THEN
+            INSERT INTO log (id) VALUES (1);
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_exception_catches_runtime_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("catch-runtime")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE TABLE log (id INT PRIMARY KEY);
+         BEGIN
+            INSERT INTO t (id) VALUES (1);
+         EXCEPTION WHEN OTHERS THEN
+            INSERT INTO log (id) VALUES (99);
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_no_exception_propagates() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("no-handler")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "BEGIN
+            RAISE EXCEPTION 'no catch';
+         END;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("no catch"),
+        "esperaba mensaje propagado: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_block_without_error_runs_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("happy-path")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         BEGIN
+            INSERT INTO log (id) VALUES (1);
+            INSERT INTO log (id) VALUES (2);
+         EXCEPTION WHEN OTHERS THEN
+            INSERT INTO log (id) VALUES (99);
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[1][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_loop_standalone_with_exit() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("loop-exit")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE i INT DEFAULT 0;
+         LOOP
+            SET i = i + 1;
+            EXIT WHEN i = 4;
+         END LOOP;
+         IF i = 4 THEN INSERT INTO log (id) VALUES (4); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(4));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_loop_max_iter_guard() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("loop-runaway")?;
+    let err = run_sql(
+        &db,
+        "DECLARE i INT DEFAULT 0; LOOP SET i = i + 1; END LOOP;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4109"),
+        "esperaba GBY-4109, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_exception_inside_loop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("exc-in-loop")?;
+    // El handler corre 3 veces (una por iteración); contamos via
+    // una variable. El INSERT final usa un literal porque vars no
+    // van en INSERT VALUES (limitación X4b documentada).
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE i INT DEFAULT 0;
+         DECLARE caught_n INT DEFAULT 0;
+         WHILE i < 3 LOOP
+            SET i = i + 1;
+            BEGIN
+                RAISE EXCEPTION 'iter-err';
+            EXCEPTION WHEN OTHERS THEN
+                SET caught_n = caught_n + 1;
+            END;
+         END LOOP;
+         IF caught_n = 3 THEN INSERT INTO log (id) VALUES (3); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4d_exception_in_trigger_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4d_setup("exc-trigger")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE caught (id INT PRIMARY KEY);
+         CREATE TRIGGER safe AFTER INSERT ON t FOR EACH ROW BEGIN
+            BEGIN
+                RAISE EXCEPTION 'inner';
+            EXCEPTION WHEN OTHERS THEN
+                INSERT INTO caught (id) VALUES (NEW.id);
+            END;
+         END;",
+    )?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (42);")?;
+    let res = run_sql(&db, "SELECT id FROM caught;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

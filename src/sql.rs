@@ -71,6 +71,12 @@ pub enum Statement {
     /// Bloque X4c: `FOR ident IN expr TO expr LOOP <body> END LOOP`.
     /// Auto-declara la variable de loop (shadowing si existe).
     For(Box<ForStmt>),
+    /// Bloque X4d (2026-05-28): `BEGIN <body> [EXCEPTION WHEN OTHERS
+    /// THEN <handler>] END`. Ejecuta body; si error y hay handler,
+    /// captura y ejecuta handler en su lugar (catch-all).
+    Block(Box<BlockStmt>),
+    /// Bloque X4d: `LOOP <body> END LOOP` standalone (infinite hasta EXIT).
+    Loop(Box<LoopStmt>),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -478,6 +484,26 @@ pub struct ForStmt {
     pub var: String,
     pub start: Expr,
     pub end: Expr,
+    pub body: Vec<Statement>,
+}
+
+/// Bloque X4d (2026-05-28): `BEGIN <body> [EXCEPTION WHEN OTHERS THEN
+/// <handler>] END`. Si hay handler, captura errores propagados desde
+/// el body (excepto EXIT que sigue su sentinel propio) y ejecuta el
+/// handler. Si no hay handler, los errores propagan normal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockStmt {
+    pub body: Vec<Statement>,
+    /// Handler `WHEN OTHERS THEN <stmts>`. En X4d solo soportamos
+    /// catch-all (`OTHERS`); filtros por código específico de error
+    /// quedan diferidos.
+    pub exception_handler: Option<Vec<Statement>>,
+}
+
+/// Bloque X4d: `LOOP <body> END LOOP` standalone (sin WHILE/FOR).
+/// Itera infinitamente hasta `EXIT` o hasta hit MAX_LOOP_ITERATIONS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopStmt {
     pub body: Vec<Statement>,
 }
 
@@ -1713,6 +1739,8 @@ impl<'a> Engine<'a> {
             Statement::Exit(stmt) => self.exec_exit(stmt),
             Statement::Raise(stmt) => self.exec_raise(stmt),
             Statement::For(stmt) => self.exec_for(*stmt),
+            Statement::Block(stmt) => self.exec_block(*stmt),
+            Statement::Loop(stmt) => self.exec_loop(*stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3988,6 +4016,89 @@ impl<'a> Engine<'a> {
                 if early_exit { "exit" } else { "completo" }
             )),
         })
+    }
+
+    /// Bloque X4d (2026-05-28): `BEGIN <body> [EXCEPTION WHEN OTHERS
+    /// THEN <handler>] END`. Ejecuta body en orden; si algún statement
+    /// rebota AND hay handler, captura y ejecuta handler en su lugar.
+    /// Si no hay handler, propaga el error normal. EXIT (sentinel) NO
+    /// se atrapa — sigue burbujeando para que el WHILE/FOR/LOOP outer
+    /// pueda terminarse.
+    fn exec_block(&mut self, stmt: BlockStmt) -> DbResult<ResultSet> {
+        let mut last_msg = "OK · block".to_string();
+        for s in stmt.body {
+            match self.exec(s) {
+                Ok(rs) => {
+                    if let Some(m) = rs.message {
+                        last_msg = m;
+                    }
+                }
+                Err(e) => {
+                    // EXIT viaja como sentinel — debe seguir
+                    // burbujeando hasta el LOOP innermost (no es un
+                    // error real).
+                    if e.to_string().contains(EXIT_SIGNAL) {
+                        return Err(e);
+                    }
+                    // Hay handler? Capturar y correr handler.
+                    if let Some(handler) = stmt.exception_handler.clone() {
+                        let mut handler_msg = format!("OK · EXCEPTION caught: {}", e);
+                        for h in handler {
+                            match self.exec(h) {
+                                Ok(rs) => {
+                                    if let Some(m) = rs.message {
+                                        handler_msg = m;
+                                    }
+                                }
+                                Err(he) => return Err(he),
+                            }
+                        }
+                        return Ok(ResultSet {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            message: Some(handler_msg),
+                        });
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(last_msg),
+        })
+    }
+
+    /// Bloque X4d: `LOOP <body> END LOOP` standalone. Itera body
+    /// infinitamente hasta EXIT (sentinel) o MAX_LOOP_ITERATIONS.
+    fn exec_loop(&mut self, stmt: LoopStmt) -> DbResult<ResultSet> {
+        let mut iter = 0usize;
+        loop {
+            if iter >= MAX_LOOP_ITERATIONS {
+                return Err(coded(
+                    codes::LOOP_MAX_ITERATIONS_EXCEEDED,
+                    format!(
+                        "LOOP standalone: superó {} iteraciones (sin EXIT)",
+                        MAX_LOOP_ITERATIONS
+                    ),
+                ));
+            }
+            for s in stmt.body.clone() {
+                match self.exec(s) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains(EXIT_SIGNAL) => {
+                        return Ok(ResultSet {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            message: Some(format!("OK · LOOP exit a iter {}", iter)),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            iter += 1;
+        }
     }
 
     /// Bloque X3b: evalúa una invocación a user-defined function.
@@ -9590,55 +9701,23 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             // tampoco — el splitter no debería incrementar para esos).
             // Heurística: IF block-open requiere que NO esté precedido
             // por DROP/CREATE/ALTER (los que usan `IF [NOT] EXISTS`).
-            // Bloque X4b (2026-05-28): `WHILE` también abre un bloque
-            // (cierra con `END LOOP` — el LOOP keyword después de END
-            // se ignora igual que el IF de END IF). Heurística mismo
-            // patrón.
-            if (ch == 'W' || ch == 'w')
-                && match_keyword_at(bytes, index, b"WHILE")
-                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
-                && !is_ident_byte_at(bytes, index + 5)
-            {
-                if !just_saw_end {
-                    begin_depth += 1;
-                }
-                just_saw_end = false;
-                current.push_str(&sql[index..index + 5]);
-                index += 5;
-                continue;
-            }
-            // Bloque X4c (2026-05-28): `FOR` también abre bloque (`END
-            // LOOP` cierra). Mismo patrón que WHILE.
-            if (ch == 'F' || ch == 'f')
-                && match_keyword_at(bytes, index, b"FOR")
-                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
-                && !is_ident_byte_at(bytes, index + 3)
-            {
-                // FOR EACH ROW (trigger) NO abre bloque — es parte del
-                // header del CREATE TRIGGER, ya tokenizado dentro.
-                let mut la = index + 3;
-                while la < bytes.len() && (bytes[la] as char).is_whitespace() {
-                    la += 1;
-                }
-                let is_trigger_each =
-                    match_keyword_at(bytes, la, b"EACH") && !is_ident_byte_at(bytes, la + 4);
-                if !is_trigger_each && !just_saw_end {
-                    begin_depth += 1;
-                }
-                just_saw_end = false;
-                current.push_str(&sql[index..index + 3]);
-                index += 3;
-                continue;
-            }
-            // `LOOP` después de END es parte del close-keyword `END LOOP`.
-            // No abre nada por sí solo (`LOOP ... END LOOP` standalone
-            // sin WHILE no se soporta en X4b — sería loop infinito hasta
-            // EXIT WHEN, diferido a X4c).
+            // Bloque X4d (2026-05-28) refactor: el block-open de loops
+            // vive en el keyword `LOOP`, no en WHILE/FOR. Resultado
+            // coherente: `WHILE cond LOOP body END LOOP`, `FOR i IN
+            // ... LOOP body END LOOP` y `LOOP body END LOOP` standalone
+            // pasan TODOS por el branch del `LOOP` abajo. WHILE/FOR
+            // simplemente avanzan sin tocar depth.
             if (ch == 'L' || ch == 'l')
                 && match_keyword_at(bytes, index, b"LOOP")
                 && !is_ident_byte_at(bytes, index.wrapping_sub(1))
                 && !is_ident_byte_at(bytes, index + 4)
             {
+                // `END LOOP` cierra el block (END decrementó, este LOOP
+                // es parte del close-keyword). Cualquier otro LOOP
+                // (post-WHILE/FOR o standalone) abre depth.
+                if !just_saw_end {
+                    begin_depth += 1;
+                }
                 just_saw_end = false;
                 current.push_str(&sql[index..index + 4]);
                 index += 4;
@@ -15384,6 +15463,11 @@ impl Parser {
         if self.match_keyword("FOR") {
             return self.parse_for_stmt();
         }
+        // Bloque X4d: `LOOP <body> END LOOP` standalone (sin WHILE/FOR
+        // prefix). Loop infinito hasta EXIT o MAX_LOOP_ITERATIONS.
+        if self.match_keyword("LOOP") {
+            return self.parse_loop_stmt();
+        }
         if self.match_keyword("INSERT") {
             return self.parse_insert();
         }
@@ -15607,9 +15691,22 @@ impl Parser {
         // ANSI). `ROLLBACK` no tiene alias estándar relevante en este
         // release (SAVEPOINT queda para un bloque posterior).
         if self.match_keyword("BEGIN") {
-            let _ = self.match_keyword("TRANSACTION"); // `BEGIN TRANSACTION` opcional
-            let _ = self.match_keyword("WORK"); // `BEGIN WORK` opcional (ANSI)
-            return Ok(Statement::Begin);
+            // Bloque X4d: BEGIN puede iniciar (a) una transacción
+            // (existing) o (b) un block con opcional EXCEPTION
+            // handler. Lookahead: si el siguiente token es
+            // TRANSACTION/WORK/EOF/`;` → transacción; sino → block.
+            let nxt = self.peek().clone();
+            let is_tx = nxt.kind == TokenKind::Eof
+                || (nxt.kind == TokenKind::Symbol && nxt.text == ";")
+                || (nxt.kind == TokenKind::Ident
+                    && (nxt.text.eq_ignore_ascii_case("TRANSACTION")
+                        || nxt.text.eq_ignore_ascii_case("WORK")));
+            if is_tx {
+                let _ = self.match_keyword("TRANSACTION");
+                let _ = self.match_keyword("WORK");
+                return Ok(Statement::Begin);
+            }
+            return self.parse_block_stmt();
         }
         if self.match_keyword("START") {
             self.expect_keyword("TRANSACTION")?;
@@ -15877,14 +15974,14 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" || upper == "WHILE" || upper == "FOR" {
-                        // X4/X4b/X4c: IF/WHILE/FOR abren depth (cierran con
-                        // END IF / END LOOP — el END decrementa, el
-                        // keyword post-END se ignora).
-                        // Excepción: `FOR EACH ROW` (header de trigger
-                        // dentro de CREATE TRIGGER) NO abre — pero estos
-                        // body parsers ya están DENTRO del body, post
-                        // FOR EACH ROW, así que no aplica.
+                    } else if upper == "IF" || upper == "LOOP" {
+                        // X4: IF abre depth (cierra con END IF).
+                        // X4d refactor: LOOP abre depth (cierra con END
+                        // LOOP). Cubre `WHILE cond LOOP ... END LOOP`,
+                        // `FOR i IN ... LOOP ... END LOOP` y `LOOP ...
+                        // END LOOP` standalone. WHILE/FOR son no-op.
+                        // `END LOOP` se distingue via just_saw_end: el
+                        // LOOP post-END es close-keyword, no abre.
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -16041,14 +16138,14 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" || upper == "WHILE" || upper == "FOR" {
-                        // X4/X4b/X4c: IF/WHILE/FOR abren depth (cierran con
-                        // END IF / END LOOP — el END decrementa, el
-                        // keyword post-END se ignora).
-                        // Excepción: `FOR EACH ROW` (header de trigger
-                        // dentro de CREATE TRIGGER) NO abre — pero estos
-                        // body parsers ya están DENTRO del body, post
-                        // FOR EACH ROW, así que no aplica.
+                    } else if upper == "IF" || upper == "LOOP" {
+                        // X4: IF abre depth (cierra con END IF).
+                        // X4d refactor: LOOP abre depth (cierra con END
+                        // LOOP). Cubre `WHILE cond LOOP ... END LOOP`,
+                        // `FOR i IN ... LOOP ... END LOOP` y `LOOP ...
+                        // END LOOP` standalone. WHILE/FOR son no-op.
+                        // `END LOOP` se distingue via just_saw_end: el
+                        // LOOP post-END es close-keyword, no abre.
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -16323,6 +16420,92 @@ impl Parser {
             end,
             body,
         })))
+    }
+
+    /// Bloque X4d (2026-05-28): parsea `BEGIN <stmts> [EXCEPTION WHEN
+    /// OTHERS THEN <handler>] END`. La `BEGIN` keyword ya fue
+    /// consumida. X4d soporta sólo `WHEN OTHERS` (catch-all); filtros
+    /// por código de error específico quedan diferidos.
+    fn parse_block_stmt(&mut self) -> DbResult<Statement> {
+        let body = self.parse_block_body()?;
+        let exception_handler = if self.match_keyword("EXCEPTION") {
+            if !self.match_keyword("WHEN") {
+                return Err(coded(
+                    codes::EXCEPTION_HANDLER_MALFORMED,
+                    "BEGIN ... EXCEPTION: se esperaba WHEN",
+                ));
+            }
+            if !self.match_keyword("OTHERS") {
+                return Err(coded(
+                    codes::EXCEPTION_HANDLER_MALFORMED,
+                    "EXCEPTION WHEN ...: solo se soporta `OTHERS` (catch-all) en X4d",
+                ));
+            }
+            if !self.match_keyword("THEN") {
+                return Err(coded(
+                    codes::EXCEPTION_HANDLER_MALFORMED,
+                    "EXCEPTION WHEN OTHERS: se esperaba THEN",
+                ));
+            }
+            let handler = self.parse_block_body()?;
+            Some(handler)
+        } else {
+            None
+        };
+        if !self.match_keyword("END") {
+            return Err(coded(
+                codes::EXCEPTION_HANDLER_MALFORMED,
+                "BEGIN ...: se esperaba END para cerrar el bloque",
+            ));
+        }
+        Ok(Statement::Block(Box::new(BlockStmt {
+            body,
+            exception_handler,
+        })))
+    }
+
+    /// Bloque X4d: parsea body de un BEGIN..[EXCEPTION..]END. Termina
+    /// en EXCEPTION o END (cualquiera de los dos).
+    fn parse_block_body(&mut self) -> DbResult<Vec<Statement>> {
+        let mut stmts = Vec::new();
+        loop {
+            while self.match_symbol(";") {}
+            let t = self.peek();
+            if t.kind == TokenKind::Eof {
+                return Err(coded(
+                    codes::EXCEPTION_HANDLER_MALFORMED,
+                    "BEGIN ...: EOF antes de END",
+                ));
+            }
+            if t.kind == TokenKind::Ident {
+                let upper = t.text.to_ascii_uppercase();
+                if upper == "EXCEPTION" || upper == "END" {
+                    break;
+                }
+            }
+            let stmt = self.parse_statement()?;
+            stmts.push(stmt);
+        }
+        Ok(stmts)
+    }
+
+    /// Bloque X4d: parsea `LOOP <stmts> END LOOP` standalone. La
+    /// `LOOP` keyword inicial ya fue consumida.
+    fn parse_loop_stmt(&mut self) -> DbResult<Statement> {
+        let body = self.parse_loop_body()?;
+        if !self.match_keyword("END") {
+            return Err(coded(
+                codes::LOOP_BLOCK_MALFORMED,
+                "LOOP ...: se esperaba END LOOP para cerrar",
+            ));
+        }
+        if !self.match_keyword("LOOP") {
+            return Err(coded(
+                codes::LOOP_BLOCK_MALFORMED,
+                "LOOP ...: se esperaba END LOOP (vi END sin LOOP)",
+            ));
+        }
+        Ok(Statement::Loop(Box::new(LoopStmt { body })))
     }
 
     /// Bloque X4b: parsea `EXIT [WHEN cond]`.

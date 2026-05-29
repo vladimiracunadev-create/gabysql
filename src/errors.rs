@@ -588,6 +588,13 @@ pub mod codes {
     /// son INT, o start > end (loop vacío es OK; X4c sólo ascendente
     /// con step=1 — descendente diferido).
     pub const FOR_RANGE_INVALID: u32 = 4113;
+    /// Bloque X4d (2026-05-28): bloque `BEGIN ... EXCEPTION ... END`
+    /// malformado — falta WHEN, falta THEN, EXCEPTION fuera de lugar.
+    /// X4d sólo soporta `EXCEPTION WHEN OTHERS THEN <body>` (catch-all).
+    pub const EXCEPTION_HANDLER_MALFORMED: u32 = 4114;
+    /// Bloque X4d: bloque `LOOP ... END LOOP` standalone malformado —
+    /// falta END LOOP.
+    pub const LOOP_BLOCK_MALFORMED: u32 = 4115;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

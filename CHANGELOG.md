@@ -6,6 +6,62 @@
 
 ---
 
+## 2026-05-28 — Bloque X4d: `BEGIN..EXCEPTION..END` + `LOOP` standalone
+
+> **Un push a `main`** sin bump on-disk. Octavo sub-bloque del bloque X. Try/catch con `BEGIN..EXCEPTION WHEN OTHERS THEN..END`, loop infinito standalone, y refactor del splitter unificando WHILE/FOR/LOOP. Detalle en [`docs/adr/0036-exception-loop-x4d.md`](docs/adr/0036-exception-loop-x4d.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- Try/catch
+BEGIN
+    INSERT INTO t (id) VALUES (1);
+    INSERT INTO t (id) VALUES (1);  -- PK dup
+EXCEPTION WHEN OTHERS THEN
+    INSERT INTO log (id) VALUES (99);
+END;
+
+-- LOOP standalone
+DECLARE i INT DEFAULT 0;
+LOOP
+    SET i = i + 1;
+    EXIT WHEN i = 5;
+END LOOP;
+
+-- EXCEPTION dentro de trigger body (no aborta el INSERT principal)
+CREATE TRIGGER safe AFTER INSERT ON t FOR EACH ROW BEGIN
+    BEGIN
+        RAISE EXCEPTION 'inner';
+    EXCEPTION WHEN OTHERS THEN
+        INSERT INTO caught (id) VALUES (NEW.id);
+    END;
+END;
+```
+
+### 🛠 Implementación
+
+- **AST**: `Statement::Block(Box<BlockStmt { body, exception_handler }>)` + `Statement::Loop(Box<LoopStmt { body }>)`.
+- **Parser**: parse_statement detecta BEGIN no-tx → parse_block_stmt. Lookahead post-BEGIN distingue de `BEGIN [TRANSACTION];`. WHEN OTHERS THEN único soporte en X4d.
+- **Engine**:
+  - `exec_block`: ejecuta body. Si error contiene EXIT_SIGNAL → re-propaga (loop outer debe recibirlo). Si NO hay handler → propaga error. Si HAY handler → captura y ejecuta handler.
+  - `exec_loop`: itera infinitamente hasta EXIT sentinel o MAX_LOOP_ITERATIONS guard.
+- **Refactor splitter** (también body parsers): el block-open de loops vive en `LOOP` keyword, no en `WHILE`/`FOR`. Unifica los 3 casos en un solo branch. `END LOOP` se distingue via `just_saw_end` flag. WHILE/FOR ya no abren depth — pasan transparente.
+
+### 🚫 Diferido (a X4e — último previsto del bloque X)
+
+- `RETURN expr` en functions (requiere lift de "function body = Expr" de X3b).
+- `FOR row IN SELECT ... LOOP` (composite row scope).
+- `EXCEPTION WHEN <code> THEN ...` filtros específicos.
+- `RAISE` con formato `%`.
+- `CASE` statement (vs CASE expression).
+
+### 🧪 Validación
+
+- 8 tests `x4d_*`: handler atrapa RAISE EXCEPTION, handler atrapa PK dup, sin handler propaga, happy path body completo, LOOP + EXIT WHEN, LOOP max-iter guard, BEGIN dentro de WHILE (handler por iteración), BEGIN dentro de trigger body.
+- Suite total: **475/475 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X4c: `RAISE` + `FOR LOOP`
 
 > **Un push a `main`** sin bump on-disk. Séptimo sub-bloque del bloque X. `RAISE EXCEPTION|NOTICE` para aborto/info, `FOR i IN start TO end LOOP` con auto-decl de la variable. EXCEPTION handlers + `FOR row IN SELECT` + `RETURN` diferidos a X4d. Detalle en [`docs/adr/0035-raise-for-x4c.md`](docs/adr/0035-raise-for-x4c.md).

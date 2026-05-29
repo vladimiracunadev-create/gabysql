@@ -56,7 +56,8 @@
 | [`IF expr THEN ... [ELSIF ...]* [ELSE ...] END IF`](#control-de-flujo-if-bloque-x4) — statement top-level + dentro de bodies; anidado | TCL | 🟢 (bloque X4) |
 | [`DECLARE` + `SET` + `WHILE LOOP` + `EXIT [WHEN]`](#variables--while-loop-bloque-x4b) — variables locales con scope plano; vars visibles en Expr (no en INSERT VALUES) | TCL | 🟢 (bloque X4b) |
 | [`RAISE [EXCEPTION\|NOTICE] 'msg'` + `FOR i IN start TO end LOOP ... END LOOP`](#raise--for-loop-bloque-x4c) — aborto explícito + range loop con auto-decl | TCL | 🟢 (bloque X4c) |
-| NEW mutable en BEFORE, `LOOP` standalone, `EXCEPTION WHEN` handlers, `FOR row IN SELECT`, `RETURN expr`, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` + `LOOP <body> END LOOP` standalone](#exception-handlers--loop-standalone-bloque-x4d) — try/catch catch-all + loop infinite hasta EXIT | TCL | 🟢 (bloque X4d) |
+| NEW mutable en BEFORE, `EXCEPTION WHEN <code>` filtrado, `FOR row IN SELECT`, `RETURN expr`, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -2237,6 +2238,102 @@ END;
 - **`STEP n`** y **`REVERSE`** (descendente) en FOR — futuro.
 - **Formato `%`** en RAISE (`RAISE EXCEPTION 'value % invalid', x`) — futuro.
 - **`RAISE WARNING` / `INFO`** — futuro.
+
+---
+
+## EXCEPTION handlers + LOOP standalone (bloque X4d)
+
+> **`BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END`**: try/catch con catch-all (X4d sólo soporta `WHEN OTHERS`). **`LOOP <body> END LOOP`** standalone: infinite hasta `EXIT` o `MAX_LOOP_ITERATIONS`.
+
+### 📜 EBNF
+
+```
+block_stmt ::= "BEGIN" stmt_list [ "EXCEPTION" "WHEN" "OTHERS" "THEN" stmt_list ] "END"
+loop_stmt  ::= "LOOP" stmt_list "END" "LOOP"
+```
+
+### 🧠 Semántica
+
+**BEGIN..END:**
+
+- Lookahead distingue `BEGIN [TRANSACTION];` (transaction) de `BEGIN <stmt>...` (block).
+- Body ejecuta en orden. Si alguno rebota:
+  - **EXIT sentinel** → re-propagar (debe alcanzar el LOOP outer).
+  - Sin handler → propagar error.
+  - Con handler → ejecutar handler en su lugar, retornar OK con `"EXCEPTION caught: <orig>"`.
+- `WHEN OTHERS` es catch-all — atrapa cualquier error (RAISE, runtime, PK dup, etc.).
+- Re-raise condicional posible dentro del handler: `RAISE EXCEPTION 'new msg'`.
+
+**LOOP standalone:**
+
+- Infinite hasta EXIT (sentinel) o hit `MAX_LOOP_ITERATIONS = 100_000`.
+- Sin EXIT → `[GBY-4109]`.
+
+### ✅ Ejemplos
+
+```sql
+-- Try/catch básico
+BEGIN
+    INSERT INTO t (id) VALUES (1);
+EXCEPTION WHEN OTHERS THEN
+    INSERT INTO log VALUES (now(), 'failed');
+END;
+
+-- LOOP standalone
+DECLARE i INT DEFAULT 0;
+LOOP
+    SET i = i + 1;
+    EXIT WHEN i = 100;
+END LOOP;
+
+-- EXCEPTION en trigger body (no aborta el INSERT principal)
+CREATE TRIGGER safe AFTER INSERT ON orders FOR EACH ROW BEGIN
+    BEGIN
+        UPDATE counters SET n = n + 1 WHERE id = NEW.id;
+    EXCEPTION WHEN OTHERS THEN
+        INSERT INTO err_log VALUES (NEW.id);
+    END;
+END;
+
+-- EXCEPTION dentro de WHILE (handler corre cada iteración)
+DECLARE i INT DEFAULT 0;
+DECLARE caught INT DEFAULT 0;
+WHILE i < 5 LOOP
+    SET i = i + 1;
+    BEGIN
+        RAISE EXCEPTION 'iter %', i;
+    EXCEPTION WHEN OTHERS THEN
+        SET caught = caught + 1;
+    END;
+END LOOP;
+-- caught == 5
+
+-- LOOP con condición compleja vía EXIT WHEN
+DECLARE done INT DEFAULT 0;
+LOOP
+    UPDATE jobs SET status = 'processing' WHERE id IN
+        (SELECT id FROM jobs WHERE status = 'pending' LIMIT 10);
+    SET done = (SELECT COUNT(*) FROM jobs WHERE status = 'pending');
+    EXIT WHEN done = 0;
+END LOOP;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4114] BEGIN ...: se esperaba END para cerrar` | Falta END. |
+| `[GBY-4114] EXCEPTION WHEN ...: solo se soporta OTHERS en X4d` | `WHEN <code>` específico (diferido). |
+| `[GBY-4115] LOOP ...: se esperaba END LOOP` | Falta END LOOP. |
+| `[GBY-4109] LOOP standalone: superó 100000 iter` | Loop infinito sin EXIT. |
+
+### ⚠️ No soportado todavía
+
+- **`EXCEPTION WHEN <code>`** filtros específicos (`WHEN no_data_found`, etc.) — X4e.
+- **`FOR row IN SELECT ... LOOP`** — X4e.
+- **`RETURN expr`** en functions — X4e.
+- **`CASE` statement** — diferido.
+- **Múltiples `WHEN` branches** en EXCEPTION.
 
 ---
 

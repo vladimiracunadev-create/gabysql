@@ -86,6 +86,8 @@
 
 - ~~`RAISE [EXCEPTION|NOTICE] 'msg'` (default EXCEPTION) — aborto explícito con mensaje (`[GBY-4111]`) o info logging. Funciona en cualquier contexto procedural (top-level, dentro de IF/WHILE/FOR, trigger/procedure body). `FOR ident IN start TO end LOOP <body> END LOOP` — range loop con auto-declaración de la variable de iteración (shadowing con restore), inclusivo, ascendente con step=1. `start > end` no itera (sin error). EXIT y guard MAX_LOOP_ITERATIONS heredados de X4b. EXCEPTION handlers + FOR row IN SELECT + LOOP standalone + RETURN diferidos a X4d~~ ✅ entregado (bloque **X4c**, 2026-05-28, [ADR-0035](docs/adr/0035-raise-for-x4c.md)).
 
+- ~~`BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` como `Statement::Block` — try/catch con catch-all. Lookahead distingue de transaction `BEGIN [TRANSACTION];`. El handler atrapa cualquier error que NO sea EXIT sentinel (RAISE, runtime, PK dup, type mismatch). `LOOP <body> END LOOP` standalone — infinite hasta EXIT o MAX_LOOP_ITERATIONS. Refactor del splitter: block-open de loops vive en `LOOP` (no en WHILE/FOR), unifica WHILE/FOR/LOOP en un solo branch. EXIT sigue burbujeando a través de Block para llegar al loop outer. `WHEN <code>` específico y `RETURN expr` diferidos a X4e~~ ✅ entregado (bloque **X4d**, 2026-05-28, [ADR-0036](docs/adr/0036-exception-loop-x4d.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

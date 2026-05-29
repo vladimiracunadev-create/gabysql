@@ -315,9 +315,11 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Nested scope real (BEGIN..END como block scope) | ❌ (X4b: scope plano) | P3 |
 | `RAISE [EXCEPTION\|NOTICE] 'msg'` | ✅ (X4c, 2026-05-28; default EXCEPTION) | — |
 | `FOR ident IN start TO end LOOP ... END LOOP` | ✅ (X4c, 2026-05-28; auto-decl var, ascendente step=1) | — |
-| `EXCEPTION WHEN ... THEN <body>` handlers | ❌ (diferido a X4d — requiere BEGIN..END como Statement) | P3 |
-| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido a X4d) | P3 |
-| `LOOP ... END LOOP` standalone, `STEP n` / `REVERSE` en FOR, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
+| `BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` (try/catch catch-all) | ✅ (X4d, 2026-05-28; lookahead distingue de BEGIN TRANSACTION) | — |
+| `LOOP <body> END LOOP` standalone (sin WHILE/FOR) | ✅ (X4d, 2026-05-28; infinite hasta EXIT o MAX_ITER) | — |
+| `EXCEPTION WHEN <code> THEN ...` filtros por código específico | ❌ (X4d solo WHEN OTHERS; diferido a X4e) | P3 |
+| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido a X4e) | P3 |
+| `RETURN expr` en functions, `CASE` statement, `STEP n` / `REVERSE` en FOR, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |
 | `CREATE PROCEDURE name(...) AS <body>` + `CALL name(args)` | ✅ (X3, 2026-05-28; VERSION 14→15; statement-only, params via token-sub) | — |
