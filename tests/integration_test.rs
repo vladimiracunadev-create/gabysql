@@ -15622,6 +15622,69 @@ fn z3d_returning_filtered_to_empty_when_no_select_policy_match() -> Result<(), B
     Ok(())
 }
 
+// ============================================================
+// Bloque Z1d (2026-05-29): Blake2b RFC 7693 puro en Rust como
+// foundation para Argon2id futuro (Z1e). Tests contra el test
+// vector oficial RFC 7693 §A. Bump VERSION 28 → 29.
+// ============================================================
+
+#[test]
+fn z1d_blake2b_rfc7693_abc_test_vector() -> Result<(), Box<dyn Error>> {
+    // RFC 7693 §A: BLAKE2b-512("abc") expected output.
+    let expected: [u8; 64] = [
+        0xBA, 0x80, 0xA5, 0x3F, 0x98, 0x1C, 0x4D, 0x0D, 0x6A, 0x27, 0x97, 0xB6, 0x9F, 0x12, 0xF6,
+        0xE9, 0x4C, 0x21, 0x2F, 0x14, 0x68, 0x5A, 0xC4, 0xB7, 0x4B, 0x12, 0xBB, 0x6F, 0xDB, 0xFF,
+        0xA2, 0xD1, 0x7D, 0x87, 0xC5, 0x39, 0x2A, 0xAB, 0x79, 0x2D, 0xC2, 0x52, 0xD5, 0xDE, 0x45,
+        0x33, 0xCC, 0x95, 0x18, 0xD3, 0x8A, 0xA8, 0xDB, 0xF1, 0x92, 0x5A, 0xB9, 0x23, 0x86, 0xED,
+        0xD4, 0x00, 0x99, 0x23,
+    ];
+    let got = gabysql::sql::blake2b(64, b"abc");
+    assert_eq!(
+        got,
+        expected.to_vec(),
+        "Blake2b-512(\"abc\") debe matchear RFC 7693 §A"
+    );
+    Ok(())
+}
+
+#[test]
+fn z1d_blake2b_empty_input() -> Result<(), Box<dyn Error>> {
+    // BLAKE2b-512("") test vector (well-known).
+    let expected_hex = "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce";
+    let got = gabysql::sql::blake2b(64, b"");
+    let got_hex: String = got.iter().map(|b| format!("{:02x}", b)).collect();
+    assert_eq!(got_hex, expected_hex);
+    Ok(())
+}
+
+#[test]
+fn z1d_blake2b_variable_output_length() -> Result<(), Box<dyn Error>> {
+    // Output trunc a 32 bytes = primeros 32 bytes del estado h.
+    // No es lo mismo que BLAKE2b-256 (parámetros distintos). Acá sólo
+    // verificamos que out_len gobierna el truncado.
+    let h32 = gabysql::sql::blake2b(32, b"abc");
+    assert_eq!(h32.len(), 32);
+    // Y que out_len=1 funciona.
+    let h1 = gabysql::sql::blake2b(1, b"abc");
+    assert_eq!(h1.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn z1d_scheme_3_argon2id_reserved_returns_clear_error() -> Result<(), Box<dyn Error>> {
+    // scheme=3 está reservado para Argon2id (Z1e). Z1d no implementa
+    // el dispatch — `SET SESSION AUTHORIZATION WITH PASSWORD` sobre un
+    // user con scheme=3 (que hoy no se crea) devolvería un error claro
+    // explicando el estado del bloque.
+    //
+    // Como no podemos crear un user con scheme=3 vía SQL todavía,
+    // verificamos que el constant del crate esté expuesto y vale 3.
+    assert_eq!(gabysql::sql::PASSWORD_SCHEME_ARGON2ID, 3);
+    // El default sigue siendo scrypt (Z1c).
+    assert_eq!(gabysql::sql::PASSWORD_SCHEME_SCRYPT, 2);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

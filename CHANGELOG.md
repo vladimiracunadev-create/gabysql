@@ -6,6 +6,53 @@
 
 ---
 
+## 2026-05-29 — Bloque Z1d: Blake2b foundation + scheme=3 reservado para Argon2id
+
+> **Un push a `main`**. Bump on-disk **VERSION 28 → 29** (corte semántico). Z1d entrega la primitiva Blake2b RFC 7693 puro en Rust como foundation para Argon2id futuro (Z1e). Detalle en [`docs/adr/0058-z1d-blake2b-foundation.md`](docs/adr/0058-z1d-blake2b-foundation.md).
+
+### 🆕 Comportamiento habilitado
+
+```rust
+// Función pública disponible para tests y futuros bloques.
+use gabysql::sql::blake2b;
+let h = blake2b(64, b"abc");
+// → match exacto con RFC 7693 §A test vector.
+```
+
+### 🛠 Implementación
+
+- **Blake2b RFC 7693** puro en Rust (~150 LOC):
+  - IV constants (= SHA-512 IV).
+  - Sigma permutation table 12 rounds.
+  - G mixing function (§3.1).
+  - Compression F (§3.2) con counter u128.
+  - API `pub fn blake2b(out_len: usize, data: &[u8]) -> Vec<u8>`.
+- **PASSWORD_SCHEME_ARGON2ID = 3** reservado.
+- `exec_set_session_auth` con arm explícito que rebota scheme=3 con mensaje informativo (`[GBY-4137]` "scheme Argon2id (3) reservado pero no implementado en Z1d... full en Z1e").
+
+### 🧠 Por qué Z1d se partió en dos
+
+Implementar Argon2id correctamente requiere ~600 LOC adicionales (G compression BlaMka, memory matrix N×128 KiB, indexing híbrido data-dependent + data-independent, pass loop completo, RFC 9106 §A.3 vector match). Hacerlo en un solo push junto con Blake2b multiplicaba el riesgo de bugs crypto sutiles. Z1d entrega foundation sólida y verificada (RFC 7693 §A match); Z1e construye Argon2id encima con foco dedicado.
+
+Default sigue siendo **scrypt** (Z1c, scheme=2) — el security-grade no se degrada por el split.
+
+### 🚫 Diferido (Z1e)
+
+- G compression de Argon2 (BlaMka modified rotations).
+- Memory matrix `B[lane][block]` con manejo de m=64 MiB típico.
+- Indexing híbrido: data-independent en slices 0/1 del pass 0 (anti-side-channel), data-dependent en el resto.
+- H' variable-length (RFC 9106 §3.2) construido sobre Blake2b.
+- Pass loop completo (passes × slices × lanes × blocks).
+- Parallelism p>1.
+- RFC 9106 §A.3 test vector validation end-to-end.
+
+### 🧪 Validación
+
+- Suite: **685 passing** (681 → +4 Z1d). Cubre: BLAKE2b-512("abc") match RFC 7693 §A, BLAKE2b-512("") match well-known vector, variable out_len, constant scheme=3 exposed.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z3d: RETURNING filtrado contra SELECT policies
 
 > **Un push a `main`** sin bump on-disk. Cierra el leak histórico de RETURNING en RLS: un INSERT/UPDATE/DELETE con RETURNING ya no expone columnas que el current_user no debería ver. Detalle en [`docs/adr/0057-z3d-returning-filter.md`](docs/adr/0057-z3d-returning-filter.md).

@@ -4738,6 +4738,17 @@ impl<'a> Engine<'a> {
                     PASSWORD_SCHEME_SCRYPT => {
                         verify_password_scrypt(pw, &meta.salt, &meta.password_hash)
                     }
+                    PASSWORD_SCHEME_ARGON2ID => {
+                        return Err(coded(
+                            codes::AUTH_PASSWORD_INCORRECT,
+                            format!(
+                                "SET SESSION AUTHORIZATION '{}': scheme Argon2id (3) \
+                                 reservado pero no implementado en Z1d (foundation \
+                                 Blake2b ya disponible; Argon2id full en Z1e)",
+                                user
+                            ),
+                        ));
+                    }
                     other => {
                         return Err(coded(
                             codes::AUTH_PASSWORD_INCORRECT,
@@ -17243,6 +17254,12 @@ fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
 pub const PASSWORD_SCHEME_FNV_LEGACY: u8 = 0;
 pub const PASSWORD_SCHEME_PBKDF2_SHA256: u8 = 1;
 pub const PASSWORD_SCHEME_SCRYPT: u8 = 2;
+/// Bloque Z1d (2026-05-29): reservado para Argon2id RFC 9106
+/// (data-independent + data-dependent hybrid indexing). Z1d entrega
+/// la **primitiva Blake2b** (foundation) y reserva el slot scheme=3;
+/// el dispatch completo del Argon2id arriva en Z1e. Hoy el verify
+/// rechaza scheme=3 con `[GBY-4137]` informativo.
+pub const PASSWORD_SCHEME_ARGON2ID: u8 = 3;
 
 /// Bloque Z1c: parámetros scrypt para interactive login. N=2^14=16384
 /// satisface OWASP/RFC 7914 §7 (32 MB memoria, ~100ms en CPU moderno).
@@ -17621,6 +17638,125 @@ fn verify_password_scrypt(password: &str, salt: &[u8], expected_hash: &[u8]) -> 
     }
     let computed = hash_password_scrypt(password, salt);
     constant_time_eq(&computed, expected_hash)
+}
+
+// ============================================================
+// Bloque Z1d (2026-05-29): Blake2b RFC 7693 puro en Rust.
+//
+// Blake2b es la primitiva sobre la que se construye Argon2id (RFC 9106).
+// Z1d entrega esta foundation con validación contra el test vector
+// oficial RFC 7693 §A ("abc" → 64-byte hash). El dispatch completo de
+// scheme=3 (Argon2id) llega en Z1e — implementarlo correctamente
+// requiere ~600 LOC adicionales (G compression con BlaMka, memory
+// matrix indexing híbrido, parallelism lanes) y merece su propio
+// bloque dedicado para minimizar el riesgo de bugs crypto sutiles.
+// ============================================================
+
+/// Blake2b IV (= SHA-512 IV).
+const BLAKE2B_IV: [u64; 8] = [
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
+];
+
+/// Blake2b sigma permutation (12 rondas; las últimas 2 reusan las
+/// primeras 2 permutaciones).
+const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+];
+
+/// G mixing function de Blake2b (RFC 7693 §3.1).
+#[inline(always)]
+fn blake2b_g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+    v[d] = (v[d] ^ v[a]).rotate_right(32);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(24);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(63);
+}
+
+/// Compression F de Blake2b (RFC 7693 §3.2).
+fn blake2b_compress(h: &mut [u64; 8], block: &[u8; 128], t: u128, last: bool) {
+    let mut m = [0u64; 16];
+    for i in 0..16 {
+        m[i] = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    let mut v = [0u64; 16];
+    v[..8].copy_from_slice(h);
+    v[8..].copy_from_slice(&BLAKE2B_IV);
+    v[12] ^= t as u64;
+    v[13] ^= (t >> 64) as u64;
+    if last {
+        v[14] ^= 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    for s in BLAKE2B_SIGMA.iter() {
+        blake2b_g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+        blake2b_g(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+        blake2b_g(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+        blake2b_g(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+        blake2b_g(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+        blake2b_g(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        blake2b_g(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+        blake2b_g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+    }
+    for i in 0..8 {
+        h[i] ^= v[i] ^ v[i + 8];
+    }
+}
+
+/// Blake2b sin keying, output `out_len` bytes (1-64).
+/// Foundation Z1d para Argon2id futuro (Z1e). Expuesto `pub` para tests.
+pub fn blake2b(out_len: usize, data: &[u8]) -> Vec<u8> {
+    debug_assert!((1..=64).contains(&out_len));
+    let mut h = BLAKE2B_IV;
+    h[0] ^= 0x0101_0000 | (out_len as u64);
+    let mut t: u128 = 0;
+    let mut buf = [0u8; 128];
+    let mut buf_len = 0usize;
+    let mut idx = 0usize;
+    while idx < data.len() {
+        if buf_len == 128 {
+            t = t.wrapping_add(128);
+            let block = buf;
+            blake2b_compress(&mut h, &block, t, false);
+            buf_len = 0;
+        }
+        let take = (128 - buf_len).min(data.len() - idx);
+        buf[buf_len..buf_len + take].copy_from_slice(&data[idx..idx + take]);
+        buf_len += take;
+        idx += take;
+    }
+    t = t.wrapping_add(buf_len as u128);
+    for byte in buf.iter_mut().skip(buf_len) {
+        *byte = 0;
+    }
+    let block = buf;
+    blake2b_compress(&mut h, &block, t, true);
+    let mut out = Vec::with_capacity(out_len);
+    for w in &h {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out.truncate(out_len);
+    out
 }
 
 fn gen_uuid_v7() -> String {
