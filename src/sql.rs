@@ -1341,6 +1341,13 @@ pub enum ScalarFunc {
     /// seeded por SystemTime (no criptográfico — para tests / IDs
     /// no-secretos).
     GenRandomUuid,
+    /// Bloque Y9 (2026-05-29): UUID v7 — los primeros 48 bits son
+    /// timestamp Unix ms big-endian, el resto random. Mejor para PK
+    /// time-ordered. Alias: `UUID_V7`, `UUID_GENERATE_V7`.
+    GenUuidV7,
+    /// Bloque Y9 (2026-05-29): `gen_random_bytes(n)` → `Value::Bytes`
+    /// con `n` bytes random (xorshift, no criptográfico).
+    GenRandomBytes,
 }
 
 impl ScalarFunc {
@@ -1376,6 +1383,8 @@ impl ScalarFunc {
             ScalarFunc::Ifnull => "IFNULL",
             ScalarFunc::If => "IF",
             ScalarFunc::GenRandomUuid => "GEN_RANDOM_UUID",
+            ScalarFunc::GenUuidV7 => "UUID_V7",
+            ScalarFunc::GenRandomBytes => "GEN_RANDOM_BYTES",
         }
     }
 
@@ -1417,6 +1426,10 @@ impl ScalarFunc {
             "GEN_RANDOM_UUID" | "UUID_V4" | "UUID_GENERATE_V4" | "RANDOM_UUID" => {
                 Some(ScalarFunc::GenRandomUuid)
             }
+            // Bloque Y9: UUID v7 (timestamp-ordered).
+            "UUID_V7" | "UUID_GENERATE_V7" | "GEN_UUID_V7" => Some(ScalarFunc::GenUuidV7),
+            // Bloque Y9: random bytes generator.
+            "GEN_RANDOM_BYTES" | "RANDOM_BYTES" => Some(ScalarFunc::GenRandomBytes),
             _ => None,
         }
     }
@@ -1806,14 +1819,39 @@ pub(crate) fn parse_decimal(input: &str, target_scale: u8) -> Result<i128, Strin
     if trimmed.is_empty() {
         return Err("decimal vacío".to_string());
     }
-    let (sign, rest) = match trimmed.as_bytes()[0] {
-        b'+' => (1i128, &trimmed[1..]),
-        b'-' => (-1i128, &trimmed[1..]),
-        _ => (1i128, trimmed),
+    // Bloque Y9 (2026-05-29): notación científica `1.5e3`, `2.5E-4`,
+    // `1e10`. Parseamos la mantissa con un target_scale que absorbe
+    // los efectos del exponente, después aplicamos el shift al valor.
+    let (mantissa_str, exponent): (&str, i32) = match trimmed.find(['e', 'E']) {
+        Some(idx) => {
+            let (m, e_part) = trimmed.split_at(idx);
+            let e_str = &e_part[1..];
+            let e_val: i32 = e_str
+                .parse()
+                .map_err(|_| format!("decimal exponente inválido: '{}'", e_str))?;
+            (m, e_val)
+        }
+        None => (trimmed, 0),
+    };
+    let (sign, rest) = match mantissa_str.as_bytes().first() {
+        Some(b'+') => (1i128, &mantissa_str[1..]),
+        Some(b'-') => (-1i128, &mantissa_str[1..]),
+        _ => (1i128, mantissa_str),
     };
     let parts: Vec<&str> = rest.splitn(2, '.').collect();
     let int_part = parts[0];
     let frac_part = parts.get(1).copied().unwrap_or("");
+    // Y9: si exp < 0, ampliar el target_scale para no perder dígitos
+    // del shift. Si exp > 0, el target_scale local sube — luego al
+    // final dividimos por la diferencia.
+    let parse_scale: u8 = if exponent < 0 {
+        (target_scale as i32 + (-exponent).min(38)).clamp(0, 38) as u8
+    } else {
+        target_scale
+    };
+    // Sustituimos target_scale por parse_scale en el resto del cuerpo
+    // shadow-binding implícito.
+    let target_scale = parse_scale;
     if int_part.is_empty() && frac_part.is_empty() {
         return Err(format!("decimal inválido: '{}'", input));
     }
@@ -1851,6 +1889,27 @@ pub(crate) fn parse_decimal(input: &str, target_scale: u8) -> Result<i128, Strin
             .checked_mul(10)
             .ok_or_else(|| format!("decimal overflow al normalizar '{}'", input))?;
         frac_digits += 1;
+    }
+    // Bloque Y9: aplicar el exponente. value está en `target_scale`
+    // (que ya absorbió el efecto del exp negativo). Si exp > 0,
+    // multiplicar por 10^exp. Si exp < 0 con parse_scale bumpado,
+    // el valor está implícitamente más grande — necesitamos dividir.
+    if exponent > 0 {
+        let pow = 10i128
+            .checked_pow(exponent as u32)
+            .ok_or_else(|| format!("decimal exponent overflow '{}'", input))?;
+        value = value
+            .checked_mul(pow)
+            .ok_or_else(|| format!("decimal overflow tras exponent '{}'", input))?;
+    } else if exponent < 0 {
+        // parse_scale = orig + |exp|. Tras absorber, value tiene
+        // (orig + |exp|) decimales pero debería tener orig — dividir
+        // por 10^|exp| (truncation hacia cero).
+        let abs_exp = (-exponent) as u32;
+        let pow = 10i128
+            .checked_pow(abs_exp)
+            .ok_or_else(|| format!("decimal exponent overflow '{}'", input))?;
+        value /= pow;
     }
     Ok(sign * value)
 }
@@ -9954,27 +10013,116 @@ fn compute_aggregate(
         }
         (AggFunc::Sum, AggArg::Column(col)) => {
             let key = normalize_ident(col);
+            // Bloque Y9 (2026-05-29): acumulador con 3 modos:
+            // - int_mode: acc_int (i128, exacto, sin decimales)
+            // - decimal_mode: acc_dec_value/acc_dec_scale (i128 exacto)
+            // - float_mode: acc_float (f64, lossy)
+            // Empezamos en int_mode; promovemos a decimal_mode si vemos
+            // un Decimal; promovemos a float_mode si vemos un Float.
             let mut acc_int: i128 = 0;
+            let mut acc_dec_value: i128 = 0;
+            let mut acc_dec_scale: u8 = 0;
             let mut acc_float: f64 = 0.0;
             let mut any = false;
-            let mut as_float = false;
+            let mut mode: u8 = 0; // 0=int, 1=decimal, 2=float
             for r in rows {
                 match r.get(&key) {
                     Some(Value::Integer(n)) => {
                         any = true;
-                        if as_float {
-                            acc_float += *n as f64;
-                        } else {
-                            acc_int += *n as i128;
+                        match mode {
+                            0 => {
+                                acc_int = acc_int.checked_add(*n as i128).ok_or_else(|| {
+                                    coded(
+                                        codes::ARITH_OVERFLOW,
+                                        "SUM(INT) overflow durante acumulación".to_string(),
+                                    )
+                                })?;
+                            }
+                            1 => {
+                                // Promote int n a decimal con scale=acc_dec_scale.
+                                let n128 = *n as i128;
+                                let pow =
+                                    10i128.checked_pow(acc_dec_scale as u32).ok_or_else(|| {
+                                        coded(
+                                            codes::ARITH_OVERFLOW,
+                                            "SUM scale overflow".to_string(),
+                                        )
+                                    })?;
+                                let n_scaled = n128.checked_mul(pow).ok_or_else(|| {
+                                    coded(
+                                        codes::ARITH_OVERFLOW,
+                                        "SUM int→decimal overflow".to_string(),
+                                    )
+                                })?;
+                                acc_dec_value =
+                                    acc_dec_value.checked_add(n_scaled).ok_or_else(|| {
+                                        coded(
+                                            codes::ARITH_OVERFLOW,
+                                            "SUM(DECIMAL) overflow".to_string(),
+                                        )
+                                    })?;
+                            }
+                            _ => acc_float += *n as f64,
                         }
                     }
                     Some(Value::Float(f)) => {
                         any = true;
-                        if !as_float {
-                            acc_float = acc_int as f64 + *f;
-                            as_float = true;
-                        } else {
-                            acc_float += *f;
+                        if mode != 2 {
+                            // Promote acc al modo float.
+                            acc_float = match mode {
+                                0 => acc_int as f64,
+                                1 => decimal_to_f64(acc_dec_value, acc_dec_scale),
+                                _ => unreachable!(),
+                            };
+                            mode = 2;
+                        }
+                        acc_float += *f;
+                    }
+                    Some(Value::Decimal { value, scale }) => {
+                        any = true;
+                        match mode {
+                            0 => {
+                                // Promote int acc al modo decimal con scale del row.
+                                let pow = 10i128.checked_pow(*scale as u32).ok_or_else(|| {
+                                    coded(codes::ARITH_OVERFLOW, "SUM scale overflow".to_string())
+                                })?;
+                                acc_dec_value = acc_int.checked_mul(pow).ok_or_else(|| {
+                                    coded(
+                                        codes::ARITH_OVERFLOW,
+                                        "SUM int→decimal overflow".to_string(),
+                                    )
+                                })?;
+                                acc_dec_scale = *scale;
+                                mode = 1;
+                                acc_dec_value =
+                                    acc_dec_value.checked_add(*value).ok_or_else(|| {
+                                        coded(
+                                            codes::ARITH_OVERFLOW,
+                                            "SUM(DECIMAL) overflow".to_string(),
+                                        )
+                                    })?;
+                            }
+                            1 => {
+                                // Mismo modo decimal. Alinear scales: subir el que tenga menor.
+                                let target = acc_dec_scale.max(*scale);
+                                let acc_norm =
+                                    rescale_decimal(acc_dec_value, acc_dec_scale, target).map_err(
+                                        |m| coded(codes::ARITH_OVERFLOW, format!("SUM: {}", m)),
+                                    )?;
+                                let row_norm =
+                                    rescale_decimal(*value, *scale, target).map_err(|m| {
+                                        coded(codes::ARITH_OVERFLOW, format!("SUM: {}", m))
+                                    })?;
+                                acc_dec_value =
+                                    acc_norm.checked_add(row_norm).ok_or_else(|| {
+                                        coded(
+                                            codes::ARITH_OVERFLOW,
+                                            "SUM(DECIMAL) overflow".to_string(),
+                                        )
+                                    })?;
+                                acc_dec_scale = target;
+                            }
+                            _ => acc_float += decimal_to_f64(*value, *scale),
                         }
                     }
                     Some(Value::Null) | None => {}
@@ -9982,7 +10130,7 @@ fn compute_aggregate(
                         return Err(coded(
                             codes::AGGREGATE_ARG_INVALID,
                             format!(
-                                "SUM solo opera sobre INT o FLOAT; valor incompatible: {:?}",
+                                "SUM solo opera sobre INT, FLOAT o DECIMAL; valor incompatible: {:?}",
                                 other
                             ),
                         ));
@@ -9992,14 +10140,68 @@ fn compute_aggregate(
             if !any {
                 return Ok(Value::Null);
             }
-            if as_float {
-                Ok(Value::Float(acc_float))
-            } else {
-                Ok(Value::Integer(acc_int as i64))
+            match mode {
+                0 => Ok(Value::Integer(acc_int as i64)),
+                1 => Ok(Value::Decimal {
+                    value: acc_dec_value,
+                    scale: acc_dec_scale,
+                }),
+                _ => Ok(Value::Float(acc_float)),
             }
         }
         (AggFunc::Avg, AggArg::Column(col)) => {
+            // Bloque Y9 (2026-05-29): AVG con dispatch a Decimal-puro
+            // si todos los valores no-NULL son Decimal/Int. Si aparece
+            // un Float, cae al path lossy f64.
             let key = normalize_ident(col);
+            // Primera pasada: detectar si hay Float en el grupo.
+            let has_float = rows
+                .iter()
+                .any(|r| matches!(r.get(&key), Some(Value::Float(_))));
+            let has_decimal = rows
+                .iter()
+                .any(|r| matches!(r.get(&key), Some(Value::Decimal { .. })));
+            if has_decimal && !has_float {
+                // Path Decimal-exacto: SUM exacto / count via div policy Y8.
+                let sum_v = compute_aggregate(AggFunc::Sum, &AggArg::Column(col.clone()), rows)?;
+                let (sum_value, sum_scale) = match sum_v {
+                    Value::Decimal { value, scale } => (value, scale),
+                    Value::Integer(n) => (n as i128, 0u8),
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(coded(
+                            codes::AGGREGATE_ARG_INVALID,
+                            format!("AVG: SUM devolvió valor inesperado: {:?}", other),
+                        ));
+                    }
+                };
+                let count: i128 = rows
+                    .iter()
+                    .filter(|r| {
+                        matches!(
+                            r.get(&key),
+                            Some(Value::Decimal { .. }) | Some(Value::Integer(_))
+                        )
+                    })
+                    .count() as i128;
+                if count == 0 {
+                    return Ok(Value::Null);
+                }
+                // Div con policy de Y8: target_scale = max(sum_scale, 6).
+                let target_scale = sum_scale.max(6);
+                let shift = (target_scale as i32) - (sum_scale as i32);
+                let pow = 10i128.checked_pow(shift as u32).ok_or_else(|| {
+                    coded(codes::ARITH_OVERFLOW, "AVG scale overflow".to_string())
+                })?;
+                let scaled = sum_value.checked_mul(pow).ok_or_else(|| {
+                    coded(codes::ARITH_OVERFLOW, "AVG sum scale overflow".to_string())
+                })?;
+                let value = scaled / count;
+                return Ok(Value::Decimal {
+                    value,
+                    scale: target_scale,
+                });
+            }
             let mut sum = 0.0;
             let mut count = 0usize;
             for r in rows {
@@ -10012,12 +10214,16 @@ fn compute_aggregate(
                         sum += *f;
                         count += 1;
                     }
+                    Some(Value::Decimal { value, scale }) => {
+                        sum += decimal_to_f64(*value, *scale);
+                        count += 1;
+                    }
                     Some(Value::Null) | None => {}
                     other => {
                         return Err(coded(
                             codes::AGGREGATE_ARG_INVALID,
                             format!(
-                                "AVG solo opera sobre INT o FLOAT; valor incompatible: {:?}",
+                                "AVG solo opera sobre INT, FLOAT o DECIMAL; valor incompatible: {:?}",
                                 other
                             ),
                         ));
@@ -13651,7 +13857,9 @@ fn validate_scalar_arity(f: ScalarFunc, n: usize) -> DbResult<()> {
         ScalarFunc::Now
         | ScalarFunc::CurrentDate
         | ScalarFunc::CurrentTimestamp
-        | ScalarFunc::GenRandomUuid => n == 0,
+        | ScalarFunc::GenRandomUuid
+        | ScalarFunc::GenUuidV7 => n == 0,
+        ScalarFunc::GenRandomBytes => n == 1,
     };
     if ok {
         return Ok(());
@@ -14751,6 +14959,23 @@ fn eval_scalar_fn(f: ScalarFunc, args: Vec<Value>) -> DbResult<Value> {
             Ok(Value::String(dt[..10].to_string()))
         }
         ScalarFunc::GenRandomUuid => Ok(Value::String(gen_uuid_v4())),
+        ScalarFunc::GenUuidV7 => Ok(Value::String(gen_uuid_v7())),
+        ScalarFunc::GenRandomBytes => {
+            let n = match &args[0] {
+                Value::Integer(i) if *i >= 0 => *i as usize,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(coded(
+                        codes::SCALAR_FN_TYPE_MISMATCH,
+                        format!(
+                            "GEN_RANDOM_BYTES requiere INT no-negativo, recibí {}",
+                            value_type_name(other)
+                        ),
+                    ));
+                }
+            };
+            Ok(Value::Bytes(gen_random_bytes(n)))
+        }
         // -------- Bloque G3: string P2/P3 --------
         ScalarFunc::Trim => match &args[0] {
             Value::String(s) => Ok(Value::String(s.trim().to_string())),
@@ -15788,6 +16013,81 @@ fn gen_uuid_v4() -> String {
     out
 }
 
+/// Bloque Y9 (2026-05-29): UUID v7 (RFC 9562). Los primeros 48 bits
+/// son timestamp Unix en milliseconds (big-endian), los siguientes 4
+/// bits son version=7, los siguientes 12 bits son random A, los
+/// siguientes 2 bits son variant=10, los últimos 62 bits son random B.
+/// PRNG: mismo xorshift no-cripto de Y5.
+fn gen_uuid_v7() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let unix_ms: u128 = now.as_millis();
+    let seed = unix_ms as u64 ^ 0x5a5a_5a5a_5a5a_5a5a;
+    let mut state = if seed == 0 {
+        0x1234_5678_9abc_def0
+    } else {
+        seed
+    };
+    // 62 + 12 = 74 bits random ≈ 10 bytes; usamos 16 bytes y luego
+    // sobreescribimos los timestamp + version + variant nibbles.
+    let mut bytes = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let chunk = state.to_le_bytes();
+        let take = (16 - i).min(8);
+        bytes[i..i + take].copy_from_slice(&chunk[..take]);
+        i += take;
+    }
+    // Timestamp ms en bytes 0..=5 (big-endian 48 bits).
+    let ts_be = (unix_ms & 0x0000_FFFF_FFFF_FFFF) as u64;
+    bytes[0] = ((ts_be >> 40) & 0xff) as u8;
+    bytes[1] = ((ts_be >> 32) & 0xff) as u8;
+    bytes[2] = ((ts_be >> 24) & 0xff) as u8;
+    bytes[3] = ((ts_be >> 16) & 0xff) as u8;
+    bytes[4] = ((ts_be >> 8) & 0xff) as u8;
+    bytes[5] = (ts_be & 0xff) as u8;
+    // Version 7 en nibble alto de byte 6.
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    // Variant 10xx en nibble alto de byte 8.
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Bloque Y9 (2026-05-29): `gen_random_bytes(n)`. PRNG xorshift no-cripto.
+fn gen_random_bytes(n: usize) -> Vec<u8> {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ 0xc3c3_c3c3_c3c3_c3c3;
+    let mut state = if seed == 0 {
+        0xfeed_face_dead_beef
+    } else {
+        seed
+    };
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let chunk = state.to_le_bytes();
+        let take = (n - out.len()).min(8);
+        out.extend_from_slice(&chunk[..take]);
+    }
+    out
+}
+
 /// Bloque G1: formatea el instante actual como `YYYY-MM-DD HH:MM:SS` en
 /// UTC, sin chrono. Convierte los segundos desde UNIX_EPOCH a la fecha
 /// civil con el algoritmo de Howard Hinnant (`days_from_civil` inverso).
@@ -16045,6 +16345,24 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                 }
                 if decimals_start == index {
                     index = dot;
+                }
+            }
+            // Bloque Y9 (2026-05-29): notación científica `1.5e3`, `2.5E-4`.
+            // Sólo consumimos si tras la 'e'/'E' viene un dígito (con signo
+            // opcional). Si no, dejamos la 'e' fuera para no romper idents.
+            if index < chars.len() && (chars[index] == 'e' || chars[index] == 'E') {
+                let exp_start = index;
+                let mut probe = index + 1;
+                if probe < chars.len() && (chars[probe] == '+' || chars[probe] == '-') {
+                    probe += 1;
+                }
+                if probe < chars.len() && chars[probe].is_ascii_digit() {
+                    index = probe + 1;
+                    while index < chars.len() && chars[index].is_ascii_digit() {
+                        index += 1;
+                    }
+                } else {
+                    let _ = exp_start;
                 }
             }
             tokens.push(Token {

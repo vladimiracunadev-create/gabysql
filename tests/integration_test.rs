@@ -13825,6 +13825,179 @@ fn y8_decimal_mul_negative() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y9 (2026-05-29): cierre de Y. SUM/AVG decimal exactos,
+// UUID v7, gen_random_bytes(n), notación científica en literales
+// DECIMAL. Sin bump on-disk.
+// ============================================================
+
+fn y9_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y9-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y9_sum_decimal_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y9_setup("sum")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2));
+         INSERT INTO t (id, a) VALUES (1, 1.50);
+         INSERT INTO t (id, a) VALUES (2, 2.25);
+         INSERT INTO t (id, a) VALUES (3, 100.00);",
+    )?;
+    let res = run_sql(&db, "SELECT SUM(a) FROM t;")?;
+    // 1.50 + 2.25 + 100.00 = 103.75 → Decimal(10375, scale=2)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 10375,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y9_avg_decimal_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y9_setup("avg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2));
+         INSERT INTO t (id, a) VALUES (1, 1.00);
+         INSERT INTO t (id, a) VALUES (2, 2.00);
+         INSERT INTO t (id, a) VALUES (3, 3.00);",
+    )?;
+    let res = run_sql(&db, "SELECT AVG(a) FROM t;")?;
+    // sum=6.00 (scale=2), target_scale = max(2,6)=6, 6_000_000 / 3 = 2_000_000.
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 2_000_000,
+            scale: 6
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y9_min_max_decimal() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y9_setup("minmax")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2));
+         INSERT INTO t (id, a) VALUES (1, 5.50);
+         INSERT INTO t (id, a) VALUES (2, 1.25);
+         INSERT INTO t (id, a) VALUES (3, 9.75);",
+    )?;
+    let res = run_sql(&db, "SELECT MIN(a), MAX(a) FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 125,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        res[0].rows[0][1],
+        Value::Decimal {
+            value: 975,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y9_uuid_v7_shape() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y9_setup("uuid-v7")?;
+    run_sql(
+        &db,
+        "CREATE TABLE one (n INT PRIMARY KEY); INSERT INTO one (n) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT UUID_V7() FROM one;")?;
+    let v = &res[0].rows[0][0];
+    let s = match v {
+        Value::String(s) => s.clone(),
+        other => panic!("expected String, got {:?}", other),
+    };
+    assert_eq!(s.len(), 36, "uuid must be 36 chars");
+    let bytes = s.as_bytes();
+    assert_eq!(bytes[8], b'-');
+    assert_eq!(bytes[13], b'-');
+    assert_eq!(bytes[18], b'-');
+    assert_eq!(bytes[23], b'-');
+    // version nibble en posición 14 (primer char tras tercer guion) = '7'.
+    assert_eq!(bytes[14] as char, '7');
+    // variant nibble en posición 19 ∈ {8,9,a,b}.
+    let variant = bytes[19] as char;
+    assert!(
+        matches!(variant, '8' | '9' | 'a' | 'b'),
+        "variant nibble must be 8/9/a/b, got {}",
+        variant
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y9_gen_random_bytes_len() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y9_setup("randbytes")?;
+    run_sql(
+        &db,
+        "CREATE TABLE one (n INT PRIMARY KEY); INSERT INTO one (n) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT GEN_RANDOM_BYTES(8) FROM one;")?;
+    match &res[0].rows[0][0] {
+        Value::Bytes(b) => assert_eq!(b.len(), 8),
+        other => panic!("expected Bytes, got {:?}", other),
+    }
+    let res = run_sql(&db, "SELECT GEN_RANDOM_BYTES(16) FROM one;")?;
+    match &res[0].rows[0][0] {
+        Value::Bytes(b) => assert_eq!(b.len(), 16),
+        other => panic!("expected Bytes, got {:?}", other),
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y9_decimal_scientific_notation() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y9_setup("sci")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(20,4));
+         INSERT INTO t (id, a) VALUES (1, 1.5e3);
+         INSERT INTO t (id, a) VALUES (2, 2.5E-2);",
+    )?;
+    let res = run_sql(&db, "SELECT a FROM t ORDER BY id;")?;
+    // 1.5e3 = 1500 → Decimal(value=15_000_000, scale=4)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 15_000_000,
+            scale: 4
+        }
+    );
+    // 2.5e-2 = 0.025 → Decimal(value=250, scale=4)
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 250,
+            scale: 4
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

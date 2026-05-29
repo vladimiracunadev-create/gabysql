@@ -6,6 +6,50 @@
 
 ---
 
+## 2026-05-29 — Bloque Y9: cierre del bloque Y (agregados decimal, UUID v7, sci notation)
+
+> **Un push a `main`** sin bump on-disk. **Cierra el bloque Y al 100%**. Bundle: `SUM`/`AVG` Decimal-exactos (acumulador multi-modo int→decimal→float), `UUID_V7()` (RFC 9562), `GEN_RANDOM_BYTES(n)`, notación científica en literales (`1.5e3`, `2.5E-4`). Diferidos explícitos (ARRAY/ENUM/INTERVAL/TZ, UNSIGNED BIGINT real, DECIMAL/BLOB indexables, CHAR padding, code points, POWER decimal, WHERE col=col relax) documentados en ADR-0049. Detalle en [`docs/adr/0049-y9-closure-y-block.md`](docs/adr/0049-y9-closure-y-block.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+-- SUM/AVG exactos sobre Decimal (sin caída a f64).
+SELECT SUM(price), AVG(price) FROM line_items;  -- ambos Value::Decimal
+
+-- UUID v7 (RFC 9562): timestamp-ordered, monotonic-ish.
+SELECT UUID_V7() FROM one;  -- "0190abcd-ef01-7xxx-Vxxx-xxxxxxxxxxxx"
+
+-- Bytes random sin cripto-fuerte.
+SELECT GEN_RANDOM_BYTES(16) FROM one;  -- Value::Bytes(16 bytes)
+
+-- Notación científica en literales.
+INSERT INTO measures (v) VALUES (1.5e3);   -- 1500
+INSERT INTO measures (v) VALUES (2.5E-4);  -- 0.00025
+```
+
+### 🛠 Implementación
+
+- `compute_aggregate` SUM: acumulador 3-modo (`acc_int: i128` → `acc_dec_value: i128 + acc_dec_scale: u8` → `acc_float: f64`) con promoción según el tipo de cada fila. Tipo de retorno refleja el modo final.
+- `compute_aggregate` AVG: pre-scan detecta `has_float`/`has_decimal`. Si Decimal-pure, llama recursivamente a SUM y divide aplicando política Y8 (`target_scale = max(sum_scale, 6)`, pre-shift, truncation).
+- `ScalarFunc::GenUuidV7` y `::GenRandomBytes` añadidos al enum, `keyword()`, `from_ident()`, arity check, dispatch. Helpers `gen_uuid_v7()` y `gen_random_bytes(n)` con PRNG xorshift64 sembrado por `SystemTime` (no cripto).
+- Lexer `tokenize`: extiende `Number` con `[eE][+-]?digits` opcional cuando va inmediatamente después de la mantissa.
+- `parse_decimal`: para exponente negativo infla `parse_scale = clamp(target_scale + |exp|, 0, 38)` para absorber sin pérdida; para positivo multiplica por `10^exp` al final.
+
+### 🚫 Sin nuevos códigos de error
+
+Reusa `[GBY-4042]` y `[GBY-4123]` existentes.
+
+### 🚫 Diferido (cada uno justifica bloque propio)
+
+ARRAY/ENUM/INTERVAL/TIMESTAMPTZ, `UNSIGNED BIGINT` real (u64), DECIMAL/BLOB indexables (B-tree), `CHAR(n)` padding, code points reales en VARCHAR, `POWER` decimal, WHERE col=col heterogéneo relajado.
+
+### 🧪 Validación
+
+- Suite: **605 passing** (599 → +6 Y9: `y9_sum_decimal_exact`, `y9_avg_decimal_exact`, `y9_min_max_decimal`, `y9_uuid_v7_shape`, `y9_gen_random_bytes_len`, `y9_decimal_scientific_notation`).
+- `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Y8: Mul/Div/Mod `DECIMAL` exactos
 
 > **Un push a `main`** sin bump on-disk. Cierra el ciclo Y6→Y7→Y8 con los 3 operadores que faltaban: `*`/`/`/`%` ahora son exactos en Decimal-puro. Detalle en [`docs/adr/0048-decimal-mul-div-mod-y8.md`](docs/adr/0048-decimal-mul-div-mod-y8.md).

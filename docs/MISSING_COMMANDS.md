@@ -398,7 +398,13 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `GEOMETRY` / `GEOGRAPHY` (PostGIS-like) | ❌ | P3 |
 | `INET` / `CIDR` (red) | ❌ | P3 |
 | UUID auto-gen v4 random (`gen_random_uuid`/`uuid_v4`/`uuid_generate_v4`/`random_uuid`) | ✅ (Y5, 2026-05-29) | — |
-| UUID v1/v6/v7 timestamp-based | ❌ (Y5 sólo v4 random; diferido) | P3 |
+| UUID v7 timestamp-ordered (`uuid_v7`/`uuid_generate_v7`/`gen_uuid_v7`) | ✅ (Y9, 2026-05-29; RFC 9562 §5.7; PRNG no-crypto) | — |
+| UUID v1/v6 timestamp-based | ❌ (Y9 sólo v7; diferido) | P3 |
+| `gen_random_bytes(n)` (bytes random) | ✅ (Y9, 2026-05-29; xorshift PRNG no-crypto; `Value::Bytes`) | — |
+| `SUM(decimal)` / `AVG(decimal)` Decimal-exactos | ✅ (Y9, 2026-05-29; acumulador multi-modo int→decimal→float; AVG aplica política Y8 `target_scale=max(sum_scale,6)`) | — |
+| Notación científica en literales numéricos (`1.5e3`, `2.5E-4`) | ✅ (Y9, 2026-05-29; lexer extiende `Number`; `parse_decimal` conserva precisión en exp negativos) | — |
+| `POWER(decimal, n)` exact (sin caer a f64) | ❌ (Y9 cae a f64; diferido) | P3 |
+| WHERE con comparación heterogénea relajada (string-vs-int normalizado) | ❌ (Y9 estricto; diferido) | P3 |
 
 ---
 
