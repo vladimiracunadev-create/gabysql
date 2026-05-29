@@ -12432,6 +12432,198 @@ fn y2_limit_survives_reopen() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y3 (2026-05-29): enforcement de rango para TINYINT/SMALLINT/
+// MEDIUMINT/INT4. Bump VERSION 18→19 — persiste int_width por columna.
+// ============================================================
+
+fn y3_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y3-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y3_tinyint_in_range_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("tiny-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT);
+         INSERT INTO t (id, n) VALUES (1, 127);
+         INSERT INTO t (id, n) VALUES (2, -128);
+         INSERT INTO t (id, n) VALUES (3, 0);",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_tinyint_over_range_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("tiny-over")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 200);");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4121"), "esperaba GBY-4121, vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_tinyint_under_range_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("tiny-under")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, -200);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_smallint_in_range_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("small-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n SMALLINT);
+         INSERT INTO t (id, n) VALUES (1, 32767);
+         INSERT INTO t (id, n) VALUES (2, -32768);",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_smallint_over_range_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("small-over")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n SMALLINT);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 50000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_int2_alias_enforced_like_smallint() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("int2")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT2);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 50000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_mediumint_in_range_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("med-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n MEDIUMINT);
+         INSERT INTO t (id, n) VALUES (1, 8388607);
+         INSERT INTO t (id, n) VALUES (2, -8388608);",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_mediumint_over_range_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("med-over")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n MEDIUMINT);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 10000000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_int4_in_range_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("int4-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT4);
+         INSERT INTO t (id, n) VALUES (1, 2147483647);
+         INSERT INTO t (id, n) VALUES (2, -2147483648);",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_int4_over_range_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("int4-over")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT4);")?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 3000000000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_int_bigint_no_enforce() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("bigint-noop")?;
+    // INT/BIGINT no enforce — cualquier i64 cabe.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, big BIGINT);
+         INSERT INTO t (id, big) VALUES (1, 9000000000000000000);",
+    )?;
+    let res = run_sql(&db, "SELECT big FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(9_000_000_000_000_000_000));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_update_also_enforced() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("update")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT);
+         INSERT INTO t (id, n) VALUES (1, 50);",
+    )?;
+    let err = run_sql(&db, "UPDATE t SET n = 999 WHERE id = 1;");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_alter_add_smallint_persists_enforcement() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("alter")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         ALTER TABLE t ADD COLUMN s SMALLINT;
+         INSERT INTO t (id, s) VALUES (1, 100);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, s) VALUES (2, 50000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y3_int_width_survives_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y3_setup("reopen")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT);")?;
+    // Cierre implícito entre run_sql — re-abrir y meter 999 debe disparar 4121.
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 999);");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4121"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

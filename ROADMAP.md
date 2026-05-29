@@ -100,6 +100,8 @@
 
 - ~~`FOR row IN (SELECT ...) LOOP <body> END LOOP` — itera fila por fila sobre un resultset; en cada iteración inyecta `row.col` en `var_scope` con claves qualified (`"row.col"` lowercase). Fast-path en `eval_expr` para resolver `Expr::Column("row.id")` contra el lookup completo antes de normalizar (que tiraría el qualifier). SELECT obligatorio entre paréntesis. EXIT/RETURN propagan por sentinel; MAX_LOOP_ITERATIONS=100K como guard. Sin bump on-disk. **Cierra el bloque X al 100%** (procedural completo: triggers, procedures, functions, IF/CASE/WHILE/FOR range/FOR row/LOOP/DECLARE/SET/RAISE WARNING-NOTICE-INFO-EXCEPTION/EXCEPTION WHEN code-name-OTHERS/RETURN)~~ ✅ entregado (bloque **X6**, 2026-05-29, [ADR-0042](docs/adr/0042-for-row-in-select-x6.md)).
 
+- ~~Enforcement de rango para `TINYINT` (i8), `SMALLINT`/`INT2` (i16), `MEDIUMINT` (24-bit signed), `INT4` (i32). Persiste `int_width: Option<u8>` por columna (flag `COLUMN_FLAG_HAS_INT_WIDTH = 0x10`, 1 byte tras max_length). Helper `extract_int_width` mapea el `type_name` a 1/2/3/4 bytes. Encoder valida en `(ColumnType::Int, Value::Integer)`. `INT`/`INTEGER`/`BIGINT`/`INT8` no enforcen (i64 nativo). Bump VERSION 18→19. `BLOB`/`BYTEA`, `DECIMAL` exacto, `UNSIGNED *`, `CHAR(n)` padding diferidos a Y4+~~ ✅ entregado (bloque **Y3**, 2026-05-29, [ADR-0043](docs/adr/0043-int-range-enforcement-y3.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

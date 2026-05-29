@@ -247,6 +247,11 @@ const COLUMN_FLAG_HAS_FK: u8 = 0x04;
 /// escriben 4 bytes LE con `max_length` (u32). Solo aplica a columnas
 /// de familia TEXT (`VARCHAR(n)`, `CHAR(n)`, etc.).
 const COLUMN_FLAG_HAS_MAX_LENGTH: u8 = 0x08;
+/// Bloque Y3 (VERSION 19): si presente, después de `max_length` (si
+/// existe) se escribe 1 byte con `int_width` (u8). Solo aplica a
+/// columnas INT — codifica TINYINT(1) / SMALLINT(2) / MEDIUMINT(3) /
+/// INT4(4). `INT`/`INTEGER`/`BIGINT`/`INT8` no setean el flag.
+const COLUMN_FLAG_HAS_INT_WIDTH: u8 = 0x10;
 
 /// Action to take when the parent row a `FOREIGN KEY` points at is
 /// deleted.
@@ -444,6 +449,13 @@ pub struct Column {
     /// bytes que da el length-prefixed encoding). Para tipos
     /// non-text el valor es ignorado.
     pub max_length: Option<u32>,
+    /// Bloque Y3 (2026-05-29): ancho declarado para columnas INT —
+    /// 1 = TINYINT (i8), 2 = SMALLINT/INT2 (i16), 3 = MEDIUMINT
+    /// (24-bit signed), 4 = INT4 (i32). `None` (o tipos non-int)
+    /// significa sin enforcement (i64 nativo, default para
+    /// `INT`/`INTEGER`/`BIGINT`/`INT8`). El motor internamente
+    /// siempre opera en i64; el chequeo de rango es en el encoder.
+    pub int_width: Option<u8>,
 }
 
 impl Column {
@@ -455,6 +467,7 @@ impl Column {
             default: None,
             references: None,
             max_length: None,
+            int_width: None,
         }
     }
 }
@@ -720,6 +733,9 @@ impl TableMeta {
             if column.max_length.is_some() {
                 flags |= COLUMN_FLAG_HAS_MAX_LENGTH;
             }
+            if column.int_width.is_some() {
+                flags |= COLUMN_FLAG_HAS_INT_WIDTH;
+            }
             out.push(flags);
             if let Some(default) = &column.default {
                 default.encode_into(&mut out)?;
@@ -773,6 +789,11 @@ impl TableMeta {
             // el orden con columnas pre-Y2.
             if let Some(n) = column.max_length {
                 out.extend_from_slice(&n.to_le_bytes());
+            }
+            // Bloque Y3 (VERSION 19): int_width (TINYINT/SMALLINT/
+            // MEDIUMINT/INT4). 1 byte después de max_length si está.
+            if let Some(w) = column.int_width {
+                out.push(w);
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -962,6 +983,20 @@ impl TableMeta {
             } else {
                 None
             };
+            // Bloque Y3 (VERSION 19): int_width opcional (1 byte) tras max_length.
+            let int_width = if flags & COLUMN_FLAG_HAS_INT_WIDTH != 0 {
+                if offset >= data.len() {
+                    return Err(DbError::new(format!(
+                        "TableMeta '{}' corrupta: falta byte int_width de columna '{}' en offset {}",
+                        name, col_name, offset
+                    )));
+                }
+                let w = data[offset];
+                offset += 1;
+                Some(w)
+            } else {
+                None
+            };
             columns.push(Column {
                 name: col_name,
                 column_type,
@@ -969,6 +1004,7 @@ impl TableMeta {
                 default,
                 references,
                 max_length,
+                int_width,
             });
         }
         if offset + 2 > data.len() {

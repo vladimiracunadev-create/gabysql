@@ -48,7 +48,8 @@
 
 | `VERSION` del header | Estado | Notas |
 | :--- | :--- | :--- |
-| `18` | 🟢 Actual | Bloque Y2 (2026-05-29). Flag bit `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08` + `u32` adicional por columna cuando está prendido. Habilita enforcement real de `VARCHAR(n)` / `CHAR(n)` en bytes UTF-8 con `[GBY-4119]` (ADR-0040). Rechaza VERSION 17 con `[GBY-1003]`. |
+| `19` | 🟢 Actual | Bloque Y3 (2026-05-29). Flag bit `COLUMN_FLAG_HAS_INT_WIDTH = 0x10` + `u8` por columna (1=TINYINT, 2=SMALLINT/INT2, 3=MEDIUMINT, 4=INT4). Habilita enforcement de rango con `[GBY-4121]` (ADR-0043). Rechaza VERSION 18 con `[GBY-1003]`. |
+| `18` | 🔴 Rechazado | Bloque Y2 (2026-05-29). Flag bit `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08` + `u32` adicional por columna cuando está prendido. Habilita enforcement real de `VARCHAR(n)` / `CHAR(n)` en bytes UTF-8 con `[GBY-4119]` (ADR-0040). Migrar via export/import. |
 | `17` | 🔴 Rechazado | Bloque Y (2026-05-29). Dos códigos nuevos para tipos: `8 = TIME` y `9 = UUID` (ambos `stores_as_text`). Aliases sintácticos (`BIGINT`, `VARCHAR(n)`, `DECIMAL(p,s)`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, …) no requirieron bump por sí solos — mapean a tipos existentes (ADR-0039). Migrar via export/import. |
 | `16` | 🔴 Rechazado | Bloque X3b (2026-05-28). `ObjectKind::Function` con payload `[name][return_type][param_count]×[pname][ptype][body_sql]`. Habilita `CREATE FUNCTION name(params) RETURNS type AS <expr\|BEGIN..END>` invocable en SELECT/WHERE (ADR-0032). Migrar via export/import. |
 | `15` | 🔴 Rechazado | Bloque X3 (2026-05-28). `ObjectKind::Procedure` con payload `[name][param_count]×[pname][ptype][body_sql]`. Habilita `CREATE PROCEDURE name(params) AS <body>` + `CALL name(args)` (ADR-0031). Migrar via export/import. |

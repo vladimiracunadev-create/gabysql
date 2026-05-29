@@ -807,6 +807,10 @@ pub struct ColumnDef {
     /// Bloque Y2 (2026-05-29): `n` declarado en `VARCHAR(n)`/`CHAR(n)`.
     /// Sólo se setea para tipos de familia TEXT; ignorado en non-text.
     pub max_length: Option<u32>,
+    /// Bloque Y3 (2026-05-29): ancho declarado para INT
+    /// (`TINYINT`=1, `SMALLINT`/`INT2`=2, `MEDIUMINT`=3, `INT4`=4).
+    /// `None` para `INT`/`INTEGER`/`BIGINT`/`INT8` (sin enforce, i64).
+    pub int_width: Option<u8>,
 }
 
 /// Parser-level representation of
@@ -1997,6 +2001,12 @@ impl<'a> Engine<'a> {
             } else {
                 None
             };
+            // Bloque Y3: int_width sólo aplica a familia INT
+            let int_width = if column_type == ColumnType::Int {
+                column.int_width
+            } else {
+                None
+            };
             columns.push(Column {
                 name: column.name,
                 column_type,
@@ -2008,6 +2018,7 @@ impl<'a> Engine<'a> {
                 },
                 references,
                 max_length,
+                int_width,
             });
         }
 
@@ -2544,6 +2555,11 @@ impl<'a> Engine<'a> {
             } else {
                 None
             },
+            int_width: if column_type == ColumnType::Int {
+                stmt.column.int_width
+            } else {
+                None
+            },
         };
         // Run the standard validation against a *prospective* meta so the
         // same DEFAULT/type compatibility rules used by CREATE TABLE
@@ -2857,6 +2873,7 @@ impl<'a> Engine<'a> {
                 default: None,
                 references: None,
                 max_length: None,
+                int_width: None,
             });
         }
         let mut meta = TableMeta {
@@ -10289,6 +10306,24 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
                 out.push(0);
             }
             (ColumnType::Int, Value::Integer(number)) => {
+                // Bloque Y3: enforcement de rango según int_width
+                // declarado por TINYINT/SMALLINT/MEDIUMINT/INT4.
+                if let Some(w) = column.int_width {
+                    let (min, max) = int_width_range(w);
+                    if number < min || number > max {
+                        return Err(coded(
+                            codes::INT_RANGE_EXCEEDED,
+                            format!(
+                                "valor {} para columna '{}' fuera de rango {} ({}..={})",
+                                number,
+                                column.name,
+                                int_width_label(w),
+                                min,
+                                max
+                            ),
+                        ));
+                    }
+                }
                 out.push(1);
                 out.extend_from_slice(&number.to_le_bytes());
                 if !composite_pk && column.name.eq_ignore_ascii_case(&meta.primary_key) {
@@ -14729,6 +14764,59 @@ pub(crate) fn extract_length_param(type_name: &str) -> Option<u32> {
     inner.parse::<u32>().ok()
 }
 
+/// Bloque Y3 (2026-05-29): devuelve `(min, max)` para un `int_width`
+/// dado (1=TINYINT, 2=SMALLINT, 3=MEDIUMINT, 4=INT4). Otros valores
+/// devuelven el rango i64 completo (no-op enforcement).
+pub(crate) fn int_width_range(width: u8) -> (i64, i64) {
+    match width {
+        1 => (i8::MIN as i64, i8::MAX as i64),
+        2 => (i16::MIN as i64, i16::MAX as i64),
+        3 => (-8_388_608, 8_388_607),
+        4 => (i32::MIN as i64, i32::MAX as i64),
+        _ => (i64::MIN, i64::MAX),
+    }
+}
+
+/// Bloque Y3: label legible del ancho INT para mensajes de error.
+pub(crate) fn int_width_label(width: u8) -> &'static str {
+    match width {
+        1 => "TINYINT",
+        2 => "SMALLINT",
+        3 => "MEDIUMINT",
+        4 => "INT4",
+        _ => "INT",
+    }
+}
+
+/// Bloque Y3 (2026-05-29): mapea el `type_name` declarado al ancho
+/// en bytes que se debe enforcer en el encoder. Sólo aplica a tipos
+/// de la familia INT que tienen rango más estrecho que i64:
+///
+/// - `TINYINT` → 1 (i8: -128..=127)
+/// - `SMALLINT` / `INT2` → 2 (i16)
+/// - `MEDIUMINT` → 3 (24-bit signed: -8388608..=8388607)
+/// - `INT4` → 4 (i32)
+///
+/// Devuelve `None` para `INT`/`INTEGER`/`BIGINT`/`INT8` (i64 nativo,
+/// sin enforcement) y para tipos non-int. El usuario sigue pudiendo
+/// usar TINYINT/SMALLINT como alias-puros si el código se compiló
+/// pre-Y3 — Y3 simplemente activa el chequeo de rango.
+pub(crate) fn extract_int_width(type_name: &str) -> Option<u8> {
+    let upper = type_name.trim().to_ascii_uppercase();
+    // Strip "(...)" suffix por si vino con `INT(11)` legacy.
+    let base = match upper.find('(') {
+        Some(idx) => upper[..idx].trim_end().to_string(),
+        None => upper,
+    };
+    match base.as_str() {
+        "TINYINT" => Some(1),
+        "SMALLINT" | "INT2" => Some(2),
+        "MEDIUMINT" => Some(3),
+        "INT4" => Some(4),
+        _ => None,
+    }
+}
+
 /// Bloque Y (2026-05-29): valida que `s` parezca una hora ISO 8601
 /// (`HH:MM:SS` o `HH:MM:SS.fff`). Validación lexical solo —
 /// no chequea rangos (24:00 no se rechaza por simplicidad).
@@ -17671,6 +17759,7 @@ impl Parser {
             }
         }
         let max_length = extract_length_param(&type_name);
+        let int_width = extract_int_width(&type_name);
         Ok(ColumnDef {
             name,
             type_name,
@@ -17680,6 +17769,7 @@ impl Parser {
             default,
             references,
             max_length,
+            int_width,
         })
     }
 

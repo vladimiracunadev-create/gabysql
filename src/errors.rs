@@ -616,6 +616,13 @@ pub mod codes {
     /// trivial). Codifica ambos en un mismo slot porque son errores
     /// estructurales del modelo procedural.
     pub const RAISE_FORMAT_OR_FOR_STEP_INVALID: u32 = 4120;
+    /// Bloque Y3 (2026-05-29): `INSERT`/`UPDATE` de un entero que excede
+    /// el rango declarado por `TINYINT` (i8: -128..=127), `SMALLINT`/
+    /// `INT2` (i16), `MEDIUMINT` (24-bit: -8388608..=8388607), o `INT4`
+    /// (i32). `INT`/`INTEGER`/`BIGINT`/`INT8` no enforcer rango (i64
+    /// nativo). El motor internamente sigue usando i64; el chequeo es
+    /// en el encoder según el `int_width` persistido por columna.
+    pub const INT_RANGE_EXCEEDED: u32 = 4121;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

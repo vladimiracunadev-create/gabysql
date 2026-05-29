@@ -6,6 +6,58 @@
 
 ---
 
+## 2026-05-29 — Bloque Y3: enforcement de rango `TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT4`
+
+> **Un push a `main`** con **bump on-disk 18 → 19**. Sigue el patrón de Y2 (`max_length` para VARCHAR(n)/CHAR(n)) — ahora un `int_width: Option<u8>` por columna enforce el rango declarado. Detalle en [`docs/adr/0043-int-range-enforcement-y3.md`](docs/adr/0043-int-range-enforcement-y3.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE TABLE personas (
+    id   INT PRIMARY KEY,
+    edad TINYINT,
+    año  SMALLINT,
+    clic MEDIUMINT,
+    salt INT4
+);
+
+INSERT INTO personas (id, edad) VALUES (1, 30);   -- OK
+INSERT INTO personas (id, edad) VALUES (2, 200);  -- [GBY-4121] INT_RANGE_EXCEEDED
+UPDATE  personas SET edad = -200 WHERE id = 1;    -- [GBY-4121] también
+```
+
+### 🛠 Implementación
+
+- **`Column`** (catalog): nuevo campo `pub int_width: Option<u8>` con codes 1=TINYINT, 2=SMALLINT/INT2, 3=MEDIUMINT, 4=INT4. `None` para INT/INTEGER/BIGINT/INT8 (i64 nativo sin enforce).
+- **Helper `extract_int_width(type_name) -> Option<u8>`** mapea el `type_name` ya parseado al ancho enforced. Strip de `(...)` por si vino con `INT(11)` legacy de MySQL.
+- **Disk format (V19)**: nuevo flag bit `COLUMN_FLAG_HAS_INT_WIDTH = 0x10`. Cuando está prendido, después del bloque `max_length` (Y2) se escribe **1 byte** con el width. Columnas sin `int_width` son byte-idénticas a V18.
+- **Enforcement en encoder**: condición agregada al arm `(ColumnType::Int, Value::Integer)` en `encode_row`. Cubre INSERT, UPDATE, INSERT...SELECT y CTAS via el mismo path.
+- **`int_width_range(w)` y `int_width_label(w)`** como helpers públicos para mensajes legibles.
+- **Bump 18 → 19**: V18 no sabría saltar el byte extra y leería el `idx_count` desde un offset inválido. V18 rechazado con `[GBY-1003]`.
+
+### 🆕 Código de error
+
+| Código | Nombre | Cuándo |
+|---|---|---|
+| `GBY-4121` | `INT_RANGE_EXCEEDED` | INSERT/UPDATE de entero fuera del rango `TINYINT`/`SMALLINT`/`INT2`/`MEDIUMINT`/`INT4`. |
+
+### 🚫 Diferido (Y4 y más allá)
+
+- **`BLOB` / `BYTEA` / `BINARY`** (requiere `Value::Bytes` y cambio de serialización).
+- **`DECIMAL(p,s)` exacto** (requiere `Value::Decimal`; hoy es alias de FLOAT).
+- **`UNSIGNED TINYINT`/`UNSIGNED INT`/etc.** (MySQL-style — Y3 solo enforce signed).
+- **`CHAR(n)` con padding** a la derecha.
+- **Conteo por code points** en VARCHAR(n) (vs bytes UTF-8 actual).
+- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**, **`TIME/TIMESTAMP WITH TIME ZONE`**.
+- **`gen_random_uuid()`** y similares.
+
+### 🧪 Validación
+
+- 14 tests `y3_*`: rangos OK + over + under para TINYINT/SMALLINT/MEDIUMINT/INT4, INT2 alias enforced, BIGINT sin enforce (9 * 10^18 OK), UPDATE también dispara, ALTER ADD COLUMN persiste, reopen mantiene la regla.
+- Suite total: **544/544 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque X6: `FOR row IN (SELECT ...) LOOP` — cierra el bloque X
 
 > **Un push a `main`** sin bump on-disk. Último item del bloque X — itera fila por fila sobre un resultset con composite row scope (`row.col`). Detalle en [`docs/adr/0042-for-row-in-select-x6.md`](docs/adr/0042-for-row-in-select-x6.md).

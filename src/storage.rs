@@ -143,7 +143,13 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08`. V17 rechazados con
 //        `[GBY-1003]` — un V18 puede tener bytes extra que V17 no
 //        sabe saltar al decodificar el bloque de columnas.
-pub const VERSION: u32 = 18;
+//  19 -> Bloque Y3 (2026-05-29): enforcement de rango para
+//        `TINYINT`/`SMALLINT`/`INT2`/`MEDIUMINT`/`INT4`. Se persiste
+//        `int_width: u8` opcional por columna (valores 1, 2, 3 o 4)
+//        tras `max_length`, indicado por el flag
+//        `COLUMN_FLAG_HAS_INT_WIDTH = 0x10`. V18 rechazados con
+//        `[GBY-1003]` por la misma razón que V17→V18.
+pub const VERSION: u32 = 19;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;
