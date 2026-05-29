@@ -687,6 +687,11 @@ pub mod codes {
     /// Las filas que fallan se tratan como "no pasa" (mismo trato que
     /// FALSE/NULL).
     pub const POLICY_PREDICATE_FAILED: u32 = 4136;
+    /// Bloque Z1b (2026-05-29): `SET SESSION AUTHORIZATION 'user' WITH
+    /// PASSWORD '...'` con password que no matchea el hash persistido.
+    /// Mismo código si la sesión activa intenta autenticarse y falla la
+    /// verificación PBKDF2.
+    pub const AUTH_PASSWORD_INCORRECT: u32 = 4137;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

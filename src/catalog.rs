@@ -1515,43 +1515,108 @@ impl FunctionMeta {
 
 /// Bloque Z1 (VERSION 23): identidad SQL-level (`CREATE USER`).
 ///
-/// `password_hash` se computa con FNV-1a-64 sobre `(salt || password)`
-/// y se serializa como 8 bytes LE. **No es crypto-grade** (no KDF, no
-/// PBKDF2/bcrypt/argon2). El propósito es mantener bookkeeping de
-/// identidad SQL alineado con el estándar; la autenticación real en
-/// el server HTTP sigue siendo via token compartido (`-token`). Para
-/// un KDF de verdad ver el defer en ADR-0050.
+/// Bloque Z1b (VERSION 26): el password se hash-ea con **PBKDF2-HMAC-SHA256**
+/// (RFC 8018), `iterations` configurable (default 100K, OWASP 2023),
+/// `salt` aleatorio de longitud variable (16B por default), `password_hash`
+/// de longitud variable (32B por default). El `scheme` byte abre la
+/// puerta a esquemas futuros (argon2id, bcrypt) sin bumpear VERSION:
+/// - `0` = FNV-1a-64 legacy (Z1 pre-bump; ya no se emite — Z1b siempre
+///   serializa scheme=1).
+/// - `1` = PBKDF2-HMAC-SHA256 (default Z1b en adelante).
+///
+/// Layout on-disk: `[len:u16][name][scheme:u8][salt_len:u16][salt]
+/// [hash_len:u16][hash][iterations:u32 LE]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMeta {
     pub name: String,
-    pub password_hash: u64,
-    pub salt: u64,
+    pub scheme: u8,
+    pub salt: Vec<u8>,
+    pub password_hash: Vec<u8>,
+    pub iterations: u32,
 }
 
 impl UserMeta {
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
-        let mut out = Vec::with_capacity(32);
+        let mut out = Vec::with_capacity(64);
         push_string(&mut out, &self.name)?;
-        out.extend_from_slice(&self.password_hash.to_le_bytes());
-        out.extend_from_slice(&self.salt.to_le_bytes());
+        out.push(self.scheme);
+        if self.salt.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "UserMeta '{}' salt {} bytes > u16::MAX",
+                self.name,
+                self.salt.len()
+            )));
+        }
+        out.extend_from_slice(&(self.salt.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.salt);
+        if self.password_hash.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "UserMeta '{}' hash {} bytes > u16::MAX",
+                self.name,
+                self.password_hash.len()
+            )));
+        }
+        out.extend_from_slice(&(self.password_hash.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.password_hash);
+        out.extend_from_slice(&self.iterations.to_le_bytes());
         Ok(out)
     }
     pub fn deserialize(data: &[u8]) -> DbResult<Self> {
         let mut offset = 0usize;
         let name = take_string(data, &mut offset)?;
-        if offset + 16 > data.len() {
+        if offset >= data.len() {
             return Err(DbError::new(format!(
-                "UserMeta '{}' corrupta: faltan 16 bytes de hash+salt",
+                "UserMeta '{}': falta byte scheme",
                 name
             )));
         }
-        let password_hash = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-        let salt = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        let scheme = data[offset];
+        offset += 1;
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "UserMeta '{}': faltan 2 bytes salt_len",
+                name
+            )));
+        }
+        let salt_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        if offset + salt_len > data.len() {
+            return Err(DbError::new(format!(
+                "UserMeta '{}': salt declarado {}B excede payload",
+                name, salt_len
+            )));
+        }
+        let salt = data[offset..offset + salt_len].to_vec();
+        offset += salt_len;
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "UserMeta '{}': faltan 2 bytes hash_len",
+                name
+            )));
+        }
+        let hash_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        if offset + hash_len > data.len() {
+            return Err(DbError::new(format!(
+                "UserMeta '{}': hash declarado {}B excede payload",
+                name, hash_len
+            )));
+        }
+        let password_hash = data[offset..offset + hash_len].to_vec();
+        offset += hash_len;
+        if offset + 4 > data.len() {
+            return Err(DbError::new(format!(
+                "UserMeta '{}': faltan 4 bytes iterations",
+                name
+            )));
+        }
+        let iterations = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         Ok(Self {
             name,
-            password_hash,
+            scheme,
             salt,
+            password_hash,
+            iterations,
         })
     }
 }

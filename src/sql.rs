@@ -509,11 +509,17 @@ pub struct RevokeStmt {
     pub grantee: String,
 }
 
-/// Bloque Z2: `SET SESSION AUTHORIZATION 'name' | DEFAULT`. Si
-/// `user` es `None`, vuelve al modo superuser (bypass total).
+/// Bloque Z2 / Z1b: `SET SESSION AUTHORIZATION 'name' | DEFAULT
+/// [WITH PASSWORD '...']`. Si `user` es `None`, vuelve al modo superuser
+/// (bypass total). Si `password` es `Some`, el engine verifica la
+/// password contra el hash persistido (Z1b PBKDF2-SHA256); si falla,
+/// retorna `[GBY-4137]`. Si `password` es `None`, no se verifica
+/// (modo "trust" — útil para el server interno con auth ya hecha en
+/// otra capa, e.g. el `-token` HTTP).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetSessionAuthStmt {
     pub user: Option<String>,
+    pub password: Option<String>,
 }
 
 /// Bloque Z3 (2026-05-29): `CREATE POLICY name ON table FOR
@@ -4416,12 +4422,15 @@ impl<'a> Engine<'a> {
                 ));
             }
         }
-        let salt = gen_password_salt();
-        let password_hash = hash_password(stmt.password.as_deref().unwrap_or(""), salt);
+        // Bloque Z1b (2026-05-29): PBKDF2-HMAC-SHA256 + salt aleatorio.
+        let salt = gen_password_salt_bytes();
+        let password_hash = hash_password_pbkdf2(stmt.password.as_deref().unwrap_or(""), &salt);
         let meta = UserMeta {
             name: stmt.name.clone(),
-            password_hash,
+            scheme: PASSWORD_SCHEME_PBKDF2_SHA256,
             salt,
+            password_hash,
+            iterations: PBKDF2_ITERATIONS,
         };
         {
             let mut catalog = Catalog::open(self.pager);
@@ -4561,12 +4570,15 @@ impl<'a> Engine<'a> {
                 format!("ALTER USER '{}': no existe", stmt.name),
             ));
         };
-        let salt = gen_password_salt();
-        let password_hash = hash_password(&stmt.password, salt);
+        // Bloque Z1b: rotamos salt + re-hasheamos con PBKDF2 al cambio.
+        let salt = gen_password_salt_bytes();
+        let password_hash = hash_password_pbkdf2(&stmt.password, &salt);
         let meta = UserMeta {
             name: stmt.name.clone(),
-            password_hash,
+            scheme: PASSWORD_SCHEME_PBKDF2_SHA256,
             salt,
+            password_hash,
+            iterations: PBKDF2_ITERATIONS,
         };
         {
             let mut catalog = Catalog::open(self.pager);
@@ -4694,15 +4706,38 @@ impl<'a> Engine<'a> {
         // Si pide un user específico, validamos que exista para evitar
         // typos silenciosos. DEFAULT (None) siempre se acepta.
         if let Some(ref user) = stmt.user {
-            let exists = {
+            let user_meta = {
                 let mut catalog = Catalog::open(self.pager);
-                catalog.get_user(user)?.is_some()
+                catalog.get_user(user)?
             };
-            if !exists {
+            let Some(meta) = user_meta else {
                 return Err(coded(
                     codes::USER_NOT_FOUND,
                     format!("SET SESSION AUTHORIZATION '{}': el user no existe", user),
                 ));
+            };
+            // Bloque Z1b: si el caller pasó `WITH PASSWORD '...'`, lo
+            // verificamos contra el hash persistido vía PBKDF2-SHA256.
+            // Sin password el modo es "trust" (compat Z2 — auth real
+            // de capa superior, e.g. token HTTP).
+            if let Some(ref pw) = stmt.password {
+                if meta.scheme != PASSWORD_SCHEME_PBKDF2_SHA256 {
+                    return Err(coded(
+                        codes::AUTH_PASSWORD_INCORRECT,
+                        format!(
+                            "SET SESSION AUTHORIZATION '{}': scheme de password \
+                             desconocido ({}); recrea el user con Z1b para habilitar \
+                             verificación",
+                            user, meta.scheme
+                        ),
+                    ));
+                }
+                if !verify_password_pbkdf2(pw, &meta.salt, &meta.password_hash) {
+                    return Err(coded(
+                        codes::AUTH_PASSWORD_INCORRECT,
+                        format!("SET SESSION AUTHORIZATION '{}': password incorrecta", user),
+                    ));
+                }
             }
         }
         self.current_user = stmt.user.clone();
@@ -4710,7 +4745,16 @@ impl<'a> Engine<'a> {
             columns: Vec::new(),
             rows: Vec::new(),
             message: Some(match &stmt.user {
-                Some(u) => format!("OK · sesión ahora autenticada como '{}'", u),
+                Some(u) => {
+                    if stmt.password.is_some() {
+                        format!("OK · sesión autenticada como '{}' (password verificada)", u)
+                    } else {
+                        format!(
+                            "OK · sesión ahora autenticada como '{}' (sin verificar password)",
+                            u
+                        )
+                    }
+                }
                 None => "OK · sesión vuelta a superuser (DEFAULT)".to_string(),
             }),
         })
@@ -16911,45 +16955,204 @@ fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
     }
 }
 
-/// Bloque Z1: genera un salt aleatorio de 64 bits via xorshift64
-/// sembrado por `SystemTime` nanos. **NO crypto-grade** — el propósito
-/// es que dos `CREATE USER name WITH PASSWORD 'same'` produzcan hashes
-/// distintos, no resistir un atacante con acceso al archivo.
-fn gen_password_salt() -> u64 {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ 0xa7a7_a7a7_a7a7_a7a7;
-    let mut state = if seed == 0 {
-        0xdead_beef_cafe_babe
-    } else {
-        seed
-    };
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    state
+/// Bloque Z1b (2026-05-29): scheme byte de password hash.
+/// - `0` = legacy FNV-1a-64 (pre-Z1b, ya no se emite — sólo se lee si
+///   un .db viejo lo trae). Z1b bumpa VERSION, así que no hay path de
+///   lectura real; el byte queda reservado por compat documental.
+/// - `1` = PBKDF2-HMAC-SHA256, 100K iter, 16B salt, 32B hash (Z1b).
+pub const PASSWORD_SCHEME_FNV_LEGACY: u8 = 0;
+pub const PASSWORD_SCHEME_PBKDF2_SHA256: u8 = 1;
+
+/// Bloque Z1b: número de iteraciones de PBKDF2-SHA256 para password
+/// hashing. 100_000 es la recomendación OWASP 2023 para PBKDF2-SHA256;
+/// con un CPU moderno tarda ~50-100ms — suficiente para inhibir ataques
+/// de diccionario online y no insultar al usuario en login.
+pub const PBKDF2_ITERATIONS: u32 = 100_000;
+
+/// Bloque Z1b: tamaño del salt en bytes (128 bits, recomendación NIST).
+pub const PASSWORD_SALT_LEN: usize = 16;
+
+/// Bloque Z1b: tamaño del hash output de PBKDF2-SHA256 (32B = un bloque
+/// SHA-256 — implementación más simple, no necesitamos T_2..T_N).
+pub const PASSWORD_HASH_LEN: usize = 32;
+
+/// Bloque Z1b: genera `PASSWORD_SALT_LEN` bytes de salt para password.
+/// Usa el mismo helper xorshift64 que Y9 (no-crypto, pero suficiente
+/// para que dos usuarios con la misma password no compartan hash). La
+/// resistencia del esquema viene de **PBKDF2 + iteraciones**, no del
+/// salt — el salt sólo debe ser único, no impredecible.
+fn gen_password_salt_bytes() -> Vec<u8> {
+    gen_random_bytes(PASSWORD_SALT_LEN)
 }
 
-/// Bloque Z1: hash de password con FNV-1a-64 sobre `(salt || password)`.
-/// **NO es crypto-grade**: no es un KDF, no resiste ataques de
-/// diccionario / GPU. El propósito es bookkeeping SQL-level alineado
-/// con el estándar. Para producción real necesitamos un KDF dedicado
-/// (PBKDF2/bcrypt/argon2) — defer en ADR-0050.
-fn hash_password(password: &str, salt: u64) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in salt.to_le_bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
+/// Bloque Z1b (RFC 6234): SHA-256 puro sin deps. Procesa el mensaje
+/// completo en memoria; suficiente para passwords (< 1KB).
+fn sha256(msg: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    // Padding: append 0x80, ceros hasta len % 64 == 56, luego u64 BE
+    // con bit_len.
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
     }
-    for byte in password.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    debug_assert_eq!(data.len() % 64, 0);
+    for chunk in data.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, q) in w.iter_mut().take(16).enumerate() {
+            *q = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
     }
-    hash
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
+/// Bloque Z1b (RFC 2104): HMAC-SHA256.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    // Si la key es más larga que el bloque, hash-eala primero.
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let h = sha256(key);
+        k[..32].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    // H((k XOR opad) || H((k XOR ipad) || msg))
+    let mut inner_input = Vec::with_capacity(BLOCK + msg.len());
+    inner_input.extend_from_slice(&ipad);
+    inner_input.extend_from_slice(msg);
+    let inner = sha256(&inner_input);
+    let mut outer_input = Vec::with_capacity(BLOCK + 32);
+    outer_input.extend_from_slice(&opad);
+    outer_input.extend_from_slice(&inner);
+    sha256(&outer_input)
+}
+
+/// Bloque Z1b (RFC 8018): PBKDF2-HMAC-SHA256 con `dkLen = 32`. Como
+/// SHA-256 produce 32 bytes y `dkLen == hLen`, sólo necesitamos T_1
+/// (un bloque); el caso general (dkLen > hLen) está documentado pero
+/// no implementado — no lo necesitamos para password hashing.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut salt_with_index = Vec::with_capacity(salt.len() + 4);
+    salt_with_index.extend_from_slice(salt);
+    salt_with_index.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &salt_with_index);
+    let mut t = u;
+    for _ in 1..iterations {
+        u = hmac_sha256(password, &u);
+        for i in 0..32 {
+            t[i] ^= u[i];
+        }
+    }
+    t
+}
+
+/// Bloque Z1b: hashea una password usando PBKDF2-HMAC-SHA256 con los
+/// parámetros estándar (`PBKDF2_ITERATIONS`, `PASSWORD_HASH_LEN`).
+/// **Crypto-grade**: resistente a ataques de diccionario hasta el límite
+/// que las 100K iter imponen (~50-100ms/intento en CPU moderno).
+fn hash_password_pbkdf2(password: &str, salt: &[u8]) -> Vec<u8> {
+    pbkdf2_sha256(password.as_bytes(), salt, PBKDF2_ITERATIONS).to_vec()
+}
+
+/// Bloque Z1b: verifica que `password` produzca el `expected_hash`
+/// guardado para un user. Constant-time compare para evitar timing
+/// attacks (aunque con 100K iter el timing es casi todo en PBKDF2).
+fn verify_password_pbkdf2(password: &str, salt: &[u8], expected_hash: &[u8]) -> bool {
+    if expected_hash.len() != PASSWORD_HASH_LEN {
+        return false;
+    }
+    let computed = hash_password_pbkdf2(password, salt);
+    constant_time_eq(&computed, expected_hash)
+}
+
+/// Comparación de bytes constant-time. NO usa `==` que cortocircuita en
+/// el primer mismatch.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn gen_uuid_v7() -> String {
@@ -19356,15 +19559,27 @@ impl Parser {
             // ('alice'), o un ident pelado (alice) por compatibilidad
             // con cualquiera de las dos sintaxis comunes.
             if self.match_keyword("DEFAULT") {
-                return Ok(Statement::SetSessionAuth(SetSessionAuthStmt { user: None }));
+                return Ok(Statement::SetSessionAuth(SetSessionAuthStmt {
+                    user: None,
+                    password: None,
+                }));
             }
             let user = if self.peek().kind == TokenKind::String {
                 self.expect_string_literal("SET SESSION AUTHORIZATION")?
             } else {
                 self.expect_ident()?
             };
+            // Bloque Z1b (2026-05-29): `WITH PASSWORD '...'` opcional.
+            // Si se da, exec_set_session_auth verifica via PBKDF2.
+            let password = if self.match_keyword("WITH") {
+                self.expect_keyword("PASSWORD")?;
+                Some(self.expect_string_literal("SET SESSION AUTHORIZATION WITH PASSWORD")?)
+            } else {
+                None
+            };
             return Ok(Statement::SetSessionAuth(SetSessionAuthStmt {
                 user: Some(user),
+                password,
             }));
         }
         let name = self.expect_ident()?;

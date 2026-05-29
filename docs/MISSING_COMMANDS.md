@@ -434,7 +434,11 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | POLICY sobre vistas | ❌ (Z3 sólo tabla base; defer) | P3 |
 | `ALTER POLICY` | ❌ (defer; usar DROP + CREATE) | P3 |
 | `SET ROLE` / `CURRENT_USER` | ❌ (defer; requiere protocolo extendido server-side) | P3 |
-| KDF real para password (PBKDF2/bcrypt/argon2) | ❌ (Z1 usa FNV-1a no-cripto; Z1b futuro) | P2 |
+| KDF real para password (PBKDF2-HMAC-SHA256) | ✅ (Z1b, 2026-05-29; VERSION 25→26; Rust puro sin deps; 100K iter OWASP; salt 16B NIST; scheme byte reserva slot para argon2) | — |
+| Verificación de password vía `SET SESSION AUTHORIZATION 'name' WITH PASSWORD '...'` | ✅ (Z1b, 2026-05-29; constant-time compare; `[GBY-4137]` AUTH_PASSWORD_INCORRECT si falla) | — |
+| Argon2id / bcrypt (memory-hard, resistente a ASIC) | ❌ (Z1b sólo PBKDF2; defer Z1c, scheme byte preparado) | P3 |
+| Iteraciones de PBKDF2 configurables (`ALTER SYSTEM ...`) | ❌ (Z1b hardcoded 100K; defer) | P3 |
+| Wire-up del verify al servidor HTTP (`Authorization: Bearer user:password`) | ❌ (Z1b sólo expone via SQL; defer) | P2 |
 | Quoted identifiers para user/role (`"foo bar"`) | ❌ (Z1 sólo `[a-zA-Z_][a-zA-Z0-9_]*`) | P3 |
 
 ---

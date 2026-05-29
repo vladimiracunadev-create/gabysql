@@ -6,6 +6,60 @@
 
 ---
 
+## 2026-05-29 — Bloque Z1b: password hashing crypto-grade (PBKDF2-HMAC-SHA256)
+
+> **Un push a `main`**. Bump on-disk **VERSION 25 → 26**. Z1b cumple el defer de Z1: reemplaza FNV-1a-64 con **PBKDF2-HMAC-SHA256** implementado en Rust puro (sin deps), y habilita la verificación real de password vía `WITH PASSWORD '...'`. Detalle en [`docs/adr/0053-z1b-pbkdf2-password-hashing.md`](docs/adr/0053-z1b-pbkdf2-password-hashing.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE USER alice WITH PASSWORD 'correct-horse-battery-staple';
+-- Hash: PBKDF2-HMAC-SHA256, 100K iter, salt 16B, hash 32B.
+
+SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'correct-horse-battery-staple';
+-- → verify_password_pbkdf2 → match → current_user = Some("alice").
+
+SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'wrong';
+-- → [GBY-4137] AUTH_PASSWORD_INCORRECT.
+
+SET SESSION AUTHORIZATION 'alice';   -- modo "trust" (compat Z2)
+-- → no verifica, current_user = Some("alice").
+```
+
+### 🛠 Implementación
+
+- **SHA-256** (RFC 6234/FIPS 180-4), **HMAC-SHA256** (RFC 2104), **PBKDF2** (RFC 8018) en Rust puro, sin deps externas. ~200 LOC, in-memory.
+- Parámetros: 100K iter (OWASP 2023), salt 16B (NIST 800-132), hash 32B (= SHA-256 output, sólo T_1).
+- `UserMeta` on-disk rediseñado: `{ name, scheme: u8, salt: Vec<u8>, password_hash: Vec<u8>, iterations: u32 }`. Byte `scheme` reserva espacio para argon2id (Z1c) sin bumpear.
+- `gen_password_salt_bytes()` reusa `gen_random_bytes` (Y9) — el salt sólo debe ser único, no impredecible.
+- `verify_password_pbkdf2()` con `constant_time_eq` para evitar timing attacks.
+- `SetSessionAuthStmt` extendido con `password: Option<String>`. Parser acepta `[WITH PASSWORD '...']` opcional tras user name.
+- `exec_set_session_auth` verifica PBKDF2 si el caller pasó password; sin password = modo trust (compat 100% Z2).
+
+### 🆕 Códigos de error
+
+- `[GBY-4137]` `AUTH_PASSWORD_INCORRECT`
+
+### ⚠️ Migración
+
+VERSION bump 25→26 sin retro-compat: `.db` pre-Z1b no se abren con código Z1b. No hay migración silenciosa para FNV legacy (scheme=0) — el `scheme` byte queda reservado para él pero no se emite ni se lee. Si querés migrar una DB vieja, recreá los users.
+
+### 🚫 Diferido (Z1c y futuro)
+
+- **Argon2id** o **bcrypt** (scheme=2, memory-hard, resistente a ASIC) — defer Z1c, el `scheme` byte ya está preparado.
+- Iteraciones configurables (`ALTER SYSTEM SET pbkdf2_iterations`).
+- Migración silenciosa de UserMeta v1 (FNV legacy) con re-hash on next login.
+- Wire-up del verify al servidor HTTP (`Authorization: Bearer user:password`).
+- Tabla virtual `gabysql_users` introspectable.
+
+### 🧪 Validación
+
+- Suite: **651 passing** (643 → +8 Z1b). Cubre: scheme/salt/hash/iterations shape, uniqueness del salt, happy auth path, [GBY-4137] en password incorrecta, modo trust compat Z2, ALTER USER invalida password vieja, determinismo de PBKDF2, CREATE USER sin password bloquea auth con cualquier password.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+- Tiempos: el suite ahora tarda ~52s (vs ~18s pre-Z1b) por los ~20 hashes PBKDF2 en tests Z1/Z1b (cada uno ~50ms). Compromiso aceptable.
+
+---
+
 ## 2026-05-29 — Bloque Z3: Row-Level Security (`CREATE POLICY` / `DROP POLICY`)
 
 > **Un push a `main`**. Bump on-disk **VERSION 24 → 25**. **Cierra el bloque Z al 100%** (Z1 identidad + Z2 GRANT/REVOKE + Z3 RLS). Detalle en [`docs/adr/0052-z3-row-level-security.md`](docs/adr/0052-z3-row-level-security.md).

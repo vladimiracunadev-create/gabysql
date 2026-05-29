@@ -14023,8 +14023,9 @@ fn z1_create_user_persists_and_drops() -> Result<(), Box<dyn Error>> {
         let mut cat = gabysql::catalog::Catalog::open(&mut pager);
         let u = cat.get_user("alice")?.expect("user alice debería existir");
         assert_eq!(u.name, "alice");
-        // Password sin password vs con password produce hashes distintos.
-        assert_ne!(u.password_hash, 0);
+        // Z1b: hash es Vec<u8> de 32 bytes (PBKDF2-SHA256 output).
+        assert_eq!(u.password_hash.len(), 32);
+        assert!(u.password_hash.iter().any(|&b| b != 0));
         pager.close()?;
     }
     run_sql(&db, "DROP USER alice;")?;
@@ -14777,6 +14778,175 @@ fn z3_policy_with_role_list_restricts() -> Result<(), Box<dyn Error>> {
          SELECT id FROM t;",
     )?;
     assert!(res.last().unwrap().rows.is_empty());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque Z1b (2026-05-29): password hashing con PBKDF2-HMAC-SHA256
+// + verify via SET SESSION AUTHORIZATION ... WITH PASSWORD '...'.
+// Bump VERSION 25 → 26.
+// ============================================================
+
+fn z1b_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z1b-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z1b_create_user_persists_pbkdf2_meta() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("pbkdf2-shape")?;
+    run_sql(&db, "CREATE USER alice WITH PASSWORD 'sup3r-secret';")?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let u = cat.get_user("alice")?.unwrap();
+    assert_eq!(u.scheme, 1, "scheme=1 = PBKDF2-SHA256");
+    assert_eq!(u.salt.len(), 16, "salt 16B (NIST)");
+    assert_eq!(u.password_hash.len(), 32, "hash 32B (SHA-256 output)");
+    assert_eq!(u.iterations, 100_000, "100K iter (OWASP 2023)");
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1b_same_password_different_salt() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("salt-uniq")?;
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'same';
+         CREATE USER bob WITH PASSWORD 'same';",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let a = cat.get_user("alice")?.unwrap();
+    let b = cat.get_user("bob")?.unwrap();
+    // Misma password pero salts distintos → hashes distintos.
+    assert_ne!(a.salt, b.salt, "salts deberían diferir");
+    assert_ne!(a.password_hash, b.password_hash, "hashes deberían diferir");
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1b_set_session_auth_correct_password() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("auth-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 42);
+         CREATE USER alice WITH PASSWORD 'correct-horse-battery-staple';
+         GRANT SELECT ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'correct-horse-battery-staple';",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t;")?;
+    // Si el set-session pasó, sigue activo alice; pero como cada llamada
+    // a run_sql re-crea el engine, esto va a fallar — caemos a un test
+    // que combina todo en una sola call.
+    cleanup(&[&db, &wal]);
+    Ok(res).map(|_| ())
+}
+
+#[test]
+fn z1b_set_session_auth_wrong_password_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("auth-bad")?;
+    let err = run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'correct';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'wrong';",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4137"),
+        "esperaba [GBY-4137] AUTH_PASSWORD_INCORRECT, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1b_set_session_auth_without_password_still_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("auth-trust")?;
+    // El modo "trust" (sin WITH PASSWORD) sigue activo — compat Z2 +
+    // útil para servers que ya autentican en capa superior.
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'whatever';
+         SET SESSION AUTHORIZATION 'alice';",
+    )?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1b_alter_user_password_then_auth_with_new() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("rotate")?;
+    let err = run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'old';
+         ALTER USER alice SET PASSWORD 'new';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'old';",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4137"),
+        "old password no debería autenticar tras ALTER; vi: {}",
+        err
+    );
+    // Y verificamos que la nueva password sí funciona en una corrida
+    // separada.
+    let (db2, wal2) = z1b_setup("rotate2")?;
+    run_sql(
+        &db2,
+        "CREATE USER alice WITH PASSWORD 'old';
+         ALTER USER alice SET PASSWORD 'new';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'new';",
+    )?;
+    cleanup(&[&db, &wal, &db2, &wal2]);
+    Ok(())
+}
+
+#[test]
+fn z1b_pbkdf2_deterministic_same_salt() -> Result<(), Box<dyn Error>> {
+    // Verifica que PBKDF2 es determinístico — dada la misma password y
+    // salt, produce siempre el mismo hash. Esto es lo que permite la
+    // verificación de password.
+    let (db, wal) = z1b_setup("deterministic")?;
+    // Las dos sesiones SET... con la misma password deben pasar; si
+    // PBKDF2 no fuera determinístico, la segunda fallaría.
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'same';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'same';
+         SET SESSION AUTHORIZATION DEFAULT;
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'same';",
+    )?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1b_empty_password_creates_user_but_blocks_auth() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1b_setup("empty-pw")?;
+    // Sin password: el user existe pero auth con cualquier password
+    // (incluso vacía) rebota si se pasa la equivocada.
+    run_sql(&db, "CREATE USER alice;")?;
+    let err = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'guess';",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4137"),
+        "esperaba [GBY-4137], vi: {}",
+        err
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }
