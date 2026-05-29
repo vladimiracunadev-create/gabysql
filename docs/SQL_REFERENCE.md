@@ -49,7 +49,8 @@
 | `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v`, `SELECT ... FROM v` | DDL+DML | 🟢 (bloque V/VERSION 13) |
 | [`WITH name AS (SELECT ...)` (CTEs no-recursivas)](#ctes-no-recursivas-with-bloque-w1) — encadenables, en JOIN/subquery/set-ops, shadowing ANSI | DML | 🟢 (bloque W1) |
 | [`WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`](#ctes-recursivas-with-recursive-bloque-w2) — fixpoint base+step, delta semantics, guards de runaway | DML | 🟢 (bloque W2) |
-| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, window functions, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| [Window functions](#window-functions-bloque-w3) — `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` con `OVER (PARTITION BY ... ORDER BY ...)` | DML | 🟢 (bloque W3) |
+| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, frame specs explícitas (`ROWS BETWEEN`), `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -1684,6 +1685,82 @@ SELECT l.lab FROM nums INNER JOIN labels l ON l.n = nums.n ORDER BY l.lab;
 - Múltiples CTEs recursive en el mismo `WITH` — usar un solo `WITH RECURSIVE` o anidar.
 - Cumulative semantics (step lee el accum, no solo el delta) — diferido; mayoría de casos prácticos funcionan con delta.
 - Window functions sobre el resultado del fixpoint — bloque **W3**.
+
+---
+
+## Window functions (bloque W3)
+
+> **Funciones que computan un valor por fila usando OTRAS filas de la misma partition** — clásicas: enumerar dentro de un grupo (`ROW_NUMBER`), rankear (`RANK`/`DENSE_RANK`), totales corridos (`SUM(x) OVER (ORDER BY d)`), mirar fila anterior/siguiente (`LAG`/`LEAD`), partir en buckets (`NTILE`), valores extremos de la partition (`FIRST_VALUE`/`LAST_VALUE`).
+
+### 📜 EBNF
+
+```
+window_call    ::= window_func "(" [ expr {"," expr}* ] ")"
+                   "OVER" "(" [ "PARTITION" "BY" expr {"," expr}* ]
+                              [ "ORDER" "BY" expr [ "ASC" | "DESC" ]
+                                              {"," expr [ "ASC" | "DESC" ]}* ] ")"
+window_func    ::= "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE"
+                 | "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                 | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE"
+```
+
+### 🧠 Defaults de frame (sin spec explícita — `ROWS BETWEEN ...` no soportado)
+
+| Familia | Con `ORDER BY` | Sin `ORDER BY` |
+|---|---|---|
+| Ranking (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`) | per-row | rank arbitrario (no determinístico) |
+| Aggregate (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) | **running** (acumula hasta CURRENT ROW) | **full partition** |
+| `LAG`/`LEAD` | offset hacia atrás/adelante | ❌ `[GBY-4088]` requerido |
+| `NTILE(n)` | distribución balanceada | ❌ `[GBY-4088]` requerido |
+| `FIRST_VALUE` | primera fila de la partition ordenada | primera del orden source |
+| `LAST_VALUE` | **última de la partition** (no CURRENT ROW; deviation de ANSI) | última del orden source |
+
+### ✅ Ejemplos
+
+```sql
+-- Numerar dentro de cada región por salario descendente
+SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY salary DESC) AS rk
+FROM employees;
+
+-- Rankear con ties (RANK salta, DENSE_RANK no)
+SELECT id, score,
+       RANK() OVER (ORDER BY score DESC) AS r,
+       DENSE_RANK() OVER (ORDER BY score DESC) AS dr
+FROM students;
+
+-- Total corrido por fecha
+SELECT date, amount, SUM(amount) OVER (ORDER BY date) AS running_total
+FROM tx;
+
+-- Total por región (full partition, sin ORDER BY)
+SELECT id, region, SUM(amount) OVER (PARTITION BY region) AS region_total
+FROM sales;
+
+-- Mirar fila anterior con default
+SELECT date, price, LAG(price, 1, 0) OVER (ORDER BY date) AS prev_or_zero
+FROM ticks;
+
+-- Partir en quartiles
+SELECT id, score, NTILE(4) OVER (ORDER BY score DESC) AS quartile
+FROM students;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4088] LAG: requiere ORDER BY dentro del OVER` | `LAG`/`LEAD`/`NTILE` sin `ORDER BY`. También: nombre always-window sin `OVER`. |
+| `[GBY-4089] ROW_NUMBER: arity esperada [0, 0], recibí 1` | Arity incorrecta. |
+| `[GBY-4090] window functions mezcladas con GROUP BY ...` | Mezcla con `GROUP BY`/`HAVING`/agregado clásico en el mismo SELECT. Workaround: derived table sobre el GROUP BY. |
+| `[GBY-4091] RETURNING no admite window functions` | Window fuera de SELECT list top-level. |
+
+### ⚠️ No soportado todavía
+
+- **Frame specs explícitas**: `ROWS BETWEEN N PRECEDING AND M FOLLOWING`, `RANGE BETWEEN ...`, `GROUPS BETWEEN ...`. Los defaults aplican; no se pueden customizar.
+- **`WINDOW w AS (...)` named windows**: reusar una spec entre múltiples columnas.
+- **`PERCENT_RANK`, `CUME_DIST`**: funciones de distribución.
+- **Mezcla con `GROUP BY`**: usar derived table como workaround.
+- **`LAST_VALUE` con semántica ANSI** (CURRENT ROW default con ORDER BY): llegará cuando se implementen frames explícitas.
 
 ---
 

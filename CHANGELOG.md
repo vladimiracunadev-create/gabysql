@@ -6,6 +6,69 @@
 
 ---
 
+## 2026-05-28 — Bloque W3: window functions (cierra bloque W)
+
+> **Un push a `main`.** Última pieza del bloque W del roadmap. 13 funciones soportadas (ranking, aggregate, value) con `OVER ( [PARTITION BY ...] [ORDER BY ...] )`. Sin bump de formato — puro motor de proyección. Detalle en [`docs/adr/0028-window-functions.md`](docs/adr/0028-window-functions.md).
+
+### 🆕 Sintaxis habilitada
+
+- **Ranking**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`.
+- **Aggregate windows**: `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX` con `OVER (...)`.
+- **Value**: `LAG(expr [, offset [, default]])`, `LEAD(...)`, `FIRST_VALUE(expr)`, `LAST_VALUE(expr)`.
+- **WindowSpec**: `PARTITION BY` y `ORDER BY` ambos opcionales (sujeto a restricciones por función).
+
+Ejemplos:
+
+```sql
+-- numerar dentro de cada region por salary descendente
+SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY salary DESC) AS rk
+FROM employees;
+
+-- total corrido por orden de fecha
+SELECT date, amount, SUM(amount) OVER (ORDER BY date) AS running
+FROM transactions;
+
+-- mirar fila anterior
+SELECT date, price, LAG(price) OVER (ORDER BY date) AS prev_price
+FROM ticks;
+
+-- partir en quartiles
+SELECT id, score, NTILE(4) OVER (ORDER BY score DESC) AS quartile
+FROM students;
+```
+
+### 🛠 Implementación
+
+- **Pipeline dedicado** `exec_window_select`: detecta windows en `stmt.columns` y deriva.
+  1. Materializa todas las filas source ejecutando una copia con `SELECT * FROM ... WHERE ...`.
+  2. Por cada window item: particiona, ordena, y computa per-row el valor.
+  3. Proyecta cada fila combinando Column / Expression / Window precomputado.
+  4. Aplica el ORDER BY / LIMIT / OFFSET originales sobre el resultado.
+- **Defaults de frame** según familia (sin frame specs explícitas en este release):
+  - Ranking: per-row.
+  - Aggregate con `ORDER BY` → running (RANGE UNBOUNDED PRECEDING AND CURRENT ROW).
+  - Aggregate sin `ORDER BY` → full partition.
+  - `LAST_VALUE` → full partition (**desviación de ANSI**, documentada).
+- **Compute per función**: ranking via comparaciones de tie por order_by; NTILE via distribución balanceada (las primeras `N % buckets` particiones reciben 1 fila más); LAG/LEAD con offset+default.
+
+### 🚫 Diferido
+
+- Frame specs explícitas (`ROWS BETWEEN N PRECEDING AND CURRENT ROW`, etc.).
+- `WINDOW w AS (...)` named windows.
+- `PERCENT_RANK`, `CUME_DIST`.
+- Mezcla con `GROUP BY` / `HAVING` / agregados clásicos en el mismo SELECT — `[GBY-4090]`. Workaround: derived table.
+
+### 🧪 Validación
+
+- 12 tests `w3_*` cubriendo cada función + edge cases (NULL en LAG, FIRST/LAST_VALUE con full-partition, NTILE distribución desigual, RANK vs DENSE_RANK con ties).
+- Suite total: **407/407 pass** (`cargo test --lib --tests`).
+
+### 🎉 Bloque W completo
+
+Con W3 cierra el bloque W del roadmap (W1 + W2 + W3 en tres pushes consecutivos: 2026-05-28). Próximos candidatos en el roadmap: Fase 3 (planner + `EXPLAIN` + comparativa con SQLite/PG/MySQL/DuckDB), bloque X (triggers + stored procs), bloque Y (tipos faltantes DECIMAL/BLOB/UUID), bloque Z (RLS).
+
+---
+
 ## 2026-05-28 — Bloque W2: `WITH RECURSIVE` (fixpoint base+step)
 
 > **Un push a `main`.** Entrega la mitad recursive del bloque W del roadmap: `WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`. Sin bump de formato — la materialización vive solo en runtime. Detalle en [`docs/adr/0027-with-recursive.md`](docs/adr/0027-with-recursive.md).

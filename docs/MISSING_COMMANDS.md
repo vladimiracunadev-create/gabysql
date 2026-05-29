@@ -320,6 +320,14 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `WITH cte(c1, c2) AS (...)` (column aliases en cabecera) | ❌ (W1/W2 rechazan con `[GBY-4081]`; workaround inline) | P2 |
 | `WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>` | ✅ (W2, 2026-05-28; una sola CTE recursive, body canónico, delta semantics, guards 1000 iter / 100K rows) | — |
 | Múltiples CTEs `RECURSIVE` o mezcla recursive + no-recursive en mismo `WITH` | ❌ (W2 rechaza con `[GBY-4082]`) | P3 |
+| `ROW_NUMBER() OVER (...)` | ✅ (W3, 2026-05-28) | — |
+| `RANK`, `DENSE_RANK`, `NTILE` | ✅ (W3, 2026-05-28) | — |
+| `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` | ✅ (W3, 2026-05-28; `LAST_VALUE` con full-partition deviation de ANSI) | — |
+| `SUM/COUNT/AVG/MIN/MAX OVER (...)` (aggregate windows) | ✅ (W3, 2026-05-28; running con ORDER BY, full-partition sin) | — |
+| `OVER (PARTITION BY ... ORDER BY ...)` window spec | ✅ (W3, 2026-05-28; sin frame specs explícitas) | — |
+| `ROWS BETWEEN ... AND ...` frame | ❌ (defaults aplican, no se puede customizar) | P3 |
+| `WINDOW w AS (...)` named windows | ❌ | P3 |
+| `PERCENT_RANK`, `CUME_DIST` | ❌ | P3 |
 | `ROW_NUMBER() OVER (...)` | ❌ | P2 |
 | `RANK`, `DENSE_RANK`, `NTILE` | ❌ | P2 |
 | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` | ❌ | P2 |

@@ -476,6 +476,32 @@ pub mod codes {
     /// se acepta — apenas la forma canónica. Workaround: si la CTE
     /// no necesita ser recursive, quitar la palabra `RECURSIVE`.
     pub const RECURSIVE_CTE_BODY_NOT_UNION: u32 = 4086;
+    /// Bloque W3 (2026-05-28): nombre de función seguido de `OVER (...)`
+    /// que no es una window function reconocida. Soportadas: ranking
+    /// (`ROW_NUMBER`/`RANK`/`DENSE_RANK`), agregados (`COUNT`/`SUM`/
+    /// `AVG`/`MIN`/`MAX`), value (`LAG`/`LEAD`/`FIRST_VALUE`/
+    /// `LAST_VALUE`/`NTILE`).
+    pub const WINDOW_FUNCTION_UNKNOWN: u32 = 4087;
+    /// Bloque W3: la función window requiere `ORDER BY` dentro del
+    /// `OVER (...)`. Aplica a `LAG`, `LEAD`, `NTILE`, y a las funciones
+    /// de ranking sin orden definido (ROW_NUMBER permite no-ORDER
+    /// pero el resultado es no-determinístico — los avisos van vía doc).
+    pub const WINDOW_REQUIRES_ORDER_BY: u32 = 4088;
+    /// Bloque W3: la función window recibió un número incorrecto de
+    /// argumentos. Las ranking no toman args; `NTILE(n)` toma 1; agg
+    /// toma 1 (excepto `COUNT(*)`); LAG/LEAD toman 1..=3
+    /// (`expr [, offset [, default]]`).
+    pub const WINDOW_ARG_MISMATCH: u32 = 4089;
+    /// Bloque W3: SELECT que mezcla window functions con `GROUP BY` /
+    /// `HAVING` / agregados clásicos no-window. Diferido — para usar
+    /// ambos hay que envolver el GROUP BY en una derived table y
+    /// aplicar el window sobre el resultado.
+    pub const WINDOW_NOT_ALLOWED_WITH_GROUP_BY: u32 = 4090;
+    /// Bloque W3: window function aparece en un contexto donde no se
+    /// permite (WHERE, HAVING, ORDER BY del propio SELECT, body de
+    /// una CTE recursive, CHECK constraint, etc.). Sólo el SELECT
+    /// list del SELECT top-level acepta windows.
+    pub const WINDOW_NOT_ALLOWED_HERE: u32 = 4091;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

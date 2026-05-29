@@ -9571,6 +9571,297 @@ fn w2_hierarchy_traversal() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque W3 (2026-05-28): window functions (OVER PARTITION/ORDER). -----
+
+fn w3_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("w3-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+fn w3_int_col(rs: &gabysql::sql::ResultSet, col: usize) -> Vec<i64> {
+    rs.rows
+        .iter()
+        .map(|r| match &r[col] {
+            Value::Integer(n) => *n,
+            other => panic!("expected Integer, got {:?}", other),
+        })
+        .collect()
+}
+
+#[test]
+fn w3_row_number_no_partition() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("rownumber")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 30);
+         INSERT INTO t (id, v) VALUES (2, 10);
+         INSERT INTO t (id, v) VALUES (3, 20);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM t ORDER BY id;",
+    )?;
+    let rn = w3_int_col(&res[0], 1);
+    assert_eq!(rn, vec![3, 1, 2]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_row_number_partitioned() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("rownumber-part")?;
+    run_sql(
+        &db,
+        "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT);
+         INSERT INTO sales (id, region, amount) VALUES (1, 'N', 100);
+         INSERT INTO sales (id, region, amount) VALUES (2, 'N', 300);
+         INSERT INTO sales (id, region, amount) VALUES (3, 'S', 50);
+         INSERT INTO sales (id, region, amount) VALUES (4, 'N', 200);
+         INSERT INTO sales (id, region, amount) VALUES (5, 'S', 250);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn \
+         FROM sales ORDER BY id;",
+    )?;
+    let rn = w3_int_col(&res[0], 1);
+    assert_eq!(rn, vec![3, 1, 2, 2, 1]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_rank_vs_dense_rank_with_ties() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("rank-dense")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, score INT);
+         INSERT INTO t (id, score) VALUES (1, 100);
+         INSERT INTO t (id, score) VALUES (2, 90);
+         INSERT INTO t (id, score) VALUES (3, 90);
+         INSERT INTO t (id, score) VALUES (4, 80);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, RANK() OVER (ORDER BY score DESC) AS r, \
+                    DENSE_RANK() OVER (ORDER BY score DESC) AS dr \
+         FROM t ORDER BY id;",
+    )?;
+    let r = w3_int_col(&res[0], 1);
+    let dr = w3_int_col(&res[0], 2);
+    assert_eq!(r, vec![1, 2, 2, 4]);
+    assert_eq!(dr, vec![1, 2, 2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_running_sum() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("running-sum")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);
+         INSERT INTO t (id, v) VALUES (4, 40);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, SUM(v) OVER (ORDER BY id) AS rsum FROM t ORDER BY id;",
+    )?;
+    let rsum = w3_int_col(&res[0], 1);
+    assert_eq!(rsum, vec![10, 30, 60, 100]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_full_partition_sum_no_order() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("full-part-sum")?;
+    run_sql(
+        &db,
+        "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT);
+         INSERT INTO sales (id, region, amount) VALUES (1, 'N', 100);
+         INSERT INTO sales (id, region, amount) VALUES (2, 'N', 200);
+         INSERT INTO sales (id, region, amount) VALUES (3, 'S', 50);
+         INSERT INTO sales (id, region, amount) VALUES (4, 'S', 70);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, SUM(amount) OVER (PARTITION BY region) AS region_total \
+         FROM sales ORDER BY id;",
+    )?;
+    let totals = w3_int_col(&res[0], 1);
+    assert_eq!(totals, vec![300, 300, 120, 120]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_lag_and_lead_default() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("lag-lead")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, LAG(v) OVER (ORDER BY id) AS prev_v, \
+                    LEAD(v) OVER (ORDER BY id) AS next_v \
+         FROM t ORDER BY id;",
+    )?;
+    assert_eq!(res[0].rows[0][1], Value::Null);
+    assert_eq!(res[0].rows[0][2], Value::Integer(20));
+    assert_eq!(res[0].rows[1][1], Value::Integer(10));
+    assert_eq!(res[0].rows[1][2], Value::Integer(30));
+    assert_eq!(res[0].rows[2][1], Value::Integer(20));
+    assert_eq!(res[0].rows[2][2], Value::Null);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_first_and_last_value() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("first-last")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, region TEXT, score INT);
+         INSERT INTO t (id, region, score) VALUES (1, 'N', 50);
+         INSERT INTO t (id, region, score) VALUES (2, 'N', 90);
+         INSERT INTO t (id, region, score) VALUES (3, 'N', 70);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, FIRST_VALUE(score) OVER (PARTITION BY region ORDER BY score DESC) AS top, \
+                    LAST_VALUE(score) OVER (PARTITION BY region ORDER BY score DESC) AS bottom \
+         FROM t ORDER BY id;",
+    )?;
+    assert_eq!(res[0].rows[0][1], Value::Integer(90));
+    assert_eq!(res[0].rows[0][2], Value::Integer(50));
+    assert_eq!(res[0].rows[1][1], Value::Integer(90));
+    assert_eq!(res[0].rows[1][2], Value::Integer(50));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_ntile_distributes_evenly() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("ntile")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         INSERT INTO t (id) VALUES (2);
+         INSERT INTO t (id) VALUES (3);
+         INSERT INTO t (id) VALUES (4);
+         INSERT INTO t (id) VALUES (5);
+         INSERT INTO t (id) VALUES (6);
+         INSERT INTO t (id) VALUES (7);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, NTILE(3) OVER (ORDER BY id) AS bucket FROM t ORDER BY id;",
+    )?;
+    let buckets = w3_int_col(&res[0], 1);
+    assert_eq!(buckets, vec![1, 1, 1, 2, 2, 3, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_count_star_running() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("count-star")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (10);
+         INSERT INTO t (id) VALUES (20);
+         INSERT INTO t (id) VALUES (30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, COUNT(*) OVER (ORDER BY id) AS running FROM t ORDER BY id;",
+    )?;
+    let r = w3_int_col(&res[0], 1);
+    assert_eq!(r, vec![1, 2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_window_with_group_by_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("with-groupby")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, k INT, v INT);
+         INSERT INTO t (id, k, v) VALUES (1, 1, 10);",
+    )?;
+    let err = run_sql(
+        &db,
+        "SELECT k, SUM(v), ROW_NUMBER() OVER (ORDER BY k) FROM t GROUP BY k;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4090"),
+        "esperaba GBY-4090, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_lag_without_order_by_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("lag-no-order")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "SELECT id, LAG(id) OVER () FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4088"),
+        "esperaba GBY-4088, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w3_avg_running() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w3_setup("avg-running")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, AVG(v) OVER (ORDER BY id) AS run_avg FROM t ORDER BY id;",
+    )?;
+    let avgs: Vec<f64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            Value::Float(f) => *f,
+            other => panic!("expected Float, got {:?}", other),
+        })
+        .collect();
+    assert!((avgs[0] - 10.0).abs() < 1e-9);
+    assert!((avgs[1] - 15.0).abs() < 1e-9);
+    assert!((avgs[2] - 20.0).abs() < 1e-9);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

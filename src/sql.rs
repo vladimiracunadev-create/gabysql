@@ -719,6 +719,91 @@ pub enum SelectItem {
         expr: Expr,
         alias: Option<String>,
     },
+    /// Bloque W3 (2026-05-28): window function en el SELECT list —
+    /// `<func>(<args>) OVER ( [PARTITION BY ...] [ORDER BY ...] )`.
+    /// El executor toma un "windowing path": materializa todas las
+    /// filas post-WHERE y JOIN, las particiona y ordena según
+    /// `over`, y calcula la función por fila. No se evalúa via
+    /// `eval_expr` row-by-row.
+    Window {
+        func: WindowFunc,
+        args: Vec<Expr>,
+        alias: Option<String>,
+        over: WindowSpec,
+    },
+}
+
+/// Bloque W3 (2026-05-28): catálogo de window functions soportadas.
+/// Tres familias: ranking (sin args), agregados (1 arg o `*`), y
+/// value functions (1..=3 args).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    // Ranking
+    RowNumber,
+    Rank,
+    DenseRank,
+    Ntile,
+    // Aggregates (mismas que las clásicas, contexto distinto)
+    Count,
+    CountStar,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    // Value
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+}
+
+impl WindowFunc {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            WindowFunc::RowNumber => "ROW_NUMBER",
+            WindowFunc::Rank => "RANK",
+            WindowFunc::DenseRank => "DENSE_RANK",
+            WindowFunc::Ntile => "NTILE",
+            WindowFunc::Count | WindowFunc::CountStar => "COUNT",
+            WindowFunc::Sum => "SUM",
+            WindowFunc::Avg => "AVG",
+            WindowFunc::Min => "MIN",
+            WindowFunc::Max => "MAX",
+            WindowFunc::Lag => "LAG",
+            WindowFunc::Lead => "LEAD",
+            WindowFunc::FirstValue => "FIRST_VALUE",
+            WindowFunc::LastValue => "LAST_VALUE",
+        }
+    }
+    /// `true` si la función puede usarse como agregado clásico (con
+    /// GROUP BY) además de como window. Las ranking y value funcs son
+    /// EXCLUSIVAS de window context.
+    pub fn is_aggregate_family(&self) -> bool {
+        matches!(
+            self,
+            WindowFunc::Count
+                | WindowFunc::CountStar
+                | WindowFunc::Sum
+                | WindowFunc::Avg
+                | WindowFunc::Min
+                | WindowFunc::Max
+        )
+    }
+}
+
+/// Bloque W3: especificación de la ventana — `OVER ( [PARTITION BY exprs]
+/// [ORDER BY exprs [ASC|DESC]] )`. Ambas cláusulas opcionales. No
+/// soportamos frame specs explícitas (`ROWS BETWEEN ...`) — el frame
+/// default se aplica según la familia de la función:
+/// - Ranking: per-row (no aplica frame).
+/// - Aggregate con ORDER BY: running (RANGE UNBOUNDED PRECEDING AND CURRENT ROW).
+/// - Aggregate sin ORDER BY: full partition.
+/// - Value (LAG/LEAD/FIRST_VALUE/LAST_VALUE): per-row según offset/posición;
+///   LAST_VALUE usa full partition (desviación de ANSI, documentada en ADR-0028).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<(Expr, OrderDir)>,
 }
 
 /// Bloque G1: árbol mínimo de expresiones escalares. Vive solo dentro del
@@ -1016,6 +1101,21 @@ impl SelectItem {
                     return a.clone();
                 }
                 expr_default_label(expr)
+            }
+            SelectItem::Window {
+                func, args, alias, ..
+            } => {
+                if let Some(a) = alias {
+                    return a.clone();
+                }
+                let func_lower = func.keyword().to_ascii_lowercase();
+                if matches!(func, WindowFunc::CountStar) {
+                    format!("{}_star", func_lower)
+                } else if args.is_empty() {
+                    func_lower
+                } else {
+                    format!("{}_{}", func_lower, expr_default_label(&args[0]))
+                }
             }
         }
     }
@@ -4297,6 +4397,155 @@ impl<'a> Engine<'a> {
         self.exec_select_query(body_query)
     }
 
+    /// Bloque W3 (2026-05-28): SELECTs con window functions toman este
+    /// camino. Pipeline:
+    /// 1. Validar que no haya GROUP BY / HAVING / agregados clásicos
+    ///    mezclados ([GBY-4090]).
+    /// 2. Materializar TODAS las filas source ejecutando una copia del
+    ///    stmt con `columns = [Star]` y sin ORDER BY/LIMIT (los outer
+    ///    ORDER BY/LIMIT aplican al resultado windowed, no al source).
+    /// 3. Para cada `SelectItem::Window`, particionar las filas según
+    ///    `partition_by`, ordenar cada partición por `order_by`, y
+    ///    calcular el valor de la función por fila (ranking, agg
+    ///    acumulada, lag/lead, etc.).
+    /// 4. Proyectar cada fila aplicando los items en orden: Column /
+    ///    Expression evalúan contra la fila, Window toma el valor
+    ///    precomputado.
+    /// 5. Aplicar el ORDER BY / LIMIT / OFFSET original sobre el
+    ///    resultado proyectado.
+    fn exec_window_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
+        // 1. Validaciones cruzadas.
+        if !stmt.group_by.is_empty()
+            || stmt.having.is_some()
+            || stmt
+                .columns
+                .iter()
+                .any(|c| matches!(c, SelectItem::Aggregate { .. }))
+        {
+            return Err(coded(
+                codes::WINDOW_NOT_ALLOWED_WITH_GROUP_BY,
+                "window functions mezcladas con GROUP BY / HAVING / agregados clásicos no se soportan en este release; \
+                 reescribir el GROUP BY como derived table y aplicar la window sobre el resultado",
+            ));
+        }
+        // Validar arity y restricciones de cada window. (Defer-friendly:
+        // detecta errores antes de materializar.)
+        for col in &stmt.columns {
+            if let SelectItem::Window {
+                func, args, over, ..
+            } = col
+            {
+                validate_window_call(*func, args, over)?;
+            }
+        }
+
+        // 2. Materialización source — clone stmt sin proyección ni
+        //    ORDER BY/LIMIT/OFFSET. El SELECT * captura todo el schema.
+        let saved_order = stmt.order_by.clone();
+        let saved_limit = stmt.limit;
+        let saved_offset = stmt.offset;
+        let original_items = stmt.columns.clone();
+        let mut materialization_stmt = stmt;
+        materialization_stmt.columns = vec![SelectItem::Star];
+        materialization_stmt.order_by = None;
+        materialization_stmt.limit = None;
+        materialization_stmt.offset = 0;
+        let source_rs =
+            self.exec_select_query(SelectQuery::Select(Box::new(materialization_stmt)))?;
+
+        // 3. Convertir a HashMap-per-row con keys cualificadas y suffix.
+        let source_maps = rows_to_lookup_maps(&source_rs.columns, &source_rs.rows);
+
+        // 4. Por cada window item, computar los valores.
+        let n_rows = source_rs.rows.len();
+        let mut window_columns: Vec<Vec<Value>> = Vec::with_capacity(original_items.len());
+        let mut window_indices: Vec<Option<usize>> = Vec::with_capacity(original_items.len());
+        for item in &original_items {
+            if let SelectItem::Window {
+                func, args, over, ..
+            } = item
+            {
+                let col_values = compute_window_column(*func, args, over, &source_maps)?;
+                window_indices.push(Some(window_columns.len()));
+                window_columns.push(col_values);
+            } else {
+                window_indices.push(None);
+            }
+        }
+
+        // 5. Proyección final por fila.
+        let output_columns: Vec<String> = original_items.iter().map(|i| i.output_name()).collect();
+        let mut projected: Vec<Vec<Value>> = Vec::with_capacity(n_rows);
+        for (row_idx, row_map) in source_maps.iter().enumerate() {
+            let mut out_row = Vec::with_capacity(original_items.len());
+            for (item_idx, item) in original_items.iter().enumerate() {
+                let v = match item {
+                    SelectItem::Star => {
+                        return Err(coded(
+                            codes::WINDOW_NOT_ALLOWED_HERE,
+                            "SELECT * mezclado con window functions no se soporta — enumerar columnas explícitamente",
+                        ));
+                    }
+                    SelectItem::Column(c) => {
+                        let key = normalize_ident(c);
+                        row_map.get(&key).cloned().unwrap_or(Value::Null)
+                    }
+                    SelectItem::Aggregate { .. } => {
+                        unreachable!("agregados ya fueron rechazados arriba")
+                    }
+                    SelectItem::Expression { expr, .. } => eval_expr(expr, row_map)?,
+                    SelectItem::Window { .. } => {
+                        let widx = window_indices[item_idx].unwrap();
+                        window_columns[widx][row_idx].clone()
+                    }
+                };
+                out_row.push(v);
+            }
+            projected.push(out_row);
+        }
+
+        // 6. Aplicar ORDER BY / LIMIT / OFFSET originales sobre la
+        //    proyección. Reusa la lógica básica: lookup por nombre de
+        //    columna en el output. Para simplicidad, soportamos ORDER
+        //    BY por nombre de columna del output (que matchea el alias
+        //    o nombre canónico de cada item).
+        if let Some(oc) = &saved_order {
+            let col_key = oc.qualified_input()?;
+            let key_norm = normalize_ident(&col_key);
+            let idx = output_columns
+                .iter()
+                .position(|c| normalize_ident(c) == key_norm);
+            let Some(idx) = idx else {
+                return Err(coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "ORDER BY: columna '{}' no aparece en el SELECT list",
+                        col_key
+                    ),
+                ));
+            };
+            projected.sort_by(|a, b| {
+                let ord = compare_values(Some(&a[idx]), Some(&b[idx]));
+                match oc.direction {
+                    OrderDir::Asc => ord,
+                    OrderDir::Desc => ord.reverse(),
+                }
+            });
+        }
+        if saved_offset > 0 {
+            projected.drain(0..saved_offset.min(projected.len()));
+        }
+        if let Some(lim) = saved_limit {
+            projected.truncate(lim);
+        }
+
+        Ok(ResultSet {
+            columns: output_columns,
+            rows: projected,
+            message: None,
+        })
+    }
+
     /// Bloque I (2026-05-26): entry-point del SELECT statement. Despacha
     /// entre SELECT plano, operación de conjunto, o VALUES standalone.
     /// El path `Select(stmt)` delega al `exec_select` clásico — todo el
@@ -4480,6 +4729,17 @@ impl<'a> Engine<'a> {
         // exec_select_joined para que el path JOIN también se
         // beneficie.
         self.memoize_select_stmt(&mut stmt)?;
+        // Bloque W3 (2026-05-28): si el SELECT list contiene alguna
+        // window function, derivamos al windowing path — toma su
+        // propio camino con materialización completa, partition+sort
+        // y compute por fila.
+        if stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectItem::Window { .. }))
+        {
+            return self.exec_window_select(stmt);
+        }
         // SELECT con JOINs sigue una ruta distinta (nested-loop, schema
         // combinado, WHERE como post-filter). El single-table path queda
         // exactamente como estaba — sin regresión en performance ni
@@ -7432,6 +7692,13 @@ fn validate_aggregate_select(stmt: &SelectStmt, meta: &TableMeta) -> DbResult<()
                      (bloque G1: solo SELECT plano); reescribir como subquery o esperar G2",
                 ));
             }
+            SelectItem::Window { .. } => {
+                return Err(coded(
+                    codes::WINDOW_NOT_ALLOWED_WITH_GROUP_BY,
+                    "window functions mezcladas con GROUP BY / agregados clásicos no se soportan en este release; \
+                     reescribir el GROUP BY como derived table y aplicar la window sobre el resultado",
+                ));
+            }
         }
     }
     Ok(())
@@ -8274,6 +8541,13 @@ fn resolve_selected_columns(
                     display: item.output_name(),
                     expr: expr.clone(),
                 });
+            }
+            SelectItem::Window { .. } => {
+                return Err(DbError::new(
+                    "interno: resolve_selected_columns no debe recibir windows; \
+                     el dispatch a exec_window_select debió haber tomado este SELECT antes"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -10066,6 +10340,13 @@ fn resolve_joined_projection(
                 output.push(item.output_name());
                 projs.push(JoinedProjection::Expr(rewritten));
             }
+            SelectItem::Window { .. } => {
+                return Err(DbError::new(
+                    "interno: build_joined_projection no debe recibir windows; \
+                     el dispatch a exec_window_select debió haber tomado este SELECT antes"
+                        .to_string(),
+                ));
+            }
         }
     }
     Ok((output, projs))
@@ -10583,6 +10864,12 @@ fn project_returning(
                         codes::COLUMN_NOT_FOUND,
                         "RETURNING no admite expresiones escalares en este release (G1: solo \
                          columnas crudas o `*`)",
+                    ));
+                }
+                SelectItem::Window { .. } => {
+                    return Err(coded(
+                        codes::WINDOW_NOT_ALLOWED_HERE,
+                        "RETURNING no admite window functions",
                     ));
                 }
             }
@@ -12616,6 +12903,25 @@ const MAX_PARSE_DEPTH: usize = 100;
 // materializa N veces (re-ejecución). Documentado en ADR-0025.
 // ---------------------------------------------------------------------
 
+/// Bloque W3 (2026-05-28): mapea el ident de una window function
+/// "always-window" (no es un agregado clásico) a su variant. Devuelve
+/// `None` para nombres de agregado (`SUM`, etc.) — esas se detectan
+/// vía `AggFunc::from_ident` y se promueven a window cuando llevan
+/// `OVER`.
+fn window_only_func_from_ident(ident: &str) -> Option<WindowFunc> {
+    match ident.to_ascii_uppercase().as_str() {
+        "ROW_NUMBER" => Some(WindowFunc::RowNumber),
+        "RANK" => Some(WindowFunc::Rank),
+        "DENSE_RANK" => Some(WindowFunc::DenseRank),
+        "NTILE" => Some(WindowFunc::Ntile),
+        "LAG" => Some(WindowFunc::Lag),
+        "LEAD" => Some(WindowFunc::Lead),
+        "FIRST_VALUE" => Some(WindowFunc::FirstValue),
+        "LAST_VALUE" => Some(WindowFunc::LastValue),
+        _ => None,
+    }
+}
+
 /// Bloque W2 (2026-05-28): convierte filas materializadas (output del
 /// fixpoint de `WITH RECURSIVE`) en un `SelectStmt` que el executor
 /// puede tratar como derived table. La estrategia: envolver cada
@@ -12685,6 +12991,370 @@ fn rows_to_values_select(name: &str, columns: &[String], rows: &[Vec<Value>]) ->
         limit: None,
         offset: 0,
     }
+}
+
+// ---------------------------------------------------------------------
+// Bloque W3 (2026-05-28): infra de window functions.
+// ---------------------------------------------------------------------
+
+/// Valida la signatura de una window call. Se ejecuta al inicio de
+/// `exec_window_select` para devolver errores temprano antes de
+/// materializar.
+fn validate_window_call(func: WindowFunc, args: &[Expr], over: &WindowSpec) -> DbResult<()> {
+    use WindowFunc::*;
+    let (min_args, max_args) = match func {
+        RowNumber | Rank | DenseRank => (0, 0),
+        Ntile => (1, 1),
+        CountStar => (0, 0),
+        Count | Sum | Avg | Min | Max | FirstValue | LastValue => (1, 1),
+        Lag | Lead => (1, 3),
+    };
+    if args.len() < min_args || args.len() > max_args {
+        return Err(coded(
+            codes::WINDOW_ARG_MISMATCH,
+            format!(
+                "{}: arity esperada [{}, {}], recibí {}",
+                func.keyword(),
+                min_args,
+                max_args,
+                args.len()
+            ),
+        ));
+    }
+    // ORDER BY es obligatorio para LAG/LEAD/NTILE (sin orden el
+    // resultado es no-determinístico). Ranking sin ORDER BY se
+    // permite (devuelve un orden arbitrario consistente con el scan).
+    if matches!(func, Lag | Lead | Ntile) && over.order_by.is_empty() {
+        return Err(coded(
+            codes::WINDOW_REQUIRES_ORDER_BY,
+            format!(
+                "{}: requiere `ORDER BY` dentro del OVER (sin orden el resultado es no-determinístico)",
+                func.keyword()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Convierte el ResultSet del materialization en `Vec<HashMap<String, Value>>`
+/// con keys cualificadas normalizadas; también inserta una entry con el
+/// sufijo (parte después del último `.`) cuando el header está
+/// cualificado — así expresiones del WindowSpec pueden referir las
+/// columnas tanto bare (`id`) como cualificadas (`t.id`).
+fn rows_to_lookup_maps(columns: &[String], rows: &[Vec<Value>]) -> Vec<HashMap<String, Value>> {
+    rows.iter()
+        .map(|row| {
+            let mut m: HashMap<String, Value> = HashMap::new();
+            for (i, col) in columns.iter().enumerate() {
+                let v = row.get(i).cloned().unwrap_or(Value::Null);
+                let key = normalize_ident(col);
+                m.insert(key.clone(), v.clone());
+                if let Some(idx) = key.rfind('.') {
+                    let suffix = key[idx + 1..].to_string();
+                    if suffix != key {
+                        m.entry(suffix).or_insert(v);
+                    }
+                }
+            }
+            m
+        })
+        .collect()
+}
+
+/// Compara dos filas según las expresiones de ORDER BY de un WindowSpec.
+/// Devuelve `true` si todas las expresiones evalúan iguales en ambas
+/// filas — usado para detectar ties en RANK / DENSE_RANK.
+fn order_by_equal(
+    rows: &[HashMap<String, Value>],
+    a_idx: usize,
+    b_idx: usize,
+    order_by: &[(Expr, OrderDir)],
+) -> bool {
+    for (e, _) in order_by {
+        let av = eval_expr(e, &rows[a_idx]).unwrap_or(Value::Null);
+        let bv = eval_expr(e, &rows[b_idx]).unwrap_or(Value::Null);
+        if compare_values(Some(&av), Some(&bv)) != std::cmp::Ordering::Equal {
+            return false;
+        }
+    }
+    true
+}
+
+/// Computa el vector de valores para una window column completa
+/// (una entry por fila source, en el mismo orden). Particiona,
+/// ordena cada partition, y delega el cálculo per-row a
+/// `compute_window_value`.
+fn compute_window_column(
+    func: WindowFunc,
+    args: &[Expr],
+    over: &WindowSpec,
+    rows: &[HashMap<String, Value>],
+) -> DbResult<Vec<Value>> {
+    let n = rows.len();
+    let mut result: Vec<Value> = vec![Value::Null; n];
+    if n == 0 {
+        return Ok(result);
+    }
+
+    // 1. Partition: agrupar índices por clave de partition_by (string-key
+    //    para eludir Hash de Value).
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for i in 0..n {
+        let key = if over.partition_by.is_empty() {
+            String::new()
+        } else {
+            let mut parts = Vec::with_capacity(over.partition_by.len());
+            for e in &over.partition_by {
+                let v = eval_expr(e, &rows[i])?;
+                parts.push(format!("{:?}", v));
+            }
+            parts.join("|")
+        };
+        groups.entry(key).or_default().push(i);
+    }
+
+    // 2. Para cada partición: ordenar por order_by, y computar valor
+    //    por cada índice en orden.
+    for (_, mut indices) in groups {
+        if !over.order_by.is_empty() {
+            indices.sort_by(|a, b| {
+                for (e, dir) in &over.order_by {
+                    let av = eval_expr(e, &rows[*a]).unwrap_or(Value::Null);
+                    let bv = eval_expr(e, &rows[*b]).unwrap_or(Value::Null);
+                    let ord = compare_values(Some(&av), Some(&bv));
+                    if ord != std::cmp::Ordering::Equal {
+                        return match dir {
+                            OrderDir::Asc => ord,
+                            OrderDir::Desc => ord.reverse(),
+                        };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        for pos in 0..indices.len() {
+            let v = compute_window_value(func, args, &indices, pos, rows, &over.order_by)?;
+            result[indices[pos]] = v;
+        }
+    }
+    Ok(result)
+}
+
+/// Computa el valor de una window function para una sola fila dentro
+/// de una partition ya ordenada. `sorted_indices` son los índices
+/// originales de las filas de la partition en el orden del ORDER BY
+/// (o el orden source si no hay ORDER BY); `pos` es la posición de
+/// la fila actual dentro de esa lista.
+fn compute_window_value(
+    func: WindowFunc,
+    args: &[Expr],
+    sorted_indices: &[usize],
+    pos: usize,
+    rows: &[HashMap<String, Value>],
+    order_by: &[(Expr, OrderDir)],
+) -> DbResult<Value> {
+    use WindowFunc::*;
+    match func {
+        RowNumber => Ok(Value::Integer((pos + 1) as i64)),
+        Rank => {
+            // 1-based; ties por order_by reciben el mismo rank; siguiente skip.
+            let mut rank = 1i64;
+            for i in 1..=pos {
+                let prev = sorted_indices[i - 1];
+                let cur = sorted_indices[i];
+                if !order_by_equal(rows, prev, cur, order_by) {
+                    rank = (i + 1) as i64;
+                }
+            }
+            Ok(Value::Integer(rank))
+        }
+        DenseRank => {
+            let mut rank = 1i64;
+            for i in 1..=pos {
+                let prev = sorted_indices[i - 1];
+                let cur = sorted_indices[i];
+                if !order_by_equal(rows, prev, cur, order_by) {
+                    rank += 1;
+                }
+            }
+            Ok(Value::Integer(rank))
+        }
+        Ntile => {
+            let n_arg = eval_expr(&args[0], &rows[sorted_indices[pos]])?;
+            let n_buckets = match n_arg {
+                Value::Integer(i) if i > 0 => i,
+                _ => {
+                    return Err(coded(
+                        codes::WINDOW_ARG_MISMATCH,
+                        "NTILE(n): n debe ser un entero positivo",
+                    ));
+                }
+            };
+            let total = sorted_indices.len() as i64;
+            // Distribución estándar: las primeras `total % n_buckets`
+            // particiones reciben una fila extra; el resto reciben
+            // `total / n_buckets`.
+            let small = total / n_buckets;
+            let big = small + 1;
+            let n_big = (total % n_buckets) as usize;
+            let big_total = n_big * big as usize;
+            let bucket = if pos < big_total {
+                (pos / big as usize) + 1
+            } else {
+                (n_big + (pos - big_total) / small.max(1) as usize) + 1
+            };
+            Ok(Value::Integer(bucket as i64))
+        }
+        CountStar => {
+            let count = if order_by.is_empty() {
+                sorted_indices.len() as i64
+            } else {
+                (pos + 1) as i64
+            };
+            Ok(Value::Integer(count))
+        }
+        Count => {
+            let upto = if order_by.is_empty() {
+                sorted_indices.len()
+            } else {
+                pos + 1
+            };
+            let mut c = 0i64;
+            for i in 0..upto {
+                let v = eval_expr(&args[0], &rows[sorted_indices[i]])?;
+                if !matches!(v, Value::Null) {
+                    c += 1;
+                }
+            }
+            Ok(Value::Integer(c))
+        }
+        Sum | Avg | Min | Max => {
+            let upto = if order_by.is_empty() {
+                sorted_indices.len()
+            } else {
+                pos + 1
+            };
+            let mut vals: Vec<Value> = Vec::with_capacity(upto);
+            for i in 0..upto {
+                let v = eval_expr(&args[0], &rows[sorted_indices[i]])?;
+                if !matches!(v, Value::Null) {
+                    vals.push(v);
+                }
+            }
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            match func {
+                Sum => window_sum(&vals),
+                Avg => window_avg(&vals),
+                Min => Ok(window_min(&vals)),
+                Max => Ok(window_max(&vals)),
+                _ => unreachable!(),
+            }
+        }
+        Lag | Lead => {
+            let offset: i64 = if args.len() >= 2 {
+                match eval_expr(&args[1], &rows[sorted_indices[pos]])? {
+                    Value::Integer(n) => n,
+                    _ => {
+                        return Err(coded(
+                            codes::WINDOW_ARG_MISMATCH,
+                            format!("{}: el offset debe ser un entero", func.keyword()),
+                        ));
+                    }
+                }
+            } else {
+                1
+            };
+            let default = if args.len() >= 3 {
+                eval_expr(&args[2], &rows[sorted_indices[pos]])?
+            } else {
+                Value::Null
+            };
+            let target = if matches!(func, Lag) {
+                pos as i64 - offset
+            } else {
+                pos as i64 + offset
+            };
+            if target < 0 || target >= sorted_indices.len() as i64 {
+                Ok(default)
+            } else {
+                eval_expr(&args[0], &rows[sorted_indices[target as usize]])
+            }
+        }
+        FirstValue => eval_expr(&args[0], &rows[sorted_indices[0]]),
+        LastValue => {
+            // Desviación de ANSI: con ORDER BY el default ANSI sería
+            // CURRENT ROW (contraintuitivo). Usamos full-partition.
+            eval_expr(&args[0], &rows[*sorted_indices.last().unwrap()])
+        }
+    }
+}
+
+fn window_sum(vals: &[Value]) -> DbResult<Value> {
+    let mut any_float = false;
+    let mut sum_i: i64 = 0;
+    let mut sum_f: f64 = 0.0;
+    for v in vals {
+        match v {
+            Value::Integer(n) => {
+                if any_float {
+                    sum_f += *n as f64;
+                } else {
+                    sum_i += *n;
+                }
+            }
+            Value::Float(f) => {
+                if !any_float {
+                    sum_f = sum_i as f64;
+                    any_float = true;
+                }
+                sum_f += *f;
+            }
+            _ => {
+                return Err(coded(
+                    codes::WINDOW_ARG_MISMATCH,
+                    "SUM() OVER: argumento numérico requerido",
+                ));
+            }
+        }
+    }
+    if any_float {
+        Ok(Value::Float(sum_f))
+    } else {
+        Ok(Value::Integer(sum_i))
+    }
+}
+
+fn window_avg(vals: &[Value]) -> DbResult<Value> {
+    let s = window_sum(vals)?;
+    let n = vals.len() as f64;
+    match s {
+        Value::Integer(i) => Ok(Value::Float(i as f64 / n)),
+        Value::Float(f) => Ok(Value::Float(f / n)),
+        _ => unreachable!(),
+    }
+}
+
+fn window_min(vals: &[Value]) -> Value {
+    let mut best = &vals[0];
+    for v in &vals[1..] {
+        if compare_values(Some(v), Some(best)) == std::cmp::Ordering::Less {
+            best = v;
+        }
+    }
+    best.clone()
+}
+
+fn window_max(vals: &[Value]) -> Value {
+    let mut best = &vals[0];
+    for v in &vals[1..] {
+        if compare_values(Some(v), Some(best)) == std::cmp::Ordering::Greater {
+            best = v;
+        }
+    }
+    best.clone()
 }
 
 fn inline_cte_into_query(query: &mut SelectQuery, cte_name: &str, cte_body: &SelectStmt) {
@@ -14773,6 +15443,41 @@ impl Parser {
         // y el siguiente es `(`, parseamos como agregado (sin tocar — se
         // preserva fast-path del bloque F).
         let head = self.peek().clone();
+        // Bloque W3 (2026-05-28): always-window funcs (ranking + value).
+        // Estas funciones SOLO pueden aparecer con `OVER (...)`. Las
+        // detectamos antes que las agg para no chocar nombres.
+        if head.kind == TokenKind::Ident {
+            if let Some(wfunc) = window_only_func_from_ident(&head.text) {
+                let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
+                    kind: TokenKind::Eof,
+                    text: String::new(),
+                });
+                if next.kind == TokenKind::Symbol && next.text == "(" {
+                    self.pos += 1; // consume func name
+                    self.expect_symbol("(")?;
+                    let args = self.parse_window_args(wfunc)?;
+                    self.expect_symbol(")")?;
+                    // OVER es obligatorio para always-window.
+                    if !self.match_keyword("OVER") {
+                        return Err(coded(
+                            codes::WINDOW_REQUIRES_ORDER_BY,
+                            format!(
+                                "`{}` es una window function — requiere `OVER ( ... )` después de los args",
+                                wfunc.keyword()
+                            ),
+                        ));
+                    }
+                    let over = self.parse_window_spec()?;
+                    let alias = self.try_parse_select_alias()?;
+                    return Ok(SelectItem::Window {
+                        func: wfunc,
+                        args,
+                        alias,
+                        over,
+                    });
+                }
+            }
+        }
         if head.kind == TokenKind::Ident {
             if let Some(func) = AggFunc::from_ident(&head.text) {
                 let next = self.tokens.get(self.pos + 1).cloned().unwrap_or(Token {
@@ -14784,6 +15489,42 @@ impl Parser {
                     self.expect_symbol("(")?;
                     let arg = self.parse_agg_arg(func)?;
                     self.expect_symbol(")")?;
+                    // Bloque W3: si tras la agg viene `OVER`, es una
+                    // aggregate window (no un agregado clásico).
+                    if self.match_keyword("OVER") {
+                        let wfunc = match func {
+                            AggFunc::Count => match &arg {
+                                AggArg::Star => WindowFunc::CountStar,
+                                _ => WindowFunc::Count,
+                            },
+                            AggFunc::Sum => WindowFunc::Sum,
+                            AggFunc::Avg => WindowFunc::Avg,
+                            AggFunc::Min => WindowFunc::Min,
+                            AggFunc::Max => WindowFunc::Max,
+                        };
+                        let args: Vec<Expr> = match arg {
+                            AggArg::Star => Vec::new(),
+                            AggArg::Column(c) => vec![Expr::Column(c)],
+                            AggArg::DistinctColumn(_) => {
+                                return Err(coded(
+                                    codes::WINDOW_ARG_MISMATCH,
+                                    format!(
+                                        "`{}(DISTINCT ...) OVER (...)`: DISTINCT dentro de una window aggregate no se soporta en este release",
+                                        func.keyword()
+                                    ),
+                                ));
+                            }
+                            AggArg::Expr(e) => vec![e],
+                        };
+                        let over = self.parse_window_spec()?;
+                        let alias = self.try_parse_select_alias()?;
+                        return Ok(SelectItem::Window {
+                            func: wfunc,
+                            args,
+                            alias,
+                            over,
+                        });
+                    }
                     let alias = self.try_parse_select_alias()?;
                     return Ok(SelectItem::Aggregate { func, arg, alias });
                 }
@@ -14849,6 +15590,61 @@ impl Parser {
     /// admitía alias en pre-G1 (no estaba en `parse_select_item`).
     fn try_parse_select_alias_for_column(&mut self, _: &mut dyn FnMut(&str)) -> Option<String> {
         None
+    }
+
+    /// Bloque W3 (2026-05-28): parsea la lista de argumentos de una window
+    /// function (ya consumido `(`). Para ranking sin args, la lista es
+    /// vacía. Para LAG/LEAD admite `expr [, offset [, default]]`. No
+    /// valida arity acá — eso lo hace el dispatcher en el engine.
+    fn parse_window_args(&mut self, _func: WindowFunc) -> DbResult<Vec<Expr>> {
+        // Caso `()` vacío.
+        if self.peek().kind == TokenKind::Symbol && self.peek().text == ")" {
+            return Ok(Vec::new());
+        }
+        let mut args = Vec::new();
+        args.push(self.parse_expr()?);
+        while self.match_symbol(",") {
+            args.push(self.parse_expr()?);
+        }
+        Ok(args)
+    }
+
+    /// Bloque W3: parsea el cuerpo de `OVER ( [PARTITION BY exprs]
+    /// [ORDER BY expr [ASC|DESC] {, expr [ASC|DESC]}*] )`. Frame
+    /// specs (`ROWS BETWEEN ...`) no se soportan en este release —
+    /// los defaults aplican según la familia de la función.
+    fn parse_window_spec(&mut self) -> DbResult<WindowSpec> {
+        self.expect_symbol("(")?;
+        let mut partition_by: Vec<Expr> = Vec::new();
+        let mut order_by: Vec<(Expr, OrderDir)> = Vec::new();
+        if self.match_keyword("PARTITION") {
+            self.expect_keyword("BY")?;
+            partition_by.push(self.parse_expr()?);
+            while self.match_symbol(",") {
+                partition_by.push(self.parse_expr()?);
+            }
+        }
+        if self.match_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            loop {
+                let e = self.parse_expr()?;
+                let dir = if self.match_keyword("DESC") {
+                    OrderDir::Desc
+                } else {
+                    let _ = self.match_keyword("ASC");
+                    OrderDir::Asc
+                };
+                order_by.push((e, dir));
+                if !self.match_symbol(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(")")?;
+        Ok(WindowSpec {
+            partition_by,
+            order_by,
+        })
     }
 
     /// Bloque G1: entry-point del parser de expresiones escalares.
