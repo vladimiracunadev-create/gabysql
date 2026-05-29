@@ -417,7 +417,15 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | `CREATE USER` / `CREATE ROLE` | ✅ (Z1, 2026-05-29; VERSION 22→23; `WITH PASSWORD` o `IDENTIFIED BY`; hash FNV-1a-64 + salt, **NO crypto-grade** — ver ADR-0050) | — |
 | `DROP USER [IF EXISTS]` / `DROP ROLE [IF EXISTS]` | ✅ (Z1, 2026-05-29) | — |
 | `ALTER USER ... SET PASSWORD ...` / `IDENTIFIED BY` / `WITH PASSWORD` | ✅ (Z1, 2026-05-29; rota salt en cada cambio) | — |
-| `GRANT` / `REVOKE` (privilegios sobre tablas/vistas) | ❌ (Z2 — bloque siguiente) | P2 |
+| `GRANT priv [, priv]* ON [TABLE] obj TO user_or_role` (SELECT/INSERT/UPDATE/DELETE/REFERENCES/TRUNCATE/ALL) | ✅ (Z2, 2026-05-29; VERSION 23→24; bitmask u32 persistido; merge OR; PUBLIC implícito; ver ADR-0051) | — |
+| `REVOKE priv [, priv]* ON [TABLE] obj FROM user_or_role` | ✅ (Z2, 2026-05-29; AND-NOT; idempotente sin GRANT previo; mask 0 borra el record) | — |
+| `SET SESSION AUTHORIZATION 'user' | DEFAULT` | ✅ (Z2, 2026-05-29; activa enforcement en exec\_select/insert/update/delete/truncate; DEFAULT vuelve a superuser) | — |
+| Enforcement de privs en DML (PRIVILEGE_DENIED `[GBY-4129]`) | ✅ (Z2, 2026-05-29; check\_priv en hooks; superuser bypass cuando current_user is None) | — |
+| `GRANT priv ON COLUMN ... TO ...` (column-level) | ❌ (Z2 sólo per-objeto; diferido) | P3 |
+| `WITH GRANT OPTION` (re-grant transitivo) | ❌ (Z2 sin grantor tracking; diferido) | P3 |
+| `GRANT role TO user` (role membership) | ❌ (Z1 persiste roles pero sin members; diferido) | P3 |
+| Funciones `current_user()` / `session_user()` | ❌ (defer Z3 — útil para policies RLS) | P3 |
+| `GRANT EXECUTE ON PROCEDURE/FUNCTION` | ❌ (Z2 sólo tabla/vista; diferido) | P3 |
 | Row-level security (RLS) `CREATE POLICY` | ❌ (Z3 — bloque siguiente) | P3 |
 | `SET ROLE` / `CURRENT_USER` | ❌ (defer; requiere protocolo extendido server-side) | P3 |
 | KDF real para password (PBKDF2/bcrypt/argon2) | ❌ (Z1 usa FNV-1a no-cripto; Z1b futuro) | P2 |

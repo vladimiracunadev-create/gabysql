@@ -651,6 +651,26 @@ pub mod codes {
     /// con caracteres no permitidos (sólo `[a-zA-Z_][a-zA-Z0-9_]*`), o
     /// con longitud > 64 bytes.
     pub const INVALID_USER_NAME: u32 = 4128;
+    /// Bloque Z2 (2026-05-29): el `current_user` de la sesión no tiene
+    /// el privilegio necesario (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/etc.)
+    /// sobre la tabla/vista objetivo. Si no hay `SET SESSION
+    /// AUTHORIZATION` previo, el caller es tratado como **superuser**
+    /// (bypass total) — el chequeo sólo aplica cuando hay un user
+    /// explícito en la sesión.
+    pub const PRIVILEGE_DENIED: u32 = 4129;
+    /// Bloque Z2 (2026-05-29): `GRANT` / `REVOKE` con un nombre de
+    /// privilegio desconocido (no es uno de `SELECT`, `INSERT`,
+    /// `UPDATE`, `DELETE`, `REFERENCES`, `TRUNCATE`, `ALL`).
+    pub const INVALID_PRIVILEGE: u32 = 4130;
+    /// Bloque Z2 (2026-05-29): `GRANT` / `REVOKE` sobre un objeto que no
+    /// existe en el catálogo (sólo se permite GRANT sobre tablas y
+    /// vistas — triggers/procedures/functions tienen su propio modelo).
+    pub const GRANT_OBJECT_NOT_FOUND: u32 = 4131;
+    /// Bloque Z2 (2026-05-29): `GRANT ... TO grantee` con un grantee que
+    /// no es un user ni un role existente. Usar `CREATE USER` o
+    /// `CREATE ROLE` primero. Especial: `PUBLIC` es un grantee implícito
+    /// que aplica a todos los users — no requiere CREATE USER previo.
+    pub const GRANTEE_NOT_FOUND: u32 = 4132;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

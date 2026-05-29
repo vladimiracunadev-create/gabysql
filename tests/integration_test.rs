@@ -14167,6 +14167,324 @@ fn z1_identified_by_syntax_works() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Z2 (2026-05-29): GRANT / REVOKE / SET SESSION AUTHORIZATION
+// + enforcement de privilegios sobre tablas/vistas. Bump VERSION
+// 23 → 24.
+// ============================================================
+
+fn z2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z2_grant_persists_bitmask() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("grant-persist")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         CREATE USER alice;
+         GRANT SELECT, INSERT ON t TO alice;",
+    )?;
+    {
+        let mut pager = Pager::open(&db)?;
+        let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+        let g = cat
+            .get_grant("alice", "t")?
+            .expect("grant alice→t debería existir");
+        // SELECT=0x01 | INSERT=0x02 = 0x03.
+        assert_eq!(g.privs & 0x03, 0x03);
+        assert_eq!(g.privs & 0x04, 0); // UPDATE no granted.
+        pager.close()?;
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_grant_merge_bitmask() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("grant-merge")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         GRANT INSERT ON t TO alice;",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let g = cat.get_grant("alice", "t")?.unwrap();
+    assert_eq!(g.privs & 0x03, 0x03);
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_revoke_clears_bits() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("revoke")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE USER alice;
+         GRANT SELECT, INSERT, UPDATE ON t TO alice;
+         REVOKE INSERT ON t FROM alice;",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let g = cat.get_grant("alice", "t")?.unwrap();
+    assert_eq!(g.privs & 0x01, 0x01); // SELECT
+    assert_eq!(g.privs & 0x02, 0); // INSERT cleared
+    assert_eq!(g.privs & 0x04, 0x04); // UPDATE
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_revoke_all_removes_record() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("revoke-all")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         REVOKE SELECT ON t FROM alice;",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    assert!(cat.get_grant("alice", "t")?.is_none());
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_grant_all_expands_mask() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("grant-all")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE USER alice;
+         GRANT ALL PRIVILEGES ON t TO alice;",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let g = cat.get_grant("alice", "t")?.unwrap();
+    // PRIV_ALL = SELECT|INSERT|UPDATE|DELETE|REFERENCES|TRUNCATE = 0x3F.
+    assert_eq!(g.privs, 0x3F);
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_set_session_user_then_select_denied() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("denied")?;
+    // Como superuser inserto datos. Después cambio de sesión a alice
+    // (que no tiene SELECT) y verifico que el SELECT rebota con 4129.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);
+         CREATE USER alice;
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT n FROM t;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4129"),
+        "esperaba [GBY-4129] PRIVILEGE_DENIED, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_grant_then_select_allowed() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("grant-allowed")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 42);
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT n FROM t;",
+    )?;
+    // El último ResultSet es el SELECT.
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_public_grant_visible_to_all_users() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("public")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 7);
+         CREATE USER bob;
+         GRANT SELECT ON t TO PUBLIC;
+         SET SESSION AUTHORIZATION 'bob';
+         SELECT n FROM t;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][0], Value::Integer(7));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_insert_denied_without_priv() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("insert-denied")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE USER alice;
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id) VALUES (1);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4129"),
+        "esperaba [GBY-4129], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_set_session_auth_default_restores_superuser() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("auth-default")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 99);
+         CREATE USER alice;
+         SET SESSION AUTHORIZATION 'alice';
+         SET SESSION AUTHORIZATION DEFAULT;
+         SELECT n FROM t;",
+    )?;
+    // El SELECT post-DEFAULT debería andar (somos superuser otra vez).
+    let last = res.last().unwrap();
+    assert_eq!(last.rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_grant_unknown_priv_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("invalid-priv")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); CREATE USER alice;",
+    )?;
+    let err = run_sql(&db, "GRANT FROBNICATE ON t TO alice;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4130"),
+        "esperaba [GBY-4130] INVALID_PRIVILEGE, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_grant_on_missing_object_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("missing-obj")?;
+    run_sql(&db, "CREATE USER alice;")?;
+    let err = run_sql(&db, "GRANT SELECT ON ghost_table TO alice;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4131"),
+        "esperaba [GBY-4131] GRANT_OBJECT_NOT_FOUND, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_grant_to_missing_user_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("missing-grantee")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "GRANT SELECT ON t TO ghost_user;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4132"),
+        "esperaba [GBY-4132] GRANTEE_NOT_FOUND, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_set_session_auth_unknown_user_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("set-unknown")?;
+    let err = run_sql(&db, "SET SESSION AUTHORIZATION 'ghost';").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4125"),
+        "esperaba [GBY-4125] USER_NOT_FOUND, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z2_update_delete_truncate_enforcement() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z2_setup("dml-enforce")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 1);
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;",
+    )?;
+    // alice tiene SELECT pero no UPDATE/DELETE/TRUNCATE.
+    let err = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION 'alice'; UPDATE t SET n = 2 WHERE id = 1;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4129"),
+        "UPDATE no rebotó: {}",
+        err
+    );
+
+    let err = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION 'alice'; DELETE FROM t WHERE id = 1;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4129"),
+        "DELETE no rebotó: {}",
+        err
+    );
+
+    let err = run_sql(&db, "SET SESSION AUTHORIZATION 'alice'; TRUNCATE TABLE t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4129"),
+        "TRUNCATE no rebotó: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -1,8 +1,9 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
-    ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, IndexKind, IndexMeta, OnDelete,
-    OnUpdate, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta, ViewMeta,
+    ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, GrantMeta, IndexKind, IndexMeta,
+    OnDelete, OnUpdate, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta, ViewMeta,
+    PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -102,6 +103,17 @@ pub enum Statement {
     /// Bloque Z1: `ALTER USER name SET PASSWORD '...'` (también acepta
     /// `IDENTIFIED BY '...'`). Cambia el hash+salt persistido.
     AlterUserPassword(AlterUserPasswordStmt),
+    /// Bloque Z2 (2026-05-29): `GRANT priv [, priv]* ON [TABLE] name
+    /// TO user_or_role`. Persiste un `GrantMeta` por par (grantee,
+    /// object), merge'eando bitmask con GRANTs previos.
+    Grant(GrantStmt),
+    /// Bloque Z2: `REVOKE priv [, priv]* ON [TABLE] name FROM
+    /// user_or_role`. Limpia bits del bitmask persistido.
+    Revoke(RevokeStmt),
+    /// Bloque Z2: `SET SESSION AUTHORIZATION 'name' | DEFAULT`. Activa
+    /// el chequeo de privilegios para los statements siguientes, o lo
+    /// desactiva con `DEFAULT`. Persistente sólo en la sesión.
+    SetSessionAuth(SetSessionAuthStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -469,6 +481,31 @@ pub struct DropRoleStmt {
 pub struct AlterUserPasswordStmt {
     pub name: String,
     pub password: String,
+}
+
+/// Bloque Z2 (2026-05-29): `GRANT priv [, priv]* ON [TABLE] name TO
+/// user_or_role`. `privs` es la lista de keywords parseadas; el engine
+/// las convierte a bitmask `u32` antes de persistir.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantStmt {
+    pub privileges: Vec<String>,
+    pub object: String,
+    pub grantee: String,
+}
+
+/// Bloque Z2: `REVOKE priv [, priv]* ON [TABLE] name FROM user_or_role`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevokeStmt {
+    pub privileges: Vec<String>,
+    pub object: String,
+    pub grantee: String,
+}
+
+/// Bloque Z2: `SET SESSION AUTHORIZATION 'name' | DEFAULT`. Si
+/// `user` es `None`, vuelve al modo superuser (bypass total).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetSessionAuthStmt {
+    pub user: Option<String>,
 }
 
 /// Bloque X4 (2026-05-28): `IF expr THEN <stmts> [ELSIF expr THEN
@@ -2155,6 +2192,13 @@ pub struct Engine<'a> {
     /// `Err(RETURN_SIGNAL)`; `eval_user_func` lo recoge cuando atrapa
     /// el sentinel.
     pending_return_value: Option<Value>,
+    /// Bloque Z2 (2026-05-29): identidad activa de la sesión. `None` =
+    /// superuser bypass (default; mismo que pre-Z2). Si `Some(name)`,
+    /// cada DML chequea el bitmask de privs persistido por
+    /// `(current_user, object)` antes de ejecutar. Se setea con
+    /// `SET SESSION AUTHORIZATION 'name'` y se limpia con
+    /// `SET SESSION AUTHORIZATION DEFAULT`.
+    current_user: Option<String>,
 }
 
 /// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
@@ -2212,6 +2256,7 @@ impl<'a> Engine<'a> {
             trigger_depth: 0,
             var_scope: HashMap::new(),
             pending_return_value: None,
+            current_user: None,
         }
     }
 
@@ -2248,6 +2293,9 @@ impl<'a> Engine<'a> {
             Statement::CreateRole(stmt) => self.exec_create_role(stmt),
             Statement::DropRole(stmt) => self.exec_drop_role(stmt),
             Statement::AlterUserPassword(stmt) => self.exec_alter_user_password(stmt),
+            Statement::Grant(stmt) => self.exec_grant(stmt),
+            Statement::Revoke(stmt) => self.exec_revoke(stmt),
+            Statement::SetSessionAuth(stmt) => self.exec_set_session_auth(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3788,13 +3836,15 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
-            Some(CatalogObject::User(_)) | Some(CatalogObject::Role(_)) => {
-                // Bloque Z1: namespace flat — user/role tampoco se pueden
-                // re-usar como nombre de vista.
+            Some(CatalogObject::User(_))
+            | Some(CatalogObject::Role(_))
+            | Some(CatalogObject::Grant(_)) => {
+                // Bloque Z1/Z2: namespace flat — user/role/grant tampoco
+                // se pueden re-usar como nombre de vista.
                 return Err(coded(
                     codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
                     format!(
-                        "CREATE VIEW '{}': ya existe un USER o ROLE con ese nombre.",
+                        "CREATE VIEW '{}': ya existe un USER/ROLE/GRANT con ese nombre.",
                         stmt.name
                     ),
                 ));
@@ -3876,6 +3926,10 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a un ROLE. Usá DROP ROLE.",
                 stmt.name
             ))),
+            Some(CatalogObject::Grant(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a un GRANT (interno).",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -3923,6 +3977,7 @@ impl<'a> Engine<'a> {
                 | Some(CatalogObject::Function(_))
                 | Some(CatalogObject::User(_))
                 | Some(CatalogObject::Role(_))
+                | Some(CatalogObject::Grant(_))
                 | None => {
                     return Err(coded(
                         codes::TABLE_NOT_FOUND,
@@ -3946,6 +4001,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Function(_) => "FUNCTION",
                     CatalogObject::User(_) => "USER",
                     CatalogObject::Role(_) => "ROLE",
+                    CatalogObject::Grant(_) => "GRANT",
                 };
                 return Err(coded(
                     codes::TRIGGER_NAME_COLLIDES,
@@ -4057,6 +4113,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Function(_) => "FUNCTION",
                     CatalogObject::User(_) => "USER",
                     CatalogObject::Role(_) => "ROLE",
+                    CatalogObject::Grant(_) => "GRANT",
                 };
                 return Err(coded(
                     codes::PROCEDURE_NAME_COLLIDES,
@@ -4218,6 +4275,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Function(_) => "FUNCTION",
                     CatalogObject::User(_) => "USER",
                     CatalogObject::Role(_) => "ROLE",
+                    CatalogObject::Grant(_) => "GRANT",
                 };
                 return Err(coded(
                     codes::FUNCTION_NAME_COLLIDES,
@@ -4476,6 +4534,180 @@ impl<'a> Engine<'a> {
             rows: Vec::new(),
             message: Some(format!("OK · password de user '{}' actualizado", stmt.name)),
         })
+    }
+
+    // ============================================================
+    // Bloque Z2 (2026-05-29): GRANT / REVOKE / SET SESSION AUTHORIZATION
+    // y enforcement de privilegios. Modelo: bitmask u32 por
+    // (grantee, object) persistido como GrantMeta. PUBLIC es un
+    // grantee implícito (no requiere CREATE USER previo).
+    // ============================================================
+
+    fn exec_grant(&mut self, stmt: GrantStmt) -> DbResult<ResultSet> {
+        let mask = privilege_list_to_mask(&stmt.privileges)?;
+        // Objeto debe existir y ser tabla o vista (DML aplicable).
+        {
+            let mut catalog = Catalog::open(self.pager);
+            match catalog.get_object(&stmt.object)? {
+                Some(CatalogObject::Table(_)) | Some(CatalogObject::View(_)) => {}
+                _ => {
+                    return Err(coded(
+                        codes::GRANT_OBJECT_NOT_FOUND,
+                        format!(
+                            "GRANT ON '{}': el objeto no existe o no es una tabla/vista",
+                            stmt.object
+                        ),
+                    ));
+                }
+            }
+        }
+        // Grantee debe ser PUBLIC, un user existente o un role existente.
+        if !grantee_is_valid(&stmt.grantee, &mut Catalog::open(self.pager))? {
+            return Err(coded(
+                codes::GRANTEE_NOT_FOUND,
+                format!(
+                    "GRANT TO '{}': el grantee no existe (no es PUBLIC, USER ni ROLE)",
+                    stmt.grantee
+                ),
+            ));
+        }
+        // Merge con bitmask previo si existe.
+        let merged = {
+            let mut catalog = Catalog::open(self.pager);
+            let prev = catalog
+                .get_grant(&stmt.grantee, &stmt.object)?
+                .map(|g| g.privs)
+                .unwrap_or(0);
+            prev | mask
+        };
+        let meta = GrantMeta {
+            grantee: stmt.grantee.clone(),
+            object: stmt.object.clone(),
+            privs: merged,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_grant(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · GRANT {} ON '{}' TO '{}' (mask={:#x})",
+                stmt.privileges.join(","),
+                stmt.object,
+                stmt.grantee,
+                merged
+            )),
+        })
+    }
+
+    fn exec_revoke(&mut self, stmt: RevokeStmt) -> DbResult<ResultSet> {
+        let mask = privilege_list_to_mask(&stmt.privileges)?;
+        let prev = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_grant(&stmt.grantee, &stmt.object)?
+        };
+        let Some(prev) = prev else {
+            // Idempotente: REVOKE sin GRANT previo no falla, sólo no-op.
+            return Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!(
+                    "OK · REVOKE no-op (no había grants previos de '{}' sobre '{}')",
+                    stmt.grantee, stmt.object
+                )),
+            });
+        };
+        let new_mask = prev.privs & !mask;
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if new_mask == 0 {
+                // Sin privs restantes → borrar el record entero.
+                catalog.remove_grant(&stmt.grantee, &stmt.object)?;
+            } else {
+                let meta = GrantMeta {
+                    grantee: stmt.grantee.clone(),
+                    object: stmt.object.clone(),
+                    privs: new_mask,
+                };
+                catalog.put_grant(&meta)?;
+            }
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · REVOKE {} ON '{}' FROM '{}' (mask={:#x})",
+                stmt.privileges.join(","),
+                stmt.object,
+                stmt.grantee,
+                new_mask
+            )),
+        })
+    }
+
+    fn exec_set_session_auth(&mut self, stmt: SetSessionAuthStmt) -> DbResult<ResultSet> {
+        // Si pide un user específico, validamos que exista para evitar
+        // typos silenciosos. DEFAULT (None) siempre se acepta.
+        if let Some(ref user) = stmt.user {
+            let exists = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.get_user(user)?.is_some()
+            };
+            if !exists {
+                return Err(coded(
+                    codes::USER_NOT_FOUND,
+                    format!("SET SESSION AUTHORIZATION '{}': el user no existe", user),
+                ));
+            }
+        }
+        self.current_user = stmt.user.clone();
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(match &stmt.user {
+                Some(u) => format!("OK · sesión ahora autenticada como '{}'", u),
+                None => "OK · sesión vuelta a superuser (DEFAULT)".to_string(),
+            }),
+        })
+    }
+
+    /// Bloque Z2: chequea que el `current_user` activo tenga el bit
+    /// `priv_required` sobre `object`. Si `current_user` es `None`
+    /// (superuser), bypass total. Si es `Some(name)`, busca el mask
+    /// persistido para `(name, object)` y para `(PUBLIC, object)`, los
+    /// mergea con OR, y compara contra `priv_required`.
+    fn check_priv(&mut self, object: &str, priv_required: u32) -> DbResult<()> {
+        let Some(ref user) = self.current_user.clone() else {
+            return Ok(());
+        };
+        let user_mask = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_grant(user, object)?
+                .map(|g| g.privs)
+                .unwrap_or(0)
+        };
+        let public_mask = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .get_grant("PUBLIC", object)?
+                .map(|g| g.privs)
+                .unwrap_or(0)
+        };
+        let effective = user_mask | public_mask;
+        if effective & priv_required == priv_required {
+            return Ok(());
+        }
+        Err(coded(
+            codes::PRIVILEGE_DENIED,
+            format!(
+                "user '{}' no tiene el privilegio requerido sobre '{}' \
+                 (necesario={:#x}, efectivo={:#x})",
+                user, object, priv_required, effective
+            ),
+        ))
     }
 
     /// Bloque X4 (2026-05-28): ejecuta un `IF ... THEN ... [ELSIF ...]*
@@ -5828,6 +6060,8 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_insert(&mut self, stmt: InsertStmt) -> DbResult<ResultSet> {
+        // Bloque Z2 (2026-05-29): chequeo de privs si current_user activo.
+        self.check_priv(&stmt.table, PRIV_INSERT)?;
         // Bloque V (2026-05-27): rechazo claro si el target es una vista.
         self.reject_if_view(&stmt.table, "INSERT")?;
         // Bloque J: validamos columnas y normalizamos UNA vez para todo
@@ -6195,6 +6429,8 @@ impl<'a> Engine<'a> {
     /// respetar `ON DELETE` declarado (cascade/restrict) y mantener
     /// índices secundarios consistentes vía el path normal de delete.
     fn exec_truncate(&mut self, stmt: TruncateStmt) -> DbResult<ResultSet> {
+        // Bloque Z2: chequeo de privs (TRUNCATE).
+        self.check_priv(&stmt.table, PRIV_TRUNCATE)?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
             catalog.get_table(&stmt.table)?.ok_or_else(|| {
@@ -7104,6 +7340,20 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_select(&mut self, mut stmt: SelectStmt) -> DbResult<ResultSet> {
+        // Bloque Z2 (2026-05-29): chequeo de PRIV_SELECT sobre la tabla
+        // base y todas las joins nombradas. Derived tables / VALUES no
+        // requieren priv (son sintéticas). Si current_user es None,
+        // bypass total (mismo path que pre-Z2).
+        if self.current_user.is_some() {
+            if stmt.derived_source.is_none() && stmt.values_source.is_none() {
+                self.check_priv(&stmt.table, PRIV_SELECT)?;
+            }
+            for j in &stmt.joins {
+                if j.right.derived.is_none() && j.right.values.is_none() {
+                    self.check_priv(&j.right.name, PRIV_SELECT)?;
+                }
+            }
+        }
         // Bloque V (2026-05-27): si el FROM apunta a una vista, la
         // re-expandimos como derived source ANTES de cualquier otro
         // dispatch — así el resto del pipeline ve la query post-rewrite.
@@ -8845,6 +9095,8 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_update(&mut self, stmt: UpdateStmt) -> DbResult<ResultSet> {
+        // Bloque Z2: chequeo de privs.
+        self.check_priv(&stmt.table, PRIV_UPDATE)?;
         self.reject_if_view(&stmt.table, "UPDATE")?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -9777,6 +10029,8 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_delete(&mut self, stmt: DeleteStmt) -> DbResult<ResultSet> {
+        // Bloque Z2: chequeo de privs.
+        self.check_priv(&stmt.table, PRIV_DELETE)?;
         self.reject_if_view(&stmt.table, "DELETE")?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -16332,6 +16586,50 @@ fn validate_user_name(name: &str) -> DbResult<()> {
     Ok(())
 }
 
+/// Bloque Z2 (2026-05-29): convierte una lista de keywords de
+/// privilegio (uppercased por el parser) en un bitmask `u32`. `ALL`
+/// expande a `PRIV_ALL`. Privilegio desconocido → `[GBY-4130]`.
+fn privilege_list_to_mask(privs: &[String]) -> DbResult<u32> {
+    let mut mask = 0u32;
+    for p in privs {
+        let bit = match p.as_str() {
+            "SELECT" => PRIV_SELECT,
+            "INSERT" => PRIV_INSERT,
+            "UPDATE" => PRIV_UPDATE,
+            "DELETE" => PRIV_DELETE,
+            "REFERENCES" => PRIV_REFERENCES,
+            "TRUNCATE" => PRIV_TRUNCATE,
+            "ALL" => PRIV_ALL,
+            other => {
+                return Err(coded(
+                    codes::INVALID_PRIVILEGE,
+                    format!(
+                        "privilegio '{}' desconocido (acepto SELECT/INSERT/UPDATE/DELETE/REFERENCES/TRUNCATE/ALL)",
+                        other
+                    ),
+                ));
+            }
+        };
+        mask |= bit;
+    }
+    Ok(mask)
+}
+
+/// Bloque Z2: valida que un grantee sea aceptable — `PUBLIC` (case
+/// insensitive), o un user/role existente en el catálogo.
+fn grantee_is_valid(grantee: &str, catalog: &mut Catalog<'_>) -> DbResult<bool> {
+    if grantee.eq_ignore_ascii_case("PUBLIC") {
+        return Ok(true);
+    }
+    if catalog.get_user(grantee)?.is_some() {
+        return Ok(true);
+    }
+    if catalog.get_role(grantee)?.is_some() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Bloque Z1: nombre descriptivo del kind para mensajes de error.
 fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
     match obj {
@@ -16342,6 +16640,7 @@ fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
         CatalogObject::Function(_) => "FUNCTION",
         CatalogObject::User(_) => "USER",
         CatalogObject::Role(_) => "ROLE",
+        CatalogObject::Grant(_) => "GRANT",
     }
 }
 
@@ -17802,6 +18101,13 @@ impl Parser {
         if self.match_keyword("CREATE") {
             return self.parse_create();
         }
+        // Bloque Z2 (2026-05-29): GRANT / REVOKE top-level.
+        if self.match_keyword("GRANT") {
+            return self.parse_grant();
+        }
+        if self.match_keyword("REVOKE") {
+            return self.parse_revoke();
+        }
         // Bloque X4 (2026-05-28): control de flujo `IF expr THEN ...`.
         // Es un statement top-level — vive principalmente dentro de
         // bodies de trigger/procedure pero se puede usar también en un
@@ -18761,10 +19067,87 @@ impl Parser {
 
     /// Bloque X4b: parsea `SET var = expr`.
     fn parse_set_stmt(&mut self) -> DbResult<Statement> {
+        // Bloque Z2 (2026-05-29): `SET SESSION AUTHORIZATION 'name'
+        // | DEFAULT`. Discriminado acá porque comparte el prefijo `SET`
+        // con `SET var = expr` (X4b). Si el siguiente keyword es
+        // SESSION, ramificamos.
+        if self.match_keyword("SESSION") {
+            self.expect_keyword("AUTHORIZATION")?;
+            // Acepta DEFAULT (vuelve a superuser), un string literal
+            // ('alice'), o un ident pelado (alice) por compatibilidad
+            // con cualquiera de las dos sintaxis comunes.
+            if self.match_keyword("DEFAULT") {
+                return Ok(Statement::SetSessionAuth(SetSessionAuthStmt { user: None }));
+            }
+            let user = if self.peek().kind == TokenKind::String {
+                self.expect_string_literal("SET SESSION AUTHORIZATION")?
+            } else {
+                self.expect_ident()?
+            };
+            return Ok(Statement::SetSessionAuth(SetSessionAuthStmt {
+                user: Some(user),
+            }));
+        }
         let name = self.expect_ident()?;
         self.expect_symbol("=")?;
         let value = self.parse_expr()?;
         Ok(Statement::Set(SetStmt { name, value }))
+    }
+
+    /// Bloque Z2 (2026-05-29): `GRANT priv [, priv]* ON [TABLE] name TO
+    /// user_or_role`. `PUBLIC` es un grantee implícito permitido.
+    fn parse_grant(&mut self) -> DbResult<Statement> {
+        let privileges = self.parse_privilege_list()?;
+        self.expect_keyword("ON")?;
+        // `TABLE` keyword es opcional en estándar SQL — la aceptamos
+        // pero no la requerimos.
+        let _ = self.match_keyword("TABLE");
+        let object = self.expect_ident()?;
+        self.expect_keyword("TO")?;
+        let grantee = self.expect_ident()?;
+        Ok(Statement::Grant(GrantStmt {
+            privileges,
+            object,
+            grantee,
+        }))
+    }
+
+    /// Bloque Z2: `REVOKE priv [, priv]* ON [TABLE] name FROM
+    /// user_or_role`.
+    fn parse_revoke(&mut self) -> DbResult<Statement> {
+        let privileges = self.parse_privilege_list()?;
+        self.expect_keyword("ON")?;
+        let _ = self.match_keyword("TABLE");
+        let object = self.expect_ident()?;
+        self.expect_keyword("FROM")?;
+        let grantee = self.expect_ident()?;
+        Ok(Statement::Revoke(RevokeStmt {
+            privileges,
+            object,
+            grantee,
+        }))
+    }
+
+    /// Bloque Z2: lista de privilegios separada por comas. Acepta
+    /// `ALL PRIVILEGES` (con la palabra PRIVILEGES opcional). Cada item
+    /// se devuelve como string upper-case; el engine valida que sea
+    /// uno de los conocidos (sino [GBY-4130]).
+    fn parse_privilege_list(&mut self) -> DbResult<Vec<String>> {
+        let mut out = Vec::new();
+        loop {
+            // Tratamiento especial de `ALL [PRIVILEGES]`.
+            if self.match_keyword("ALL") {
+                let _ = self.match_keyword("PRIVILEGES");
+                out.push("ALL".to_string());
+            } else {
+                let priv_name = self.expect_ident()?;
+                out.push(priv_name.to_ascii_uppercase());
+            }
+            if !self.match_symbol(",") {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Bloque X4b: parsea `WHILE cond LOOP <stmts> END LOOP`.

@@ -1275,6 +1275,9 @@ pub enum ObjectKind {
     /// Bloque Z1 (VERSION 23): role SQL-level. Por ahora sólo nombre;
     /// GRANT a role llega en Z2.
     Role,
+    /// Bloque Z2 (VERSION 24): privilegio persistido por (grantee, object).
+    /// Privs codificados como bitmask u32. Ver `GrantMeta`.
+    Grant,
 }
 
 impl ObjectKind {
@@ -1287,6 +1290,7 @@ impl ObjectKind {
             Self::Function => 4,
             Self::User => 5,
             Self::Role => 6,
+            Self::Grant => 7,
         }
     }
 
@@ -1299,8 +1303,9 @@ impl ObjectKind {
             4 => Ok(Self::Function),
             5 => Ok(Self::User),
             6 => Ok(Self::Role),
+            7 => Ok(Self::Grant),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role, 7=Grant)",
                 other
             ))),
         }
@@ -1566,7 +1571,72 @@ impl RoleMeta {
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user o role.
+/// Bloque Z2 (VERSION 24): privilegio persistido por (grantee, object).
+///
+/// Bitmask `privs` codifica privilegios estilo SQL standard:
+/// - `0x01` SELECT, `0x02` INSERT, `0x04` UPDATE, `0x08` DELETE
+/// - `0x10` REFERENCES (FK), `0x20` TRUNCATE
+/// - `0x3F` = `ALL PRIVILEGES`
+///
+/// La key del record es `hash_name(grantee || ":" || object)` para que
+/// cada par (grantee, object) tenga su propio slot. Múltiples GRANTs
+/// sobre el mismo par se mergean por OR del bitmask en `exec_grant`;
+/// REVOKE limpia bits con AND-NOT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantMeta {
+    pub grantee: String,
+    pub object: String,
+    pub privs: u32,
+}
+
+pub const PRIV_SELECT: u32 = 0x01;
+pub const PRIV_INSERT: u32 = 0x02;
+pub const PRIV_UPDATE: u32 = 0x04;
+pub const PRIV_DELETE: u32 = 0x08;
+pub const PRIV_REFERENCES: u32 = 0x10;
+pub const PRIV_TRUNCATE: u32 = 0x20;
+pub const PRIV_ALL: u32 =
+    PRIV_SELECT | PRIV_INSERT | PRIV_UPDATE | PRIV_DELETE | PRIV_REFERENCES | PRIV_TRUNCATE;
+
+impl GrantMeta {
+    /// Clave de catálogo que combina grantee + object con un separador
+    /// (`:`) que no aparece en idents válidos. Garantiza que dos pares
+    /// distintos no colisionen en el B-tree del catálogo.
+    pub fn catalog_key_name(grantee: &str, object: &str) -> String {
+        format!(
+            "__grant__:{}:{}",
+            grantee.to_ascii_lowercase(),
+            object.to_ascii_lowercase()
+        )
+    }
+
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(32);
+        push_string(&mut out, &self.grantee)?;
+        push_string(&mut out, &self.object)?;
+        out.extend_from_slice(&self.privs.to_le_bytes());
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let grantee = take_string(data, &mut offset)?;
+        let object = take_string(data, &mut offset)?;
+        if offset + 4 > data.len() {
+            return Err(DbError::new(format!(
+                "GrantMeta ({} → {}) corrupto: faltan 4 bytes de privs",
+                grantee, object
+            )));
+        }
+        let privs = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        Ok(Self {
+            grantee,
+            object,
+            privs,
+        })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user, role o grant.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
@@ -1576,6 +1646,7 @@ pub enum CatalogObject {
     Function(FunctionMeta),
     User(UserMeta),
     Role(RoleMeta),
+    Grant(GrantMeta),
 }
 
 impl CatalogObject {
@@ -1588,6 +1659,25 @@ impl CatalogObject {
             Self::Function(f) => &f.name,
             Self::User(u) => &u.name,
             Self::Role(r) => &r.name,
+            // Para Grant el "name" en el sentido del catálogo es la
+            // clave compuesta `__grant__:grantee:object`. La calcula
+            // perezosamente `get_object` cuando hace la comparación de
+            // colisión. Acá devolvemos el grantee como display útil; la
+            // comparación robusta vive en `is_grant_key_match`.
+            Self::Grant(g) => &g.grantee,
+        }
+    }
+
+    /// Bloque Z2: helper para la verificación de colisión de hash en
+    /// `Catalog::get_object`. Para `Grant`, el nombre lookup-eable es
+    /// la clave compuesta `__grant__:grantee:object`, no `grantee` solo.
+    pub(crate) fn matches_lookup_name(&self, lookup: &str) -> bool {
+        match self {
+            Self::Grant(g) => {
+                let key = GrantMeta::catalog_key_name(&g.grantee, &g.object);
+                key.eq_ignore_ascii_case(lookup)
+            }
+            other => other.name().eq_ignore_ascii_case(lookup),
         }
     }
 }
@@ -1610,6 +1700,7 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
         ObjectKind::Function => CatalogObject::Function(FunctionMeta::deserialize(rest)?),
         ObjectKind::User => CatalogObject::User(UserMeta::deserialize(rest)?),
         ObjectKind::Role => CatalogObject::Role(RoleMeta::deserialize(rest)?),
+        ObjectKind::Grant => CatalogObject::Grant(GrantMeta::deserialize(rest)?),
     })
 }
 
@@ -1708,7 +1799,11 @@ impl<'a> Catalog<'a> {
         let mut tree = Tree::new(self.pager);
         if let Some(bytes) = tree.get(header.catalog_root_page, key)? {
             let obj = decode_catalog_object(&bytes)?;
-            if obj.name().eq_ignore_ascii_case(name) {
+            // Bloque Z2: Grants usan clave compuesta — la comparación
+            // delega a `matches_lookup_name` para que el chequeo de
+            // colisión funcione tanto para nombres simples (tabla,
+            // vista, etc.) como compuestos (`__grant__:grantee:object`).
+            if obj.matches_lookup_name(name) {
                 return Ok(Some(obj));
             }
             return Err(DbError::new(format!(
@@ -1874,6 +1969,49 @@ impl<'a> Catalog<'a> {
         let mut tree = Tree::new(self.pager);
         tree.upsert(root, key, payload)?;
         Ok(())
+    }
+
+    /// Bloque Z2 (VERSION 24): persiste un `Grant` en el catálogo bajo
+    /// la clave compuesta `__grant__:grantee:object`. Múltiples GRANTs
+    /// sobre el mismo par se merge'an por OR en `exec_grant` antes de
+    /// llamar a este put (no lo hace acá).
+    pub fn put_grant(&mut self, meta: &GrantMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key_name = GrantMeta::catalog_key_name(&meta.grantee, &meta.object);
+        let key = hash_name(&key_name);
+        let mut payload = Vec::with_capacity(1 + 32);
+        payload.push(ObjectKind::Grant.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    /// Bloque Z2: lookup de un grant por (grantee, object).
+    pub fn get_grant(&mut self, grantee: &str, object: &str) -> DbResult<Option<GrantMeta>> {
+        let key_name = GrantMeta::catalog_key_name(grantee, object);
+        match self.get_object(&key_name)? {
+            Some(CatalogObject::Grant(g)) => Ok(Some(g)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Bloque Z2: borra el record de un grant. Devuelve true si existía.
+    pub fn remove_grant(&mut self, grantee: &str, object: &str) -> DbResult<bool> {
+        let key_name = GrantMeta::catalog_key_name(grantee, object);
+        self.remove_object(&key_name)
+    }
+
+    /// Bloque Z2: lista todos los grants del catálogo.
+    pub fn list_grants(&mut self) -> DbResult<Vec<GrantMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Grant(g) => Some(g),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Remove the catalog entry for the named object (table or view).

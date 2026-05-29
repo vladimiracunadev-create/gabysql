@@ -6,6 +6,55 @@
 
 ---
 
+## 2026-05-29 — Bloque Z2: `GRANT` / `REVOKE` + `SET SESSION AUTHORIZATION`
+
+> **Un push a `main`**. Bump on-disk **VERSION 23 → 24**. Z2 conecta la identidad Z1 al motor: privilegios persistidos por (grantee, object) con bitmask, enforcement en cada DML cuando hay user activo en la sesión. Detalle en [`docs/adr/0051-z2-grant-revoke.md`](docs/adr/0051-z2-grant-revoke.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE USER alice;
+GRANT SELECT, INSERT ON t TO alice;       -- merge OR si ya existía
+GRANT ALL PRIVILEGES ON t TO bob;         -- 0x3F mask
+GRANT SELECT ON t TO PUBLIC;              -- grantee implícito
+REVOKE INSERT ON t FROM alice;            -- AND-NOT
+
+SET SESSION AUTHORIZATION 'alice';        -- modo "actuar como alice"
+SELECT * FROM t;                          -- check_priv(t, SELECT) → OK
+INSERT INTO t VALUES (1);                 -- [GBY-4129] PRIVILEGE_DENIED
+
+SET SESSION AUTHORIZATION DEFAULT;        -- vuelve a superuser bypass
+```
+
+### 🛠 Implementación
+
+- `ObjectKind::Grant = 7` + `GrantMeta { grantee, object, privs: u32 }` con clave compuesta `__grant__:grantee:object` en el B-tree del catálogo.
+- Bitmask: `PRIV_SELECT=0x01`, `INSERT=0x02`, `UPDATE=0x04`, `DELETE=0x08`, `REFERENCES=0x10`, `TRUNCATE=0x20`, `ALL=0x3F`.
+- AST: `Statement::Grant/Revoke/SetSessionAuth`.
+- Parser: `parse_grant`, `parse_revoke`, `parse_privilege_list` (acepta `ALL [PRIVILEGES]`), dispatch SESSION AUTHORIZATION dentro de `parse_set_stmt`.
+- Engine: `current_user: Option<String>` en struct; `exec_grant`/`exec_revoke`/`exec_set_session_auth`/`check_priv` métodos. Helpers `privilege_list_to_mask` y `grantee_is_valid` (acepta PUBLIC, user existente, role existente).
+- Enforcement: hook `check_priv(table, priv)` al inicio de `exec_select` (base + joins), `exec_insert`, `exec_update`, `exec_delete`, `exec_truncate`. Si `current_user is None`, bypass total (idéntico pre-Z2).
+- `CatalogObject::matches_lookup_name` para soportar claves compuestas en la verificación de colisión de hash de `get_object`.
+
+### 🆕 Códigos de error
+
+- `[GBY-4129]` `PRIVILEGE_DENIED`
+- `[GBY-4130]` `INVALID_PRIVILEGE`
+- `[GBY-4131]` `GRANT_OBJECT_NOT_FOUND`
+- `[GBY-4132]` `GRANTEE_NOT_FOUND`
+
+### 🚫 Diferido (Z3 y futuro)
+
+- **Z3**: RLS (`CREATE POLICY ... USING (expr)`) — bloque siguiente.
+- `GRANT priv ON COLUMN ...`, `WITH GRANT OPTION`, GRANT role membership (`GRANT role_name TO user`), funciones `current_user`/`session_user`, GRANTs sobre procedure/function (`EXECUTE`), default-deny en lugar de superuser bypass.
+
+### 🧪 Validación
+
+- Suite: **629 passing** (614 → +15 Z2). Cubre: persist/merge/revoke de bitmask, GRANT ALL, denied SELECT/INSERT/UPDATE/DELETE/TRUNCATE, PUBLIC visible a todos, SET SESSION AUTHORIZATION + DEFAULT, errores 4129/4130/4131/4132 + 4125 a user inexistente.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z1: identidad SQL-level (`CREATE USER` / `CREATE ROLE`)
 
 > **Un push a `main`** que abre el bloque Z. Bump on-disk **VERSION 22 → 23**. Z1 entrega la fundación sobre la cual GRANT/REVOKE (Z2) y RLS (Z3) van a apoyarse: un namespace persistente de users y roles, DDL completo y un hash de password no-cripto. Detalle en [`docs/adr/0050-z1-users-roles.md`](docs/adr/0050-z1-users-roles.md).
