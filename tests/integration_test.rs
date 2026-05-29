@@ -15899,6 +15899,143 @@ fn z3e_upsert_no_policies_compat() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Z3f (2026-05-29): DEFAULTs aplicados ANTES de enforce_with_check
+// en exec_insert. Sin bump on-disk.
+// ============================================================
+
+fn z3f_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z3f-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z3f_default_aplica_antes_de_with_check_pass() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3f_setup("default-pass")?;
+    // Policy WITH CHECK referencia la columna 'status', que tiene
+    // DEFAULT 'pending'. Pre-Z3f el check veía Null para status (no
+    // stated), así el INSERT pasaba aunque la policy exigiera
+    // status='pending'. Z3f aplica el DEFAULT antes → check ve 'pending'
+    // → policy pasa. Mismo resultado pero por la razón correcta.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'pending', n INT);
+         CREATE USER alice;
+         GRANT INSERT, SELECT ON t TO alice;
+         CREATE POLICY only_pending ON t FOR INSERT
+           WITH CHECK (status = 'pending');
+         CREATE POLICY sel ON t FOR SELECT USING (TRUE);
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, n) VALUES (1, 42);
+         SELECT id, status, n FROM t;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][1], Value::String("pending".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3f_default_aplica_antes_de_with_check_reject() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3f_setup("default-reject")?;
+    // Policy exige status='approved' pero el DEFAULT es 'pending'. Pre-Z3f
+    // el check veía Null (= no aceptado por '= approved') → ya rebotaba
+    // por la razón coincidentemente correcta. Z3f sigue rebotando, ahora
+    // con la check_row mostrando 'pending' explícitamente.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'pending');
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY only_approved ON t FOR INSERT
+           WITH CHECK (status = 'approved');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id) VALUES (1);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3f_user_stated_value_overrides_default() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3f_setup("user-override")?;
+    // Si el user state explícitamente un valor que viola WITH CHECK,
+    // ese valor debe ganar al DEFAULT y la policy rechazar.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'pending');
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY only_pending ON t FOR INSERT
+           WITH CHECK (status = 'pending');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, status) VALUES (1, 'approved');",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] (user-stated 'approved' viola), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3f_no_default_col_sin_state_sigue_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3f_setup("no-default")?;
+    // Col sin DEFAULT y sin user-state debe seguir apareciendo como
+    // Null en el check (comportamiento Z3b/Z3f consistente).
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, opt TEXT);
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY needs_opt ON t FOR INSERT
+           WITH CHECK (opt = 'X');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id) VALUES (1);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] (opt sin default = Null), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3f_compat_sin_policies_sin_change() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3f_setup("compat")?;
+    // Sin policies, el path no cambia (no hay enforce_with_check).
+    // DEFAULT se aplica vía apply_insert_row_with_conflict normal.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'pending');
+         INSERT INTO t (id) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT status FROM t WHERE id = 1;")?;
+    assert_eq!(
+        res.last().unwrap().rows[0][0],
+        Value::String("pending".to_string())
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

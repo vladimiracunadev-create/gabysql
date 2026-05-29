@@ -6710,6 +6710,13 @@ impl<'a> Engine<'a> {
             // new-row pre-persist. Si current_user is None o la tabla no
             // tiene policies, no-op (compat pre-Z3b). Si hay policies y
             // ninguna acepta esta fila → [GBY-4138].
+            //
+            // Bloque Z3f (2026-05-29): aplicar DEFAULTs ANTES de
+            // enforce_with_check. Pre-Z3f, cols no-stated aparecían
+            // como Null en la check_row, así una policy `WITH CHECK
+            // (status = 'pending')` veía Null incluso si el DEFAULT
+            // era 'pending' y la fila terminaba aceptándose. Fix:
+            // apply_defaults() llena los huecos primero.
             if self.current_user.is_some() {
                 let mut check_row: HashMap<String, Value> = HashMap::new();
                 for (i, col) in normalized_cols.iter().enumerate() {
@@ -6718,6 +6725,10 @@ impl<'a> Engine<'a> {
                         row_values.get(i).cloned().unwrap_or(Value::Null),
                     );
                 }
+                // Z3f: aplicar DEFAULTs antes del check.
+                apply_defaults(&meta, &mut check_row);
+                // Inicializar columnas restantes a Null (las que no
+                // tienen DEFAULT y no fueron stated).
                 for c in &meta.columns {
                     check_row
                         .entry(normalize_ident(&c.name))

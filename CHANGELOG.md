@@ -6,6 +6,48 @@
 
 ---
 
+## 2026-05-29 — Bloque Z3f: DEFAULTs aplicados antes de WITH CHECK en INSERT
+
+> **Un push a `main`** sin bump on-disk. Cierra un gap sutil en el WITH CHECK que producía falsos rejects/accepts cuando policies referenciaban columnas con DEFAULT. Detalle en [`docs/adr/0062-z3f-defaults-before-with-check.md`](docs/adr/0062-z3f-defaults-before-with-check.md).
+
+### 🐛 Bug fix
+
+Pre-Z3f, una policy `WITH CHECK (col = 'X')` sobre un INSERT que no state `col` (DEFAULT='X') veía `col=Null` en la `check_row` y rebotaba con `[GBY-4138]` aunque la fila terminaría persistiendo con el DEFAULT correcto.
+
+### 🛠 Implementación
+
+```rust
+if self.current_user.is_some() {
+    let mut check_row: HashMap<String, Value> = HashMap::new();
+    for (i, col) in normalized_cols.iter().enumerate() {
+        check_row.insert(col.clone(), row_values.get(i).cloned().unwrap_or(Value::Null));
+    }
+    // Z3f: aplicar DEFAULTs ANTES del check.
+    apply_defaults(&meta, &mut check_row);
+    for c in &meta.columns {
+        check_row.entry(normalize_ident(&c.name)).or_insert(Value::Null);
+    }
+    self.enforce_with_check(&stmt.table, POLICY_ACTION_INSERT, &check_row)?;
+}
+```
+
+- Stated values siguen ganando sobre DEFAULT (orden de inserción).
+- Cols sin DEFAULT y no-stated siguen siendo Null.
+- Sin policies → sin cambio (compat 100%).
+
+### 🚫 Diferido (Z3g)
+
+- Statement-level rollback en RLS violation (requiere savepoint primitive — Bloque T extension).
+- Column-level filter en RETURNING.
+- Existence leak vía ON CONFLICT DO NOTHING con invisible row — inherente a SQL semantics; PG tiene la misma issue.
+
+### 🧪 Validación
+
+- Suite: **698 passing + 1 ignored** (693 → +5 Z3f).
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z1f: fix `same_slice_extra` inversion en Argon2id ⚠️ (parcial)
 
 > **Un push a `main`**. Bump on-disk **VERSION 30 → 31** (corte semántico). Z1f corrige un bug específico identificado en Z1e: la condición edge para cross-lane reference area estaba invertida. El output del Argon2id cambia significativamente pero **aún no matchea RFC §A.3** — al menos un bug adicional remaining. Detalle en [`docs/adr/0061-z1f-argon2id-partial-fix.md`](docs/adr/0061-z1f-argon2id-partial-fix.md).
