@@ -1727,7 +1727,23 @@ impl GrantMeta {
 /// aplicable evalúa USING como TRUE (OR semantics, igual que
 /// PostgreSQL para policies PERMISSIVE). Si ninguna aplica, deny.
 ///
-/// **WITH CHECK**: deferido a Z3b. INSERT no se enforce en Z3.
+/// Bloque Z3b (VERSION 27): policy de RLS con `WITH CHECK` para
+/// enforcement write-side.
+///
+/// `using_sql` puede estar vacío si la action es `INSERT` (solo
+/// `WITH CHECK` aplica). `with_check_sql` es `None` cuando no se
+/// especificó — en ese caso, el engine usa `using_sql` como
+/// `WITH CHECK` para `UPDATE` (semántica PG: WITH CHECK default = USING).
+/// Para `INSERT` sin `WITH CHECK` la policy no aplica al INSERT.
+///
+/// **Combinación INSERT**: si una fila a insertar dispara una policy
+/// aplicable (action ∈ {INSERT, ALL} + role match), debe pasar al
+/// menos un `with_check_sql` para que se acepte (PERMISSIVE OR).
+///
+/// **Combinación UPDATE post-image**: si una policy con action ∈
+/// {UPDATE, ALL} y role match define `with_check_sql`, la fila
+/// resultante post-update debe pasarla. Si no hay `with_check_sql`,
+/// el `using_sql` original se reusa.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyMeta {
     pub name: String,
@@ -1735,10 +1751,12 @@ pub struct PolicyMeta {
     pub action: u8,
     pub roles: Vec<String>,
     pub using_sql: String,
+    pub with_check_sql: Option<String>,
 }
 
 pub const POLICY_ACTION_ALL: u8 = 0;
 pub const POLICY_ACTION_SELECT: u8 = 1;
+pub const POLICY_ACTION_INSERT: u8 = 2;
 pub const POLICY_ACTION_UPDATE: u8 = 3;
 pub const POLICY_ACTION_DELETE: u8 = 4;
 
@@ -1772,6 +1790,14 @@ impl PolicyMeta {
             push_string(&mut out, r)?;
         }
         push_string(&mut out, &self.using_sql)?;
+        // Bloque Z3b: `with_check_sql` como flag byte (1=Some, 0=None)
+        // seguido del string si Some.
+        if let Some(ref wc) = self.with_check_sql {
+            out.push(1);
+            push_string(&mut out, wc)?;
+        } else {
+            out.push(0);
+        }
         Ok(out)
     }
     pub fn deserialize(data: &[u8]) -> DbResult<Self> {
@@ -1799,12 +1825,25 @@ impl PolicyMeta {
             roles.push(take_string(data, &mut offset)?);
         }
         let using_sql = take_string(data, &mut offset)?;
+        // Bloque Z3b: with_check_sql opcional.
+        let with_check_sql = if offset < data.len() {
+            let flag = data[offset];
+            offset += 1;
+            if flag == 1 {
+                Some(take_string(data, &mut offset)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(Self {
             name,
             table,
             action,
             roles,
             using_sql,
+            with_check_sql,
         })
     }
 }

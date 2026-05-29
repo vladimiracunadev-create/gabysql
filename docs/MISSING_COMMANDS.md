@@ -428,7 +428,10 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | `GRANT EXECUTE ON PROCEDURE/FUNCTION` | ❌ (Z2 sólo tabla/vista; diferido) | P3 |
 | Row-level security (RLS) `CREATE POLICY name ON table FOR {ALL|SELECT|UPDATE|DELETE} [TO role,...] USING (expr)` | ✅ (Z3, 2026-05-29; VERSION 24→25; WHERE rewriting + OR semantics; ver ADR-0052) | — |
 | `DROP POLICY [IF EXISTS] name ON table` | ✅ (Z3, 2026-05-29) | — |
-| `WITH CHECK (expr)` clause + POLICY sobre INSERT | ❌ (Z3 sólo USING; defer Z3b) | P3 |
+| `WITH CHECK (expr)` clause + `FOR INSERT` POLICY | ✅ (Z3b, 2026-05-29; VERSION 26→27; `CREATE POLICY ... [USING (expr)] [WITH CHECK (expr)]`; enforcement en INSERT con PERMISSIVE OR; `[GBY-4138]` POLICY_CHECK_VIOLATION; ver ADR-0054) | — |
+| UPDATE post-image check con WITH CHECK | ❌ (Z3b sólo INSERT; defer Z3c) | P3 |
+| `INSERT ... ON CONFLICT DO UPDATE` con WITH CHECK del UPDATE path | ❌ (defer Z3c) | P3 |
+| `INSERT ... RETURNING` filtrado contra policies SELECT | ❌ (defer) | P3 |
 | `AS PERMISSIVE | RESTRICTIVE` modifier | ❌ (Z3 sólo PERMISSIVE = OR; defer) | P3 |
 | `ALTER TABLE ... ENABLE/FORCE ROW LEVEL SECURITY` | ❌ (Z3 activa implícitamente con cualquier policy; defer del flag) | P3 |
 | POLICY sobre vistas | ❌ (Z3 sólo tabla base; defer) | P3 |

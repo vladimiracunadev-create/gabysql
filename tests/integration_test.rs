@@ -14951,6 +14951,250 @@ fn z1b_empty_password_creates_user_but_blocks_auth() -> Result<(), Box<dyn Error
     Ok(())
 }
 
+// ============================================================
+// Bloque Z3b (2026-05-29): WITH CHECK clauses + FOR INSERT en RLS.
+// Bump VERSION 26 → 27.
+// ============================================================
+
+fn z3b_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z3b-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z3b_create_policy_with_check_persists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("persist")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE POLICY ins_self ON t FOR INSERT WITH CHECK (owner = 'alice');",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let p = cat.get_policy("ins_self", "t")?.unwrap();
+    assert_eq!(p.action, 2); // POLICY_ACTION_INSERT
+    assert_eq!(p.using_sql, "");
+    let wc = p.with_check_sql.unwrap();
+    assert!(wc.contains("owner"));
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_insert_passing_with_check_allowed() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("ins-ok")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         GRANT INSERT, SELECT ON t TO alice;
+         CREATE POLICY ins_self ON t FOR INSERT WITH CHECK (owner = 'alice');
+         CREATE POLICY sel_all ON t FOR SELECT USING (TRUE);
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         SELECT id, owner FROM t;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][1], Value::String("alice".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_insert_failing_with_check_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("ins-deny")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY ins_self ON t FOR INSERT WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'bob');",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] POLICY_CHECK_VIOLATION, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_insert_with_no_applicable_policy_denied() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("ins-no-policy")?;
+    // Hay policies pero ninguna para INSERT → deny por default.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY only_sel ON t FOR SELECT USING (TRUE);
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, n) VALUES (1, 1);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_insert_no_policies_bypass() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("ins-bypass")?;
+    // Sin policies en la tabla → compat pre-Z3b: el INSERT pasa.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         CREATE USER alice;
+         GRANT INSERT, SELECT ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, n) VALUES (1, 42);
+         SET SESSION AUTHORIZATION DEFAULT;
+         SELECT n FROM t;",
+    )?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_insert_for_all_with_check_used() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("for-all")?;
+    // FOR ALL con WITH CHECK aplica a INSERT también.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         GRANT INSERT, SELECT ON t TO alice;
+         CREATE POLICY own_all ON t FOR ALL USING (owner = 'alice') WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         SELECT id FROM t;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_insert_for_all_without_with_check_blocks() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("for-all-no-wc")?;
+    // FOR ALL sin WITH CHECK explícito → no aplica al INSERT.
+    // Una policy FOR ALL con sólo USING gatea SELECT/UPDATE/DELETE pero
+    // no INSERT (porque INSERT requiere WITH CHECK explícito según
+    // semántica Z3b).
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY own_all ON t FOR ALL USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice');",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_create_policy_insert_with_using_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("ins-using-bad")?;
+    // FOR INSERT no acepta USING (sólo WITH CHECK).
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE POLICY bad ON t FOR INSERT USING (TRUE);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("USING no aplica"),
+        "esperaba error de USING no aplica, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_create_policy_no_predicate_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("no-pred")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE POLICY bad ON t FOR SELECT;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("USING (...) y/o WITH CHECK") || err.to_string().contains("USING"),
+        "esperaba error pidiendo USING o WITH CHECK, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_role_filtered_insert_with_check() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("role-filter")?;
+    // policy con TO alice — bob no la ve, su INSERT rebota por deny.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE USER alice;
+         CREATE USER bob;
+         GRANT INSERT ON t TO alice;
+         GRANT INSERT ON t TO bob;
+         CREATE POLICY alice_ins ON t FOR INSERT TO alice WITH CHECK (TRUE);
+         SET SESSION AUTHORIZATION 'bob';
+         INSERT INTO t (id) VALUES (1);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] para bob (no en TO alice), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3b_superuser_bypasses_with_check() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3b_setup("super-bypass")?;
+    // Sin SET SESSION AUTHORIZATION = superuser → bypass.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE POLICY restrict ON t FOR INSERT WITH CHECK (owner = 'alice');
+         INSERT INTO t (id, owner) VALUES (1, 'bob');
+         SELECT id, owner FROM t;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][1], Value::String("bob".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -692,6 +692,11 @@ pub mod codes {
     /// Mismo código si la sesión activa intenta autenticarse y falla la
     /// verificación PBKDF2.
     pub const AUTH_PASSWORD_INCORRECT: u32 = 4137;
+    /// Bloque Z3b (2026-05-29): un `INSERT` o `UPDATE` viola el
+    /// predicado `WITH CHECK` de alguna policy aplicable al
+    /// `current_user`. La row no se persiste; el statement entero
+    /// rebota (no hay rollback parcial dentro del mismo statement).
+    pub const POLICY_CHECK_VIOLATION: u32 = 4138;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

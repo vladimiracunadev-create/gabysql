@@ -6,6 +6,57 @@
 
 ---
 
+## 2026-05-29 — Bloque Z3b: `WITH CHECK` + `FOR INSERT` policies
+
+> **Un push a `main`**. Bump on-disk **VERSION 26 → 27**. Z3b cubre el defer de Z3: write-side de RLS para INSERT vía `WITH CHECK (expr)`. Detalle en [`docs/adr/0054-z3b-with-check-rls.md`](docs/adr/0054-z3b-with-check-rls.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+-- Policy sólo para INSERT (USING no aplica):
+CREATE POLICY ins_self ON orders
+  FOR INSERT
+  WITH CHECK (owner = 'alice');
+
+-- Policy para ALL con USING + WITH CHECK separados (PG-style):
+CREATE POLICY own ON orders
+  FOR ALL
+  USING (owner = 'alice')        -- gates SELECT/UPDATE/DELETE
+  WITH CHECK (owner = 'alice');  -- gates INSERT + UPDATE post-image
+
+-- INSERT que pasa WITH CHECK → OK.
+INSERT INTO orders (id, owner) VALUES (1, 'alice');
+
+-- INSERT que viola WITH CHECK → [GBY-4138] POLICY_CHECK_VIOLATION.
+INSERT INTO orders (id, owner) VALUES (2, 'bob');
+```
+
+### 🛠 Implementación
+
+- `PolicyMeta` extendido: `with_check_sql: Option<String>`. Layout on-disk: campos Z3 + flag byte (1=Some, 0=None) + string opcional.
+- Nueva const `POLICY_ACTION_INSERT = 2`.
+- Parser `parse_create_policy` reescrito: acepta `FOR INSERT`, USING opcional, WITH CHECK opcional, valida que al menos una esté, rechaza `USING` para `FOR INSERT`. Nuevo helper `capture_paren_balanced`.
+- Engine `enforce_with_check(table, action, new_row)`: filtra policies aplicables (action ∈ {INSERT, ALL} para INSERT; roles match), evalúa WITH CHECK contra el row (con fallback a USING para action ALL/UPDATE per PG semantics), PERMISSIVE OR — al menos una debe pasar.
+- Hook en `exec_insert` antes de `apply_insert_row_with_conflict`: builds `check_row` con cols stated + Null para no-stated, llama `enforce_with_check`.
+
+### 🆕 Códigos de error
+
+- `[GBY-4138]` `POLICY_CHECK_VIOLATION`
+
+### 🚫 Diferido (Z3c)
+
+- **UPDATE post-image WITH CHECK** — Z3 USING ya gatea qué filas se tocan; el post-image check (asegura que la modificación no saca la fila del scope) queda como bloque siguiente.
+- `INSERT ... ON CONFLICT DO UPDATE` con WITH CHECK del UPDATE path.
+- `INSERT ... RETURNING` filtrado contra policies SELECT.
+- DEFAULTs aplicados antes del WITH CHECK (hoy ven Null en cols no-stated).
+
+### 🧪 Validación
+
+- Suite: **662 passing** (651 → +11 Z3b). Cubre: persist+action=2, INSERT pass/fail, deny por default, bypass sin policies, FOR ALL combinations, parser validations (FOR INSERT rechaza USING, requiere predicate), role filter, superuser bypass.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z1b: password hashing crypto-grade (PBKDF2-HMAC-SHA256)
 
 > **Un push a `main`**. Bump on-disk **VERSION 25 → 26**. Z1b cumple el defer de Z1: reemplaza FNV-1a-64 con **PBKDF2-HMAC-SHA256** implementado en Rust puro (sin deps), y habilita la verificación real de password vía `WITH PASSWORD '...'`. Detalle en [`docs/adr/0053-z1b-pbkdf2-password-hashing.md`](docs/adr/0053-z1b-pbkdf2-password-hashing.md).

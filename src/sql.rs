@@ -3,8 +3,9 @@ use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
     ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, GrantMeta, IndexKind, IndexMeta,
     OnDelete, OnUpdate, PolicyMeta, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta,
-    ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
-    PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
+    ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT,
+    POLICY_ACTION_UPDATE, PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT,
+    PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -531,11 +532,18 @@ pub struct CreatePolicyStmt {
     pub name: String,
     pub table: String,
     /// Action code: ver constantes `POLICY_ACTION_*` en `catalog.rs`.
-    /// 0=ALL, 1=SELECT, 3=UPDATE, 4=DELETE.
+    /// 0=ALL, 1=SELECT, 2=INSERT (Z3b), 3=UPDATE, 4=DELETE.
     pub action: u8,
     /// Roles permitidos. Vacío = PUBLIC (aplica a todos).
     pub roles: Vec<String>,
+    /// `USING (expr)` — gates read-side (SELECT/UPDATE/DELETE). Vacío
+    /// permitido para FOR INSERT (en ese caso, sólo importa `with_check_sql`).
     pub using_sql: String,
+    /// `WITH CHECK (expr)` — gates write-side (INSERT + post-image de
+    /// UPDATE). Bloque Z3b: opcional. Si es `None` y action ∈
+    /// {INSERT}, la policy no aplica al INSERT; si action ∈ {UPDATE},
+    /// el `using_sql` se usa también como WITH CHECK (PG semantics).
+    pub with_check_sql: Option<String>,
 }
 
 /// Bloque Z3: `DROP POLICY [IF EXISTS] name ON table`.
@@ -4819,9 +4827,8 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        // Validar que la USING expr parsee — si rebota acá, el GBY
-        // que viene del parser es informativo de qué falló.
-        {
+        // Validar que las exprs (USING / WITH CHECK) parseen.
+        if !stmt.using_sql.is_empty() {
             let mut p = Parser {
                 tokens: tokenize(&stmt.using_sql)?,
                 pos: 0,
@@ -4833,6 +4840,24 @@ impl<'a> Engine<'a> {
                 coded(
                     codes::POLICY_PREDICATE_FAILED,
                     format!("CREATE POLICY '{}': USING expr no parsea: {}", stmt.name, e),
+                )
+            })?;
+        }
+        if let Some(ref wc) = stmt.with_check_sql {
+            let mut p = Parser {
+                tokens: tokenize(wc)?,
+                pos: 0,
+                where_depth: 0,
+                in_having: false,
+                pending_check_name: None,
+            };
+            let _ = p.parse_expr().map_err(|e| {
+                coded(
+                    codes::POLICY_PREDICATE_FAILED,
+                    format!(
+                        "CREATE POLICY '{}': WITH CHECK expr no parsea: {}",
+                        stmt.name, e
+                    ),
                 )
             })?;
         }
@@ -4855,6 +4880,7 @@ impl<'a> Engine<'a> {
             action: stmt.action,
             roles: stmt.roles.clone(),
             using_sql: stmt.using_sql.clone(),
+            with_check_sql: stmt.with_check_sql.clone(),
         };
         {
             let mut catalog = Catalog::open(self.pager);
@@ -4984,6 +5010,106 @@ impl<'a> Engine<'a> {
             (None, None) => None,
             (Some(w), None) | (None, Some(w)) => Some(w),
             (Some(a), Some(b)) => Some(WhereExpr::And(Box::new(a), Box::new(b))),
+        }
+    }
+
+    /// Bloque Z3b (2026-05-29): chequea que una fila satisfaga al menos
+    /// una de las policies aplicables al `(table, action_write)` con
+    /// semántica WITH CHECK. `action_write` es `POLICY_ACTION_INSERT`
+    /// para INSERT y `POLICY_ACTION_UPDATE` para el post-image de
+    /// UPDATE. Si la tabla no tiene policies → bypass (Ok). Si hay
+    /// policies aplicables pero ninguna evalúa a TRUE contra la fila →
+    /// `[GBY-4138]`. Si current_user is None → bypass.
+    fn enforce_with_check(
+        &mut self,
+        table: &str,
+        action_write: u8,
+        new_row: &HashMap<String, Value>,
+    ) -> DbResult<()> {
+        let Some(user) = self.current_user.clone() else {
+            return Ok(());
+        };
+        let policies = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_policies_for_table(table)?
+        };
+        if policies.is_empty() {
+            return Ok(());
+        }
+        let applicable: Vec<PolicyMeta> = policies
+            .into_iter()
+            .filter(|p| {
+                let action_ok = p.action == POLICY_ACTION_ALL || p.action == action_write;
+                let role_ok =
+                    p.roles.is_empty() || p.roles.iter().any(|r| r.eq_ignore_ascii_case(&user));
+                action_ok && role_ok
+            })
+            .collect();
+        if applicable.is_empty() {
+            return Err(coded(
+                codes::POLICY_CHECK_VIOLATION,
+                format!(
+                    "INSERT/UPDATE sobre '{}': ninguna policy aplicable al user '{}' \
+                     habilita la operación (action={})",
+                    table, user, action_write
+                ),
+            ));
+        }
+        // PERMISSIVE OR: al menos UNA policy debe pasar WITH CHECK
+        // (o USING como fallback para action ALL/UPDATE — PG semantics).
+        let mut any_passed = false;
+        for p in &applicable {
+            // Fuente del predicado:
+            // - Si la policy define WITH CHECK explícito → ese.
+            // - Sino, para INSERT no aplica (la policy no gatea INSERT).
+            // - Sino, para UPDATE/ALL: fallback al USING (PG default).
+            let predicate_sql: Option<String> = match (&p.with_check_sql, action_write) {
+                (Some(wc), _) => Some(wc.clone()),
+                (None, POLICY_ACTION_INSERT) => None,
+                (None, _) => {
+                    if p.using_sql.is_empty() {
+                        None
+                    } else {
+                        Some(p.using_sql.clone())
+                    }
+                }
+            };
+            let Some(sql) = predicate_sql else {
+                continue;
+            };
+            let mut parser = Parser {
+                tokens: tokenize(&sql)?,
+                pos: 0,
+                where_depth: 0,
+                in_having: false,
+                pending_check_name: None,
+            };
+            let expr = parser.parse_expr().map_err(|e| {
+                coded(
+                    codes::POLICY_PREDICATE_FAILED,
+                    format!(
+                        "POLICY '{}' ON '{}': predicado WITH CHECK no parsea: {}",
+                        p.name, table, e
+                    ),
+                )
+            })?;
+            let v = self.eval_expr_full(&expr, new_row, None);
+            if let Ok(Value::Bool(true)) = v {
+                any_passed = true;
+                break;
+            }
+        }
+        if any_passed {
+            Ok(())
+        } else {
+            Err(coded(
+                codes::POLICY_CHECK_VIOLATION,
+                format!(
+                    "user '{}' violó WITH CHECK de todas las policies aplicables \
+                     sobre '{}' (action={})",
+                    user, table, action_write
+                ),
+            ))
         }
     }
 
@@ -6476,6 +6602,25 @@ impl<'a> Engine<'a> {
                     Some(&new_map),
                     None,
                 )?;
+            }
+            // Bloque Z3b (2026-05-29): enforcement WITH CHECK sobre el
+            // new-row pre-persist. Si current_user is None o la tabla no
+            // tiene policies, no-op (compat pre-Z3b). Si hay policies y
+            // ninguna acepta esta fila → [GBY-4138].
+            if self.current_user.is_some() {
+                let mut check_row: HashMap<String, Value> = HashMap::new();
+                for (i, col) in normalized_cols.iter().enumerate() {
+                    check_row.insert(
+                        col.clone(),
+                        row_values.get(i).cloned().unwrap_or(Value::Null),
+                    );
+                }
+                for c in &meta.columns {
+                    check_row
+                        .entry(normalize_ident(&c.name))
+                        .or_insert(Value::Null);
+                }
+                self.enforce_with_check(&stmt.table, POLICY_ACTION_INSERT, &check_row)?;
             }
             let outcome = self.apply_insert_row_with_conflict(
                 &meta,
@@ -20544,22 +20689,23 @@ impl Parser {
         self.expect_keyword("ON")?;
         let table = self.expect_ident()?;
         self.expect_keyword("FOR")?;
-        // Action: ALL/SELECT/UPDATE/DELETE. INSERT no se soporta en Z3
-        // (requeriría WITH CHECK; ver ADR-0052).
+        // Action: ALL/SELECT/INSERT/UPDATE/DELETE. Bloque Z3b habilita
+        // INSERT (requiere WITH CHECK; USING no aplica).
         let action = if self.match_keyword("ALL") {
             POLICY_ACTION_ALL
         } else if self.match_keyword("SELECT") {
             POLICY_ACTION_SELECT
+        } else if self.match_keyword("INSERT") {
+            POLICY_ACTION_INSERT
         } else if self.match_keyword("UPDATE") {
             POLICY_ACTION_UPDATE
         } else if self.match_keyword("DELETE") {
             POLICY_ACTION_DELETE
         } else {
             return Err(DbError::new(
-                "CREATE POLICY ... FOR: se esperaba ALL/SELECT/UPDATE/DELETE",
+                "CREATE POLICY ... FOR: se esperaba ALL/SELECT/INSERT/UPDATE/DELETE",
             ));
         };
-        // Lista opcional de roles `TO role1, role2, ...`. Vacío = PUBLIC.
         let mut roles = Vec::new();
         if self.match_keyword("TO") {
             loop {
@@ -20569,18 +20715,52 @@ impl Parser {
                 }
             }
         }
-        // USING (expr) — captura el texto SQL entre paréntesis
-        // balanceados para re-parsearlo por fila en eval-time.
-        self.expect_keyword("USING")?;
+        // Bloque Z3b: `USING (expr)` ahora opcional para FOR INSERT
+        // (donde no aplica). `WITH CHECK (expr)` también opcional.
+        // Como mínimo una de las dos debe estar; sino, error.
+        let using_sql = if self.match_keyword("USING") {
+            Some(self.capture_paren_balanced("CREATE POLICY ... USING (...)")?)
+        } else {
+            None
+        };
+        let with_check_sql = if self.match_keyword("WITH") {
+            self.expect_keyword("CHECK")?;
+            Some(self.capture_paren_balanced("CREATE POLICY ... WITH CHECK (...)")?)
+        } else {
+            None
+        };
+        if using_sql.is_none() && with_check_sql.is_none() {
+            return Err(DbError::new(
+                "CREATE POLICY: se requiere USING (...) y/o WITH CHECK (...)",
+            ));
+        }
+        // INSERT no se gatea con USING — sólo con WITH CHECK.
+        if action == POLICY_ACTION_INSERT && using_sql.is_some() {
+            return Err(DbError::new(
+                "CREATE POLICY ... FOR INSERT: USING no aplica (sólo WITH CHECK)",
+            ));
+        }
+        Ok(Statement::CreatePolicy(CreatePolicyStmt {
+            name,
+            table,
+            action,
+            roles,
+            using_sql: using_sql.unwrap_or_default(),
+            with_check_sql,
+        }))
+    }
+
+    /// Bloque Z3b: helper para capturar el texto SQL entre paréntesis
+    /// balanceados, abriendo con un `(` ya esperado y devolviendo el
+    /// inner reconstruido. Avanza el cursor a `)` consumido.
+    fn capture_paren_balanced(&mut self, context: &str) -> DbResult<String> {
         self.expect_symbol("(")?;
         let start = self.pos;
         let mut depth = 1usize;
         while depth > 0 {
             let tok = self.peek().clone();
             if matches!(tok.kind, TokenKind::Eof) {
-                return Err(DbError::new(
-                    "CREATE POLICY ... USING (...): paréntesis sin cerrar",
-                ));
+                return Err(DbError::new(format!("{}: paréntesis sin cerrar", context)));
             }
             if tok.kind == TokenKind::Symbol && tok.text == "(" {
                 depth += 1;
@@ -20592,17 +20772,9 @@ impl Parser {
             }
             self.pos += 1;
         }
-        let inner_tokens = &self.tokens[start..self.pos];
-        let using_sql = reconstruct_sql_from_tokens(inner_tokens);
-        // Consumir el ')'.
+        let inner = reconstruct_sql_from_tokens(&self.tokens[start..self.pos]);
         self.expect_symbol(")")?;
-        Ok(Statement::CreatePolicy(CreatePolicyStmt {
-            name,
-            table,
-            action,
-            roles,
-            using_sql,
-        }))
+        Ok(inner)
     }
 
     fn parse_create_database(&mut self) -> DbResult<Statement> {
