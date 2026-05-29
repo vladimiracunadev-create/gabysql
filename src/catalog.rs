@@ -1278,6 +1278,9 @@ pub enum ObjectKind {
     /// Bloque Z2 (VERSION 24): privilegio persistido por (grantee, object).
     /// Privs codificados como bitmask u32. Ver `GrantMeta`.
     Grant,
+    /// Bloque Z3 (VERSION 25): policy de Row-Level Security — predicado
+    /// USING(expr) por (name, table, action). Ver `PolicyMeta`.
+    Policy,
 }
 
 impl ObjectKind {
@@ -1291,6 +1294,7 @@ impl ObjectKind {
             Self::User => 5,
             Self::Role => 6,
             Self::Grant => 7,
+            Self::Policy => 8,
         }
     }
 
@@ -1304,8 +1308,9 @@ impl ObjectKind {
             5 => Ok(Self::User),
             6 => Ok(Self::Role),
             7 => Ok(Self::Grant),
+            8 => Ok(Self::Policy),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role, 7=Grant)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role, 7=Grant, 8=Policy)",
                 other
             ))),
         }
@@ -1636,7 +1641,110 @@ impl GrantMeta {
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user, role o grant.
+/// Bloque Z3 (VERSION 25): policy de Row-Level Security.
+///
+/// Action codes:
+/// - `0` ALL — aplica a SELECT/UPDATE/DELETE.
+/// - `1` SELECT
+/// - `3` UPDATE
+/// - `4` DELETE
+///
+/// `roles` vacío significa **PUBLIC** (aplica a todos los users con la
+/// sesión activa). Si tiene contenido, sólo aplica cuando el
+/// `current_user` aparece en la lista.
+///
+/// `using_sql` es el texto del predicado SQL. Se re-tokeniza y re-parsea
+/// en cada fire (mismo patrón que `ViewMeta::source` y
+/// `TriggerMeta::body_sql`).
+///
+/// **Semántica de combinación**: si una tabla tiene policies y el
+/// `current_user` es `Some`, una fila pasa si **al menos una** policy
+/// aplicable evalúa USING como TRUE (OR semantics, igual que
+/// PostgreSQL para policies PERMISSIVE). Si ninguna aplica, deny.
+///
+/// **WITH CHECK**: deferido a Z3b. INSERT no se enforce en Z3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyMeta {
+    pub name: String,
+    pub table: String,
+    pub action: u8,
+    pub roles: Vec<String>,
+    pub using_sql: String,
+}
+
+pub const POLICY_ACTION_ALL: u8 = 0;
+pub const POLICY_ACTION_SELECT: u8 = 1;
+pub const POLICY_ACTION_UPDATE: u8 = 3;
+pub const POLICY_ACTION_DELETE: u8 = 4;
+
+impl PolicyMeta {
+    /// Clave de catálogo `__policy__:name:table`. El name solo no
+    /// alcanzaría para evitar colisiones (PG permite mismo nombre en
+    /// tablas distintas), así que componemos.
+    pub fn catalog_key_name(name: &str, table: &str) -> String {
+        format!(
+            "__policy__:{}:{}",
+            name.to_ascii_lowercase(),
+            table.to_ascii_lowercase()
+        )
+    }
+
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(64);
+        push_string(&mut out, &self.name)?;
+        push_string(&mut out, &self.table)?;
+        out.push(self.action);
+        if self.roles.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "PolicyMeta '{}' tiene {} roles, máximo {}",
+                self.name,
+                self.roles.len(),
+                u16::MAX
+            )));
+        }
+        out.extend_from_slice(&(self.roles.len() as u16).to_le_bytes());
+        for r in &self.roles {
+            push_string(&mut out, r)?;
+        }
+        push_string(&mut out, &self.using_sql)?;
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        let table = take_string(data, &mut offset)?;
+        if offset >= data.len() {
+            return Err(DbError::new(format!(
+                "PolicyMeta '{}': falta byte action",
+                name
+            )));
+        }
+        let action = data[offset];
+        offset += 1;
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "PolicyMeta '{}': faltan 2 bytes role_count",
+                name
+            )));
+        }
+        let rcount = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let mut roles = Vec::with_capacity(rcount);
+        for _ in 0..rcount {
+            roles.push(take_string(data, &mut offset)?);
+        }
+        let using_sql = take_string(data, &mut offset)?;
+        Ok(Self {
+            name,
+            table,
+            action,
+            roles,
+            using_sql,
+        })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user, role, grant o policy.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
@@ -1647,6 +1755,7 @@ pub enum CatalogObject {
     User(UserMeta),
     Role(RoleMeta),
     Grant(GrantMeta),
+    Policy(PolicyMeta),
 }
 
 impl CatalogObject {
@@ -1665,16 +1774,21 @@ impl CatalogObject {
             // colisión. Acá devolvemos el grantee como display útil; la
             // comparación robusta vive en `is_grant_key_match`.
             Self::Grant(g) => &g.grantee,
+            Self::Policy(p) => &p.name,
         }
     }
 
-    /// Bloque Z2: helper para la verificación de colisión de hash en
-    /// `Catalog::get_object`. Para `Grant`, el nombre lookup-eable es
-    /// la clave compuesta `__grant__:grantee:object`, no `grantee` solo.
+    /// Bloque Z2/Z3: helper para la verificación de colisión de hash en
+    /// `Catalog::get_object`. Variants con clave compuesta (Grant, Policy)
+    /// usan su key compuesta; el resto usa `name()` directo.
     pub(crate) fn matches_lookup_name(&self, lookup: &str) -> bool {
         match self {
             Self::Grant(g) => {
                 let key = GrantMeta::catalog_key_name(&g.grantee, &g.object);
+                key.eq_ignore_ascii_case(lookup)
+            }
+            Self::Policy(p) => {
+                let key = PolicyMeta::catalog_key_name(&p.name, &p.table);
                 key.eq_ignore_ascii_case(lookup)
             }
             other => other.name().eq_ignore_ascii_case(lookup),
@@ -1701,6 +1815,7 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
         ObjectKind::User => CatalogObject::User(UserMeta::deserialize(rest)?),
         ObjectKind::Role => CatalogObject::Role(RoleMeta::deserialize(rest)?),
         ObjectKind::Grant => CatalogObject::Grant(GrantMeta::deserialize(rest)?),
+        ObjectKind::Policy => CatalogObject::Policy(PolicyMeta::deserialize(rest)?),
     })
 }
 
@@ -2011,6 +2126,58 @@ impl<'a> Catalog<'a> {
                 CatalogObject::Grant(g) => Some(g),
                 _ => None,
             })
+            .collect())
+    }
+
+    /// Bloque Z3 (VERSION 25): persiste una `Policy` en el catálogo.
+    /// Clave compuesta `__policy__:name:table`.
+    pub fn put_policy(&mut self, meta: &PolicyMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key_name = PolicyMeta::catalog_key_name(&meta.name, &meta.table);
+        let key = hash_name(&key_name);
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(ObjectKind::Policy.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    /// Bloque Z3: lookup de una policy por (name, table).
+    pub fn get_policy(&mut self, name: &str, table: &str) -> DbResult<Option<PolicyMeta>> {
+        let key_name = PolicyMeta::catalog_key_name(name, table);
+        match self.get_object(&key_name)? {
+            Some(CatalogObject::Policy(p)) => Ok(Some(p)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Bloque Z3: borra el record de una policy. Devuelve true si existía.
+    pub fn remove_policy(&mut self, name: &str, table: &str) -> DbResult<bool> {
+        let key_name = PolicyMeta::catalog_key_name(name, table);
+        self.remove_object(&key_name)
+    }
+
+    /// Bloque Z3: lista todas las policies del catálogo.
+    pub fn list_policies(&mut self) -> DbResult<Vec<PolicyMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Policy(p) => Some(p),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Bloque Z3: lista policies de una tabla específica. El executor
+    /// filtra después por `action` + `roles` antes de evaluar.
+    pub fn list_policies_for_table(&mut self, table: &str) -> DbResult<Vec<PolicyMeta>> {
+        let target = table.to_ascii_lowercase();
+        Ok(self
+            .list_policies()?
+            .into_iter()
+            .filter(|p| p.table.to_ascii_lowercase() == target)
             .collect())
     }
 

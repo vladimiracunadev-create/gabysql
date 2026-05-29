@@ -2,7 +2,8 @@ use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
     ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, GrantMeta, IndexKind, IndexMeta,
-    OnDelete, OnUpdate, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta, ViewMeta,
+    OnDelete, OnUpdate, PolicyMeta, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta,
+    ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
     PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
@@ -114,6 +115,13 @@ pub enum Statement {
     /// el chequeo de privilegios para los statements siguientes, o lo
     /// desactiva con `DEFAULT`. Persistente sólo en la sesión.
     SetSessionAuth(SetSessionAuthStmt),
+    /// Bloque Z3 (2026-05-29): `CREATE POLICY name ON table FOR
+    /// {ALL|SELECT|UPDATE|DELETE} [TO role,...] USING (expr)`. Persiste
+    /// el predicado SQL como texto y lo re-parsea en cada fire (mismo
+    /// patrón que `ViewMeta::source`).
+    CreatePolicy(CreatePolicyStmt),
+    /// Bloque Z3: `DROP POLICY [IF EXISTS] name ON table`.
+    DropPolicy(DropPolicyStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -506,6 +514,30 @@ pub struct RevokeStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetSessionAuthStmt {
     pub user: Option<String>,
+}
+
+/// Bloque Z3 (2026-05-29): `CREATE POLICY name ON table FOR
+/// {ALL|SELECT|UPDATE|DELETE} [TO role,...] USING (expr)`.
+/// `using_sql` se persiste como texto y se re-parsea por fila en cada
+/// fire (mismo patrón que ViewMeta y TriggerMeta).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePolicyStmt {
+    pub name: String,
+    pub table: String,
+    /// Action code: ver constantes `POLICY_ACTION_*` en `catalog.rs`.
+    /// 0=ALL, 1=SELECT, 3=UPDATE, 4=DELETE.
+    pub action: u8,
+    /// Roles permitidos. Vacío = PUBLIC (aplica a todos).
+    pub roles: Vec<String>,
+    pub using_sql: String,
+}
+
+/// Bloque Z3: `DROP POLICY [IF EXISTS] name ON table`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropPolicyStmt {
+    pub name: String,
+    pub table: String,
+    pub if_exists: bool,
 }
 
 /// Bloque X4 (2026-05-28): `IF expr THEN <stmts> [ELSIF expr THEN
@@ -2296,6 +2328,8 @@ impl<'a> Engine<'a> {
             Statement::Grant(stmt) => self.exec_grant(stmt),
             Statement::Revoke(stmt) => self.exec_revoke(stmt),
             Statement::SetSessionAuth(stmt) => self.exec_set_session_auth(stmt),
+            Statement::CreatePolicy(stmt) => self.exec_create_policy(stmt),
+            Statement::DropPolicy(stmt) => self.exec_drop_policy(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3838,13 +3872,14 @@ impl<'a> Engine<'a> {
             }
             Some(CatalogObject::User(_))
             | Some(CatalogObject::Role(_))
-            | Some(CatalogObject::Grant(_)) => {
-                // Bloque Z1/Z2: namespace flat — user/role/grant tampoco
-                // se pueden re-usar como nombre de vista.
+            | Some(CatalogObject::Grant(_))
+            | Some(CatalogObject::Policy(_)) => {
+                // Bloque Z1/Z2/Z3: namespace flat — user/role/grant/policy
+                // tampoco se pueden re-usar como nombre de vista.
                 return Err(coded(
                     codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
                     format!(
-                        "CREATE VIEW '{}': ya existe un USER/ROLE/GRANT con ese nombre.",
+                        "CREATE VIEW '{}': ya existe un USER/ROLE/GRANT/POLICY con ese nombre.",
                         stmt.name
                     ),
                 ));
@@ -3930,6 +3965,10 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a un GRANT (interno).",
                 stmt.name
             ))),
+            Some(CatalogObject::Policy(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a una POLICY. Usá DROP POLICY.",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -3978,6 +4017,7 @@ impl<'a> Engine<'a> {
                 | Some(CatalogObject::User(_))
                 | Some(CatalogObject::Role(_))
                 | Some(CatalogObject::Grant(_))
+                | Some(CatalogObject::Policy(_))
                 | None => {
                     return Err(coded(
                         codes::TABLE_NOT_FOUND,
@@ -4002,6 +4042,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::User(_) => "USER",
                     CatalogObject::Role(_) => "ROLE",
                     CatalogObject::Grant(_) => "GRANT",
+                    CatalogObject::Policy(_) => "POLICY",
                 };
                 return Err(coded(
                     codes::TRIGGER_NAME_COLLIDES,
@@ -4114,6 +4155,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::User(_) => "USER",
                     CatalogObject::Role(_) => "ROLE",
                     CatalogObject::Grant(_) => "GRANT",
+                    CatalogObject::Policy(_) => "POLICY",
                 };
                 return Err(coded(
                     codes::PROCEDURE_NAME_COLLIDES,
@@ -4276,6 +4318,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::User(_) => "USER",
                     CatalogObject::Role(_) => "ROLE",
                     CatalogObject::Grant(_) => "GRANT",
+                    CatalogObject::Policy(_) => "POLICY",
                 };
                 return Err(coded(
                     codes::FUNCTION_NAME_COLLIDES,
@@ -4708,6 +4751,196 @@ impl<'a> Engine<'a> {
                 user, object, priv_required, effective
             ),
         ))
+    }
+
+    // ============================================================
+    // Bloque Z3 (2026-05-29): Row-Level Security — CREATE POLICY /
+    // DROP POLICY + enforcement por fila vía evaluación de USING(expr).
+    // ============================================================
+
+    fn exec_create_policy(&mut self, stmt: CreatePolicyStmt) -> DbResult<ResultSet> {
+        // Target debe ser tabla (sin vistas en Z3 — defer).
+        {
+            let mut catalog = Catalog::open(self.pager);
+            match catalog.get_object(&stmt.table)? {
+                Some(CatalogObject::Table(_)) => {}
+                _ => {
+                    return Err(coded(
+                        codes::POLICY_TARGET_INVALID,
+                        format!(
+                            "CREATE POLICY '{}': target '{}' no es una tabla",
+                            stmt.name, stmt.table
+                        ),
+                    ));
+                }
+            }
+        }
+        // Validar que la USING expr parsee — si rebota acá, el GBY
+        // que viene del parser es informativo de qué falló.
+        {
+            let mut p = Parser {
+                tokens: tokenize(&stmt.using_sql)?,
+                pos: 0,
+                where_depth: 0,
+                in_having: false,
+                pending_check_name: None,
+            };
+            let _ = p.parse_expr().map_err(|e| {
+                coded(
+                    codes::POLICY_PREDICATE_FAILED,
+                    format!("CREATE POLICY '{}': USING expr no parsea: {}", stmt.name, e),
+                )
+            })?;
+        }
+        // Duplicate check.
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if catalog.get_policy(&stmt.name, &stmt.table)?.is_some() {
+                return Err(coded(
+                    codes::POLICY_ALREADY_EXISTS,
+                    format!(
+                        "CREATE POLICY '{}' ON '{}': ya existe",
+                        stmt.name, stmt.table
+                    ),
+                ));
+            }
+        }
+        let meta = PolicyMeta {
+            name: stmt.name.clone(),
+            table: stmt.table.clone(),
+            action: stmt.action,
+            roles: stmt.roles.clone(),
+            using_sql: stmt.using_sql.clone(),
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_policy(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · policy '{}' creada ON '{}' (action={}, roles={})",
+                stmt.name,
+                stmt.table,
+                stmt.action,
+                if stmt.roles.is_empty() {
+                    "PUBLIC".to_string()
+                } else {
+                    stmt.roles.join(",")
+                }
+            )),
+        })
+    }
+
+    fn exec_drop_policy(&mut self, stmt: DropPolicyStmt) -> DbResult<ResultSet> {
+        let exists = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_policy(&stmt.name, &stmt.table)?.is_some()
+        };
+        if !exists {
+            if stmt.if_exists {
+                return Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!(
+                        "OK · policy '{}' ON '{}' no existía (IF EXISTS)",
+                        stmt.name, stmt.table
+                    )),
+                });
+            }
+            return Err(coded(
+                codes::POLICY_NOT_FOUND,
+                format!("DROP POLICY '{}' ON '{}': no existe", stmt.name, stmt.table),
+            ));
+        }
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.remove_policy(&stmt.name, &stmt.table)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · policy '{}' eliminada de '{}'",
+                stmt.name, stmt.table
+            )),
+        })
+    }
+
+    /// Bloque Z3: construye el `WhereExpr` que representa las policies
+    /// activas para `(table, action)` cuando hay `current_user` activo.
+    ///
+    /// Retorna:
+    /// - `Ok(None)` si no hay current_user, o la tabla no tiene policies
+    ///   en absoluto (compat pre-Z3: comportamiento idéntico).
+    /// - `Ok(Some(WhereExpr::Atom(ExprPredicate { Literal(false) })))` si
+    ///   hay policies pero ninguna aplicable al user/action (deny all).
+    /// - `Ok(Some(<or-chain de USING preds>))` si hay policies aplicables.
+    ///
+    /// El caller hace AND con el `where_clause` existente.
+    fn build_rls_where(&mut self, table: &str, action: u8) -> DbResult<Option<WhereExpr>> {
+        let Some(user) = self.current_user.clone() else {
+            return Ok(None);
+        };
+        let policies = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_policies_for_table(table)?
+        };
+        if policies.is_empty() {
+            return Ok(None);
+        }
+        let applicable: Vec<PolicyMeta> = policies
+            .into_iter()
+            .filter(|p| {
+                let action_ok = p.action == POLICY_ACTION_ALL || p.action == action;
+                let role_ok =
+                    p.roles.is_empty() || p.roles.iter().any(|r| r.eq_ignore_ascii_case(&user));
+                action_ok && role_ok
+            })
+            .collect();
+        if applicable.is_empty() {
+            // Deny all: WHERE false.
+            return Ok(Some(WhereExpr::Atom(WhereClause::ExprPredicate {
+                expr: Expr::Literal(Value::Bool(false)),
+            })));
+        }
+        // OR-chain de USING predicates.
+        let mut chain: Option<WhereExpr> = None;
+        for p in &applicable {
+            let mut parser = Parser {
+                tokens: tokenize(&p.using_sql)?,
+                pos: 0,
+                where_depth: 0,
+                in_having: false,
+                pending_check_name: None,
+            };
+            let expr = parser.parse_expr().map_err(|e| {
+                coded(
+                    codes::POLICY_PREDICATE_FAILED,
+                    format!(
+                        "POLICY '{}' ON '{}': USING expr inválido: {}",
+                        p.name, table, e
+                    ),
+                )
+            })?;
+            let atom = WhereExpr::Atom(WhereClause::ExprPredicate { expr });
+            chain = Some(match chain {
+                None => atom,
+                Some(prev) => WhereExpr::Or(Box::new(prev), Box::new(atom)),
+            });
+        }
+        Ok(chain)
+    }
+
+    /// Bloque Z3: combina un `WhereExpr` opcional pre-existente con el
+    /// predicado RLS via AND. Si RLS es None, devuelve el WHERE original.
+    fn merge_where_with_rls(orig: Option<WhereExpr>, rls: Option<WhereExpr>) -> Option<WhereExpr> {
+        match (orig, rls) {
+            (None, None) => None,
+            (Some(w), None) | (None, Some(w)) => Some(w),
+            (Some(a), Some(b)) => Some(WhereExpr::And(Box::new(a), Box::new(b))),
+        }
     }
 
     /// Bloque X4 (2026-05-28): ejecuta un `IF ... THEN ... [ELSIF ...]*
@@ -7353,6 +7586,15 @@ impl<'a> Engine<'a> {
                     self.check_priv(&j.right.name, PRIV_SELECT)?;
                 }
             }
+            // Bloque Z3 (2026-05-29): RLS — inyectar policies como
+            // predicado adicional sobre el WHERE de la base table. Sólo
+            // aplica si la base no es derived / VALUES.
+            if stmt.derived_source.is_none() && stmt.values_source.is_none() {
+                if let Some(rls) = self.build_rls_where(&stmt.table, POLICY_ACTION_SELECT)? {
+                    stmt.where_clause =
+                        Self::merge_where_with_rls(stmt.where_clause.take(), Some(rls));
+                }
+            }
         }
         // Bloque V (2026-05-27): si el FROM apunta a una vista, la
         // re-expandimos como derived source ANTES de cualquier otro
@@ -9094,9 +9336,21 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn exec_update(&mut self, stmt: UpdateStmt) -> DbResult<ResultSet> {
+    fn exec_update(&mut self, mut stmt: UpdateStmt) -> DbResult<ResultSet> {
         // Bloque Z2: chequeo de privs.
         self.check_priv(&stmt.table, PRIV_UPDATE)?;
+        // Bloque Z3: inyectar RLS sobre el WHERE existente.
+        if self.current_user.is_some() {
+            if let Some(rls) = self.build_rls_where(&stmt.table, POLICY_ACTION_UPDATE)? {
+                let prev = std::mem::replace(
+                    &mut stmt.where_clause,
+                    WhereExpr::Atom(WhereClause::ExprPredicate {
+                        expr: Expr::Literal(Value::Bool(true)),
+                    }),
+                );
+                stmt.where_clause = WhereExpr::And(Box::new(prev), Box::new(rls));
+            }
+        }
         self.reject_if_view(&stmt.table, "UPDATE")?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -10028,9 +10282,21 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn exec_delete(&mut self, stmt: DeleteStmt) -> DbResult<ResultSet> {
+    fn exec_delete(&mut self, mut stmt: DeleteStmt) -> DbResult<ResultSet> {
         // Bloque Z2: chequeo de privs.
         self.check_priv(&stmt.table, PRIV_DELETE)?;
+        // Bloque Z3: inyectar RLS sobre el WHERE existente.
+        if self.current_user.is_some() {
+            if let Some(rls) = self.build_rls_where(&stmt.table, POLICY_ACTION_DELETE)? {
+                let prev = std::mem::replace(
+                    &mut stmt.where_clause,
+                    WhereExpr::Atom(WhereClause::ExprPredicate {
+                        expr: Expr::Literal(Value::Bool(true)),
+                    }),
+                );
+                stmt.where_clause = WhereExpr::And(Box::new(prev), Box::new(rls));
+            }
+        }
         self.reject_if_view(&stmt.table, "DELETE")?;
         let meta = {
             let mut catalog = Catalog::open(self.pager);
@@ -16641,6 +16907,7 @@ fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
         CatalogObject::User(_) => "USER",
         CatalogObject::Role(_) => "ROLE",
         CatalogObject::Grant(_) => "GRANT",
+        CatalogObject::Policy(_) => "POLICY",
     }
 }
 
@@ -18547,6 +18814,18 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::DropRole(DropRoleStmt { name, if_exists }));
         }
+        if self.match_keyword("POLICY") {
+            // Bloque Z3 (2026-05-29): `DROP POLICY [IF EXISTS] name ON table`.
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            self.expect_keyword("ON")?;
+            let table = self.expect_ident()?;
+            return Ok(Statement::DropPolicy(DropPolicyStmt {
+                name,
+                table,
+                if_exists,
+            }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
@@ -20041,6 +20320,76 @@ impl Parser {
         }))
     }
 
+    /// Bloque Z3 (2026-05-29): `CREATE POLICY name ON table FOR
+    /// {ALL|SELECT|UPDATE|DELETE} [TO role,...] USING (expr)`. La expr
+    /// se captura como texto SQL re-construido (mismo patrón que
+    /// `CREATE VIEW ... AS ...`).
+    fn parse_create_policy(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        self.expect_keyword("ON")?;
+        let table = self.expect_ident()?;
+        self.expect_keyword("FOR")?;
+        // Action: ALL/SELECT/UPDATE/DELETE. INSERT no se soporta en Z3
+        // (requeriría WITH CHECK; ver ADR-0052).
+        let action = if self.match_keyword("ALL") {
+            POLICY_ACTION_ALL
+        } else if self.match_keyword("SELECT") {
+            POLICY_ACTION_SELECT
+        } else if self.match_keyword("UPDATE") {
+            POLICY_ACTION_UPDATE
+        } else if self.match_keyword("DELETE") {
+            POLICY_ACTION_DELETE
+        } else {
+            return Err(DbError::new(
+                "CREATE POLICY ... FOR: se esperaba ALL/SELECT/UPDATE/DELETE",
+            ));
+        };
+        // Lista opcional de roles `TO role1, role2, ...`. Vacío = PUBLIC.
+        let mut roles = Vec::new();
+        if self.match_keyword("TO") {
+            loop {
+                roles.push(self.expect_ident()?);
+                if !self.match_symbol(",") {
+                    break;
+                }
+            }
+        }
+        // USING (expr) — captura el texto SQL entre paréntesis
+        // balanceados para re-parsearlo por fila en eval-time.
+        self.expect_keyword("USING")?;
+        self.expect_symbol("(")?;
+        let start = self.pos;
+        let mut depth = 1usize;
+        while depth > 0 {
+            let tok = self.peek().clone();
+            if matches!(tok.kind, TokenKind::Eof) {
+                return Err(DbError::new(
+                    "CREATE POLICY ... USING (...): paréntesis sin cerrar",
+                ));
+            }
+            if tok.kind == TokenKind::Symbol && tok.text == "(" {
+                depth += 1;
+            } else if tok.kind == TokenKind::Symbol && tok.text == ")" {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            self.pos += 1;
+        }
+        let inner_tokens = &self.tokens[start..self.pos];
+        let using_sql = reconstruct_sql_from_tokens(inner_tokens);
+        // Consumir el ')'.
+        self.expect_symbol(")")?;
+        Ok(Statement::CreatePolicy(CreatePolicyStmt {
+            name,
+            table,
+            action,
+            roles,
+            using_sql,
+        }))
+    }
+
     fn parse_create_database(&mut self) -> DbResult<Statement> {
         let if_not_exists = if self.match_keyword("IF") {
             self.expect_keyword("NOT")?;
@@ -20099,6 +20448,10 @@ impl Parser {
         // Bloque Z1: `CREATE ROLE name`. Sin atributos por ahora.
         if self.match_keyword("ROLE") {
             return self.parse_create_role();
+        }
+        // Bloque Z3 (2026-05-29): `CREATE POLICY name ON table FOR ... USING (...)`.
+        if self.match_keyword("POLICY") {
+            return self.parse_create_policy();
         }
         self.expect_keyword("TABLE")?;
         // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS

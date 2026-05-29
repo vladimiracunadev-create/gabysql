@@ -426,7 +426,13 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | `GRANT role TO user` (role membership) | ❌ (Z1 persiste roles pero sin members; diferido) | P3 |
 | Funciones `current_user()` / `session_user()` | ❌ (defer Z3 — útil para policies RLS) | P3 |
 | `GRANT EXECUTE ON PROCEDURE/FUNCTION` | ❌ (Z2 sólo tabla/vista; diferido) | P3 |
-| Row-level security (RLS) `CREATE POLICY` | ❌ (Z3 — bloque siguiente) | P3 |
+| Row-level security (RLS) `CREATE POLICY name ON table FOR {ALL|SELECT|UPDATE|DELETE} [TO role,...] USING (expr)` | ✅ (Z3, 2026-05-29; VERSION 24→25; WHERE rewriting + OR semantics; ver ADR-0052) | — |
+| `DROP POLICY [IF EXISTS] name ON table` | ✅ (Z3, 2026-05-29) | — |
+| `WITH CHECK (expr)` clause + POLICY sobre INSERT | ❌ (Z3 sólo USING; defer Z3b) | P3 |
+| `AS PERMISSIVE | RESTRICTIVE` modifier | ❌ (Z3 sólo PERMISSIVE = OR; defer) | P3 |
+| `ALTER TABLE ... ENABLE/FORCE ROW LEVEL SECURITY` | ❌ (Z3 activa implícitamente con cualquier policy; defer del flag) | P3 |
+| POLICY sobre vistas | ❌ (Z3 sólo tabla base; defer) | P3 |
+| `ALTER POLICY` | ❌ (defer; usar DROP + CREATE) | P3 |
 | `SET ROLE` / `CURRENT_USER` | ❌ (defer; requiere protocolo extendido server-side) | P3 |
 | KDF real para password (PBKDF2/bcrypt/argon2) | ❌ (Z1 usa FNV-1a no-cripto; Z1b futuro) | P2 |
 | Quoted identifiers para user/role (`"foo bar"`) | ❌ (Z1 sólo `[a-zA-Z_][a-zA-Z0-9_]*`) | P3 |

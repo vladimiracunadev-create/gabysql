@@ -14485,6 +14485,302 @@ fn z2_update_delete_truncate_enforcement() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Z3 (2026-05-29): Row-Level Security — CREATE POLICY /
+// DROP POLICY + filtrado por fila vía rewriting del WHERE con un
+// OR de los predicados USING aplicables. Bump VERSION 24 → 25.
+// ============================================================
+
+fn z3_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z3-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z3_create_policy_persists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("persist")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE POLICY only_alice ON t FOR SELECT USING (owner = 'alice');",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let p = cat
+        .get_policy("only_alice", "t")?
+        .expect("policy debería existir");
+    assert_eq!(p.name, "only_alice");
+    assert_eq!(p.table, "t");
+    assert_eq!(p.action, 1); // SELECT
+    assert!(p.roles.is_empty()); // PUBLIC
+    assert!(p.using_sql.contains("owner"));
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_filters_select_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("select-filter")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT, n INT);
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 10);
+         INSERT INTO t (id, owner, n) VALUES (2, 'bob', 20);
+         INSERT INTO t (id, owner, n) VALUES (3, 'alice', 30);
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         CREATE POLICY only_own ON t FOR SELECT USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT id, n FROM t ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 2);
+    assert_eq!(last.rows[0][0], Value::Integer(1));
+    assert_eq!(last.rows[1][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_no_match_denies_all() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("no-match")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         INSERT INTO t (id, owner) VALUES (2, 'bob');
+         CREATE USER alice;
+         CREATE USER bob;
+         GRANT SELECT ON t TO alice;
+         CREATE POLICY only_bob ON t FOR SELECT TO bob USING (TRUE);
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT id FROM t;",
+    )?;
+    assert!(res.last().unwrap().rows.is_empty());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_for_all_action() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("policy-all")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT, n INT);
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 10);
+         INSERT INTO t (id, owner, n) VALUES (2, 'bob', 20);
+         CREATE USER alice;
+         GRANT SELECT, UPDATE, DELETE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT id FROM t ORDER BY id;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 1);
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_update_filters() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("update-filter")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT, n INT);
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 10);
+         INSERT INTO t (id, owner, n) VALUES (2, 'bob', 20);
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         CREATE POLICY own_upd ON t FOR UPDATE USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET n = 99 WHERE id > 0;",
+    )?;
+    let res = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION DEFAULT; SELECT id, n FROM t ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows[0][1], Value::Integer(99));
+    assert_eq!(last.rows[1][1], Value::Integer(20));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_delete_filters() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("delete-filter")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         INSERT INTO t (id, owner) VALUES (2, 'bob');
+         INSERT INTO t (id, owner) VALUES (3, 'alice');
+         CREATE USER alice;
+         GRANT SELECT, DELETE ON t TO alice;
+         CREATE POLICY own_del ON t FOR DELETE USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         DELETE FROM t WHERE id > 0;",
+    )?;
+    let res = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION DEFAULT; SELECT id FROM t ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_multiple_or_semantics() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("multi-or")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         INSERT INTO t (id, category) VALUES (1, 'public');
+         INSERT INTO t (id, category) VALUES (2, 'private');
+         INSERT INTO t (id, category) VALUES (3, 'shared');
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         CREATE POLICY p_public ON t FOR SELECT USING (category = 'public');
+         CREATE POLICY p_shared ON t FOR SELECT USING (category = 'shared');
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT id FROM t ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 2);
+    assert_eq!(last.rows[0][0], Value::Integer(1));
+    assert_eq!(last.rows[1][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_no_policies_means_no_rls() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("no-rls")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);
+         INSERT INTO t (id, n) VALUES (2, 20);
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT id FROM t ORDER BY id;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_drop_policy_removes_filter() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("drop")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         INSERT INTO t (id, owner) VALUES (2, 'bob');
+         CREATE USER alice;
+         GRANT SELECT ON t TO alice;
+         CREATE POLICY own ON t FOR SELECT USING (owner = 'alice');
+         DROP POLICY own ON t;
+         SET SESSION AUTHORIZATION 'alice';
+         SELECT id FROM t ORDER BY id;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_drop_policy_not_found_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("drop-404")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "DROP POLICY ghost ON t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4134"),
+        "esperaba [GBY-4134], vi: {}",
+        err
+    );
+    run_sql(&db, "DROP POLICY IF EXISTS ghost ON t;")?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_create_policy_duplicate_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("dup")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         CREATE POLICY p ON t FOR SELECT USING (n > 0);",
+    )?;
+    let err = run_sql(&db, "CREATE POLICY p ON t FOR SELECT USING (n < 100);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4133"),
+        "esperaba [GBY-4133], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_on_missing_table_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("bad-target")?;
+    let err = run_sql(&db, "CREATE POLICY p ON ghost FOR SELECT USING (TRUE);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4135"),
+        "esperaba [GBY-4135], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_superuser_bypasses_rls() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("super-bypass")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         INSERT INTO t (id, owner) VALUES (2, 'bob');
+         CREATE POLICY only_alice ON t FOR SELECT USING (owner = 'alice');
+         SELECT id FROM t ORDER BY id;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3_policy_with_role_list_restricts() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3_setup("role-list")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);
+         CREATE USER alice;
+         CREATE USER bob;
+         GRANT SELECT ON t TO alice;
+         GRANT SELECT ON t TO bob;
+         CREATE POLICY p_alice ON t FOR SELECT TO alice USING (TRUE);
+         SET SESSION AUTHORIZATION 'bob';
+         SELECT id FROM t;",
+    )?;
+    assert!(res.last().unwrap().rows.is_empty());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

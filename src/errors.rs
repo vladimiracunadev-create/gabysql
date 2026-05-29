@@ -671,6 +671,22 @@ pub mod codes {
     /// `CREATE ROLE` primero. Especial: `PUBLIC` es un grantee implícito
     /// que aplica a todos los users — no requiere CREATE USER previo.
     pub const GRANTEE_NOT_FOUND: u32 = 4132;
+    /// Bloque Z3 (2026-05-29): `CREATE POLICY` con un nombre que ya
+    /// existe sobre la misma tabla. Nombres únicos por (name, table).
+    pub const POLICY_ALREADY_EXISTS: u32 = 4133;
+    /// Bloque Z3 (2026-05-29): `DROP POLICY` sobre un nombre/tabla que
+    /// no existe.
+    pub const POLICY_NOT_FOUND: u32 = 4134;
+    /// Bloque Z3 (2026-05-29): `CREATE POLICY` sobre un target que no
+    /// es una tabla (no se soporta sobre vistas en este release). El
+    /// target debe existir y ser `ObjectKind::Table`.
+    pub const POLICY_TARGET_INVALID: u32 = 4135;
+    /// Bloque Z3 (2026-05-29): el predicado USING de la policy falló
+    /// al evaluarse contra una fila (error de tipo, columna inexistente,
+    /// división por cero, etc.). El mensaje incluye el detalle interno.
+    /// Las filas que fallan se tratan como "no pasa" (mismo trato que
+    /// FALSE/NULL).
+    pub const POLICY_PREDICATE_FAILED: u32 = 4136;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

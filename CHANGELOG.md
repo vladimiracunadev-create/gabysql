@@ -6,6 +6,67 @@
 
 ---
 
+## 2026-05-29 — Bloque Z3: Row-Level Security (`CREATE POLICY` / `DROP POLICY`)
+
+> **Un push a `main`**. Bump on-disk **VERSION 24 → 25**. **Cierra el bloque Z al 100%** (Z1 identidad + Z2 GRANT/REVOKE + Z3 RLS). Detalle en [`docs/adr/0052-z3-row-level-security.md`](docs/adr/0052-z3-row-level-security.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE POLICY only_own ON orders
+  FOR SELECT
+  USING (owner = 'alice');
+
+CREATE POLICY mod_own ON orders
+  FOR ALL                                  -- cubre SELECT/UPDATE/DELETE
+  TO alice, bob                            -- roles específicos
+  USING (owner = current_user_literal);    -- expr cualquiera del lenguaje
+
+DROP POLICY [IF EXISTS] mod_own ON orders;
+
+-- Múltiples policies → OR semantics (PERMISSIVE estilo PG).
+-- Sin policy aplicable → deny todo.
+-- Sin policies en absoluto → bypass (sólo gobiernan GRANTs).
+-- current_user = None (sin SET SESSION AUTHORIZATION) → bypass RLS.
+```
+
+### 🛠 Implementación
+
+- `ObjectKind::Policy = 8` + `PolicyMeta { name, table, action: u8, roles: Vec<String>, using_sql: String }` con clave compuesta `__policy__:name:table`.
+- Action codes: `0=ALL`, `1=SELECT`, `3=UPDATE`, `4=DELETE`.
+- AST: `Statement::CreatePolicy/DropPolicy`.
+- Parser: `parse_create_policy` (captura USING como texto SQL via `reconstruct_sql_from_tokens`), dispatch `CREATE/DROP POLICY` en `parse_create` y `parse_drop`.
+- Engine: `exec_create_policy`/`exec_drop_policy`; helpers `build_rls_where(table, action) -> Option<WhereExpr>` y `merge_where_with_rls(orig, rls)`.
+- Estrategia de enforcement: **WHERE rewriting** — inyecta `WHERE (orig) AND (USING_1 OR USING_2 OR ...)` al inicio de `exec_select/update/delete`. Reusa el pipeline existente del engine (fast-paths indexados se aplican automáticamente al predicado combinado).
+- Sin policies aplicables + current_user set → `WHERE false` = deny all.
+- Sin policies en absoluto → no rewrite, compat 100% pre-Z3.
+- Sin current_user (superuser) → bypass.
+
+### 🆕 Códigos de error
+
+- `[GBY-4133]` `POLICY_ALREADY_EXISTS`
+- `[GBY-4134]` `POLICY_NOT_FOUND`
+- `[GBY-4135]` `POLICY_TARGET_INVALID`
+- `[GBY-4136]` `POLICY_PREDICATE_FAILED`
+
+### 🚫 Diferido (Z3b y futuro)
+
+- **WITH CHECK (expr)** para INSERT y UPDATE write-side (Z3b).
+- POLICY sobre INSERT (requiere WITH CHECK).
+- `AS RESTRICTIVE` (AND semantics — Z3 implementa sólo PERMISSIVE).
+- POLICY sobre vistas (hoy `POLICY_TARGET_INVALID`).
+- RLS sobre JOINs / tablas secundarias del SELECT (Z3 sólo rewrite-ea base table).
+- `ALTER TABLE ... ENABLE/FORCE ROW LEVEL SECURITY` flag (Z3 activa implícitamente).
+- `ALTER POLICY` (hoy DROP + CREATE).
+- Función `current_user()` dentro del USING expr.
+
+### 🧪 Validación
+
+- Suite: **643 passing** (629 → +14 Z3). Cubre: persist+drop, SELECT/UPDATE/DELETE filter, action ALL, multiple-policies OR, no-policies = compat, role list restricts, superuser bypass, errores 4133/4134/4135.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z2: `GRANT` / `REVOKE` + `SET SESSION AUTHORIZATION`
 
 > **Un push a `main`**. Bump on-disk **VERSION 23 → 24**. Z2 conecta la identidad Z1 al motor: privilegios persistidos por (grantee, object) con bitmask, enforcement en cada DML cuando hay user activo en la sesión. Detalle en [`docs/adr/0051-z2-grant-revoke.md`](docs/adr/0051-z2-grant-revoke.md).
