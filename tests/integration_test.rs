@@ -15195,6 +15195,164 @@ fn z3b_superuser_bypasses_with_check() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Z3c (2026-05-29): UPDATE post-image WITH CHECK
+// enforcement. Sin bump on-disk.
+// ============================================================
+
+fn z3c_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z3c-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z3c_update_post_image_passes() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3c_setup("post-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT, n INT);
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 10);
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL
+           USING (owner = 'alice')
+           WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET n = 99 WHERE id = 1;",
+    )?;
+    let res = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION DEFAULT; SELECT n FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3c_update_post_image_violation_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3c_setup("post-bad")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL
+           USING (owner = 'alice')
+           WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET owner = 'bob' WHERE id = 1;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3c_update_without_with_check_falls_back_to_using() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3c_setup("fallback-using")?;
+    // PG semantics: si UPDATE policy no define WITH CHECK explícito,
+    // se reusa el USING como WITH CHECK.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR UPDATE USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET owner = 'bob' WHERE id = 1;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] (USING reusado como WITH CHECK), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3c_update_with_explicit_with_check_distinct_from_using() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3c_setup("explicit-wc")?;
+    // USING permite leer/modificar todo; WITH CHECK exige n >= 0.
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR UPDATE
+           USING (TRUE)
+           WITH CHECK (n >= 0);
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET n = -1 WHERE id = 1;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] (n=-1 viola WITH CHECK), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3c_update_superuser_bypasses() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3c_setup("super")?;
+    // Sin SET SESSION AUTHORIZATION = superuser → bypass.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         CREATE POLICY block ON t FOR UPDATE
+           USING (FALSE)
+           WITH CHECK (FALSE);
+         UPDATE t SET owner = 'bob' WHERE id = 1;
+         SELECT owner FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(
+        res.last().unwrap().rows[0][0],
+        Value::String("bob".to_string())
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3c_update_no_policies_bypass() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3c_setup("no-pol")?;
+    // Sin policies → compat pre-Z3c.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET n = 999 WHERE id = 1;",
+    )?;
+    let res = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION DEFAULT; SELECT n FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

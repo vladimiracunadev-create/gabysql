@@ -429,7 +429,7 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | Row-level security (RLS) `CREATE POLICY name ON table FOR {ALL|SELECT|UPDATE|DELETE} [TO role,...] USING (expr)` | ✅ (Z3, 2026-05-29; VERSION 24→25; WHERE rewriting + OR semantics; ver ADR-0052) | — |
 | `DROP POLICY [IF EXISTS] name ON table` | ✅ (Z3, 2026-05-29) | — |
 | `WITH CHECK (expr)` clause + `FOR INSERT` POLICY | ✅ (Z3b, 2026-05-29; VERSION 26→27; `CREATE POLICY ... [USING (expr)] [WITH CHECK (expr)]`; enforcement en INSERT con PERMISSIVE OR; `[GBY-4138]` POLICY_CHECK_VIOLATION; ver ADR-0054) | — |
-| UPDATE post-image check con WITH CHECK | ❌ (Z3b sólo INSERT; defer Z3c) | P3 |
+| UPDATE post-image check con WITH CHECK | ✅ (Z3c, 2026-05-29; hook en exec_update pre-persist; reusa enforce_with_check de Z3b; sin bump on-disk; ver ADR-0055) | — |
 | `INSERT ... ON CONFLICT DO UPDATE` con WITH CHECK del UPDATE path | ❌ (defer Z3c) | P3 |
 | `INSERT ... RETURNING` filtrado contra policies SELECT | ❌ (defer) | P3 |
 | `AS PERMISSIVE | RESTRICTIVE` modifier | ❌ (Z3 sólo PERMISSIVE = OR; defer) | P3 |

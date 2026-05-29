@@ -9652,6 +9652,44 @@ impl<'a> Engine<'a> {
                     old_row.as_ref(),
                 )?;
             }
+            // Bloque Z3c (2026-05-29): WITH CHECK post-image. Si hay
+            // current_user activo, construimos la fila resultante
+            // (OLD + assignments) y la pasamos por enforce_with_check
+            // con action=UPDATE. Si fallece → [GBY-4138] y NO se
+            // persiste el UPDATE para esta fila (las anteriores ya
+            // commiteadas en este batch quedan persistidas — semántica
+            // consistente con el resto del engine, no hay
+            // statement-level rollback).
+            if self.current_user.is_some() {
+                let post_row: HashMap<String, Value> = if let Some(old) = &old_row {
+                    let mut new_map = old.clone();
+                    for (col, expr) in &expr_assignments {
+                        let v = self.eval_expr_full(expr, old, Some(meta.name.as_str()))?;
+                        new_map.insert(normalize_ident(col), v);
+                    }
+                    new_map
+                } else {
+                    // Sin OLD snapshot disponible (porque needs_old_snapshot
+                    // estaba false), lo levantamos ahora — el check lo
+                    // necesita sí o sí.
+                    let bytes = {
+                        let mut catalog = Catalog::open(self.pager);
+                        catalog.get_row(meta.root_page, *pk)?
+                    };
+                    let old = bytes.map(|b| decode_row(&meta, &b)).transpose()?;
+                    if let Some(old) = old {
+                        let mut new_map = old.clone();
+                        for (col, expr) in &expr_assignments {
+                            let v = self.eval_expr_full(expr, &old, Some(meta.name.as_str()))?;
+                            new_map.insert(normalize_ident(col), v);
+                        }
+                        new_map
+                    } else {
+                        HashMap::new()
+                    }
+                };
+                self.enforce_with_check(&meta.name, POLICY_ACTION_UPDATE, &post_row)?;
+            }
             self.apply_update_to_pk(&meta, *pk, &expr_assignments)?;
             updated += 1;
             // X1: re-leer la fila para tener NEW. Si la PK cambió, el

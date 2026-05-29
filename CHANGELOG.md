@@ -6,6 +6,49 @@
 
 ---
 
+## 2026-05-29 — Bloque Z3c: UPDATE post-image WITH CHECK
+
+> **Un push a `main`** sin bump on-disk. Z3c cubre el último caso del trío PostgreSQL RLS: verificar que la fila resultante de un UPDATE (post-assignments) siga dentro del scope de las policies. Detalle en [`docs/adr/0055-z3c-update-post-image-check.md`](docs/adr/0055-z3c-update-post-image-check.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE POLICY own ON orders FOR ALL
+  USING (owner = 'alice')
+  WITH CHECK (owner = 'alice');
+
+SET SESSION AUTHORIZATION 'alice';
+
+-- OK: post-image sigue dentro del scope.
+UPDATE orders SET total = total + 10 WHERE id = 1;
+
+-- Rebota con [GBY-4138]: el cambio sacaría la fila del scope de alice.
+UPDATE orders SET owner = 'bob' WHERE id = 1;
+```
+
+### 🛠 Implementación
+
+- Hook nuevo en `exec_update` antes de `apply_update_to_pk` por fila.
+- Si `current_user.is_some()`, construye `post_row` = `old_row` clone + assignments aplicados via `eval_expr_full`.
+- Llama `enforce_with_check(table, POLICY_ACTION_UPDATE, &post_row)`.
+- Reusa al 100% `enforce_with_check` introducido en Z3b: misma OR semantics, mismo fallback USING-as-WITH-CHECK para UPDATE policies sin WITH CHECK explícito.
+- Sin policies → no enforcement (compat 100% pre-Z3c).
+- Si `needs_old_snapshot` era false (no había trigger ni RETURNING), Z3c recarga el `old_row` del catálogo on-demand para el check.
+
+### 🚫 Diferido (Z3d)
+
+- `INSERT ... ON CONFLICT DO UPDATE` con WITH CHECK del UPDATE path (el path interno de upsert no llama `exec_update`).
+- `INSERT/UPDATE ... RETURNING` filtrado contra policies SELECT (RETURNING expone el row sin segundo filter).
+- Statement-level rollback en RLS violation (hoy las filas pre-violación quedan persistidas).
+- DEFAULTs aplicados antes del check (cols no-stated ven `Null` en post_row).
+
+### 🧪 Validación
+
+- Suite: **668 passing** (662 → +6 Z3c). Cubre: post-image dentro de scope, violación del scope, fallback USING→WITH CHECK, WITH CHECK explícito distinto, superuser bypass, sin policies = compat.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z3b: `WITH CHECK` + `FOR INSERT` policies
 
 > **Un push a `main`**. Bump on-disk **VERSION 26 → 27**. Z3b cubre el defer de Z3: write-side de RLS para INSERT vía `WITH CHECK (expr)`. Detalle en [`docs/adr/0054-z3b-with-check-rls.md`](docs/adr/0054-z3b-with-check-rls.md).
