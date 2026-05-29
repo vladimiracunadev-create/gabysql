@@ -119,7 +119,12 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        tabla target, timing y event (1 byte cada uno), y el body
 //        como texto SQL (re-parseado en cada fire — mismo patrón que
 //        ViewMeta). V13 rechazados con `[GBY-1003]` — migración manual.
-pub const VERSION: u32 = 14;
+//  15 -> Bloque X3 (2026-05-28): stored procedures (`CREATE PROCEDURE
+//        name(p1 TYPE, p2 TYPE) AS <body>`, `DROP PROCEDURE`, `CALL`).
+//        Discriminator `3=Procedure`. Cada procedure guarda nombre,
+//        params (Vec<(String,ColumnType)>) y body como texto SQL.
+//        V14 rechazados con `[GBY-1003]` — migración manual.
+pub const VERSION: u32 = 15;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

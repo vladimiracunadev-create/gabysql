@@ -2,7 +2,7 @@ use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
     ColumnType, DefaultLiteral, ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate,
-    TableMeta, TriggerMeta, ViewMeta,
+    ProcedureMeta, TableMeta, TriggerMeta, ViewMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -39,6 +39,12 @@ pub enum Statement {
     CreateTrigger(CreateTriggerStmt),
     /// Bloque X1: `DROP TRIGGER [IF EXISTS] name`.
     DropTrigger(DropTriggerStmt),
+    /// Bloque X3 (2026-05-28): `CREATE PROCEDURE name(p1 TYPE, ...) AS <body>`.
+    CreateProcedure(CreateProcedureStmt),
+    /// Bloque X3: `DROP PROCEDURE [IF EXISTS] name`.
+    DropProcedure(DropProcedureStmt),
+    /// Bloque X3: `CALL name(arg1, arg2, ...)`.
+    Call(CallStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -324,6 +330,32 @@ pub struct CreateTriggerStmt {
 pub struct DropTriggerStmt {
     pub name: String,
     pub if_exists: bool,
+}
+
+/// Bloque X3 (2026-05-28): `CREATE PROCEDURE name(p1 TYPE, p2 TYPE, ...) AS <body>`.
+/// Body es DML simple o `BEGIN ... END` multi-statement (mismo grammar
+/// que trigger bodies). Persistido como texto SQL; al CALL se
+/// substituye cada parámetro formal por la expresión evaluada del
+/// arg correspondiente (vía token-sub) y se ejecuta.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateProcedureStmt {
+    pub name: String,
+    pub params: Vec<(String, ColumnType)>,
+    pub body_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropProcedureStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// Bloque X3: `CALL name(arg1, arg2, ...)`. Cada `arg` es una expresión
+/// arbitraria (`Expr`) evaluada contra una fila vacía al exec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallStmt {
+    pub name: String,
+    pub args: Vec<Expr>,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1520,6 +1552,9 @@ impl<'a> Engine<'a> {
             Statement::DropView(stmt) => self.exec_drop_view(stmt),
             Statement::CreateTrigger(stmt) => self.exec_create_trigger(stmt),
             Statement::DropTrigger(stmt) => self.exec_drop_trigger(stmt),
+            Statement::CreateProcedure(stmt) => self.exec_create_procedure(stmt),
+            Statement::DropProcedure(stmt) => self.exec_drop_procedure(stmt),
+            Statement::Call(stmt) => self.exec_call(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3000,6 +3035,16 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
+            Some(CatalogObject::Procedure(_)) => {
+                return Err(coded(
+                    codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
+                    format!(
+                        "CREATE VIEW '{}': ya existe una PROCEDURE con ese nombre. \
+                         Todos los objetos comparten namespace.",
+                        stmt.name
+                    ),
+                ));
+            }
             Some(CatalogObject::View(_)) => {
                 if stmt.if_not_exists {
                     return Ok(ResultSet {
@@ -3061,6 +3106,10 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a un TRIGGER, no a una vista. Usá DROP TRIGGER.",
                 stmt.name
             ))),
+            Some(CatalogObject::Procedure(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a una PROCEDURE. Usá DROP PROCEDURE.",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -3103,7 +3152,7 @@ impl<'a> Engine<'a> {
                         ),
                     ));
                 }
-                Some(CatalogObject::Trigger(_)) | None => {
+                Some(CatalogObject::Trigger(_)) | Some(CatalogObject::Procedure(_)) | None => {
                     return Err(coded(
                         codes::TABLE_NOT_FOUND,
                         format!(
@@ -3122,6 +3171,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Table(_) => "TABLA",
                     CatalogObject::View(_) => "VISTA",
                     CatalogObject::Trigger(_) => "TRIGGER",
+                    CatalogObject::Procedure(_) => "PROCEDURE",
                 };
                 return Err(coded(
                     codes::TRIGGER_NAME_COLLIDES,
@@ -3198,6 +3248,168 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// Bloque X3 (2026-05-28): `CREATE PROCEDURE name(p1 TYPE, ...) AS <body>`.
+    /// Valida nombre, colisión, y persiste el ProcedureMeta. El body
+    /// se persiste como texto SQL — re-parseado en cada CALL post-
+    /// substitución de parámetros (mismo patrón que TriggerMeta).
+    fn exec_create_procedure(&mut self, stmt: CreateProcedureStmt) -> DbResult<ResultSet> {
+        validate_identifier(&stmt.name, "procedure")?;
+        // Validar que no haya params con nombres duplicados.
+        let mut seen: HashSet<String> = HashSet::new();
+        for (pname, _) in &stmt.params {
+            validate_identifier(pname, "param de procedure")?;
+            let k = pname.to_ascii_lowercase();
+            if !seen.insert(k) {
+                return Err(coded(
+                    codes::PROCEDURE_BODY_INVALID,
+                    format!(
+                        "CREATE PROCEDURE '{}': el parámetro '{}' aparece más de una vez",
+                        stmt.name, pname
+                    ),
+                ));
+            }
+        }
+        // Colisión de nombre con cualquier objeto del catálogo.
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if let Some(existing) = catalog.get_object(&stmt.name)? {
+                let kind = match existing {
+                    CatalogObject::Table(_) => "TABLA",
+                    CatalogObject::View(_) => "VISTA",
+                    CatalogObject::Trigger(_) => "TRIGGER",
+                    CatalogObject::Procedure(_) => "PROCEDURE",
+                };
+                return Err(coded(
+                    codes::PROCEDURE_NAME_COLLIDES,
+                    format!(
+                        "CREATE PROCEDURE '{}': ya existe un objeto ({}) con ese nombre",
+                        stmt.name, kind
+                    ),
+                ));
+            }
+        }
+        let meta = ProcedureMeta {
+            name: stmt.name.clone(),
+            params: stmt.params.clone(),
+            body_sql: stmt.body_sql,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_procedure(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · procedure '{}' creada ({} params)",
+                stmt.name,
+                stmt.params.len()
+            )),
+        })
+    }
+
+    /// Bloque X3: `DROP PROCEDURE [IF EXISTS] name`.
+    fn exec_drop_procedure(&mut self, stmt: DropProcedureStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::Procedure(_)) => {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.remove_object(&stmt.name)?;
+                Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!("OK · procedure '{}' eliminada", stmt.name)),
+                })
+            }
+            Some(_) => Err(coded(
+                codes::PROCEDURE_NOT_FOUND,
+                format!(
+                    "DROP PROCEDURE '{}': el nombre apunta a un objeto que no es una procedure",
+                    stmt.name
+                ),
+            )),
+            None => {
+                if stmt.if_exists {
+                    Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!(
+                            "OK · procedure '{}' no existía (IF EXISTS)",
+                            stmt.name
+                        )),
+                    })
+                } else {
+                    Err(coded(
+                        codes::PROCEDURE_NOT_FOUND,
+                        format!("DROP PROCEDURE '{}': no existe", stmt.name),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Bloque X3: `CALL name(arg1, arg2, ...)`. Lookup de la procedure,
+    /// validación de arity, evaluación de cada arg contra fila vacía
+    /// (igual que VALUES), substitución de parámetros formales en el
+    /// body por los literales evaluados, parse + exec.
+    fn exec_call(&mut self, stmt: CallStmt) -> DbResult<ResultSet> {
+        let proc = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_procedure(&stmt.name)?.ok_or_else(|| {
+                coded(
+                    codes::PROCEDURE_NOT_FOUND,
+                    format!("CALL '{}': procedure no existe", stmt.name),
+                )
+            })?
+        };
+        if proc.params.len() != stmt.args.len() {
+            return Err(coded(
+                codes::PROCEDURE_ARITY_MISMATCH,
+                format!(
+                    "CALL '{}': esperaba {} args, recibí {}",
+                    stmt.name,
+                    proc.params.len(),
+                    stmt.args.len()
+                ),
+            ));
+        }
+        // Evaluar cada arg contra una fila vacía (VALUES-style: sin scope).
+        let empty: HashMap<String, Value> = HashMap::new();
+        let mut bound: HashMap<String, Value> = HashMap::new();
+        for ((pname, _ptype), arg_expr) in proc.params.iter().zip(stmt.args.iter()) {
+            let v = self.eval_expr_full(arg_expr, &empty, None)?;
+            bound.insert(pname.to_ascii_lowercase(), v);
+        }
+        // Substituir parámetros en el body via token-sub (mismo helper
+        // que los triggers, pero buscamos idents bare en `bound` map).
+        let substituted = substitute_params_in_sql_text(&proc.body_sql, &bound, &proc.name)?;
+        let parsed = parse(&substituted)?;
+        if parsed.is_empty() {
+            return Err(coded(
+                codes::PROCEDURE_BODY_INVALID,
+                format!(
+                    "procedure '{}': el body persistido está vacío post-substitución",
+                    proc.name
+                ),
+            ));
+        }
+        let mut last_msg = format!("OK · procedure '{}' ejecutada", proc.name);
+        for body_stmt in parsed {
+            let rs = self.exec(body_stmt)?;
+            if let Some(m) = rs.message {
+                last_msg = m;
+            }
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(last_msg),
+        })
     }
 
     /// Bloque X1/X2: helper rápido — ¿hay algún trigger `timing` `event`
@@ -13568,6 +13780,39 @@ fn rows_to_values_select(name: &str, columns: &[String], rows: &[Vec<Value>]) ->
 // admite Expr y el AST-walking del W1/W2 no llegaba).
 // ---------------------------------------------------------------------
 
+/// Bloque X3 (2026-05-28): substitución de parámetros formales en el
+/// body de una procedure antes del exec. Tokeniza el body_sql,
+/// busca tokens `Ident` cuyo texto matchee (case-insensitive) algún
+/// param bindeado, y los reemplaza por los tokens del literal del
+/// arg evaluado. **Limitación conocida**: si una columna real tiene
+/// el mismo nombre que un parámetro, el ident de la columna también
+/// se substituye (rompe la query). Workaround documentado: usar
+/// prefijos (`p_id`, `arg_name`).
+fn substitute_params_in_sql_text(
+    body_sql: &str,
+    bound: &HashMap<String, Value>,
+    proc_name: &str,
+) -> DbResult<String> {
+    let _ = proc_name;
+    let tokens = tokenize(body_sql)?;
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        if tok.kind != TokenKind::Ident {
+            out.push(tok);
+            continue;
+        }
+        let lower = tok.text.to_ascii_lowercase();
+        if let Some(v) = bound.get(&lower) {
+            let literal_sql = format_value_literal(v);
+            let mut sub_tokens = tokenize(&literal_sql)?;
+            out.append(&mut sub_tokens);
+        } else {
+            out.push(tok);
+        }
+    }
+    Ok(reconstruct_sql_from_tokens(&out))
+}
+
 fn substitute_new_old_in_sql_text(
     body_sql: &str,
     new_row: Option<&HashMap<String, Value>>,
@@ -14499,6 +14744,21 @@ impl Parser {
                 new_name,
             }));
         }
+        // Bloque X3 (2026-05-28): `CALL name(arg1, arg2, ...)`. CALL
+        // como statement dispara una procedure persistida.
+        if self.match_keyword("CALL") {
+            let name = self.expect_ident()?;
+            self.expect_symbol("(")?;
+            let mut args = Vec::new();
+            if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
+                args.push(self.parse_expr()?);
+                while self.match_symbol(",") {
+                    args.push(self.parse_expr()?);
+                }
+            }
+            self.expect_symbol(")")?;
+            return Ok(Statement::Call(CallStmt { name, args }));
+        }
         if self.match_keyword("TRUNCATE") {
             // Bloque J: `TRUNCATE TABLE <name>` (palabra TABLE opcional,
             // como en MySQL/SQLite).
@@ -14634,6 +14894,15 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             return Ok(Statement::DropTrigger(DropTriggerStmt { name, if_exists }));
+        }
+        if self.match_keyword("PROCEDURE") {
+            // Bloque X3 (2026-05-28).
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropProcedure(DropProcedureStmt {
+                name,
+                if_exists,
+            }));
         }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
@@ -14806,6 +15075,100 @@ impl Parser {
             table,
             timing,
             event,
+            body_sql,
+        }))
+    }
+
+    /// Bloque X3 (2026-05-28): parsea
+    /// `CREATE PROCEDURE name(p1 TYPE [, p2 TYPE]*) AS <body>`.
+    /// El body sigue el mismo grammar que un trigger body — DML simple
+    /// o `BEGIN stmt; stmt; END`.
+    fn parse_create_procedure(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        self.expect_symbol("(")?;
+        let mut params: Vec<(String, ColumnType)> = Vec::new();
+        if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
+            loop {
+                let pname = self.expect_ident()?;
+                let ptype_raw = self.expect_ident()?;
+                let ptype = ColumnType::from_sql(&ptype_raw)?;
+                params.push((pname, ptype));
+                if !self.match_symbol(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(")")?;
+        self.expect_keyword("AS")?;
+        // Body: single-stmt o BEGIN...END (mismo grammar que triggers).
+        let head = self.peek().clone();
+        let body_sql = if head.kind == TokenKind::Ident && head.text.eq_ignore_ascii_case("BEGIN") {
+            self.pos += 1;
+            let start = self.pos;
+            let mut depth = 1usize;
+            while depth > 0 {
+                let t = self.peek().clone();
+                if t.kind == TokenKind::Eof {
+                    return Err(coded(
+                        codes::PROCEDURE_BODY_INVALID,
+                        "CREATE PROCEDURE ... BEGIN: falta el END que cierra el bloque",
+                    ));
+                }
+                if t.kind == TokenKind::Ident {
+                    if t.text.eq_ignore_ascii_case("BEGIN") {
+                        depth += 1;
+                    } else if t.text.eq_ignore_ascii_case("END") {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                self.pos += 1;
+            }
+            let end = self.pos;
+            self.pos += 1; // consume END
+            if start == end {
+                return Err(coded(
+                    codes::PROCEDURE_BODY_INVALID,
+                    "CREATE PROCEDURE ... BEGIN END: body vacío",
+                ));
+            }
+            reconstruct_sql_from_tokens(&self.tokens[start..end])
+        } else {
+            if head.kind != TokenKind::Ident
+                || !matches!(
+                    head.text.to_ascii_uppercase().as_str(),
+                    "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+                )
+            {
+                return Err(coded(
+                    codes::PROCEDURE_BODY_INVALID,
+                    format!(
+                        "CREATE PROCEDURE ... AS: el body debe arrancar con INSERT, UPDATE, DELETE, REPLACE o BEGIN (vi '{}')",
+                        head.text
+                    ),
+                ));
+            }
+            let start = self.pos;
+            while self.peek().kind != TokenKind::Eof {
+                if self.peek().kind == TokenKind::Symbol && self.peek().text == ";" {
+                    break;
+                }
+                self.pos += 1;
+            }
+            let end = self.pos;
+            if start == end {
+                return Err(coded(
+                    codes::PROCEDURE_BODY_INVALID,
+                    "CREATE PROCEDURE ... AS: body vacío",
+                ));
+            }
+            reconstruct_sql_from_tokens(&self.tokens[start..end])
+        };
+        Ok(Statement::CreateProcedure(CreateProcedureStmt {
+            name,
+            params,
             body_sql,
         }))
     }
@@ -15249,6 +15612,10 @@ impl Parser {
         // {INSERT|UPDATE|DELETE} ON table FOR EACH ROW <single_dml>`.
         if self.match_keyword("TRIGGER") {
             return self.parse_create_trigger();
+        }
+        // Bloque X3 (2026-05-28): `CREATE PROCEDURE name(...) AS <body>`.
+        if self.match_keyword("PROCEDURE") {
+            return self.parse_create_procedure();
         }
         self.expect_keyword("TABLE")?;
         // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS

@@ -41,7 +41,7 @@ impl ColumnType {
         }
     }
 
-    fn code(&self) -> u8 {
+    pub fn code(&self) -> u8 {
         match self {
             Self::Int => 1,
             Self::Text => 2,
@@ -53,7 +53,7 @@ impl ColumnType {
         }
     }
 
-    fn from_code(code: u8) -> DbResult<Self> {
+    pub fn from_code(code: u8) -> DbResult<Self> {
         match code {
             1 => Ok(Self::Int),
             2 => Ok(Self::Text),
@@ -1051,11 +1051,13 @@ impl ViewMeta {
 /// en el mismo B+Tree del catálogo sin colisiones de schema.
 ///
 /// Bloque X1 (VERSION 14, 2026-05-28): agregado `Trigger`.
+/// Bloque X3 (VERSION 15, 2026-05-28): agregado `Procedure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Table,
     View,
     Trigger,
+    Procedure,
 }
 
 impl ObjectKind {
@@ -1064,6 +1066,7 @@ impl ObjectKind {
             Self::Table => 0,
             Self::View => 1,
             Self::Trigger => 2,
+            Self::Procedure => 3,
         }
     }
 
@@ -1072,8 +1075,9 @@ impl ObjectKind {
             0 => Ok(Self::Table),
             1 => Ok(Self::View),
             2 => Ok(Self::Trigger),
+            3 => Ok(Self::Procedure),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure)",
                 other
             ))),
         }
@@ -1129,12 +1133,83 @@ impl TriggerMeta {
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla, vista o trigger.
+/// Bloque X3 (VERSION 15, 2026-05-28): metadata de un stored procedure.
+/// Layout on-disk:
+///
+///     [name][param_count:u16] · param_count × ([param_name][type_code:u8]) · [body_sql]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcedureMeta {
+    pub name: String,
+    /// Lista ordenada de parámetros formales con su tipo declarado.
+    /// El tipo se valida en CALL (best-effort: el motor hace coerce
+    /// implícito INT↔FLOAT; mismatch de TEXT vs INT rebota).
+    pub params: Vec<(String, ColumnType)>,
+    /// Body persistido como texto SQL (mismo enfoque que TriggerMeta).
+    /// Puede ser una sola sentencia DML o un bloque `BEGIN ... END`.
+    pub body_sql: String,
+}
+
+impl ProcedureMeta {
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::new();
+        push_string(&mut out, &self.name)?;
+        if self.params.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "procedure '{}' tiene {} params, máximo {}",
+                self.name,
+                self.params.len(),
+                u16::MAX
+            )));
+        }
+        out.extend_from_slice(&(self.params.len() as u16).to_le_bytes());
+        for (n, t) in &self.params {
+            push_string(&mut out, n)?;
+            out.push(t.code());
+        }
+        push_string(&mut out, &self.body_sql)?;
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "ProcedureMeta '{}' corrupta: faltan 2 bytes param_count",
+                name
+            )));
+        }
+        let pcount = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let mut params = Vec::with_capacity(pcount);
+        for _ in 0..pcount {
+            let pname = take_string(data, &mut offset)?;
+            if offset >= data.len() {
+                return Err(DbError::new(format!(
+                    "ProcedureMeta '{}': falta type_code de param '{}'",
+                    name, pname
+                )));
+            }
+            let tcode = data[offset];
+            offset += 1;
+            let ptype = ColumnType::from_code(tcode)?;
+            params.push((pname, ptype));
+        }
+        let body_sql = take_string(data, &mut offset)?;
+        Ok(Self {
+            name,
+            params,
+            body_sql,
+        })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger o procedure.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
     View(ViewMeta),
     Trigger(TriggerMeta),
+    Procedure(ProcedureMeta),
 }
 
 impl CatalogObject {
@@ -1143,6 +1218,7 @@ impl CatalogObject {
             Self::Table(t) => &t.name,
             Self::View(v) => &v.name,
             Self::Trigger(t) => &t.name,
+            Self::Procedure(p) => &p.name,
         }
     }
 }
@@ -1161,6 +1237,7 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
         ObjectKind::Table => CatalogObject::Table(TableMeta::deserialize(rest)?),
         ObjectKind::View => CatalogObject::View(ViewMeta::deserialize(rest)?),
         ObjectKind::Trigger => CatalogObject::Trigger(TriggerMeta::deserialize(rest)?),
+        ObjectKind::Procedure => CatalogObject::Procedure(ProcedureMeta::deserialize(rest)?),
     })
 }
 
@@ -1223,6 +1300,18 @@ impl<'a> Catalog<'a> {
             .collect())
     }
 
+    /// Bloque X3: lista todas las procedures del catálogo.
+    pub fn list_procedures(&mut self) -> DbResult<Vec<ProcedureMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Procedure(p) => Some(p),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Lookup case-insensitive por nombre. Devuelve el objeto sea
     /// table o view; se usa cuando el caller no sabe (e.g. resolver
     /// de FROM, ALTER TABLE rechazando colisión con vista).
@@ -1270,6 +1359,13 @@ impl<'a> Catalog<'a> {
         }
     }
 
+    pub fn get_procedure(&mut self, name: &str) -> DbResult<Option<ProcedureMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::Procedure(p)) => Ok(Some(p)),
+            _ => Ok(None),
+        }
+    }
+
     pub fn put_table(&mut self, meta: &TableMeta) -> DbResult<()> {
         let root = self.ensure_root()?;
         let key = hash_name(&meta.name);
@@ -1297,6 +1393,17 @@ impl<'a> Catalog<'a> {
         let key = hash_name(&meta.name);
         let mut payload = Vec::with_capacity(1 + 32);
         payload.push(ObjectKind::Trigger.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    pub fn put_procedure(&mut self, meta: &ProcedureMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key = hash_name(&meta.name);
+        let mut payload = Vec::with_capacity(1 + 32);
+        payload.push(ObjectKind::Procedure.code());
         payload.extend_from_slice(&meta.serialize()?);
         let mut tree = Tree::new(self.pager);
         tree.upsert(root, key, payload)?;

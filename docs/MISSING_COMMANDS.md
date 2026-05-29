@@ -312,7 +312,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Control de flujo en trigger body (`IF`/`LOOP`/`WHILE`, variables) | ❌ (diferido a X3+) | P3 |
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |
-| `CREATE FUNCTION` / stored procedures | ❌ | P3 |
+| `CREATE PROCEDURE name(...) AS <body>` + `CALL name(args)` | ✅ (X3, 2026-05-28; VERSION 14→15; statement-only, params via token-sub) | — |
+| `CREATE FUNCTION ... RETURNS scalar` invocable en SELECT | ❌ (diferido a X3b — requiere extender AST de Expr) | P3 |
+| Args OUT/INOUT en procedures, `DECLARE` variables, `IF`/`LOOP`/`WHILE` en body | ❌ (diferido a X4 — PL/pgSQL completo) | P3 |
 | `CREATE TYPE` (enums, composites) | ❌ | P3 |
 
 ---

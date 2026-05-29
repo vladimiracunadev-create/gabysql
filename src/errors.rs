@@ -522,6 +522,21 @@ pub mod codes {
     /// Bloque X1: `DROP TRIGGER name` sobre un nombre que no existe.
     /// `DROP TRIGGER IF EXISTS` no rebota — devuelve OK silencioso.
     pub const TRIGGER_NOT_FOUND: u32 = 4096;
+    /// Bloque X3 (2026-05-28): `CREATE PROCEDURE name ...` cuyo nombre
+    /// colisiona con tabla / vista / trigger / procedure existente.
+    /// Mismo namespace global que el resto del catálogo.
+    pub const PROCEDURE_NAME_COLLIDES: u32 = 4097;
+    /// Bloque X3: el body de `CREATE PROCEDURE ... AS <body>` debe ser
+    /// una sentencia DML simple (INSERT/UPDATE/DELETE/REPLACE) o un
+    /// bloque `BEGIN stmt; stmt; END` con varias DMLs. SELECT y otros
+    /// rechazados.
+    pub const PROCEDURE_BODY_INVALID: u32 = 4098;
+    /// Bloque X3: `CALL name(args)` sobre un nombre que no existe.
+    /// También usado por `DROP PROCEDURE name` sin `IF EXISTS`.
+    pub const PROCEDURE_NOT_FOUND: u32 = 4099;
+    /// Bloque X3: `CALL name(args)` recibió un número de argumentos
+    /// distinto al declarado en la signatura de la procedure.
+    pub const PROCEDURE_ARITY_MISMATCH: u32 = 4100;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

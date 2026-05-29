@@ -6,6 +6,53 @@
 
 ---
 
+## 2026-05-28 — Bloque X3: stored procedures (`CREATE PROCEDURE` + `CALL`) [VERSION 14→15]
+
+> **Un push a `main`** con bump on-disk **VERSION 14 → 15**. Tercer sub-bloque del bloque X. Stored procedures con `CALL`, persistidas en el catálogo (`ObjectKind::Procedure`). Funciones invocables desde SELECT diferidas a X3b. Detalle en [`docs/adr/0031-stored-procedures-x3.md`](docs/adr/0031-stored-procedures-x3.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+CREATE PROCEDURE log_msg(p_id INT, p_msg TEXT) AS
+    INSERT INTO log (id, msg) VALUES (p_id, p_msg);
+
+CREATE PROCEDURE log_both(p_id INT) AS BEGIN
+    INSERT INTO log_a (id) VALUES (p_id);
+    INSERT INTO log_b (id) VALUES (p_id);
+END;
+
+CALL log_msg(42, 'hello');
+CALL log_both(10 + 5);  -- args son expresiones
+
+DROP PROCEDURE [IF EXISTS] log_msg;
+```
+
+### 🛠 Implementación
+
+- **Persistencia**: nuevo `ObjectKind::Procedure` (discriminator `3`). `ProcedureMeta { name, params: Vec<(String, ColumnType)>, body_sql }`. Body persistido como texto SQL.
+- **Bump VERSION 14 → 15**. V14 abierto por binario X3+ rebota con `[GBY-1003]`.
+- **Substitución de parámetros via token-sub bare-ident**: `substitute_params_in_sql_text` busca tokens `Ident` cuyo texto matchee param name (case-insensitive) y los reemplaza por los tokens del literal del arg evaluado.
+- **CALL statement standalone**: no es Expr. El executor: lookup → arity check → evaluar args con `eval_expr_full` contra fila vacía → bind → token-sub → parse + exec cada stmt.
+- **Body grammar** idéntico a triggers: DML simple o `BEGIN ... END` multi-stmt. Reusa el splitter de X2 (que ya distingue `BEGIN TRANSACTION` vs `BEGIN <body>`).
+
+### 🚫 Limitación conocida (documentada)
+
+Si una columna real tiene el mismo nombre que un parámetro, el ident de la columna también se substituye y la query rompe. **Workaround**: prefijar param names (`p_id`, `arg_name`) — convención estándar PG.
+
+### 🚫 Diferido (a X3b+)
+
+- **`CREATE FUNCTION ... RETURNS scalar`** invocable desde SELECT/WHERE — requiere extender el AST de `Expr` (~160 match arms).
+- **Type checking estricto** en CALL (hoy confía en que el DML downstream rebote).
+- **Args OUT/INOUT**, **`DECLARE` variables locales**, **control de flujo** (`IF`/`LOOP`/`WHILE`) — área de lenguaje procedural, X4+.
+- **Recursion guard** para procedures (`MAX_PROCEDURE_DEPTH`).
+
+### 🧪 Validación
+
+- 9 tests `x3_*`: CALL simple, multi-stmt body, args como expresiones, arity mismatch, procedure desconocida, DROP + IF EXISTS, name collision, persistencia tras reopen.
+- Suite total: **432/432 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X2: triggers BEFORE + body multi-statement
 
 > **Un push a `main`** sin bump on-disk (los slots ya estaban en `TriggerMeta` desde X1). Cierra los dos huecos más visibles que dejó X1: BEFORE triggers y body `BEGIN ... END` con múltiples sentencias. Detalle en [`docs/adr/0030-triggers-before-multistmt-x2.md`](docs/adr/0030-triggers-before-multistmt-x2.md).

@@ -51,7 +51,8 @@
 | [`WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`](#ctes-recursivas-with-recursive-bloque-w2) — fixpoint base+step, delta semantics, guards de runaway | DML | 🟢 (bloque W2) |
 | [Window functions](#window-functions-bloque-w3) — `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` con `OVER (PARTITION BY ... ORDER BY ...)` | DML | 🟢 (bloque W3) |
 | [`CREATE TRIGGER name {BEFORE\|AFTER} {INSERT\|UPDATE\|DELETE} ON t FOR EACH ROW <body>` + `DROP TRIGGER`](#triggers-bloques-x1--x2) — body single-stmt o `BEGIN stmt; stmt; END` | DDL | 🟢 (bloques X1+X2 / VERSION 14) |
-| NEW mutable en BEFORE, `IF`/`LOOP`/variables en body, `CREATE FUNCTION`, `CREATE PROCEDURE`, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`CREATE PROCEDURE name(p1 TYPE, ...) AS <body>` + `DROP PROCEDURE` + `CALL name(args)`](#stored-procedures-bloque-x3) | DDL+DML | 🟢 (bloque X3 / VERSION 15) |
+| NEW mutable en BEFORE, `IF`/`LOOP`/variables en body, `CREATE FUNCTION` invocable en SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -1845,6 +1846,77 @@ Las sentencias dentro del block se separan con `;` y se ejecutan en orden. Si al
 - **`INSTEAD OF` triggers** (sobre vistas) — fuera de scope.
 - **Lenguaje procedural** (variables, IF/THEN, LOOP, EXCEPTION) — X3+.
 - **OLD en UPSERT que terminó en UPDATE** — el path `INSERT ... ON CONFLICT DO UPDATE` que dispara AFTER UPDATE fire con OLD=None.
+
+---
+
+## Stored procedures (bloque X3)
+
+> **`CREATE PROCEDURE name(p1 TYPE, ...) AS <body>`** + **`CALL name(args)`** + **`DROP PROCEDURE`**: encapsular side effects parametrizados. Body es DML simple o `BEGIN ... END` multi-stmt. CALL es un statement standalone — no se puede usar como expresión (funciones invocables en SELECT llegan en X3b). Persistido en catálogo (bump VERSION 14 → 15).
+
+### 📜 EBNF
+
+```
+create_proc  ::= "CREATE" "PROCEDURE" ident "(" [param {"," param}*] ")"
+                 "AS" proc_body
+param        ::= ident type_name
+proc_body    ::= dml_stmt
+               | "BEGIN" dml_stmt {";" dml_stmt}* [";"] "END"
+drop_proc    ::= "DROP" "PROCEDURE" ["IF" "EXISTS"] ident
+call_stmt    ::= "CALL" ident "(" [expr {"," expr}*] ")"
+```
+
+### ✅ Ejemplos
+
+```sql
+-- Procedure simple
+CREATE PROCEDURE log_msg(p_id INT, p_msg TEXT) AS
+    INSERT INTO log (id, msg) VALUES (p_id, p_msg);
+
+CALL log_msg(42, 'hello');
+
+-- Body multi-statement
+CREATE PROCEDURE log_both(p_id INT) AS BEGIN
+    INSERT INTO log_a (id) VALUES (p_id);
+    INSERT INTO log_b (id) VALUES (p_id);
+END;
+
+CALL log_both(99);
+
+-- Args como expresiones
+CALL log_msg(10 + 5, UPPER('abc'));
+
+-- Cleanup
+DROP PROCEDURE IF EXISTS log_msg;
+```
+
+### ⚠️ Limitación conocida — choque param/columna
+
+Si una columna tiene el mismo nombre que un parámetro, el ident de la columna también se substituye (token-level) y la query rompe. **Workaround**: prefijar param names (`p_id`, `arg_name`) — convención estándar PG.
+
+```sql
+-- ❌ choque: `id` aparece como param Y como columna
+CREATE PROCEDURE add_log(id INT) AS INSERT INTO log (id) VALUES (id);
+
+-- ✅
+CREATE PROCEDURE add_log(p_id INT) AS INSERT INTO log (id) VALUES (p_id);
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4097] CREATE PROCEDURE '...': ya existe un objeto ...` | Colisión de nombre con tabla / vista / trigger / procedure. |
+| `[GBY-4098] el body debe arrancar con INSERT, UPDATE, DELETE, REPLACE o BEGIN` | Body no válido o `BEGIN` sin `END`. |
+| `[GBY-4099] CALL '...': procedure no existe` | También `DROP PROCEDURE` sin `IF EXISTS`. |
+| `[GBY-4100] CALL '...': esperaba N args, recibí M` | Arity mismatch. |
+
+### ⚠️ No soportado todavía
+
+- **`CREATE FUNCTION ... RETURNS scalar`** invocable desde SELECT/WHERE — X3b.
+- **Type checking estricto** en CALL (hoy el motor confía en que el DML downstream rebote).
+- **Args OUT/INOUT**, **`DECLARE` variables locales**, **`IF`/`LOOP`/`WHILE`** — área de PL/pgSQL, X4+.
+- **Recursion guard** para procedures.
+- **`CREATE PROCEDURE ... RETURNS TABLE`** (tabla de salida).
 
 ---
 

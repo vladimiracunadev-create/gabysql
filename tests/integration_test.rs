@@ -10223,6 +10223,176 @@ fn x2_begin_without_end_rejected() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X3 (2026-05-28): stored procedures + CALL. -----
+
+fn x3_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x3-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x3_simple_call_inserts() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("simple")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY, msg TEXT);
+         CREATE PROCEDURE log_msg(p_id INT, p_msg TEXT) AS \
+            INSERT INTO log (id, msg) VALUES (p_id, p_msg);",
+    )?;
+    run_sql(&db, "CALL log_msg(42, 'hello');")?;
+    run_sql(&db, "CALL log_msg(43, 'world');")?;
+    let res = run_sql(&db, "SELECT id, msg FROM log ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    assert_eq!(res[0].rows[0][1], Value::String("hello".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::Integer(43));
+    assert_eq!(res[0].rows[1][1], Value::String("world".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_call_with_multi_stmt_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("multi-body")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log_a (id INT PRIMARY KEY);
+         CREATE TABLE log_b (id INT PRIMARY KEY);
+         CREATE PROCEDURE log_both(p_id INT) AS BEGIN \
+            INSERT INTO log_a (id) VALUES (p_id); \
+            INSERT INTO log_b (id) VALUES (p_id); \
+         END;",
+    )?;
+    run_sql(&db, "CALL log_both(99);")?;
+    let a = run_sql(&db, "SELECT id FROM log_a;")?;
+    let b = run_sql(&db, "SELECT id FROM log_b;")?;
+    assert_eq!(a[0].rows.len(), 1);
+    assert_eq!(a[0].rows[0][0], Value::Integer(99));
+    assert_eq!(b[0].rows.len(), 1);
+    assert_eq!(b[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_call_arg_can_be_expression() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("arg-expr")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE PROCEDURE add_id(p_id INT) AS INSERT INTO t (id) VALUES (p_id);",
+    )?;
+    // arg evaluado: 10 + 5 = 15.
+    run_sql(&db, "CALL add_id(10 + 5);")?;
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(15));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_call_arity_mismatch_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("arity")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE PROCEDURE one_arg(p_id INT) AS INSERT INTO t (id) VALUES (p_id);",
+    )?;
+    let err = run_sql(&db, "CALL one_arg(1, 2);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4100"),
+        "esperaba GBY-4100, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_call_unknown_procedure_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("unknown")?;
+    let err = run_sql(&db, "CALL nope(1);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4099"),
+        "esperaba GBY-4099, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_drop_procedure_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE PROCEDURE p(p_id INT) AS INSERT INTO t (id) VALUES (p_id);",
+    )?;
+    run_sql(&db, "DROP PROCEDURE p;")?;
+    let err = run_sql(&db, "CALL p(1);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4099"),
+        "esperaba GBY-4099, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_drop_procedure_if_exists_noop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("drop-if-exists")?;
+    run_sql(&db, "DROP PROCEDURE IF EXISTS nope;")?;
+    let err = run_sql(&db, "DROP PROCEDURE nope;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4099"),
+        "esperaba GBY-4099, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_procedure_name_collides_with_table() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("collide")?;
+    run_sql(&db, "CREATE TABLE collide (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "CREATE PROCEDURE collide(p_id INT) AS INSERT INTO collide (id) VALUES (p_id);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4097"),
+        "esperaba GBY-4097, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3_procedure_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3_setup("persist")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE PROCEDURE p(p_id INT) AS INSERT INTO t (id) VALUES (p_id);",
+    )?;
+    run_sql(&db, "CALL p(1);")?;
+    run_sql(&db, "CALL p(2);")?;
+    let res = run_sql(&db, "SELECT id FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
