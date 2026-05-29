@@ -442,7 +442,8 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | scrypt RFC 7914 (memory-hard, resistente a ASIC, ~32 MB/hash) | ✅ (Z1c, 2026-05-29; VERSION 27→28; default; Salsa20/8 + BlockMix + ROMix puro en Rust; ver ADR-0056) | — |
 | Blake2b RFC 7693 (foundation crypto) | ✅ (Z1d, 2026-05-29; VERSION 28→29; validado contra RFC 7693 §A; `pub fn blake2b(out_len, data)`; ver ADR-0058) | — |
 | `PASSWORD_SCHEME_ARGON2ID = 3` reservado | ✅ (Z1d, 2026-05-29; slot reservado, dispatch con mensaje informativo) | — |
-| Argon2id RFC 9106 full implementation | ❌ (Z1d partió el entregable; Z1e dedicado para G compression + memory matrix + indexing híbrido + RFC §A.3 vector) | P3 |
+| Argon2id RFC 9106 estructura completa (`pub fn argon2id`) | ⚠️ (Z1e, 2026-05-29; estructura completa ~450 LOC; **NO matchea RFC §A.3 vector todavía**; default sigue scrypt; ver ADR-0060) | — |
+| Argon2id RFC 9106 §A.3 test vector match + default scheme=3 | ❌ (Z1f — debug del bug + cambio de default + migración silenciosa) | P3 |
 | Migración silenciosa de scheme=1 (PBKDF2) → scheme=2 (scrypt) on next login | ❌ (defer Z1d) | P3 |
 | Iteraciones de PBKDF2 configurables (`ALTER SYSTEM ...`) | ❌ (Z1b hardcoded 100K; defer) | P3 |
 | Wire-up del verify al servidor HTTP (`Authorization: Bearer user:password`) | ❌ (Z1b sólo expone via SQL; defer) | P2 |

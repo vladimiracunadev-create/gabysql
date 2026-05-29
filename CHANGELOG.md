@@ -6,6 +6,55 @@
 
 ---
 
+## 2026-05-29 — Bloque Z1e: Argon2id RFC 9106 estructura (vector match pendiente Z1f) ⚠️
+
+> **Un push a `main`**. Bump on-disk **VERSION 29 → 30**. Z1e shippea la estructura completa de Argon2id sobre Blake2b de Z1d, pero **NO matchea el test vector RFC 9106 §A.3** — bug pendiente de debug. Default sigue siendo scrypt (Z1c). Detalle en [`docs/adr/0060-z1e-argon2id-structural.md`](docs/adr/0060-z1e-argon2id-structural.md).
+
+### 🆕 Disponible (con limitación)
+
+```rust
+// Función pública con la estructura Argon2id RFC 9106 completa.
+// NOTA: NO matchea el output canónico del RFC §A.3 todavía.
+// Determinístico (h(p, s) = h(p, s)) y único por salt.
+use gabysql::sql::argon2id;
+let hash = argon2id(password, salt, &[], &[], 65536, 2, 1, 32);
+```
+
+### 🛠 Implementación (~450 LOC sobre Blake2b)
+
+- `argon2_h_prime(t, data)`: RFC §3.2 variable-output Blake2b (recursive chain para t > 64).
+- `argon2_gb(v, a, b, c, d)`: BlaMka G operation.
+- `argon2_round(v)`: 8 BlaMka calls (column + diagonal).
+- `argon2_compress(x, y)`: G compression para 1024-byte blocks (row + column phase).
+- `argon2_make_addr_block(...)`: address block para data-independent indexing.
+- `argon2_process_segment(...)`: per-segment loop con J1/J2 derivation + ref index calculation.
+- `pub fn argon2id(password, salt, secret, ad, m_kib, t, p, dk_len)`: pipeline completo.
+- Parameters constants: `ARGON2_M_KIB = 65536` (64 MiB), `ARGON2_T = 2`, `ARGON2_P = 1`.
+
+### ⚠️ Limitación honesta
+
+El output de `argon2id()` NO matchea el test vector RFC 9106 §A.3 (primer byte: `0xa6` vs esperado `0x0a`). El bug está en algún sitio del pipeline (compress column phase, W cálculo, start_pos en pass > 0, indep block layout). Sin reference implementation paso-a-paso para contrastar, debug ciego es impráctico.
+
+**Implicaciones**:
+- `exec_create_user` y `exec_alter_user_password` siguen usando `scrypt` (scheme=2) como default. **Sin regresión de seguridad**.
+- `exec_set_session_auth` sigue rechazando `meta.scheme == 3` con mensaje informativo.
+- Función `pub fn argon2id` disponible para experimentación + debug Z1f.
+- Test `z1e_argon2id_rfc9106_test_vector_pending_z1f` marcado `#[ignore]` para tracking (`cargo test -- --ignored` lo corre).
+
+### 🚫 Diferido (Z1f)
+
+- **RFC 9106 §A.3 vector match** — debug del bug + ajuste de implementación.
+- Cambio de default `scheme = scrypt` → `scheme = argon2id`.
+- Cambio del dispatch en `exec_set_session_auth` para aceptar scheme=3.
+- Migración silenciosa scheme=2 → scheme=3 on next login.
+
+### 🧪 Validación
+
+- Suite: **693 passing + 1 ignored** (690 → +3 z1e_* + 1 ignored). Cubre: determinismo de `argon2id`, salt uniqueness, default scheme sigue scrypt, constante `PASSWORD_SCHEME_ARGON2ID = 3` expuesta.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z3e: ON CONFLICT DO UPDATE con WITH CHECK
 
 > **Un push a `main`** sin bump on-disk. Cierra el último leak histórico del WITH CHECK en el upsert path. Detalle en [`docs/adr/0059-z3e-on-conflict-with-check.md`](docs/adr/0059-z3e-on-conflict-with-check.md).

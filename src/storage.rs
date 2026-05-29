@@ -170,7 +170,7 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        nuevo flag `COLUMN_FLAG_HAS_DECIMAL_META = 0x20`. Value
 //        gana variante `Decimal { value: i128, scale: u8 }`. V21
 //        rechazados con `[GBY-1003]`.
-pub const VERSION: u32 = 29;
+pub const VERSION: u32 = 30;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;
