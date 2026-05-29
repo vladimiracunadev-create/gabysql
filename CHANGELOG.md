@@ -6,6 +6,59 @@
 
 ---
 
+## 2026-05-29 — Bloque X5: refinamientos PL/pgSQL (RAISE WARNING/INFO, formato `%`, FOR STEP/REVERSE, EXCEPTION WHEN simbólico)
+
+> **Un push a `main`** sin bump on-disk. Cleanup de los 4 items menores que quedaron diferidos al cerrar X4f. Detalle en [`docs/adr/0041-x5-procedural-refinements.md`](docs/adr/0041-x5-procedural-refinements.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- RAISE WARNING / INFO + formato %
+RAISE WARNING 'cuidado con el valor %', x;
+RAISE INFO  'procesando registro % de %', i, total;
+RAISE EXCEPTION 'valor % inválido en columna %', v, col;
+
+-- FOR con STEP y REVERSE
+FOR i IN 1 TO 100 STEP 2 LOOP ... END LOOP;
+FOR i IN REVERSE 10 TO 1 LOOP ... END LOOP;
+FOR i IN REVERSE 100 TO 1 STEP 10 LOOP ... END LOOP;
+
+-- EXCEPTION WHEN <name> simbólico estilo PG
+BEGIN
+   INSERT INTO t (id) VALUES (1);
+EXCEPTION
+   WHEN primary_key_violation THEN ...;
+   WHEN foreign_key_violation THEN ...;
+   WHEN check_violation THEN ...;
+   WHEN OTHERS THEN ...;
+END;
+```
+
+### 🛠 Implementación
+
+- **`RaiseLevel`**: nuevos variants `Warning` e `Info`. Mismo comportamiento que `Notice` — distintos prefijos (`WARNING:` / `INFO:` / `NOTICE:`) en el mensaje. La diferencia es semántica (para el cliente / logger), no del motor.
+- **`RaiseStmt.args: Vec<Expr>`**: parser acepta args separados por `,` tras el literal STRING. `format_raise_message(template, args)` substituye cada `%` con la representación textual del arg; `%%` escapa un `%` literal; arity strict → `[GBY-4120]` si mismatch.
+- **`ForStmt.step: Option<Expr>` + `reverse: bool`**: parser acepta `REVERSE` opcional antes de start y `STEP n` opcional después de end. Engine calcula `step_effective = ±|n|` y usa `saturating_add` con condición de parada según el signo. `STEP 0` → `[GBY-4120]`.
+- **`ExceptionFilter::Name(String)`**: parser captura ident después de WHEN si no es OTHERS ni número. Engine: `resolve_exception_name(n) -> Option<u32>` mapea PG-style (`unique_violation` → 3003, `primary_key_violation` → 3001, etc.). Nombres no mapeados nunca matchean (caen al próximo handler).
+
+### 🆕 Código de error
+
+| Código | Nombre | Cuándo |
+|---|---|---|
+| `GBY-4120` | `RAISE_FORMAT_OR_FOR_STEP_INVALID` | Arity mismatch entre `%` y args en RAISE, **o** `FOR ... STEP 0`. |
+
+### 🚫 Diferido (X6 y más allá)
+
+- **`FOR row IN SELECT ... LOOP`** (composite row scope `row.col`) — requiere extender var_scope con nested records.
+- Más nombres simbólicos en `resolve_exception_name` según pidan los users reales.
+
+### 🧪 Validación
+
+- 12 tests `x5_*`: RAISE WARNING/INFO, RAISE format con args, RAISE format con `%%` escape, RAISE format arity error, FOR STEP, FOR REVERSE, FOR REVERSE+STEP combinados, FOR STEP 0 rejected, EXCEPTION WHEN unique_violation cae a OTHERS sobre PK dup (mapping correcto), EXCEPTION WHEN primary_key_violation matchea PK dup, EXCEPTION WHEN nombre desconocido cae a OTHERS.
+- Suite total: **522/522 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y2: enforcement de longitud `VARCHAR(n)` / `CHAR(n)`
 
 > **Un push a `main`** con **bump on-disk 17 → 18**. Cierra la deuda más visible de Y: ahora una columna `VARCHAR(254)` realmente rechaza strings de 300 bytes en vez de aceptarlos silenciosamente. Detalle en [`docs/adr/0040-varchar-length-enforcement-y2.md`](docs/adr/0040-varchar-length-enforcement-y2.md).

@@ -323,7 +323,10 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `CASE expr WHEN val THEN ...` simple form como statement | ❌ (diferido) | P3 |
 | `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido) | P3 |
 | `RETURN expr` en function bodies multi-statement (`AS BEGIN ... RETURN x; END`) | ✅ (X4f, 2026-05-29; sentinel pattern, single-expr body de X3b sigue válido) | — |
-| `STEP n` / `REVERSE` en FOR range, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
+| `STEP n` / `REVERSE` en FOR range | ✅ (X5, 2026-05-29; `STEP 0` rechazado con `[GBY-4120]`) | — |
+| `RAISE WARNING` / `RAISE INFO` (además de EXCEPTION/NOTICE) | ✅ (X5, 2026-05-29; mismo behavior que NOTICE, distinto prefijo) | — |
+| Formato `%` en RAISE (`RAISE EXCEPTION 'val % bad', x`) | ✅ (X5, 2026-05-29; arity strict, `%%` escapa) | — |
+| `EXCEPTION WHEN <name>` filtros simbólicos PG-style | ✅ (X5, 2026-05-29; `primary_key_violation`/`unique_violation`/`foreign_key_violation`/etc. via `resolve_exception_name`) | — |
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |
 | `CREATE PROCEDURE name(...) AS <body>` + `CALL name(args)` | ✅ (X3, 2026-05-28; VERSION 14→15; statement-only, params via token-sub) | — |

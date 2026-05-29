@@ -467,42 +467,88 @@ pub struct ExitStmt {
     pub when: Option<Expr>,
 }
 
-/// Bloque X4c (2026-05-28): nivel de la directiva `RAISE`. EXCEPTION
-/// aborta con `[GBY-4111]` (propaga error); NOTICE es informativo.
+/// Bloque X4c (2026-05-28) + extendido en X5 (2026-05-29): nivel de
+/// la directiva `RAISE`. `Exception` aborta con `[GBY-4111]` (propaga
+/// error); `Notice`/`Warning`/`Info` son informativos y aparecen como
+/// `message` del ResultSet vacío.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaiseLevel {
     Exception,
     Notice,
+    /// X5 (2026-05-29): nivel intermedio, mismo comportamiento que
+    /// NOTICE pero con prefijo distinto. Útil para distinguir señales
+    /// en logs sin romper la convención PG.
+    Warning,
+    /// X5 (2026-05-29): nivel info-only.
+    Info,
 }
 
-/// Bloque X4c: `RAISE [EXCEPTION|NOTICE] 'msg'`. Mensaje es un literal
-/// STRING — formato `%` estilo PG diferido a X4d.
+/// Bloque X4c: `RAISE [EXCEPTION|NOTICE|WARNING|INFO] 'msg' [, arg1, arg2, ...]`.
+/// El mensaje es un literal STRING; cada `%` se substituye con el
+/// `arg_i` correspondiente (estilo PG). X5 (2026-05-29) sumó los
+/// niveles `WARNING`/`INFO` y la sustitución por `%`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RaiseStmt {
     pub level: RaiseLevel,
     pub message: String,
+    /// X5: argumentos a interpolar en cada `%` del mensaje. Vacío =
+    /// sin sustitución (compat X4c).
+    pub args: Vec<Expr>,
 }
 
-/// Bloque X4c: `FOR var IN start TO end LOOP <body> END LOOP`. La
-/// variable se auto-declara en `var_scope` al inicio (shadowing si
-/// existe; se restaura al terminar). Iteración inclusiva: `i` toma
-/// `start, start+1, ..., end`. Si `start > end`, no itera (no error).
-/// Step fijo en 1 en X4c — `STEP n` diferido.
+/// Bloque X4c: `FOR var IN [REVERSE] start TO end [STEP n] LOOP <body> END LOOP`.
+/// La variable se auto-declara en `var_scope` al inicio (shadowing si
+/// existe; se restaura al terminar). Iteración inclusiva.
+/// X5 (2026-05-29) sumó `REVERSE` (decrementa de start a end) y
+/// `STEP n` (n != 0; signo se valida contra el sentido).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForStmt {
     pub var: String,
     pub start: Expr,
     pub end: Expr,
     pub body: Vec<Statement>,
+    /// X5: `STEP n` opcional. `None` = step=1 ascendente (o step=-1 si
+    /// hay REVERSE). Si lleva valor, debe ser INT no-cero.
+    pub step: Option<Expr>,
+    /// X5: `REVERSE` invierte el sentido — start debe ser >= end y la
+    /// variable se decrementa.
+    pub reverse: bool,
 }
 
-/// Bloque X4e (2026-05-29): filtro de un `EXCEPTION WHEN ... THEN`.
-/// `Code(n)` matchea el código `[GBY-NNNN]` del error. `Others` es
-/// catch-all (mismo comportamiento que X4d).
+/// Bloque X4e (2026-05-29) + X5 (2026-05-29): filtro de un
+/// `EXCEPTION WHEN ... THEN`. `Code(n)` matchea el código `[GBY-NNNN]`
+/// del error. `Name(s)` matchea por nombre simbólico (PG-style:
+/// `no_data_found`, `unique_violation`, etc. — ver
+/// `resolve_exception_name`). `Others` es catch-all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExceptionFilter {
     Code(u32),
+    /// X5: nombre simbólico estilo PG. Se resuelve a código en runtime.
+    Name(String),
     Others,
+}
+
+/// Bloque X5 (2026-05-29): mapea nombres simbólicos estilo PostgreSQL
+/// a códigos numéricos `[GBY-NNNN]` para `EXCEPTION WHEN <name> THEN`.
+/// Sólo los más usados — el catálogo crece según demanda. Nombres
+/// desconocidos no matchean nada (mismo comportamiento que un Code
+/// que nadie emite).
+pub(crate) fn resolve_exception_name(name: &str) -> Option<u32> {
+    match name.to_ascii_lowercase().as_str() {
+        "no_data_found" | "not_found" => Some(codes::ROW_NOT_FOUND_FOR_PK),
+        "unique_violation" => Some(codes::UNIQUE_VIOLATED),
+        "not_null_violation" => Some(codes::NOT_NULL_VIOLATED),
+        "foreign_key_violation" => Some(codes::FK_PARENT_MISSING),
+        "check_violation" => Some(codes::CHECK_VIOLATED),
+        "primary_key_violation" => Some(codes::DUPLICATE_PRIMARY_KEY),
+        "division_by_zero" => Some(codes::DIVISION_BY_ZERO),
+        "numeric_value_out_of_range" => Some(codes::ARITH_OVERFLOW),
+        "string_data_right_truncation" | "value_length_exceeded" => {
+            Some(codes::VALUE_LENGTH_EXCEEDED)
+        }
+        "raise_exception" => Some(codes::RAISE_EXCEPTION),
+        _ => None,
+    }
 }
 
 /// Bloque X4d (2026-05-28) + extendido en X4e (2026-05-29): `BEGIN
@@ -4042,21 +4088,46 @@ impl<'a> Engine<'a> {
     /// no lo atrapa (X4c no tiene EXCEPTION handlers, diferido a X4d).
     /// NOTICE devuelve OK con el mensaje en el ResultSet.
     fn exec_raise(&mut self, stmt: RaiseStmt) -> DbResult<ResultSet> {
+        // X5: substituir cada `%` del mensaje con el arg posicional
+        // correspondiente. Arity strict: si #% != #args, error 4120.
+        let formatted = if stmt.args.is_empty() {
+            stmt.message.clone()
+        } else {
+            let empty: HashMap<String, Value> = HashMap::new();
+            let arg_values: Vec<Value> = stmt
+                .args
+                .iter()
+                .map(|e| self.eval_expr_full(e, &empty, None))
+                .collect::<DbResult<_>>()?;
+            format_raise_message(&stmt.message, &arg_values)?
+        };
         match stmt.level {
-            RaiseLevel::Exception => Err(coded(codes::RAISE_EXCEPTION, stmt.message)),
+            RaiseLevel::Exception => Err(coded(codes::RAISE_EXCEPTION, formatted)),
             RaiseLevel::Notice => Ok(ResultSet {
                 columns: Vec::new(),
                 rows: Vec::new(),
-                message: Some(format!("NOTICE: {}", stmt.message)),
+                message: Some(format!("NOTICE: {}", formatted)),
+            }),
+            RaiseLevel::Warning => Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!("WARNING: {}", formatted)),
+            }),
+            RaiseLevel::Info => Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!("INFO: {}", formatted)),
             }),
         }
     }
 
-    /// Bloque X4c: `FOR var IN start TO end LOOP <body> END LOOP`.
-    /// Eval start/end (deben ser INT), auto-declara la variable
-    /// (guarda el valor previo si ya existe — shadowing temporal),
-    /// itera inclusivo de start a end. EXIT viaja como sentinel.
-    /// Si start > end, el loop no itera (sin error).
+    /// Bloque X4c + X5 (2026-05-29):
+    /// `FOR var IN [REVERSE] start TO end [STEP n] LOOP <body> END LOOP`.
+    /// Eval start/end/step (todos INT), auto-declara la variable
+    /// (shadowing temporal), itera inclusivo. EXIT viaja como
+    /// sentinel. Sin REVERSE: `step > 0` y `start > end` no itera.
+    /// Con REVERSE: el step efectivo es `-step.abs()` y `start < end`
+    /// no itera. `STEP 0` es error 4120.
     fn exec_for(&mut self, stmt: ForStmt) -> DbResult<ResultSet> {
         let empty: HashMap<String, Value> = HashMap::new();
         let start_v = self.eval_expr_full(&stmt.start, &empty, None)?;
@@ -4085,6 +4156,34 @@ impl<'a> Engine<'a> {
                 ));
             }
         };
+        // X5: resolver step. Default = 1 (o -1 si REVERSE). El usuario
+        // pasa siempre un valor positivo; el sentido lo da REVERSE.
+        let step_magnitude = match &stmt.step {
+            None => 1i64,
+            Some(expr) => match self.eval_expr_full(expr, &empty, None)? {
+                Value::Integer(n) => n.unsigned_abs() as i64,
+                other => {
+                    return Err(coded(
+                        codes::FOR_RANGE_INVALID,
+                        format!(
+                            "FOR ... STEP n: n debe ser INT, recibí {}",
+                            value_type_name(&other)
+                        ),
+                    ));
+                }
+            },
+        };
+        if step_magnitude == 0 {
+            return Err(coded(
+                codes::RAISE_FORMAT_OR_FOR_STEP_INVALID,
+                "FOR ... STEP 0: el incremento no puede ser cero (loop infinito)",
+            ));
+        }
+        let step_effective = if stmt.reverse {
+            -step_magnitude
+        } else {
+            step_magnitude
+        };
         let key = stmt.var.to_ascii_lowercase();
         // Shadowing: guardamos el valor anterior si existe y lo
         // restauramos al final del loop (PG convention).
@@ -4092,7 +4191,16 @@ impl<'a> Engine<'a> {
         let mut iter_count = 0usize;
         let mut early_exit = false;
         let mut i = start;
-        while i <= end {
+        loop {
+            // X5: condición de parada según el sentido.
+            let still_in_range = if step_effective > 0 {
+                i <= end
+            } else {
+                i >= end
+            };
+            if !still_in_range {
+                break;
+            }
             if iter_count >= MAX_LOOP_ITERATIONS {
                 self.var_scope.remove(&key);
                 if let Some(v) = saved {
@@ -4128,7 +4236,8 @@ impl<'a> Engine<'a> {
                 break;
             }
             iter_count += 1;
-            i += 1;
+            // X5: overflow guard — saturating_add evita panic en i64::MAX/MIN.
+            i = i.saturating_add(step_effective);
         }
         // Restaurar var previa (o borrar si no existía).
         self.var_scope.remove(&key);
@@ -4182,6 +4291,13 @@ impl<'a> Engine<'a> {
                                         None
                                     }
                                 }
+                                // X5: nombre simbólico → resolver a código
+                                // y comparar. Si el nombre no está en el
+                                // mapa, no matchea (sigue al próximo).
+                                ExceptionFilter::Name(n) => match resolve_exception_name(n) {
+                                    Some(c) if err_code == Some(c) => Some(handler),
+                                    _ => None,
+                                },
                             });
                     if let Some(handler) = matched {
                         let mut handler_msg = format!("OK · EXCEPTION caught: {}", e);
@@ -14397,6 +14513,50 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
     }
 }
 
+/// Bloque X5 (2026-05-29): substituye cada `%` del template con el
+/// arg posicional correspondiente. PG-style: el `%` es literal (sin
+/// type code; usa la representación textual del valor). `%%` escapa
+/// un literal `%`. Si la cantidad de `%` no matchea la cantidad de
+/// args, devuelve `[GBY-4120]`.
+fn format_raise_message(template: &str, args: &[Value]) -> DbResult<String> {
+    let mut out = String::with_capacity(template.len());
+    let mut arg_idx = 0usize;
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some('%') = chars.peek() {
+                chars.next();
+                out.push('%');
+                continue;
+            }
+            if arg_idx >= args.len() {
+                return Err(coded(
+                    codes::RAISE_FORMAT_OR_FOR_STEP_INVALID,
+                    format!(
+                        "RAISE: mensaje tiene más placeholders `%` que argumentos ({} args)",
+                        args.len()
+                    ),
+                ));
+            }
+            out.push_str(&value_to_text(&args[arg_idx]));
+            arg_idx += 1;
+        } else {
+            out.push(c);
+        }
+    }
+    if arg_idx < args.len() {
+        return Err(coded(
+            codes::RAISE_FORMAT_OR_FOR_STEP_INVALID,
+            format!(
+                "RAISE: mensaje tiene {} placeholders `%` pero se pasaron {} argumentos",
+                arg_idx,
+                args.len()
+            ),
+        ));
+    }
+    Ok(out)
+}
+
 /// Bloque Y2 (2026-05-29): extrae el primer parámetro entero de un
 /// type_name como `VARCHAR(255)` o `CHAR(10)` y lo devuelve como
 /// `u32` para usar como `max_length`. Solo retorna `Some(_)` si el
@@ -16817,12 +16977,18 @@ impl Parser {
         Ok(stmts)
     }
 
-    /// Bloque X4c (2026-05-28): parsea `RAISE [EXCEPTION|NOTICE] 'msg'`.
-    /// Si no se especifica el level, default es EXCEPTION (consistente
-    /// con PG). El mensaje debe ser un literal STRING.
+    /// Bloque X4c (2026-05-28) + X5 (2026-05-29): parsea
+    /// `RAISE [EXCEPTION|NOTICE|WARNING|INFO] 'msg' [, arg1, arg2, ...]`.
+    /// Default level es `EXCEPTION` (consistente con PG). El mensaje
+    /// debe ser un literal STRING. Los args después de la coma son
+    /// expresiones que se interpolan en cada `%` del mensaje.
     fn parse_raise_stmt(&mut self) -> DbResult<Statement> {
         let level = if self.match_keyword("NOTICE") {
             RaiseLevel::Notice
+        } else if self.match_keyword("WARNING") {
+            RaiseLevel::Warning
+        } else if self.match_keyword("INFO") {
+            RaiseLevel::Info
         } else {
             let _ = self.match_keyword("EXCEPTION"); // opcional
             RaiseLevel::Exception
@@ -16838,13 +17004,20 @@ impl Parser {
             ));
         }
         self.pos += 1;
+        // X5: args opcionales separados por coma.
+        let mut args: Vec<Expr> = Vec::new();
+        while self.match_symbol(",") {
+            args.push(self.parse_expr()?);
+        }
         Ok(Statement::Raise(RaiseStmt {
             level,
             message: tok.text,
+            args,
         }))
     }
 
-    /// Bloque X4c: parsea `FOR ident IN start TO end LOOP <body> END LOOP`.
+    /// Bloque X4c + X5 (2026-05-29): parsea
+    /// `FOR ident IN [REVERSE] start TO end [STEP n] LOOP <body> END LOOP`.
     fn parse_for_stmt(&mut self) -> DbResult<Statement> {
         let var = self.expect_ident()?;
         if !self.match_keyword("IN") {
@@ -16853,6 +17026,8 @@ impl Parser {
                 "FOR ident ...: se esperaba IN",
             ));
         }
+        // X5: REVERSE opcional antes de start.
+        let reverse = self.match_keyword("REVERSE");
         let start = self.parse_expr()?;
         if !self.match_keyword("TO") {
             return Err(coded(
@@ -16861,10 +17036,16 @@ impl Parser {
             ));
         }
         let end = self.parse_expr()?;
+        // X5: STEP n opcional después de end.
+        let step = if self.match_keyword("STEP") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         if !self.match_keyword("LOOP") {
             return Err(coded(
                 codes::IF_BLOCK_MALFORMED,
-                "FOR ...: se esperaba LOOP después de end",
+                "FOR ...: se esperaba LOOP después de end/STEP",
             ));
         }
         let body = self.parse_loop_body()?;
@@ -16885,6 +17066,8 @@ impl Parser {
             start,
             end,
             body,
+            step,
+            reverse,
         })))
     }
 
@@ -16907,25 +17090,33 @@ impl Parser {
                 let filter = if self.match_keyword("OTHERS") {
                     ExceptionFilter::Others
                 } else {
-                    // Espera literal entero (código GBY-NNNN sin prefijo).
                     let tok = self.peek().clone();
-                    if tok.kind != TokenKind::Number {
-                        return Err(coded(
-                            codes::EXCEPTION_FILTER_INVALID,
-                            format!(
-                                "EXCEPTION WHEN <filter>: se esperaba OTHERS o código entero (vi '{}')",
-                                tok.text
-                            ),
-                        ));
+                    match tok.kind {
+                        TokenKind::Number => {
+                            self.pos += 1;
+                            let code: u32 = tok.text.parse().map_err(|_| {
+                                coded(
+                                    codes::EXCEPTION_FILTER_INVALID,
+                                    format!("EXCEPTION WHEN: código inválido '{}'", tok.text),
+                                )
+                            })?;
+                            ExceptionFilter::Code(code)
+                        }
+                        // X5 (2026-05-29): nombre simbólico estilo PG.
+                        TokenKind::Ident => {
+                            self.pos += 1;
+                            ExceptionFilter::Name(tok.text)
+                        }
+                        _ => {
+                            return Err(coded(
+                                codes::EXCEPTION_FILTER_INVALID,
+                                format!(
+                                    "EXCEPTION WHEN <filter>: se esperaba OTHERS, código entero o nombre simbólico (vi '{}')",
+                                    tok.text
+                                ),
+                            ));
+                        }
                     }
-                    self.pos += 1;
-                    let code: u32 = tok.text.parse().map_err(|_| {
-                        coded(
-                            codes::EXCEPTION_FILTER_INVALID,
-                            format!("EXCEPTION WHEN: código inválido '{}'", tok.text),
-                        )
-                    })?;
-                    ExceptionFilter::Code(code)
                 };
                 if !self.match_keyword("THEN") {
                     return Err(coded(

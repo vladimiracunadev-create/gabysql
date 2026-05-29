@@ -610,6 +610,12 @@ pub mod codes {
     /// se mide en bytes UTF-8 (no en code points), igual que el
     /// length-prefixed encoding global.
     pub const VALUE_LENGTH_EXCEEDED: u32 = 4119;
+    /// Bloque X5 (2026-05-29): mensaje de `RAISE EXCEPTION 'fmt %', args`
+    /// con cantidad de `%` distinta a la cantidad de argumentos
+    /// posicionales, o `FOR i IN ... STEP n` con `n = 0` (loop infinito
+    /// trivial). Codifica ambos en un mismo slot porque son errores
+    /// estructurales del modelo procedural.
+    pub const RAISE_FORMAT_OR_FOR_STEP_INVALID: u32 = 4120;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

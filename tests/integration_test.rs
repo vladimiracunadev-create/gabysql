@@ -11806,6 +11806,279 @@ fn y_unsupported_type_still_errors() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque X5 (2026-05-29): refinamientos del bloque X.
+// RAISE WARNING/INFO, formato `%` en RAISE, FOR STEP/REVERSE,
+// EXCEPTION WHEN <nombre> simbólico.
+// ============================================================
+
+fn x5_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x5-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x5_raise_warning_emits_message() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("warning")?;
+    let res = run_sql(&db, "RAISE WARNING 'cuidado con esto';")?;
+    let msg = res[0].message.clone().unwrap_or_default();
+    assert!(msg.contains("WARNING"));
+    assert!(msg.contains("cuidado con esto"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_raise_info_emits_message() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("info")?;
+    let res = run_sql(&db, "RAISE INFO 'solo informativo';")?;
+    let msg = res[0].message.clone().unwrap_or_default();
+    assert!(msg.contains("INFO"));
+    assert!(msg.contains("solo informativo"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_raise_format_pct_substitutes_args() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("fmt")?;
+    let err = run_sql(
+        &db,
+        "RAISE EXCEPTION 'valor % invalido en % campos', 42, 3;",
+    );
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("valor 42 invalido en 3 campos"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_raise_format_pct_escape_double() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("escape")?;
+    let err = run_sql(&db, "RAISE EXCEPTION '100%% lleno con % items', 7;");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("100% lleno con 7 items"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_raise_format_pct_arity_mismatch_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("arity")?;
+    let err = run_sql(&db, "RAISE EXCEPTION 'a % b % c', 1;");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4120"), "esperaba GBY-4120, vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_for_step_skips_values() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("step")?;
+    // Patrón X4b: vars no visibles en INSERT VALUES → acumulamos en
+    // DECLARE/SET y verificamos afuera. FOR 1 TO 10 STEP 2 itera 5
+    // veces (1,3,5,7,9) y last_i debe quedar en 9.
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "DECLARE cnt INT DEFAULT 0;
+         DECLARE last_i INT DEFAULT 0;
+         FOR i IN 1 TO 10 STEP 2 LOOP
+            SET cnt = cnt + 1;
+            SET last_i = i;
+         END LOOP;
+         IF cnt = 5 THEN INSERT INTO log (id) VALUES (5); END IF;
+         IF last_i = 9 THEN INSERT INTO log (id) VALUES (9); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log ORDER BY id;")?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("esperaba INT"),
+        })
+        .collect();
+    assert_eq!(ids, vec![5, 9]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_for_reverse_decrements() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("reverse")?;
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    // FOR REVERSE 5 TO 1 itera 5 veces, último i = 1, primero = 5.
+    run_sql(
+        &db,
+        "DECLARE cnt INT DEFAULT 0;
+         DECLARE last_i INT DEFAULT 99;
+         FOR i IN REVERSE 5 TO 1 LOOP
+            SET cnt = cnt + 1;
+            SET last_i = i;
+         END LOOP;
+         IF cnt = 5 THEN INSERT INTO log (id) VALUES (5); END IF;
+         IF last_i = 1 THEN INSERT INTO log (id) VALUES (1); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log ORDER BY id;")?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("esperaba INT"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 5]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_for_reverse_step_combined() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("rev-step")?;
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    // FOR REVERSE 10 TO 1 STEP 3 itera 4 veces (10, 7, 4, 1), suma = 22.
+    run_sql(
+        &db,
+        "DECLARE cnt INT DEFAULT 0;
+         DECLARE total INT DEFAULT 0;
+         FOR i IN REVERSE 10 TO 1 STEP 3 LOOP
+            SET cnt = cnt + 1;
+            SET total = total + i;
+         END LOOP;
+         IF cnt = 4 THEN INSERT INTO log (id) VALUES (4); END IF;
+         IF total = 22 THEN INSERT INTO log (id) VALUES (22); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log ORDER BY id;")?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("esperaba INT"),
+        })
+        .collect();
+    assert_eq!(ids, vec![4, 22]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_for_step_zero_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("step-zero")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         CREATE PROCEDURE p() AS BEGIN
+            FOR i IN 1 TO 5 STEP 0 LOOP
+               INSERT INTO log (id) VALUES (1);
+            END LOOP;
+         END;",
+    )?;
+    let err = run_sql(&db, "CALL p();");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4120"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_exception_when_symbolic_unique_falls_through_on_pk_dup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("name-fallthru")?;
+    // PK dup tira [GBY-3001] DUPLICATE_PRIMARY_KEY. El nombre simbólico
+    // `unique_violation` mapea a 3003 (UNIQUE_VIOLATED), así que no
+    // matchea el PK dup → cae al OTHERS catch-all.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE TABLE caught (id INT PRIMARY KEY, tag TEXT);
+         CREATE PROCEDURE try_dup() AS BEGIN
+            BEGIN
+               INSERT INTO t (id) VALUES (1);
+            EXCEPTION
+               WHEN unique_violation THEN
+                  INSERT INTO caught (id, tag) VALUES (1, 'unique');
+               WHEN OTHERS THEN
+                  INSERT INTO caught (id, tag) VALUES (2, 'other');
+            END;
+         END;
+         CALL try_dup();",
+    )?;
+    let res = run_sql(&db, "SELECT tag FROM caught;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    let tag = match &res[0].rows[0][0] {
+        Value::String(s) => s.clone(),
+        _ => panic!("expected string"),
+    };
+    assert_eq!(tag, "other");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_exception_when_primary_key_violation_name() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("pk-name")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE TABLE caught (id INT PRIMARY KEY, tag TEXT);
+         CREATE PROCEDURE try_dup() AS BEGIN
+            BEGIN
+               INSERT INTO t (id) VALUES (1);
+            EXCEPTION
+               WHEN primary_key_violation THEN
+                  INSERT INTO caught (id, tag) VALUES (1, 'pk');
+            END;
+         END;
+         CALL try_dup();",
+    )?;
+    let res = run_sql(&db, "SELECT tag FROM caught;")?;
+    let tag = match &res[0].rows[0][0] {
+        Value::String(s) => s.clone(),
+        _ => panic!("expected string"),
+    };
+    assert_eq!(tag, "pk");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x5_exception_when_unknown_name_falls_through() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x5_setup("unknown-name")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE TABLE caught (id INT PRIMARY KEY, tag TEXT);
+         CREATE PROCEDURE try_dup() AS BEGIN
+            BEGIN
+               INSERT INTO t (id) VALUES (1);
+            EXCEPTION
+               WHEN no_such_exception_name THEN
+                  INSERT INTO caught (id, tag) VALUES (1, 'bad');
+               WHEN OTHERS THEN
+                  INSERT INTO caught (id, tag) VALUES (2, 'others');
+            END;
+         END;
+         CALL try_dup();",
+    )?;
+    let res = run_sql(&db, "SELECT tag FROM caught;")?;
+    let tag = match &res[0].rows[0][0] {
+        Value::String(s) => s.clone(),
+        _ => panic!("expected string"),
+    };
+    assert_eq!(tag, "others");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque Y2 (2026-05-29): enforcement de VARCHAR(n) / CHAR(n).
 // Bump VERSION 17→18 — persiste max_length por columna.
 // ============================================================

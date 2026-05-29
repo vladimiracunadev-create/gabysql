@@ -213,6 +213,7 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4117` | `EXCEPTION_FILTER_INVALID` | X4e: `EXCEPTION WHEN <filter>` con filtro que no es `OTHERS` ni un entero. | Usar `OTHERS` o un código numérico (`WHEN 4111 THEN`). |
 | `4118` | `RETURN_OUTSIDE_FUNCTION` | Bloque X4f (2026-05-29): `RETURN expr` fuera del body de una function. | Mover el `RETURN` al body de un `CREATE FUNCTION ... AS BEGIN ... END`. |
 | `4119` | `VALUE_LENGTH_EXCEEDED` | Bloque Y2 (2026-05-29): INSERT/UPDATE de string que excede `VARCHAR(n)`/`CHAR(n)`. La longitud se mide en bytes UTF-8. | Truncar el string o ampliar el `n` con `ALTER TABLE` (no soportado todavía — usar `DROP COLUMN` + `ADD COLUMN`). |
+| `4120` | `RAISE_FORMAT_OR_FOR_STEP_INVALID` | Bloque X5 (2026-05-29): `RAISE 'fmt %', args` con arity mismatch entre `%` y argumentos, **o** `FOR i IN ... STEP 0` (incremento cero → loop infinito). | Igualar el número de `%` y args en el RAISE; o usar `STEP n` con `n != 0`. |
 
 ---
 

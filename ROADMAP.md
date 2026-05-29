@@ -96,6 +96,8 @@
 
 - ~~Enforcement de longitud `VARCHAR(n)` / `CHAR(n)`: persiste `max_length: Option<u32>` por columna (nuevo flag `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08`, 4 bytes LE adicionales). Helper `extract_length_param` re-parsea `(n)` desde el `type_name` y lo asigna sólo a tipos de familia TEXT. Encoder valida en INSERT/UPDATE/INSERT...SELECT/CTAS — un solo check en `encode_row`. Conteo en **bytes UTF-8** (no code points). Bump VERSION 17→18. Range enforcement SMALLINT/TINYINT, BLOB/BYTEA, DECIMAL exacto, ARRAY, ENUM diferidos a Y3~~ ✅ entregado (bloque **Y2**, 2026-05-29, [ADR-0040](docs/adr/0040-varchar-length-enforcement-y2.md)).
 
+- ~~Refinamientos del bloque X (cleanup post-X4f de items menores): `RAISE WARNING|INFO` (además de EXCEPTION/NOTICE), formato `%` en RAISE (`RAISE EXCEPTION 'value % bad', x` con substitución posicional, `%%` escapa, arity strict), `STEP n` y `REVERSE` en `FOR i IN a TO b LOOP` (step magnitude + sign por REVERSE, STEP 0 rechazado), `EXCEPTION WHEN <name>` filtros simbólicos PG-style (`unique_violation`, `primary_key_violation`, `foreign_key_violation`, `check_violation`, `division_by_zero`, etc. — tabla `resolve_exception_name`). Sin bump on-disk. `FOR row IN SELECT` (composite row scope) diferido a X6~~ ✅ entregado (bloque **X5**, 2026-05-29, [ADR-0041](docs/adr/0041-x5-procedural-refinements.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`
