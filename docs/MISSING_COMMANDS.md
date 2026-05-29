@@ -306,7 +306,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `CREATE SEQUENCE` / `nextval` | ❌ | P1 |
 | `AUTO_INCREMENT` / `SERIAL` / `IDENTITY` (PK auto) | ❌ | P0 |
 | `CREATE SCHEMA` / namespace | ❌ | P3 |
-| `CREATE TRIGGER` | ❌ | P2 |
+| `CREATE TRIGGER name AFTER {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <single_dml>` | ✅ (X1, 2026-05-28; VERSION 13→14, persistido, NEW/OLD via token-sub) | — |
+| `CREATE TRIGGER ... BEFORE ...` | ❌ (X1 rechaza con `[GBY-4093]`, diferido a X2) | P2 |
+| Trigger body multi-statement (`BEGIN ... END`) | ❌ (diferido a X2) | P2 |
 | `CREATE FUNCTION` / stored procedures | ❌ | P3 |
 | `CREATE TYPE` (enums, composites) | ❌ | P3 |
 

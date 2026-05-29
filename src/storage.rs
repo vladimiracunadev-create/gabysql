@@ -112,7 +112,14 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        como subquery en cualquier FROM que las referencia. V12
 //        rechazados con `[GBY-1003]` — migración manual: dump SELECT
 //        + recreate con binario V13.
-pub const VERSION: u32 = 13;
+//  14 -> Bloque X1 (2026-05-28): triggers (`CREATE TRIGGER name
+//        {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table FOR EACH ROW
+//        <single_dml>`, `DROP TRIGGER`). El discriminator `[kind:u8]`
+//        agrega el valor `2=Trigger`. Cada trigger guarda nombre,
+//        tabla target, timing y event (1 byte cada uno), y el body
+//        como texto SQL (re-parseado en cada fire — mismo patrón que
+//        ViewMeta). V13 rechazados con `[GBY-1003]` — migración manual.
+pub const VERSION: u32 = 14;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

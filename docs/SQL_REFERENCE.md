@@ -50,7 +50,8 @@
 | [`WITH name AS (SELECT ...)` (CTEs no-recursivas)](#ctes-no-recursivas-with-bloque-w1) — encadenables, en JOIN/subquery/set-ops, shadowing ANSI | DML | 🟢 (bloque W1) |
 | [`WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`](#ctes-recursivas-with-recursive-bloque-w2) — fixpoint base+step, delta semantics, guards de runaway | DML | 🟢 (bloque W2) |
 | [Window functions](#window-functions-bloque-w3) — `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` con `OVER (PARTITION BY ... ORDER BY ...)` | DML | 🟢 (bloque W3) |
-| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, frame specs explícitas (`ROWS BETWEEN`), `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| [`CREATE TRIGGER name AFTER {INSERT\|UPDATE\|DELETE} ON t FOR EACH ROW <single_dml>` + `DROP TRIGGER`](#triggers-after-bloque-x1) | DDL | 🟢 (bloque X1 / VERSION 14) |
+| BEFORE triggers, body multi-statement, `CREATE FUNCTION`, `CREATE PROCEDURE`, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -1761,6 +1762,73 @@ FROM students;
 - **`PERCENT_RANK`, `CUME_DIST`**: funciones de distribución.
 - **Mezcla con `GROUP BY`**: usar derived table como workaround.
 - **`LAST_VALUE` con semántica ANSI** (CURRENT ROW default con ORDER BY): llegará cuando se implementen frames explícitas.
+
+---
+
+## Triggers AFTER (bloque X1)
+
+> **`CREATE TRIGGER ... AFTER ... FOR EACH ROW <single_dml>`**: ejecuta una sentencia INSERT/UPDATE/DELETE/REPLACE después de cada fila afectada por un INSERT/UPDATE/DELETE. Casos típicos: auditoría, log de cambios, denormalización, tombstone tables. Persistido en el catálogo (bump VERSION 13 → 14).
+
+### 📜 EBNF
+
+```
+create_trigger ::= "CREATE" "TRIGGER" ident "AFTER" ("INSERT"|"UPDATE"|"DELETE")
+                   "ON" ident "FOR" "EACH" "ROW" dml_stmt
+drop_trigger   ::= "DROP" "TRIGGER" ["IF" "EXISTS"] ident
+dml_stmt       ::= insert_stmt | update_stmt | delete_stmt | replace_stmt
+```
+
+### 🧠 Referencias `NEW.col` / `OLD.col`
+
+| Evento | NEW disponible | OLD disponible |
+|---|:---:|:---:|
+| `INSERT` | ✅ (fila recién insertada) | ❌ → `[GBY-4094]` |
+| `UPDATE` | ✅ (fila post-update) | ✅ (fila pre-update) |
+| `DELETE` | ❌ → `[GBY-4094]` | ✅ (fila recién borrada) |
+
+Las referencias se substituyen a nivel de **TOKEN** antes de re-parsear el body — funciona en cualquier contexto (`INSERT VALUES`, `UPDATE SET`, `WHERE`, etc.).
+
+### ✅ Ejemplos
+
+```sql
+-- Auditoría simple
+CREATE TABLE audit (id INT PRIMARY KEY, action TEXT, who INT);
+CREATE TRIGGER audit_user_insert AFTER INSERT ON users
+    FOR EACH ROW INSERT INTO audit (id, action, who)
+                 VALUES (NEW.id, 'inserted', NEW.id);
+
+-- Log de cambios con NEW y OLD
+CREATE TRIGGER log_price_change AFTER UPDATE ON products
+    FOR EACH ROW INSERT INTO price_log (id, old_price, new_price)
+                 VALUES (NEW.id, OLD.price, NEW.price);
+
+-- Tombstone table
+CREATE TRIGGER tomb AFTER DELETE ON items
+    FOR EACH ROW INSERT INTO removed (id, name) VALUES (OLD.id, OLD.name);
+
+-- Borrado
+DROP TRIGGER IF EXISTS audit_user_insert;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4092] CREATE TRIGGER '...': ya existe un objeto ...` | Colisión de nombre con tabla / vista / trigger. |
+| `[GBY-4093] BEFORE triggers no se soportan en este release` | Diferido a X2. |
+| `[GBY-4093] el body debe arrancar con INSERT, UPDATE, DELETE o REPLACE` | Body es SELECT u otra cosa. |
+| `[GBY-4094] trigger 'X': NEW.y no es una columna válida` | Referencia a columna inexistente o NEW/OLD en evento incompatible. |
+| `[GBY-4095] cascada de triggers excedió la profundidad 16` | Recursión runaway (un trigger dispara otro DML que dispara más triggers). |
+| `[GBY-4096] DROP TRIGGER '...': no existe` | Nombre desconocido sin `IF EXISTS`. |
+
+### ⚠️ No soportado todavía
+
+- **`BEFORE` triggers** — diferido a X2.
+- **Body multi-statement (`BEGIN ... END`)** — diferido a X2.
+- **`FOR EACH STATEMENT`** (vs `FOR EACH ROW`) — fuera de scope.
+- **`INSTEAD OF` triggers** (sobre vistas) — fuera de scope.
+- **Lenguaje procedural** (variables, IF/THEN, LOOP, EXCEPTION) — X3+.
+- **OLD en UPSERT que terminó en UPDATE** — el path `INSERT ... ON CONFLICT DO UPDATE` que dispara AFTER UPDATE fire con OLD=None.
 
 ---
 

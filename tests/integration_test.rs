@@ -9862,6 +9862,213 @@ fn w3_avg_running() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X1 (2026-05-28): triggers AFTER. -----
+
+fn x1_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x1-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x1_after_insert_audit() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("after-insert")?;
+    run_sql(
+        &db,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE audit (id INT PRIMARY KEY, action TEXT, who INT);
+         CREATE TRIGGER audit_user_insert AFTER INSERT ON users \
+            FOR EACH ROW INSERT INTO audit (id, action, who) VALUES (NEW.id, 'inserted', NEW.id);",
+    )?;
+    run_sql(&db, "INSERT INTO users (id, name) VALUES (10, 'Ana');")?;
+    run_sql(&db, "INSERT INTO users (id, name) VALUES (20, 'Bob');")?;
+    let res = run_sql(&db, "SELECT id, action, who FROM audit ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(10));
+    assert_eq!(res[0].rows[0][1], Value::String("inserted".to_string()));
+    assert_eq!(res[0].rows[0][2], Value::Integer(10));
+    assert_eq!(res[0].rows[1][0], Value::Integer(20));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_after_update_uses_new_and_old() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("after-update")?;
+    run_sql(
+        &db,
+        "CREATE TABLE products (id INT PRIMARY KEY, price INT);
+         CREATE TABLE price_log (id INT PRIMARY KEY, old_price INT, new_price INT);
+         INSERT INTO products (id, price) VALUES (1, 100);
+         CREATE TRIGGER log_price_change AFTER UPDATE ON products \
+            FOR EACH ROW INSERT INTO price_log (id, old_price, new_price) \
+                         VALUES (NEW.id, OLD.price, NEW.price);",
+    )?;
+    run_sql(&db, "UPDATE products SET price = 150 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT id, old_price, new_price FROM price_log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::Integer(100));
+    assert_eq!(res[0].rows[0][2], Value::Integer(150));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_after_delete_uses_old() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("after-delete")?;
+    run_sql(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE removed (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO items (id, name) VALUES (1, 'A');
+         INSERT INTO items (id, name) VALUES (2, 'B');
+         CREATE TRIGGER tomb AFTER DELETE ON items \
+            FOR EACH ROW INSERT INTO removed (id, name) VALUES (OLD.id, OLD.name);",
+    )?;
+    run_sql(&db, "DELETE FROM items WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT id, name FROM removed;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::String("A".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_trigger_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("persists")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE log (id INT PRIMARY KEY);
+         CREATE TRIGGER trg AFTER INSERT ON t \
+            FOR EACH ROW INSERT INTO log (id) VALUES (NEW.id);",
+    )?;
+    // Re-open implícito a través de un run_sql posterior — el pager se
+    // crea de cero cada vez en este harness.
+    run_sql(&db, "INSERT INTO t (id) VALUES (42);")?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_drop_trigger_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE log (id INT PRIMARY KEY);
+         CREATE TRIGGER trg AFTER INSERT ON t \
+            FOR EACH ROW INSERT INTO log (id) VALUES (NEW.id);",
+    )?;
+    run_sql(&db, "DROP TRIGGER trg;")?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (1);")?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_drop_trigger_if_exists_noop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("drop-if-exists")?;
+    run_sql(&db, "DROP TRIGGER IF EXISTS nope;")?;
+    let err = run_sql(&db, "DROP TRIGGER nope;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4096"),
+        "esperaba GBY-4096, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_before_rejected_in_release() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("before-reject")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW INSERT INTO t (id) VALUES (0);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4093"),
+        "esperaba GBY-4093, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_trigger_name_collides_with_table() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("name-collision")?;
+    run_sql(&db, "CREATE TABLE collide (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "CREATE TRIGGER collide AFTER INSERT ON collide \
+            FOR EACH ROW INSERT INTO collide (id) VALUES (NEW.id);",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4092"),
+        "esperaba GBY-4092, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_trigger_recursion_guard() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("recursion")?;
+    // El trigger AFTER UPDATE hace otro UPDATE sobre la misma fila →
+    // cascada infinita hasta MAX_TRIGGER_DEPTH (16). Usa UPDATE SET
+    // (que admite Expr `NEW.n + 1`) en lugar de INSERT VALUES (que
+    // solo admite literales).
+    run_sql(
+        &db,
+        "CREATE TABLE counter (id INT PRIMARY KEY, n INT);
+         INSERT INTO counter (id, n) VALUES (1, 0);
+         CREATE TRIGGER bump AFTER UPDATE ON counter \
+            FOR EACH ROW UPDATE counter SET n = NEW.n + 1 WHERE id = NEW.id;",
+    )?;
+    let err = run_sql(&db, "UPDATE counter SET n = 1 WHERE id = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4095"),
+        "esperaba GBY-4095, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x1_trigger_body_must_be_dml() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x1_setup("body-dml")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW SELECT * FROM t;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4093"),
+        "esperaba GBY-4093, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

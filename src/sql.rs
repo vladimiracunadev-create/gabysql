@@ -2,7 +2,7 @@ use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
     ColumnType, DefaultLiteral, ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate,
-    TableMeta, ViewMeta,
+    TableMeta, TriggerMeta, ViewMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -34,6 +34,11 @@ pub enum Statement {
     CreateView(CreateViewStmt),
     /// Bloque V (2026-05-27): `DROP VIEW [IF EXISTS] <name>`.
     DropView(DropViewStmt),
+    /// Bloque X1 (2026-05-28): `CREATE TRIGGER name {BEFORE|AFTER}
+    /// {INSERT|UPDATE|DELETE} ON table FOR EACH ROW <single_dml>`.
+    CreateTrigger(CreateTriggerStmt),
+    /// Bloque X1: `DROP TRIGGER [IF EXISTS] name`.
+    DropTrigger(DropTriggerStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -236,6 +241,87 @@ pub struct CreateViewStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropViewStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// Bloque X1 (2026-05-28): timing del trigger respecto al DML que lo
+/// dispara.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+impl TriggerTiming {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            Self::Before => "BEFORE",
+            Self::After => "AFTER",
+        }
+    }
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Before => 0,
+            Self::After => 1,
+        }
+    }
+    pub fn from_code(c: u8) -> Option<Self> {
+        match c {
+            0 => Some(Self::Before),
+            1 => Some(Self::After),
+            _ => None,
+        }
+    }
+}
+
+/// Bloque X1: evento DML que dispara el trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl TriggerEvent {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Insert => 0,
+            Self::Update => 1,
+            Self::Delete => 2,
+        }
+    }
+    pub fn from_code(c: u8) -> Option<Self> {
+        match c {
+            0 => Some(Self::Insert),
+            1 => Some(Self::Update),
+            2 => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// Bloque X1 (2026-05-28): `CREATE TRIGGER name { BEFORE | AFTER }
+/// { INSERT | UPDATE | DELETE } ON table FOR EACH ROW <single_dml_stmt>`.
+/// Body persistido como texto SQL, re-parseado en cada fire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerStmt {
+    pub name: String,
+    pub table: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub body_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTriggerStmt {
     pub name: String,
     pub if_exists: bool,
 }
@@ -1386,12 +1472,25 @@ pub struct Engine<'a> {
     /// mutuamente (`A → B → A`) y contra el caso degenerado donde una
     /// vista se referencia a sí misma. Límite duro: `MAX_VIEW_DEPTH`.
     view_expansion_depth: usize,
+    /// Bloque X1 (2026-05-28): profundidad de cascada de triggers. Cada
+    /// fire de trigger (BEFORE o AFTER) incrementa este contador antes
+    /// de ejecutar el body; se decrementa al volver. Protege contra
+    /// triggers que disparan triggers en loop (e.g. trigger AFTER
+    /// INSERT que hace otro INSERT sobre la misma tabla). Límite duro:
+    /// `MAX_TRIGGER_DEPTH`.
+    trigger_depth: usize,
 }
 
 /// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
 /// por encima de cualquier caso real (5-6 niveles es lo normal) y muy
 /// por debajo del stack de Rust (~5k frames).
 const MAX_VIEW_DEPTH: usize = 32;
+
+/// Bloque X1: límite de profundidad de cascada de triggers. 16 niveles
+/// es suficiente para cualquier diseño razonable de triggers
+/// encadenados; un valor superior casi siempre indica una recursión
+/// no intencionada que conviene atajar temprano.
+const MAX_TRIGGER_DEPTH: usize = 16;
 
 #[derive(Debug, Clone)]
 struct OuterRow {
@@ -1406,6 +1505,7 @@ impl<'a> Engine<'a> {
             outer_stack: Vec::new(),
             explicit_tx: false,
             view_expansion_depth: 0,
+            trigger_depth: 0,
         }
     }
 
@@ -1418,6 +1518,8 @@ impl<'a> Engine<'a> {
             Statement::AlterTableDropConstraint(stmt) => self.exec_alter_drop_constraint(stmt),
             Statement::CreateView(stmt) => self.exec_create_view(stmt),
             Statement::DropView(stmt) => self.exec_drop_view(stmt),
+            Statement::CreateTrigger(stmt) => self.exec_create_trigger(stmt),
+            Statement::DropTrigger(stmt) => self.exec_drop_trigger(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -2888,6 +2990,16 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
+            Some(CatalogObject::Trigger(_)) => {
+                return Err(coded(
+                    codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
+                    format!(
+                        "CREATE VIEW '{}': ya existe un TRIGGER con ese nombre. Tablas, vistas \
+                         y triggers comparten namespace; usá otro nombre.",
+                        stmt.name
+                    ),
+                ));
+            }
             Some(CatalogObject::View(_)) => {
                 if stmt.if_not_exists {
                     return Ok(ResultSet {
@@ -2945,6 +3057,10 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a una TABLA, no a una vista. Usá DROP TABLE.",
                 stmt.name
             ))),
+            Some(CatalogObject::Trigger(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a un TRIGGER, no a una vista. Usá DROP TRIGGER.",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -2960,6 +3076,221 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// Bloque X1 (2026-05-28): `CREATE TRIGGER`. Valida colisión de
+    /// nombre con cualquier objeto del catálogo (tabla/vista/trigger
+    /// comparten namespace), valida que la tabla target exista (no se
+    /// aceptan triggers sobre vistas en X1), y persiste el TriggerMeta.
+    fn exec_create_trigger(&mut self, stmt: CreateTriggerStmt) -> DbResult<ResultSet> {
+        // Validar nombre
+        validate_identifier(&stmt.name, "trigger")?;
+        // X1: solo AFTER soportado en este release. BEFORE difiere a X2.
+        if matches!(stmt.timing, TriggerTiming::Before) {
+            return Err(coded(
+                codes::TRIGGER_BODY_INVALID,
+                format!(
+                    "CREATE TRIGGER '{}': BEFORE triggers no se soportan en este release (X1: solo AFTER). \
+                     Workaround: usar AFTER. BEFORE llega en X2.",
+                    stmt.name
+                ),
+            ));
+        }
+        // Tabla target debe existir y ser tabla (no vista)
+        {
+            let mut catalog = Catalog::open(self.pager);
+            match catalog.get_object(&stmt.table)? {
+                Some(CatalogObject::Table(_)) => {}
+                Some(CatalogObject::View(_)) => {
+                    return Err(coded(
+                        codes::TRIGGER_BODY_INVALID,
+                        format!(
+                            "CREATE TRIGGER '{}': la target '{}' es una vista, no una tabla. \
+                             Triggers sobre vistas no soportados en este release.",
+                            stmt.name, stmt.table
+                        ),
+                    ));
+                }
+                Some(CatalogObject::Trigger(_)) | None => {
+                    return Err(coded(
+                        codes::TABLE_NOT_FOUND,
+                        format!(
+                            "CREATE TRIGGER '{}': la tabla target '{}' no existe",
+                            stmt.name, stmt.table
+                        ),
+                    ));
+                }
+            }
+        }
+        // Colisión de nombre
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if let Some(existing) = catalog.get_object(&stmt.name)? {
+                let kind = match existing {
+                    CatalogObject::Table(_) => "TABLA",
+                    CatalogObject::View(_) => "VISTA",
+                    CatalogObject::Trigger(_) => "TRIGGER",
+                };
+                return Err(coded(
+                    codes::TRIGGER_NAME_COLLIDES,
+                    format!(
+                        "CREATE TRIGGER '{}': ya existe un objeto ({}) con ese nombre. \
+                         Tablas, vistas y triggers comparten namespace.",
+                        stmt.name, kind
+                    ),
+                ));
+            }
+        }
+        let meta = TriggerMeta {
+            name: stmt.name.clone(),
+            table: stmt.table.clone(),
+            timing_code: stmt.timing.code(),
+            event_code: stmt.event.code(),
+            body_sql: stmt.body_sql,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_trigger(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · trigger '{}' creado ({} {} ON {})",
+                stmt.name,
+                stmt.timing.keyword(),
+                stmt.event.keyword(),
+                stmt.table
+            )),
+        })
+    }
+
+    /// Bloque X1: `DROP TRIGGER [IF EXISTS] name`.
+    fn exec_drop_trigger(&mut self, stmt: DropTriggerStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::Trigger(_)) => {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.remove_object(&stmt.name)?;
+                Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!("OK · trigger '{}' eliminado", stmt.name)),
+                })
+            }
+            Some(_) => Err(coded(
+                codes::TRIGGER_NOT_FOUND,
+                format!(
+                    "DROP TRIGGER '{}': el nombre apunta a un objeto que no es un trigger",
+                    stmt.name
+                ),
+            )),
+            None => {
+                if stmt.if_exists {
+                    Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!(
+                            "OK · trigger '{}' no existía (IF EXISTS)",
+                            stmt.name
+                        )),
+                    })
+                } else {
+                    Err(coded(
+                        codes::TRIGGER_NOT_FOUND,
+                        format!("DROP TRIGGER '{}': no existe", stmt.name),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Bloque X1: helper rápido — ¿hay algún trigger AFTER `event` sobre
+    /// `table`? Usado para skip de snapshots OLD/NEW cuando no aplica.
+    fn has_after_trigger(&mut self, table: &str, event: TriggerEvent) -> DbResult<bool> {
+        let table_norm = normalize_ident(table);
+        let mut catalog = Catalog::open(self.pager);
+        let trigs = catalog.list_triggers()?;
+        Ok(trigs.iter().any(|t| {
+            normalize_ident(&t.table) == table_norm
+                && t.event_code == event.code()
+                && t.timing_code == TriggerTiming::After.code()
+        }))
+    }
+
+    /// Bloque X1: dispara todos los triggers que matchean (table, event,
+    /// timing) en orden alfabético por nombre. Para cada trigger:
+    /// substituye NEW.col / OLD.col a nivel de TOKEN (no AST) — así
+    /// también funciona dentro de `INSERT VALUES` (donde la posición
+    /// pide un Value literal, no un Expr). Re-parsea el resultado y
+    /// ejecuta. Guard de recursión via `trigger_depth`.
+    fn fire_triggers(
+        &mut self,
+        table: &str,
+        event: TriggerEvent,
+        timing: TriggerTiming,
+        new_row: Option<&HashMap<String, Value>>,
+        old_row: Option<&HashMap<String, Value>>,
+    ) -> DbResult<()> {
+        let table_norm = normalize_ident(table);
+        let mut matching: Vec<TriggerMeta> = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog
+                .list_triggers()?
+                .into_iter()
+                .filter(|t| {
+                    normalize_ident(&t.table) == table_norm
+                        && t.event_code == event.code()
+                        && t.timing_code == timing.code()
+                })
+                .collect()
+        };
+        if matching.is_empty() {
+            return Ok(());
+        }
+        matching.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        });
+        for trig in matching {
+            if self.trigger_depth >= MAX_TRIGGER_DEPTH {
+                return Err(coded(
+                    codes::TRIGGER_RECURSION_DEPTH_EXCEEDED,
+                    format!(
+                        "trigger '{}': cascada de triggers excedió la profundidad {} \
+                         (¿un trigger modifica su misma tabla?)",
+                        trig.name, MAX_TRIGGER_DEPTH
+                    ),
+                ));
+            }
+            // Substituir NEW.x / OLD.x a nivel de TOKEN sobre el
+            // body_sql antes de re-parsear. Esto funciona en cualquier
+            // contexto (INSERT VALUES, UPDATE SET, WHERE, etc.) sin
+            // depender del AST.
+            let substituted =
+                substitute_new_old_in_sql_text(&trig.body_sql, new_row, old_row, &trig.name)?;
+            let mut parsed = parse(&substituted)?;
+            if parsed.len() != 1 {
+                return Err(coded(
+                    codes::TRIGGER_BODY_INVALID,
+                    format!(
+                        "trigger '{}': el body persistido contiene {} sentencias (esperaba 1)",
+                        trig.name,
+                        parsed.len()
+                    ),
+                ));
+            }
+            let body_stmt = parsed.remove(0);
+            self.trigger_depth += 1;
+            let res = self.exec(body_stmt);
+            self.trigger_depth -= 1;
+            res?;
+        }
+        Ok(())
     }
 
     /// Issue #1 (2026-05-27): pre-evalúa toda `ScalarSubquery` no
@@ -3629,12 +3960,33 @@ impl<'a> Engine<'a> {
             match outcome {
                 RowOutcome::Inserted(row) => {
                     inserted += 1;
+                    // Bloque X1 (2026-05-28): fire AFTER INSERT triggers.
+                    // NEW = la fila tal cual quedó escrita.
+                    self.fire_triggers(
+                        &stmt.table,
+                        TriggerEvent::Insert,
+                        TriggerTiming::After,
+                        Some(&row),
+                        None,
+                    )?;
                     if stmt.returning.is_some() {
                         affected_rows.push(row);
                     }
                 }
                 RowOutcome::Updated(row) => {
                     replaced += 1;
+                    // Bloque X1: UPSERT/REPLACE que terminó en UPDATE → fire
+                    // AFTER UPDATE. OLD no disponible en este path
+                    // (apply_insert_row_with_conflict no lo conserva); se
+                    // fire con OLD=None — el body que use OLD.x devolverá
+                    // [GBY-4094]. Documentado como limitación X1.
+                    self.fire_triggers(
+                        &stmt.table,
+                        TriggerEvent::Update,
+                        TriggerTiming::After,
+                        Some(&row),
+                        None,
+                    )?;
                     if stmt.returning.is_some() {
                         affected_rows.push(row);
                     }
@@ -6530,17 +6882,48 @@ impl<'a> Engine<'a> {
 
         let mut updated = 0usize;
         let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
+        // Bloque X1 (2026-05-28): detectar si hay triggers AFTER UPDATE
+        // sobre esta tabla — si los hay, snapshot OLD antes de cada
+        // update para pasárselo al body. Si no hay, evitamos la lectura
+        // extra para no pagar el overhead.
+        let needs_old_snapshot = self.has_after_trigger(&meta.name, TriggerEvent::Update)?;
         for pk in &target_pks {
-            self.apply_update_to_pk(&meta, *pk, &expr_assignments)?;
-            updated += 1;
-            if stmt.returning.is_some() {
-                // Bloque J2: re-leer la fila post-update para RETURNING.
+            let old_row: Option<HashMap<String, Value>> = if needs_old_snapshot {
                 let bytes = {
                     let mut catalog = Catalog::open(self.pager);
                     catalog.get_row(meta.root_page, *pk)?
                 };
-                if let Some(b) = bytes {
-                    affected_rows.push(decode_row(&meta, &b)?);
+                bytes.map(|b| decode_row(&meta, &b)).transpose()?
+            } else {
+                None
+            };
+            self.apply_update_to_pk(&meta, *pk, &expr_assignments)?;
+            updated += 1;
+            // X1: re-leer la fila para tener NEW. Si la PK cambió, el
+            // row movió a otra clave — para X1 firewall con NEW=None
+            // (el body que use NEW.x devolverá [GBY-4094]).
+            let new_row: Option<HashMap<String, Value>> =
+                if needs_old_snapshot || stmt.returning.is_some() {
+                    let bytes = {
+                        let mut catalog = Catalog::open(self.pager);
+                        catalog.get_row(meta.root_page, *pk)?
+                    };
+                    bytes.map(|b| decode_row(&meta, &b)).transpose()?
+                } else {
+                    None
+                };
+            if needs_old_snapshot {
+                self.fire_triggers(
+                    &meta.name,
+                    TriggerEvent::Update,
+                    TriggerTiming::After,
+                    new_row.as_ref(),
+                    old_row.as_ref(),
+                )?;
+            }
+            if stmt.returning.is_some() {
+                if let Some(r) = new_row {
+                    affected_rows.push(r);
                 }
             }
         }
@@ -7371,17 +7754,34 @@ impl<'a> Engine<'a> {
                 continue;
             }
             // Bloque J2: snapshot de la fila ANTES del delete para RETURNING.
-            if stmt.returning.is_some() {
+            // Bloque X1 (2026-05-28): si hay triggers AFTER DELETE,
+            // necesitamos la fila ANTES del delete para pasar como OLD.
+            let needs_old = stmt.returning.is_some()
+                || self.has_after_trigger(&meta.name, TriggerEvent::Delete)?;
+            let old_row: Option<HashMap<String, Value>> = if needs_old {
                 let bytes = {
                     let mut catalog = Catalog::open(self.pager);
                     catalog.get_row(meta.root_page, pk)?
                 };
-                if let Some(b) = bytes {
-                    affected_rows.push(decode_row(&meta, &b)?);
+                bytes.map(|b| decode_row(&meta, &b)).transpose()?
+            } else {
+                None
+            };
+            if stmt.returning.is_some() {
+                if let Some(r) = &old_row {
+                    affected_rows.push(r.clone());
                 }
             }
             delete_with_cascade(self.pager, &meta.name, pk)?;
             deleted += 1;
+            // Bloque X1: fire AFTER DELETE con OLD.
+            self.fire_triggers(
+                &meta.name,
+                TriggerEvent::Delete,
+                TriggerTiming::After,
+                None,
+                old_row.as_ref(),
+            )?;
         }
 
         if let Some(returning) = &stmt.returning {
@@ -12994,6 +13394,240 @@ fn rows_to_values_select(name: &str, columns: &[String], rows: &[Vec<Value>]) ->
 }
 
 // ---------------------------------------------------------------------
+// Bloque X1 (2026-05-28): substitución de NEW.col / OLD.col en el body
+// de un trigger antes de exec. Estrategia: TOKEN-level — tokenizamos
+// el body_sql persistido, walkeamos buscando triplets
+// [Ident("NEW"|"OLD"), Symbol("."), Ident("col")] y los reemplazamos
+// por los tokens del literal correspondiente (via `format_value_literal`
+// + re-tokenizar). Reconstruimos SQL y lo parseamos limpio. Funciona
+// también dentro de `INSERT VALUES (...)` (donde la sintaxis no
+// admite Expr y el AST-walking del W1/W2 no llegaba).
+// ---------------------------------------------------------------------
+
+fn substitute_new_old_in_sql_text(
+    body_sql: &str,
+    new_row: Option<&HashMap<String, Value>>,
+    old_row: Option<&HashMap<String, Value>>,
+    trig_name: &str,
+) -> DbResult<String> {
+    let tokens = tokenize(body_sql)?;
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        if tok.kind != TokenKind::Ident {
+            out.push(tok);
+            continue;
+        }
+        // El tokenizer trata `.` como parte del ident → `NEW.id` viene
+        // como un único Ident("NEW.id"). Chequeamos el prefijo
+        // case-insensitive y substituimos si matchea.
+        let lower = tok.text.to_ascii_lowercase();
+        let (prefix_upper, rest) = if let Some(r) = lower.strip_prefix("new.") {
+            ("NEW", r.to_string())
+        } else if let Some(r) = lower.strip_prefix("old.") {
+            ("OLD", r.to_string())
+        } else {
+            out.push(tok);
+            continue;
+        };
+        if rest.is_empty() || rest.contains('.') {
+            // Forma rara como `NEW.` solo o `NEW.a.b` — dejamos pasar.
+            out.push(tok);
+            continue;
+        }
+        let row_opt = if prefix_upper == "NEW" {
+            new_row
+        } else {
+            old_row
+        };
+        let row = row_opt.ok_or_else(|| {
+            coded(
+                codes::TRIGGER_NEW_OLD_OUT_OF_SCOPE,
+                format!(
+                    "trigger '{}': referencia a {} fuera de scope (el evento DML no expone esa forma)",
+                    trig_name, prefix_upper
+                ),
+            )
+        })?;
+        let v = row.get(&rest).cloned().ok_or_else(|| {
+            coded(
+                codes::TRIGGER_NEW_OLD_OUT_OF_SCOPE,
+                format!(
+                    "trigger '{}': {}.{} no es una columna válida del row del evento",
+                    trig_name, prefix_upper, rest
+                ),
+            )
+        })?;
+        let literal_sql = format_value_literal(&v);
+        let mut sub_tokens = tokenize(&literal_sql)?;
+        out.append(&mut sub_tokens);
+    }
+    Ok(reconstruct_sql_from_tokens(&out))
+}
+
+#[allow(dead_code)]
+fn substitute_new_old_in_stmt(
+    stmt: &mut Statement,
+    new_row: Option<&HashMap<String, Value>>,
+    old_row: Option<&HashMap<String, Value>>,
+    trig_name: &str,
+) -> DbResult<()> {
+    match stmt {
+        Statement::Insert(ins) | Statement::Replace(ins) => {
+            // INSERT VALUES tiene `Value` literal (no Expr) en
+            // InsertSource::Values, así que no hay sustitución
+            // posible ahí. INSERT ... SELECT tampoco se toca acá:
+            // el SELECT subyacente vive en otra rama y para X1
+            // su body no es sustituido (limitación documentada).
+            // Sí procesamos los assignments de UPSERT DO UPDATE.
+            if let Some(oc) = &mut ins.on_conflict {
+                if let OnConflictAction::DoUpdate { assignments } = &mut oc.action {
+                    for (_, expr) in assignments {
+                        substitute_new_old_in_expr(expr, new_row, old_row, trig_name)?;
+                    }
+                }
+            }
+        }
+        Statement::Update(upd) => {
+            for (_, expr) in &mut upd.assignments {
+                substitute_new_old_in_expr(expr, new_row, old_row, trig_name)?;
+            }
+            substitute_new_old_in_where(&mut upd.where_clause, new_row, old_row, trig_name)?;
+        }
+        Statement::Delete(del) => {
+            substitute_new_old_in_where(&mut del.where_clause, new_row, old_row, trig_name)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn substitute_new_old_in_where(
+    w: &mut WhereExpr,
+    new_row: Option<&HashMap<String, Value>>,
+    old_row: Option<&HashMap<String, Value>>,
+    trig_name: &str,
+) -> DbResult<()> {
+    match w {
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            substitute_new_old_in_where(a, new_row, old_row, trig_name)?;
+            substitute_new_old_in_where(b, new_row, old_row, trig_name)?;
+        }
+        WhereExpr::Not(a) => substitute_new_old_in_where(a, new_row, old_row, trig_name)?,
+        WhereExpr::Atom(c) => substitute_new_old_in_clause(c, new_row, old_row, trig_name)?,
+    }
+    Ok(())
+}
+
+fn substitute_new_old_in_clause(
+    c: &mut WhereClause,
+    new_row: Option<&HashMap<String, Value>>,
+    old_row: Option<&HashMap<String, Value>>,
+    trig_name: &str,
+) -> DbResult<()> {
+    match c {
+        WhereClause::Eq { value, .. } => {
+            // value es Value, no Expr — no aplica
+            let _ = value;
+        }
+        WhereClause::Compare { value, .. } => {
+            let _ = value;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn substitute_new_old_in_expr(
+    e: &mut Expr,
+    new_row: Option<&HashMap<String, Value>>,
+    old_row: Option<&HashMap<String, Value>>,
+    trig_name: &str,
+) -> DbResult<()> {
+    match e {
+        Expr::Column(name) => {
+            let lower = name.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("new.") {
+                let row = new_row.ok_or_else(|| {
+                    coded(
+                        codes::TRIGGER_NEW_OLD_OUT_OF_SCOPE,
+                        format!(
+                            "trigger '{}': referencia a NEW fuera de scope (evento DELETE no expone NEW)",
+                            trig_name
+                        ),
+                    )
+                })?;
+                let v = row.get(rest).cloned().ok_or_else(|| {
+                    coded(
+                        codes::TRIGGER_NEW_OLD_OUT_OF_SCOPE,
+                        format!(
+                            "trigger '{}': NEW.{} no es una columna válida",
+                            trig_name, rest
+                        ),
+                    )
+                })?;
+                *e = Expr::Literal(v);
+            } else if let Some(rest) = lower.strip_prefix("old.") {
+                let row = old_row.ok_or_else(|| {
+                    coded(
+                        codes::TRIGGER_NEW_OLD_OUT_OF_SCOPE,
+                        format!(
+                            "trigger '{}': referencia a OLD fuera de scope (evento INSERT no expone OLD)",
+                            trig_name
+                        ),
+                    )
+                })?;
+                let v = row.get(rest).cloned().ok_or_else(|| {
+                    coded(
+                        codes::TRIGGER_NEW_OLD_OUT_OF_SCOPE,
+                        format!(
+                            "trigger '{}': OLD.{} no es una columna válida",
+                            trig_name, rest
+                        ),
+                    )
+                })?;
+                *e = Expr::Literal(v);
+            }
+        }
+        Expr::Func(_, args) => {
+            for a in args {
+                substitute_new_old_in_expr(a, new_row, old_row, trig_name)?;
+            }
+        }
+        Expr::Cast(b, _) => substitute_new_old_in_expr(b, new_row, old_row, trig_name)?,
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                substitute_new_old_in_expr(op, new_row, old_row, trig_name)?;
+            }
+            for (cond, val) in branches {
+                substitute_new_old_in_expr(cond, new_row, old_row, trig_name)?;
+                substitute_new_old_in_expr(val, new_row, old_row, trig_name)?;
+            }
+            if let Some(eb) = else_branch {
+                substitute_new_old_in_expr(eb, new_row, old_row, trig_name)?;
+            }
+        }
+        Expr::Compare(a, _, b) | Expr::Arith(a, _, b) => {
+            substitute_new_old_in_expr(a, new_row, old_row, trig_name)?;
+            substitute_new_old_in_expr(b, new_row, old_row, trig_name)?;
+        }
+        Expr::IsNull(a, _) | Expr::Like(a, _, _) | Expr::InList(a, _, _) => {
+            substitute_new_old_in_expr(a, new_row, old_row, trig_name)?;
+        }
+        Expr::Between(a, lo, hi, _) => {
+            substitute_new_old_in_expr(a, new_row, old_row, trig_name)?;
+            substitute_new_old_in_expr(lo, new_row, old_row, trig_name)?;
+            substitute_new_old_in_expr(hi, new_row, old_row, trig_name)?;
+        }
+        Expr::Literal(_) | Expr::ScalarSubquery(_) => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // Bloque W3 (2026-05-28): infra de window functions.
 // ---------------------------------------------------------------------
 
@@ -13831,6 +14465,12 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::DropView(DropViewStmt { name, if_exists }));
         }
+        if self.match_keyword("TRIGGER") {
+            // Bloque X1 (2026-05-28).
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropTrigger(DropTriggerStmt { name, if_exists }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
@@ -13876,6 +14516,93 @@ impl Parser {
             if_not_exists,
             column_aliases,
             source,
+        }))
+    }
+
+    /// Bloque X1 (2026-05-28): parsea `CREATE TRIGGER name {BEFORE|AFTER}
+    /// {INSERT|UPDATE|DELETE} ON table FOR EACH ROW <single_dml>`.
+    /// El body se valida sintácticamente como Insert/Update/Delete
+    /// statement, y el texto SQL se reconstruye desde los tokens para
+    /// persistirlo (re-parseado en cada fire — mismo patrón que VIEW).
+    fn parse_create_trigger(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        let timing = if self.match_keyword("BEFORE") {
+            TriggerTiming::Before
+        } else if self.match_keyword("AFTER") {
+            TriggerTiming::After
+        } else {
+            return Err(coded(
+                codes::TRIGGER_BODY_INVALID,
+                "CREATE TRIGGER: se esperaba BEFORE o AFTER",
+            ));
+        };
+        let event = if self.match_keyword("INSERT") {
+            TriggerEvent::Insert
+        } else if self.match_keyword("UPDATE") {
+            TriggerEvent::Update
+        } else if self.match_keyword("DELETE") {
+            TriggerEvent::Delete
+        } else {
+            return Err(coded(
+                codes::TRIGGER_BODY_INVALID,
+                "CREATE TRIGGER: se esperaba INSERT, UPDATE o DELETE",
+            ));
+        };
+        self.expect_keyword("ON")?;
+        let table = self.expect_ident()?;
+        self.expect_keyword("FOR")?;
+        self.expect_keyword("EACH")?;
+        self.expect_keyword("ROW")?;
+        // Body: una sola sentencia DML. No podemos parsearla acá
+        // porque puede contener `NEW.col` / `OLD.col` (que el parser
+        // de VALUES rechaza por no ser literal). Estrategia:
+        // 1. Verificar que el primer keyword del body sea
+        //    INSERT/UPDATE/DELETE/REPLACE (chequeo barato).
+        // 2. Consumir tokens hasta el `;` o EOF.
+        // 3. Reconstruir el body_sql desde los tokens.
+        // 4. La validación real sucede en cada fire (post-substitución
+        //    de NEW/OLD → literales) — el parser ahí ve SQL ya
+        //    estándar y rechaza si es inválido.
+        let head = self.peek().clone();
+        if head.kind != TokenKind::Ident
+            || !matches!(
+                head.text.to_ascii_uppercase().as_str(),
+                "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+            )
+        {
+            return Err(coded(
+                codes::TRIGGER_BODY_INVALID,
+                format!(
+                    "CREATE TRIGGER ... FOR EACH ROW: el body debe arrancar con INSERT, UPDATE, DELETE o REPLACE (vi '{}')",
+                    head.text
+                ),
+            ));
+        }
+        let start = self.pos;
+        // Consumir tokens del body hasta `;` o EOF. El statement
+        // splitter de `parse()` ya separa por `;`, así que llegamos
+        // acá con un único statement-chunk; sólo necesitamos avanzar
+        // hasta el final del chunk.
+        while self.peek().kind != TokenKind::Eof {
+            if self.peek().kind == TokenKind::Symbol && self.peek().text == ";" {
+                break;
+            }
+            self.pos += 1;
+        }
+        let end = self.pos;
+        if start == end {
+            return Err(coded(
+                codes::TRIGGER_BODY_INVALID,
+                "CREATE TRIGGER ... FOR EACH ROW: body vacío",
+            ));
+        }
+        let body_sql = reconstruct_sql_from_tokens(&self.tokens[start..end]);
+        Ok(Statement::CreateTrigger(CreateTriggerStmt {
+            name,
+            table,
+            timing,
+            event,
+            body_sql,
         }))
     }
 
@@ -14313,6 +15040,11 @@ impl Parser {
         // SELECT/VALUES/set-ops del CTAS (K1).
         if self.match_keyword("VIEW") {
             return self.parse_create_view();
+        }
+        // Bloque X1 (2026-05-28): `CREATE TRIGGER name {BEFORE|AFTER}
+        // {INSERT|UPDATE|DELETE} ON table FOR EACH ROW <single_dml>`.
+        if self.match_keyword("TRIGGER") {
+            return self.parse_create_trigger();
         }
         self.expect_keyword("TABLE")?;
         // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS

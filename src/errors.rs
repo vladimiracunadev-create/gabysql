@@ -502,6 +502,26 @@ pub mod codes {
     /// una CTE recursive, CHECK constraint, etc.). Sólo el SELECT
     /// list del SELECT top-level acepta windows.
     pub const WINDOW_NOT_ALLOWED_HERE: u32 = 4091;
+    /// Bloque X1 (2026-05-28): `CREATE TRIGGER name ...` cuyo nombre
+    /// colisiona con otra trigger / tabla / vista en el catálogo. Los
+    /// nombres viven en un namespace global (mismo trato que vistas).
+    pub const TRIGGER_NAME_COLLIDES: u32 = 4092;
+    /// Bloque X1: el body de `CREATE TRIGGER ... FOR EACH ROW <stmt>`
+    /// debe ser una sentencia DML simple (INSERT / UPDATE / DELETE).
+    /// SELECTs, transacciones, DDL u otros statements rechazados.
+    pub const TRIGGER_BODY_INVALID: u32 = 4093;
+    /// Bloque X1: referencia a `NEW.col` en un trigger `DELETE` (donde
+    /// NEW no existe), a `OLD.col` en un `INSERT`, o a una columna
+    /// inexistente en NEW/OLD.
+    pub const TRIGGER_NEW_OLD_OUT_OF_SCOPE: u32 = 4094;
+    /// Bloque X1: la cascada de triggers excedió `MAX_TRIGGER_DEPTH`
+    /// (un trigger disparó otro DML que disparó otro trigger, etc.).
+    /// Causa típica: trigger que modifica la misma tabla. Mismo
+    /// fail-safe que VIEW_EXPANSION_DEPTH_EXCEEDED.
+    pub const TRIGGER_RECURSION_DEPTH_EXCEEDED: u32 = 4095;
+    /// Bloque X1: `DROP TRIGGER name` sobre un nombre que no existe.
+    /// `DROP TRIGGER IF EXISTS` no rebota — devuelve OK silencioso.
+    pub const TRIGGER_NOT_FOUND: u32 = 4096;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -1047,12 +1047,15 @@ impl ViewMeta {
 }
 
 /// Bloque V (VERSION 13): discriminator byte que arranca cada record
-/// del catálogo. Permite tener tablas y vistas conviviendo en el mismo
-/// B+Tree del catálogo sin colisiones de schema.
+/// del catálogo. Permite tener tablas, vistas y triggers conviviendo
+/// en el mismo B+Tree del catálogo sin colisiones de schema.
+///
+/// Bloque X1 (VERSION 14, 2026-05-28): agregado `Trigger`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Table,
     View,
+    Trigger,
 }
 
 impl ObjectKind {
@@ -1060,6 +1063,7 @@ impl ObjectKind {
         match self {
             Self::Table => 0,
             Self::View => 1,
+            Self::Trigger => 2,
         }
     }
 
@@ -1067,19 +1071,70 @@ impl ObjectKind {
         match code {
             0 => Ok(Self::Table),
             1 => Ok(Self::View),
+            2 => Ok(Self::Trigger),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger)",
                 other
             ))),
         }
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla o vista.
+/// Bloque X1 (VERSION 14): metadata de un trigger. El body se persiste
+/// como texto SQL — re-tokenizado y re-parseado en cada fire (mismo
+/// patrón que `ViewMeta::source`). Layout on-disk:
+///
+///     [name][table][timing:u8][event:u8][body_sql]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerMeta {
+    pub name: String,
+    pub table: String,
+    pub timing_code: u8,
+    pub event_code: u8,
+    pub body_sql: String,
+}
+
+impl TriggerMeta {
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::new();
+        push_string(&mut out, &self.name)?;
+        push_string(&mut out, &self.table)?;
+        out.push(self.timing_code);
+        out.push(self.event_code);
+        push_string(&mut out, &self.body_sql)?;
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        let table = take_string(data, &mut offset)?;
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "TriggerMeta '{}' corrupta: faltan bytes timing/event",
+                name
+            )));
+        }
+        let timing_code = data[offset];
+        offset += 1;
+        let event_code = data[offset];
+        offset += 1;
+        let body_sql = take_string(data, &mut offset)?;
+        Ok(Self {
+            name,
+            table,
+            timing_code,
+            event_code,
+            body_sql,
+        })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista o trigger.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
     View(ViewMeta),
+    Trigger(TriggerMeta),
 }
 
 impl CatalogObject {
@@ -1087,6 +1142,7 @@ impl CatalogObject {
         match self {
             Self::Table(t) => &t.name,
             Self::View(v) => &v.name,
+            Self::Trigger(t) => &t.name,
         }
     }
 }
@@ -1104,6 +1160,7 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
     Ok(match kind {
         ObjectKind::Table => CatalogObject::Table(TableMeta::deserialize(rest)?),
         ObjectKind::View => CatalogObject::View(ViewMeta::deserialize(rest)?),
+        ObjectKind::Trigger => CatalogObject::Trigger(TriggerMeta::deserialize(rest)?),
     })
 }
 
@@ -1137,7 +1194,7 @@ impl<'a> Catalog<'a> {
             .into_iter()
             .filter_map(|o| match o {
                 CatalogObject::Table(t) => Some(t),
-                CatalogObject::View(_) => None,
+                _ => None,
             })
             .collect())
     }
@@ -1147,8 +1204,21 @@ impl<'a> Catalog<'a> {
             .list_objects()?
             .into_iter()
             .filter_map(|o| match o {
-                CatalogObject::Table(_) => None,
                 CatalogObject::View(v) => Some(v),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Bloque X1: lista todos los triggers del catálogo. El executor
+    /// los filtra in-memory por tabla/event/timing antes de fire.
+    pub fn list_triggers(&mut self) -> DbResult<Vec<TriggerMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Trigger(t) => Some(t),
+                _ => None,
             })
             .collect())
     }
@@ -1182,16 +1252,21 @@ impl<'a> Catalog<'a> {
     pub fn get_table(&mut self, name: &str) -> DbResult<Option<TableMeta>> {
         match self.get_object(name)? {
             Some(CatalogObject::Table(t)) => Ok(Some(t)),
-            // Una vista con el mismo nombre NO es una tabla — devolvemos
-            // None y el caller decide cómo reportarlo.
-            Some(CatalogObject::View(_)) | None => Ok(None),
+            _ => Ok(None),
         }
     }
 
     pub fn get_view(&mut self, name: &str) -> DbResult<Option<ViewMeta>> {
         match self.get_object(name)? {
             Some(CatalogObject::View(v)) => Ok(Some(v)),
-            Some(CatalogObject::Table(_)) | None => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn get_trigger(&mut self, name: &str) -> DbResult<Option<TriggerMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::Trigger(t)) => Ok(Some(t)),
+            _ => Ok(None),
         }
     }
 
@@ -1211,6 +1286,17 @@ impl<'a> Catalog<'a> {
         let key = hash_name(&meta.name);
         let mut payload = Vec::with_capacity(1 + 32);
         payload.push(ObjectKind::View.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    pub fn put_trigger(&mut self, meta: &TriggerMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key = hash_name(&meta.name);
+        let mut payload = Vec::with_capacity(1 + 32);
+        payload.push(ObjectKind::Trigger.code());
         payload.extend_from_slice(&meta.serialize()?);
         let mut tree = Tree::new(self.pager);
         tree.upsert(root, key, payload)?;

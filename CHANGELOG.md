@@ -6,6 +6,49 @@
 
 ---
 
+## 2026-05-28 — Bloque X1: triggers AFTER (`CREATE TRIGGER`)
+
+> **Un push a `main`** con bump on-disk **VERSION 13 → 14**. Entrega el primer sub-bloque del bloque X del roadmap: triggers AFTER con body single-statement, persistidos en el catálogo. Detalle en [`docs/adr/0029-triggers-after-x1.md`](docs/adr/0029-triggers-after-x1.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+CREATE TRIGGER audit_user_insert AFTER INSERT ON users
+    FOR EACH ROW INSERT INTO audit (id, action, who) VALUES (NEW.id, 'inserted', NEW.id);
+
+CREATE TRIGGER log_price_change AFTER UPDATE ON products
+    FOR EACH ROW INSERT INTO price_log (id, old_price, new_price)
+                 VALUES (NEW.id, OLD.price, NEW.price);
+
+CREATE TRIGGER tomb AFTER DELETE ON items
+    FOR EACH ROW INSERT INTO removed (id, name) VALUES (OLD.id, OLD.name);
+
+DROP TRIGGER [IF EXISTS] audit_user_insert;
+```
+
+### 🛠 Implementación
+
+- **Persistencia**: nuevo `ObjectKind::Trigger` en el catálogo (discriminator `2`). `TriggerMeta { name, table, timing, event, body_sql }`. Body persistido como texto SQL — mismo enfoque que `ViewMeta.source`.
+- **Bump VERSION 13 → 14**. V13 abierto por un binario X1+ rebota con `[GBY-1003]` (migración manual: dump + recreate).
+- **NEW/OLD vía substitución a nivel de TOKEN**: el parser de INSERT VALUES solo acepta literales, no Expr — así que en lugar de un walker AST, tokenizamos el body persistido, reemplazamos cada token `Ident("NEW.x"|"OLD.x")` por los tokens del literal correspondiente del row, reconstruimos SQL y parseamos. Funciona en cualquier contexto.
+- **Hooks en `exec_insert/update/delete`**: AFTER fires después del write exitoso. `has_after_trigger(table, event)` evita el overhead de snapshot OLD/NEW cuando no hay triggers.
+- **Guard de recursión `MAX_TRIGGER_DEPTH = 16`** vía `Engine::trigger_depth`. Cascada infinita rebota `[GBY-4095]`.
+
+### 🚫 Diferido (con código de error explícito)
+
+- **BEFORE triggers** → `[GBY-4093]`. Diferido a X2 (necesita semántica clara de NEW antes-de-defaults y abort).
+- **Body multi-statement (`BEGIN ... END`)** → X2.
+- **Lenguaje procedural** (variables, IF/THEN, LOOP, EXCEPTION) → X3+.
+- **`CREATE FUNCTION` / `CREATE PROCEDURE`** → X3+.
+- **Triggers sobre vistas (INSTEAD OF)** → futuro.
+
+### 🧪 Validación
+
+- 10 tests `x1_*`: audit INSERT, UPDATE con NEW+OLD, DELETE con OLD, persistencia tras reopen, DROP + DROP IF EXISTS, BEFORE rechazado, colisión de nombres, recursion guard, body no-DML rechazado.
+- Suite total: **417/417 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque W3: window functions (cierra bloque W)
 
 > **Un push a `main`.** Última pieza del bloque W del roadmap. 13 funciones soportadas (ranking, aggregate, value) con `OVER ( [PARTITION BY ...] [ORDER BY ...] )`. Sin bump de formato — puro motor de proyección. Detalle en [`docs/adr/0028-window-functions.md`](docs/adr/0028-window-functions.md).
