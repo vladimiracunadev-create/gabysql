@@ -16242,15 +16242,24 @@ fn p1_explain_does_not_execute_statement() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn p1_explain_analyze_unsupported_clean_error() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = p1_setup("analyze")?;
+fn p1_explain_analyze_now_executes_after_p2() -> Result<(), Box<dyn Error>> {
+    // P1 originalmente rebotaba ANALYZE con [GBY-4139] como defer P2.
+    // P2 ya lo implementa: ANALYZE corre el statement real y agrega
+    // actual.time + actual.rows. Verificamos eso aquí.
+    let (db, wal) = p1_setup("analyze-post-p2")?;
     run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
-    let err = run_sql(&db, "EXPLAIN ANALYZE SELECT * FROM t;").unwrap_err();
-    assert!(
-        err.to_string().contains("GBY-4139"),
-        "esperaba [GBY-4139], vi: {}",
-        err
-    );
+    let res = run_sql(&db, "EXPLAIN ANALYZE SELECT * FROM t;")?;
+    let last = res.last().unwrap();
+    let steps: Vec<String> = last
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert!(steps.contains(&"actual.time".to_string()));
+    assert!(steps.contains(&"actual.rows".to_string()));
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -16277,6 +16286,176 @@ fn p1_explain_select_distinct_and_limit() -> Result<(), Box<dyn Error>> {
     assert!(joined.contains("ORDER BY"));
     assert!(joined.contains("LIMIT"));
     assert!(joined.contains("DISTINCT"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque P2 (2026-05-29): EXPLAIN ANALYZE — plan P1 + ejecución
+// real + timing (Instant) + row count. Sin bump on-disk.
+// ============================================================
+
+fn p2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("p2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn p2_explain_analyze_select_includes_plan_and_actuals() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("select")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30);",
+    )?;
+    let res = run_sql(&db, "EXPLAIN ANALYZE SELECT n FROM t WHERE id = 2;")?;
+    let last = res.last().unwrap();
+    let rows: Vec<(String, String)> = last
+        .rows
+        .iter()
+        .map(|r| {
+            let s = match &r[0] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            let d = match &r[1] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            (s, d)
+        })
+        .collect();
+    // Plan step.
+    assert!(
+        rows.iter().any(|(_, d)| d.contains("PK lookup")),
+        "esperaba plan PK lookup en {:?}",
+        rows
+    );
+    // actual.time aparece.
+    let actual_time = rows
+        .iter()
+        .find(|(s, _)| s == "actual.time")
+        .expect("falta actual.time");
+    assert!(
+        actual_time.1.contains("ms"),
+        "actual.time debe traer ms en {:?}",
+        actual_time
+    );
+    // actual.rows aparece con conteo 1 (id=2 existe).
+    let actual_rows = rows
+        .iter()
+        .find(|(s, _)| s == "actual.rows")
+        .expect("falta actual.rows");
+    assert!(
+        actual_rows.1.starts_with("1 fila"),
+        "esperaba '1 fila producida', vi: {:?}",
+        actual_rows
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p2_explain_analyze_select_zero_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("zero-rows")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    let res = run_sql(&db, "EXPLAIN ANALYZE SELECT n FROM t WHERE id = 999;")?;
+    let actual_rows = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| matches!(&r[0], Value::String(s) if s == "actual.rows"))
+        .expect("falta actual.rows");
+    let detail = match &actual_rows[1] {
+        Value::String(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert!(
+        detail.starts_with("0 filas"),
+        "esperaba '0 filas producidas', vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p2_explain_analyze_insert_persists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("insert-persists")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    // ANALYZE INSERT debería ejecutar el INSERT (con side-effects).
+    run_sql(&db, "EXPLAIN ANALYZE INSERT INTO t (id, n) VALUES (1, 42);")?;
+    let res = run_sql(&db, "SELECT n FROM t WHERE id = 1;")?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p2_explain_sin_analyze_no_persiste() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("dry-run")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    // EXPLAIN sin ANALYZE NO ejecuta.
+    run_sql(&db, "EXPLAIN INSERT INTO t (id, n) VALUES (1, 42);")?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p2_explain_analyze_update_modifica() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("update")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);",
+    )?;
+    run_sql(&db, "EXPLAIN ANALYZE UPDATE t SET n = 99 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT n FROM t WHERE id = 1;")?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p2_explain_analyze_message_warns_persistencia() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("warn")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let res = run_sql(&db, "EXPLAIN ANALYZE SELECT * FROM t;")?;
+    let msg = res.last().unwrap().message.clone().unwrap_or_default();
+    assert!(
+        msg.contains("EXPLAIN ANALYZE") && msg.contains("PERSISTIDOS"),
+        "esperaba warning de side-effects en message: {}",
+        msg
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p2_explain_analyze_error_capturado() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p2_setup("err")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    // INSERT que viola PK — el inner exec falla, ANALYZE captura el error
+    // como actual.error step.
+    run_sql(&db, "INSERT INTO t (id) VALUES (1);")?;
+    let res = run_sql(&db, "EXPLAIN ANALYZE INSERT INTO t (id) VALUES (1);")?;
+    let last = res.last().unwrap();
+    let has_error_step = last
+        .rows
+        .iter()
+        .any(|r| matches!(&r[0], Value::String(s) if s == "actual.error"));
+    assert!(
+        has_error_step,
+        "esperaba step actual.error tras INSERT duplicado, vi: {:?}",
+        last
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }

@@ -6,6 +6,36 @@
 
 ---
 
+## 2026-05-29 — Bloque P2: `EXPLAIN ANALYZE <statement>`
+
+> **Un push a `main`** sin bump on-disk. Segundo sub-bloque de Fase 3 (Performance/Planeación). Detalle en [`docs/adr/0064-p2-explain-analyze.md`](docs/adr/0064-p2-explain-analyze.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+EXPLAIN ANALYZE SELECT n FROM t WHERE id = 2;
+-- ResultSet con cols ["step", "detail"]:
+--   1               | PK lookup `t.id` = 2
+--   actual.time     | 0.123 ms wall-clock (Instant elapsed)
+--   actual.rows     | 1 fila producida
+-- message: "EXPLAIN ANALYZE: plan + ejecución real (0.123 ms, 1 rows). Cuidado: side-effects PERSISTIDOS."
+```
+
+### 🔑 Decisiones clave
+
+- **AST refactor**: `Statement::Explain` pasa de variante tupla a struct `{ analyze: bool, inner: Box<Statement> }`.
+- **Ejecuta el inner real**: `std::time::Instant` mide wall-clock, conteo real de filas (`rs.rows.len()`).
+- **Side-effects PERSISTEN**: `EXPLAIN ANALYZE INSERT/UPDATE/DELETE/DDL` aplican cambios. Para dry-run, `EXPLAIN <stmt>` sin ANALYZE.
+- **Errores se capturan como dato**: si el inner falla (PK violation, RLS, etc.), no propaga Err — agrega step `actual.error` y devuelve ResultSet OK con plan + error.
+- Test obsoleto P1 `p1_explain_analyze_unsupported_clean_error` (esperaba [GBY-4139]) renombrado a `p1_explain_analyze_now_executes_after_p2` y reescrito para asertar comportamiento positivo.
+
+### 🧪 Tests
+
+- 7 nuevos `p2_*` + 1 renombrado.
+- Suite: **715 passing + 1 ignored** (708 → +7).
+
+---
+
 ## 2026-05-29 — Bloque P1: `EXPLAIN <statement>` (Fase 3 arranca)
 
 > **Un push a `main`** sin bump on-disk. Primer sub-bloque de Fase 3 (Performance/Planeación). Nombrado **P1** para cortar limpio con la cadena Z. Detalle en [`docs/adr/0063-p1-explain-statement.md`](docs/adr/0063-p1-explain-statement.md).

@@ -6,7 +6,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-31-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-708%2F708-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-715%2F715-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 > **2026-05-29 — Bloques W/X/Y entregados.** Esta tabla se mantiene mayormente como estaba al cierre de 2026-05-27 (V13). Los subsistemas nuevos del 2026-05-29 son:
@@ -72,7 +72,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | `CREATE/DROP DATABASE` + `SHOW DATABASES` | 🟢 | Despachados por server (`/exec`) y CLI antes de abrir Pager. En modo single-DB → 405. | [src/server.rs](../src/server.rs), [src/bin/gabysql.rs](../src/bin/gabysql.rs) |
 | Engine (executor) | 🟡 | `LeafCursor` lazy para `SELECT … LIMIT N` sin ORDER BY (O(N+offset) IO) + prefetch one-leaf-ahead (ADR-0016) que warm-a la PageCache para la próxima leaf transition. Sin spill-to-disk para sort grande, sin plan lógico/físico explícito. | [src/sql.rs](../src/sql.rs), [src/bptree.rs](../src/bptree.rs) |
 | Optimizer cost-based | 🔴 | Camino B/C. | — |
-| `EXPLAIN` | 🔴 | Camino A.5+. | — |
+| `EXPLAIN` / `EXPLAIN ANALYZE` | 🟢 | P1 (plan estimado, dry-run) + P2 (ejecución real + Instant timing + row counts). Side-effects PERSISTEN en ANALYZE. Sin bump on-disk. | [src/sql.rs](../src/sql.rs) |
 | Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`) | 🟢 | Bloque T (2026-05-25): batch-local, alias ANSI (`START TRANSACTION`/`END`) y MySQL (`WORK`) aceptados. **Pendiente**: `SAVEPOINT`/`ROLLBACK TO`, isolation levels, read-only y cross-request (HTTP session state). | [src/sql.rs](../src/sql.rs), [src/storage.rs](../src/storage.rs) |
 | MVCC | 🔴 | Camino C. | — |
 | Manejo de errores | 🟢 | Guía canónica + ~210 mensajes en español con contexto (qué/por qué/cómo). Ver [ERROR_HANDLING.md](ERROR_HANDLING.md). | [src/lib.rs](../src/lib.rs) |

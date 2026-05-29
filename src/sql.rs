@@ -123,14 +123,17 @@ pub enum Statement {
     CreatePolicy(CreatePolicyStmt),
     /// Bloque Z3: `DROP POLICY [IF EXISTS] name ON table`.
     DropPolicy(DropPolicyStmt),
-    /// Bloque P1 (2026-05-29): `EXPLAIN <statement>` — describe el
-    /// plan de ejecución como ResultSet textual (cols `step`, `detail`)
-    /// sin ejecutar el statement subyacente. Soporta SELECT, INSERT,
-    /// UPDATE, DELETE. Detecta fast-paths (PK lookup, ordered-index
-    /// range, hash-index equality) vs full scan. `EXPLAIN ANALYZE` no
-    /// está soportado en P1 (defer P2 — requiere instrumentación de
-    /// timings + row counts reales).
-    Explain(Box<Statement>),
+    /// Bloque P1/P2 (2026-05-29): `EXPLAIN [ANALYZE] <statement>`.
+    /// Con `analyze = false` (P1): describe el plan sin ejecutar.
+    /// Con `analyze = true` (P2): ejecuta el statement real, lo
+    /// timestea con `Instant::now()`, y agrega filas finales con
+    /// elapsed time + row count. **Importante**: ANALYZE de
+    /// INSERT/UPDATE/DELETE persiste el efecto — para dry-run usá
+    /// EXPLAIN sin ANALYZE.
+    Explain {
+        analyze: bool,
+        inner: Box<Statement>,
+    },
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -2352,7 +2355,7 @@ impl<'a> Engine<'a> {
             Statement::SetSessionAuth(stmt) => self.exec_set_session_auth(stmt),
             Statement::CreatePolicy(stmt) => self.exec_create_policy(stmt),
             Statement::DropPolicy(stmt) => self.exec_drop_policy(stmt),
-            Statement::Explain(inner) => self.exec_explain(*inner),
+            Statement::Explain { analyze, inner } => self.exec_explain(*inner, analyze),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -4980,8 +4983,12 @@ impl<'a> Engine<'a> {
     // como ResultSet sin ejecutar el statement subyacente.
     // ============================================================
 
-    fn exec_explain(&mut self, inner: Statement) -> DbResult<ResultSet> {
+    fn exec_explain(&mut self, inner: Statement, analyze: bool) -> DbResult<ResultSet> {
         let mut steps: Vec<(String, String)> = Vec::new();
+        // Bloque P2: para ANALYZE, clonamos el inner ANTES de consumirlo
+        // en el match plan-walker, porque después hay que volver a
+        // pasarlo a `exec()` para la ejecución real.
+        let inner_for_exec = if analyze { Some(inner.clone()) } else { None };
         match inner {
             Statement::Select(query) => self.explain_select_query(&query, &mut steps, 0)?,
             Statement::SelectRecursive(stmt) => {
@@ -5087,7 +5094,7 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
-            Statement::Explain(_) => {
+            Statement::Explain { .. } => {
                 return Err(coded(
                     codes::UNSUPPORTED_SYNTAX,
                     "EXPLAIN EXPLAIN no tiene sentido; usá EXPLAIN <stmt>.",
@@ -5106,13 +5113,72 @@ impl<'a> Engine<'a> {
                 ));
             }
         }
+        // Bloque P2: si analyze=true, ejecutamos el inner stmt real,
+        // timesteamos con Instant, y anexamos filas con stats reales.
+        // **Side-effects**: ANALYZE INSERT persiste, UPDATE/DELETE
+        // mutan. Para dry-run, usar EXPLAIN sin ANALYZE.
+        let analyze_msg = if let Some(inner_stmt) = inner_for_exec {
+            let t_start = std::time::Instant::now();
+            let exec_res = self.exec(inner_stmt);
+            let elapsed = t_start.elapsed();
+            match exec_res {
+                Ok(rs) => {
+                    let row_count = rs.rows.len();
+                    steps.push((
+                        "actual.time".to_string(),
+                        format!(
+                            "{:.3} ms wall-clock (Instant elapsed)",
+                            elapsed.as_secs_f64() * 1000.0
+                        ),
+                    ));
+                    steps.push((
+                        "actual.rows".to_string(),
+                        format!(
+                            "{} fila{} producida{}{}",
+                            row_count,
+                            if row_count == 1 { "" } else { "s" },
+                            if row_count == 1 { "" } else { "s" },
+                            if let Some(msg) = &rs.message {
+                                format!(" — message: {}", msg)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    ));
+                    Some(format!(
+                        "EXPLAIN ANALYZE: plan + ejecución real ({:.3} ms, {} rows). \
+                         Cuidado: side-effects PERSISTIDOS.",
+                        elapsed.as_secs_f64() * 1000.0,
+                        row_count
+                    ))
+                }
+                Err(e) => {
+                    steps.push((
+                        "actual.error".to_string(),
+                        format!(
+                            "statement falló tras {:.3} ms: {}",
+                            elapsed.as_secs_f64() * 1000.0,
+                            e
+                        ),
+                    ));
+                    Some(format!(
+                        "EXPLAIN ANALYZE: plan + ejecución real ({:.3} ms, ERROR).",
+                        elapsed.as_secs_f64() * 1000.0
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         Ok(ResultSet {
             columns: vec!["step".to_string(), "detail".to_string()],
             rows: steps
                 .into_iter()
                 .map(|(s, d)| vec![Value::String(s), Value::String(d)])
                 .collect(),
-            message: Some("EXPLAIN: plan estimado (sin ejecutar el statement)".to_string()),
+            message: Some(analyze_msg.unwrap_or_else(|| {
+                "EXPLAIN: plan estimado (sin ejecutar el statement)".to_string()
+            })),
         })
     }
 
@@ -20020,19 +20086,16 @@ fn inline_cte_into_expr(e: &mut Expr, cte_name: &str, cte_body: &SelectStmt) {
 
 impl Parser {
     fn parse_statement(&mut self) -> DbResult<Statement> {
-        // Bloque P1 (2026-05-29): `EXPLAIN <statement>`. ANALYZE no
-        // está soportado en P1.
+        // Bloque P1/P2 (2026-05-29): `EXPLAIN [ANALYZE] <statement>`.
+        // ANALYZE ejecuta el inner stmt y agrega timings + row counts
+        // reales al output. Sin ANALYZE = dry-run del plan.
         if self.match_keyword("EXPLAIN") {
-            if self.match_keyword("ANALYZE") {
-                return Err(coded(
-                    codes::UNSUPPORTED_SYNTAX,
-                    "EXPLAIN ANALYZE no está soportado en P1 (defer a P2 — \
-                     requiere instrumentación de timings + row counts reales). \
-                     Usá `EXPLAIN <stmt>` para ver el plan estimado.",
-                ));
-            }
+            let analyze = self.match_keyword("ANALYZE");
             let inner = self.parse_statement()?;
-            return Ok(Statement::Explain(Box::new(inner)));
+            return Ok(Statement::Explain {
+                analyze,
+                inner: Box::new(inner),
+            });
         }
         if self.match_keyword("CREATE") {
             return self.parse_create();
