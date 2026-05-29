@@ -277,7 +277,12 @@ fn secondary_index_lookup_and_maintenance() -> Result<(), Box<dyn Error>> {
     // del fix devolvía las 200 filas sin filtrar.
     run_sql(&db, "DROP INDEX idx_u_name;")?;
     let res = run_sql(&db, "SELECT id FROM u WHERE name = 'Ana';")?;
-    assert_eq!(res[0].rows.len(), 40, "tras DROP INDEX, WHERE name='Ana' debe filtrar a 40 filas; got: {:?}", res[0].rows);
+    assert_eq!(
+        res[0].rows.len(),
+        40,
+        "tras DROP INDEX, WHERE name='Ana' debe filtrar a 40 filas; got: {:?}",
+        res[0].rows
+    );
     assert_eq!(res[0].rows[0][0], Value::Integer(0));
 
     cleanup(&[&db, &wal]);
@@ -9242,24 +9247,6 @@ fn w1_cte_duplicate_name_rejected() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn w1_cte_recursive_rejected() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = w1_setup("recursive")?;
-    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
-    let err = run_sql(
-        &db,
-        "WITH RECURSIVE a AS (SELECT id FROM t) SELECT * FROM a;",
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("GBY-4080"),
-        "esperaba GBY-4080, got: {}",
-        err
-    );
-    cleanup(&[&db, &wal]);
-    Ok(())
-}
-
-#[test]
 fn w1_cte_column_aliases_rejected() -> Result<(), Box<dyn Error>> {
     let (db, wal) = w1_setup("col-aliases")?;
     run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
@@ -9359,8 +9346,227 @@ fn regression_eq_non_indexed_col_filters() -> Result<(), Box<dyn Error>> {
          INSERT INTO t (id, v) VALUES (2, 2);",
     )?;
     let res = run_sql(&db, "SELECT id FROM t WHERE v = 1;")?;
-    assert_eq!(res[0].rows.len(), 1, "WHERE v = 1 debe devolver exactamente 1 fila");
+    assert_eq!(
+        res[0].rows.len(),
+        1,
+        "WHERE v = 1 debe devolver exactamente 1 fila"
+    );
     assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----- Bloque W2 (2026-05-28): WITH RECURSIVE (fixpoint base+step). -----
+
+fn w2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("w2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn w2_number_generator_union_all() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("nums")?;
+    run_sql(&db, "CREATE TABLE seed (n INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO seed (n) VALUES (1);")?;
+    let res = run_sql(
+        &db,
+        "WITH RECURSIVE nums AS ( \
+             SELECT n FROM seed \
+             UNION ALL \
+             SELECT n + 1 FROM nums WHERE n < 5 \
+         ) \
+         SELECT n FROM nums ORDER BY n;",
+    )?;
+    assert_eq!(res[0].rows.len(), 5);
+    let got: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            other => panic!("expected Integer, got {:?}", other),
+        })
+        .collect();
+    assert_eq!(got, vec![1, 2, 3, 4, 5]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_union_dedups_naturally() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("union-dedup")?;
+    run_sql(&db, "CREATE TABLE seed (n INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO seed (n) VALUES (1);")?;
+    // step produce SIEMPRE n=1 (constante) — UNION (no ALL) dedup ⇒ delta
+    // queda vacío en la 1era iteración tras filtrar el dup, fixpoint termina.
+    let res = run_sql(
+        &db,
+        "WITH RECURSIVE r AS ( \
+             SELECT n FROM seed \
+             UNION \
+             SELECT 1 FROM r \
+         ) \
+         SELECT n FROM r;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_max_iterations_guard() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("max-iter")?;
+    run_sql(&db, "CREATE TABLE seed (n INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO seed (n) VALUES (1);")?;
+    // Recursión sin corte: cada iteración produce 1 fila nueva (n+1).
+    // Debe rebotar con [GBY-4083] al pasar las 1000 iteraciones.
+    let err = run_sql(
+        &db,
+        "WITH RECURSIVE r AS ( \
+             SELECT n FROM seed \
+             UNION ALL \
+             SELECT n + 1 FROM r \
+         ) \
+         SELECT n FROM r;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4083"),
+        "esperaba GBY-4083, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_body_not_union_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("not-union")?;
+    run_sql(&db, "CREATE TABLE seed (n INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "WITH RECURSIVE r AS (SELECT n FROM seed) SELECT n FROM r;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4086"),
+        "esperaba GBY-4086, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_multiple_recursive_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("multi")?;
+    run_sql(&db, "CREATE TABLE seed (n INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "WITH RECURSIVE a AS (SELECT n FROM seed UNION ALL SELECT n + 1 FROM a WHERE n < 3), \
+                       b AS (SELECT n FROM seed UNION ALL SELECT n + 1 FROM b WHERE n < 3) \
+         SELECT n FROM a;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4082"),
+        "esperaba GBY-4082, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_schema_mismatch_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("schema-mismatch")?;
+    run_sql(&db, "CREATE TABLE seed (n INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO seed (n) VALUES (1);")?;
+    // anchor projecta 1 col, step proyecta 2 cols ⇒ [GBY-4085].
+    let err = run_sql(
+        &db,
+        "WITH RECURSIVE r AS ( \
+             SELECT n FROM seed \
+             UNION ALL \
+             SELECT n + 1, n + 2 FROM r WHERE n < 3 \
+         ) \
+         SELECT * FROM r;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4085"),
+        "esperaba GBY-4085, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_recursive_visible_in_body_joins() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("body-join")?;
+    run_sql(
+        &db,
+        "CREATE TABLE seed (n INT PRIMARY KEY);
+         CREATE TABLE labels (n INT PRIMARY KEY, lab TEXT);
+         INSERT INTO seed (n) VALUES (1);
+         INSERT INTO labels (n, lab) VALUES (1, 'a');
+         INSERT INTO labels (n, lab) VALUES (2, 'b');
+         INSERT INTO labels (n, lab) VALUES (3, 'c');",
+    )?;
+    let res = run_sql(
+        &db,
+        "WITH RECURSIVE nums AS ( \
+             SELECT n FROM seed \
+             UNION ALL \
+             SELECT n + 1 FROM nums WHERE n < 3 \
+         ) \
+         SELECT l.lab FROM nums INNER JOIN labels l ON l.n = nums.n ORDER BY l.lab;",
+    )?;
+    assert_eq!(res[0].rows.len(), 3);
+    assert_eq!(res[0].rows[0][0], Value::String("a".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::String("b".to_string()));
+    assert_eq!(res[0].rows[2][0], Value::String("c".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w2_hierarchy_traversal() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = w2_setup("hierarchy")?;
+    // Árbol: 1 → 2 → 4, 1 → 3 → 5
+    run_sql(
+        &db,
+        "CREATE TABLE tree (id INT PRIMARY KEY, parent INT);
+         INSERT INTO tree (id, parent) VALUES (1, 0);
+         INSERT INTO tree (id, parent) VALUES (2, 1);
+         INSERT INTO tree (id, parent) VALUES (3, 1);
+         INSERT INTO tree (id, parent) VALUES (4, 2);
+         INSERT INTO tree (id, parent) VALUES (5, 3);",
+    )?;
+    // Descendientes de 1 (incluyendo 1).
+    let res = run_sql(
+        &db,
+        "WITH RECURSIVE descendants AS ( \
+             SELECT id FROM tree WHERE id = 1 \
+             UNION ALL \
+             SELECT t.id FROM tree t INNER JOIN descendants d ON t.parent = d.id \
+         ) \
+         SELECT id FROM descendants ORDER BY id;",
+    )?;
+    let got: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            _ => panic!("int expected"),
+        })
+        .collect();
+    assert_eq!(got, vec![1, 2, 3, 4, 5]);
     cleanup(&[&db, &wal]);
     Ok(())
 }

@@ -441,15 +441,41 @@ pub mod codes {
     /// ser único dentro de la cláusula `WITH`; el lookup posterior es
     /// case-insensitive.
     pub const CTE_DUPLICATE_NAME: u32 = 4079;
-    /// Bloque W1: `WITH RECURSIVE` se reconoce pero está diferido al
-    /// bloque W2 (fixpoint sobre `UNION ALL` base+step). Sintaxis no-
-    /// recursiva (`WITH name AS (SELECT ...) ...`) sí está soportada.
+    /// Bloque W1: reservado para `WITH RECURSIVE`. **Retirado en W2**
+    /// (2026-05-28): la sintaxis recursiva está soportada — los errores
+    /// específicos del fixpoint viven en 4082..=4086. El código se
+    /// mantiene reservado para no reciclar el slot.
     pub const CTE_RECURSIVE_NOT_SUPPORTED: u32 = 4080;
     /// Bloque W1: `WITH name(c1, c2, ...) AS (...)` — column aliases en
     /// la cabecera de la CTE diferidos. Workaround: aliasar dentro del
     /// SELECT del body (`SELECT x AS c1, y AS c2 FROM ...`), que es
     /// equivalente en semántica.
     pub const CTE_COLUMN_ALIASES_NOT_SUPPORTED: u32 = 4081;
+    /// Bloque W2 (2026-05-28): `WITH RECURSIVE` con más de una CTE
+    /// declarada — soportamos exactamente una CTE recursive por `WITH`
+    /// en este release. Workaround: anidar `WITH RECURSIVE`s en
+    /// subqueries separadas o pre-materializar.
+    pub const RECURSIVE_CTE_MULTIPLE_NOT_SUPPORTED: u32 = 4082;
+    /// Bloque W2: la materialización del fixpoint excedió el límite
+    /// duro de iteraciones (`MAX_RECURSIVE_ITERATIONS`). Recursión sin
+    /// terminación natural — agregar una condición de corte al step
+    /// (`WHERE n < N`) o usar `UNION` en vez de `UNION ALL` para que
+    /// el dedup converja.
+    pub const RECURSIVE_CTE_MAX_ITERATIONS_EXCEEDED: u32 = 4083;
+    /// Bloque W2: la materialización del fixpoint excedió el límite
+    /// duro de filas totales acumuladas (`MAX_RECURSIVE_ROWS`). Mismo
+    /// diagnóstico que `MAX_ITERATIONS_EXCEEDED`.
+    pub const RECURSIVE_CTE_MAX_ROWS_EXCEEDED: u32 = 4084;
+    /// Bloque W2: el SELECT del step proyecta una arity / orden de
+    /// columnas incompatible con el anchor. ANSI exige columnas
+    /// posicionalmente compatibles para que UNION ALL pueda anidar.
+    pub const RECURSIVE_CTE_SCHEMA_MISMATCH: u32 = 4085;
+    /// Bloque W2: el body de una CTE marcada `RECURSIVE` debe ser una
+    /// `UNION` o `UNION ALL` de dos SELECTs (anchor + step). Otra
+    /// forma (un único SELECT, o INTERSECT/EXCEPT, o tres ramas) no
+    /// se acepta — apenas la forma canónica. Workaround: si la CTE
+    /// no necesita ser recursive, quitar la palabra `RECURSIVE`.
+    pub const RECURSIVE_CTE_BODY_NOT_UNION: u32 = 4086;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

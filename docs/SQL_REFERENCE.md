@@ -48,7 +48,8 @@
 | `UPDATE` de PK con re-encode + cascade `ON UPDATE` (regular UPDATE; UPSERT DO UPDATE sigue restringido) | DML | 🟢 (residual #4) |
 | `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v`, `SELECT ... FROM v` | DDL+DML | 🟢 (bloque V/VERSION 13) |
 | [`WITH name AS (SELECT ...)` (CTEs no-recursivas)](#ctes-no-recursivas-with-bloque-w1) — encadenables, en JOIN/subquery/set-ops, shadowing ANSI | DML | 🟢 (bloque W1) |
-| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, window functions, `WITH RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
+| [`WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`](#ctes-recursivas-with-recursive-bloque-w2) — fixpoint base+step, delta semantics, guards de runaway | DML | 🟢 (bloque W2) |
+| Partial indexes, `ALTER COLUMN TYPE`, ALTER PK, window functions, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md) y [COMMERCIAL_ROADMAP](COMMERCIAL_ROADMAP.md)) |
 
 ---
 
@@ -1604,15 +1605,85 @@ SELECT id FROM x UNION SELECT id FROM t WHERE id = 2 ORDER BY id;
 | Mensaje | Causa |
 | :--- | :--- |
 | `[GBY-4079] WITH: el nombre 'X' aparece más de una vez` | Dos CTEs con el mismo nombre en el mismo `WITH` (case-insensitive). |
-| `[GBY-4080] WITH RECURSIVE no está soportado en este release` | `WITH RECURSIVE` — diferido al bloque W2 (fixpoint base+step). |
 | `[GBY-4081] WITH cte(...) AS (...): los column aliases en la cabecera están diferidos` | Column aliases en la cabecera de la CTE. Workaround: aliasar dentro del body (`SELECT x AS c1, y AS c2 FROM ...`). |
 
 ### ⚠️ No soportado todavía
 
-- `WITH RECURSIVE` — bloque **W2** (fixpoint base+step sobre `UNION ALL`).
 - Column aliases en la cabecera (`WITH cte(c1, c2) AS (...)`) — workaround inline disponible.
 - Window functions (`ROW_NUMBER`, `RANK`, `SUM() OVER (...)`) — bloque **W3**.
 - CTEs sobre `UPDATE` / `DELETE` — sólo `SELECT` por ahora.
+
+---
+
+## CTEs recursivas (`WITH RECURSIVE`, bloque W2)
+
+> **Common Table Expressions recursivas**: el body se materializa por fixpoint base+step. Soporta exactamente UNA CTE recursive por statement, con body canónico `anchor UNION [ALL] step`. Casos típicos: generadores de números, traversal de jerarquías (descendientes / ancestros), expansión transitiva.
+
+### 📜 EBNF
+
+```
+recursive_query  ::= "WITH" "RECURSIVE" ident "AS" "(" recursive_body ")" select_query
+recursive_body   ::= select_stmt "UNION" [ "ALL" ] select_stmt
+```
+
+El primer SELECT es el **anchor** (caso base — no puede referenciar la CTE). El segundo es el **step** (caso recursivo — debe referenciar la CTE por nombre en algún `FROM`).
+
+### 🧠 Semántica (delta semantics, ANSI)
+
+- **Iteración 0**: `accum = anchor.exec()`; `delta = accum`.
+- **Iteración N≥1**: el step se ejecuta con la CTE bindeada SOLO a `delta` (no al `accum` cumulativo); el resultado se filtra por dedup contra `accum` cuando es `UNION` (no `ALL`); `accum` se extiende con las filas nuevas; `delta = filas nuevas`.
+- **Terminación**: cuando `delta = ∅`.
+- **Guards de runaway**: `MAX_RECURSIVE_ITERATIONS = 1000` y `MAX_RECURSIVE_ROWS = 100_000`. Recursión bien terminada no se acerca a estos límites.
+
+### ✅ Ejemplos
+
+```sql
+-- Generador 1..100
+WITH RECURSIVE nums AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 100
+)
+SELECT n FROM nums;
+
+-- Descendientes de un nodo en un árbol (id, parent)
+WITH RECURSIVE descendants AS (
+    SELECT id FROM tree WHERE id = :root_id
+    UNION ALL
+    SELECT t.id FROM tree t INNER JOIN descendants d ON t.parent = d.id
+)
+SELECT id FROM descendants ORDER BY id;
+
+-- UNION (no ALL) — termina natural por dedup
+WITH RECURSIVE r AS (
+    SELECT 1 AS n
+    UNION
+    SELECT 1 FROM r  -- step produce SIEMPRE 1; dedup ⇒ delta vacío ⇒ stop
+)
+SELECT n FROM r;
+
+-- JOIN entre la CTE recursive y una tabla persistente
+WITH RECURSIVE nums AS (
+    SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 5
+)
+SELECT l.lab FROM nums INNER JOIN labels l ON l.n = nums.n ORDER BY l.lab;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4082] WITH RECURSIVE: soportamos exactamente UNA CTE recursive por statement` | Más de una CTE dentro del mismo `WITH RECURSIVE`. Workaround: anidar. |
+| `[GBY-4083] WITH RECURSIVE r: superó el límite de 1000 iteraciones` | Recursión sin condición de corte. Agregar `WHERE n < N` al step, o usar `UNION` (no `UNION ALL`) para dedup. |
+| `[GBY-4084] WITH RECURSIVE r: superó el límite de 100000 filas` | Mismo diagnóstico. |
+| `[GBY-4085] WITH RECURSIVE r: el step proyecta N columnas pero el anchor proyectó M` | Schema inconsistente — ANSI exige arity posicional idéntica. |
+| `[GBY-4086] WITH RECURSIVE r: el body debe ser anchor UNION [ALL] step` | Body que no es la forma canónica. Si no necesita ser recursive, quitar la palabra `RECURSIVE`. |
+
+### ⚠️ No soportado todavía
+
+- Múltiples CTEs recursive en el mismo `WITH` — usar un solo `WITH RECURSIVE` o anidar.
+- Cumulative semantics (step lee el accum, no solo el delta) — diferido; mayoría de casos prácticos funcionan con delta.
+- Window functions sobre el resultado del fixpoint — bloque **W3**.
 
 ---
 

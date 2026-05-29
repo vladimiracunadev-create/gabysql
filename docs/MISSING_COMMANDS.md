@@ -317,8 +317,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Feature | Soportado | Prioridad |
 |---|:---:|:---:|
 | `WITH cte AS (SELECT ...) SELECT ...` | ✅ (W1, 2026-05-28; múltiples + encadenadas, visible en JOIN/subquery/set-ops, shadowing ANSI) | — |
-| `WITH cte(c1, c2) AS (...)` (column aliases en cabecera) | ❌ (W1 rechaza con `[GBY-4081]`; workaround inline) | P2 |
-| `WITH RECURSIVE` | ❌ (W1 rechaza con `[GBY-4080]`, diferido a W2) | P3 |
+| `WITH cte(c1, c2) AS (...)` (column aliases en cabecera) | ❌ (W1/W2 rechazan con `[GBY-4081]`; workaround inline) | P2 |
+| `WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>` | ✅ (W2, 2026-05-28; una sola CTE recursive, body canónico, delta semantics, guards 1000 iter / 100K rows) | — |
+| Múltiples CTEs `RECURSIVE` o mezcla recursive + no-recursive en mismo `WITH` | ❌ (W2 rechaza con `[GBY-4082]`) | P3 |
 | `ROW_NUMBER() OVER (...)` | ❌ | P2 |
 | `RANK`, `DENSE_RANK`, `NTILE` | ❌ | P2 |
 | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` | ❌ | P2 |

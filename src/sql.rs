@@ -62,6 +62,11 @@ pub enum Statement {
     /// puro sigue funcionando idéntico — se construye como
     /// `SelectQuery::Select(stmt)`.
     Select(Box<SelectQuery>),
+    /// Bloque W2 (2026-05-28): `WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`.
+    /// El body se materializa por fixpoint y queda expuesto al `body` como
+    /// virtual table. Soporta exactamente UNA CTE recursive (no multi);
+    /// la lista no recursive estándar (W1) se mezcla en parseo separado.
+    SelectRecursive(Box<RecursiveSelectStmt>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateIndex(CreateIndexStmt),
@@ -516,6 +521,31 @@ pub enum InsertSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TruncateStmt {
     pub table: String,
+}
+
+/// Bloque W2 (2026-05-28): definición de una CTE recursive. El body
+/// canónico es `anchor UNION [ALL] step` donde `step` referencia el
+/// nombre de la CTE en algún `FROM`. La materialización por fixpoint
+/// vive en `Engine::exec_recursive_select`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCte {
+    pub name: String,
+    pub anchor: Box<SelectStmt>,
+    pub step: Box<SelectStmt>,
+    /// `true` = `UNION ALL` (preserva duplicados — el step es responsable
+    /// de terminar). `false` = `UNION` (dedup contra el accum entre
+    /// iteraciones; convergencia natural cuando el step deja de producir
+    /// filas nuevas).
+    pub union_all: bool,
+}
+
+/// Bloque W2: envoltorio top-level del statement `WITH RECURSIVE ... SELECT ...`.
+/// Para este release: una sola CTE recursive. La mezcla con CTEs no-
+/// recursive (W1) y múltiples recursives quedan diferidas.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveSelectStmt {
+    pub cte: RecursiveCte,
+    pub body: SelectQuery,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1294,6 +1324,7 @@ impl<'a> Engine<'a> {
             Statement::AlterTableRenameColumn(stmt) => self.exec_alter_rename_column(stmt),
             Statement::Insert(stmt) => self.exec_insert(stmt),
             Statement::Select(query) => self.exec_select_query(*query),
+            Statement::SelectRecursive(stmt) => self.exec_recursive_select(*stmt),
             Statement::Update(stmt) => self.exec_update(stmt),
             Statement::Delete(stmt) => self.exec_delete(stmt),
             Statement::CreateIndex(stmt) => self.exec_create_index(stmt),
@@ -4147,6 +4178,123 @@ impl<'a> Engine<'a> {
                 ),
             )
         })
+    }
+
+    /// Bloque W2 (2026-05-28): ejecuta un `WITH RECURSIVE cte AS (anchor
+    /// UNION [ALL] step) <body>` materializando el fixpoint en memoria
+    /// y exponiéndolo al `body` como tabla virtual (vía `VALUES`).
+    ///
+    /// Algoritmo de fixpoint con **delta semantics** (ANSI):
+    /// 1. Ejecutar `anchor` → `accum` = filas iniciales, `delta` = accum.
+    /// 2. Loop: bind `delta` al nombre de la CTE en una copia del `step`
+    ///    (via el inlining de W1), ejecutar. El resultado `new_rows` se
+    ///    deduplica contra `accum` cuando `UNION` (no `UNION ALL`).
+    ///    `accum` extiende con `new_rows`, `delta = new_rows`.
+    /// 3. Termina cuando `delta` queda vacía, o se exceden los guards
+    ///    `MAX_RECURSIVE_ITERATIONS` / `MAX_RECURSIVE_ROWS`.
+    ///
+    /// El `accum` final se convierte a un `SelectStmt` con `values_source`
+    /// (cada `Value` envuelto en `Expr::Literal`) y se inyecta en el
+    /// `body` reusando `inline_cte_into_query` del bloque W1. Después
+    /// el body se ejecuta como un SELECT normal — el resto del motor no
+    /// necesita saber que hay recursión.
+    fn exec_recursive_select(&mut self, stmt: RecursiveSelectStmt) -> DbResult<ResultSet> {
+        const MAX_ITER: usize = 1000;
+        const MAX_ROWS: usize = 100_000;
+
+        let RecursiveSelectStmt { cte, body } = stmt;
+        let cte_name = cte.name.clone();
+
+        // 1. Anchor
+        let anchor_rs = self.exec_select((*cte.anchor).clone())?;
+        let anchor_columns = anchor_rs.columns.clone();
+        let arity = anchor_columns.len();
+        if arity == 0 {
+            return Err(coded(
+                codes::RECURSIVE_CTE_SCHEMA_MISMATCH,
+                format!(
+                    "WITH RECURSIVE {}: el anchor no proyecta ninguna columna",
+                    cte_name
+                ),
+            ));
+        }
+        let mut accum: Vec<Vec<Value>> = anchor_rs.rows.clone();
+        let mut delta: Vec<Vec<Value>> = anchor_rs.rows;
+        // Para dedup cuando es `UNION` (no ALL). `Value` no implementa
+        // `Hash`/`Eq` (por la variant `Float`, que no es totalmente
+        // ordenable), así que usamos una key derivada de `Debug` —
+        // estable dentro de un proceso y suficiente para dedup.
+        let row_key = |row: &Vec<Value>| -> String { format!("{:?}", row) };
+        let mut seen: HashSet<String> = if cte.union_all {
+            HashSet::new()
+        } else {
+            accum.iter().map(&row_key).collect()
+        };
+
+        let mut iter = 0;
+        while !delta.is_empty() {
+            if iter >= MAX_ITER {
+                return Err(coded(
+                    codes::RECURSIVE_CTE_MAX_ITERATIONS_EXCEEDED,
+                    format!(
+                        "WITH RECURSIVE {}: superó el límite de {} iteraciones del fixpoint. \
+                         Causa típica: recursión sin condición de corte. Workarounds: agregar \
+                         `WHERE n < N` al step, o usar `UNION` (no `UNION ALL`) para dedup.",
+                        cte_name, MAX_ITER
+                    ),
+                ));
+            }
+            if accum.len() >= MAX_ROWS {
+                return Err(coded(
+                    codes::RECURSIVE_CTE_MAX_ROWS_EXCEEDED,
+                    format!(
+                        "WITH RECURSIVE {}: superó el límite de {} filas acumuladas. \
+                         Mismo diagnóstico que MAX_ITERATIONS — recursión runaway.",
+                        cte_name, MAX_ROWS
+                    ),
+                ));
+            }
+
+            // Bind delta como virtual table al nombre de la CTE en una
+            // copia fresca del step. Sintetizamos un `SelectStmt` con
+            // `values_source` cuyos rows son Expr::Literal de cada Value.
+            let delta_select = rows_to_values_select(&cte_name, &anchor_columns, &delta);
+            let mut step_iter = (*cte.step).clone();
+            inline_cte_into_select(&mut step_iter, &cte_name, &delta_select);
+
+            let step_rs = self.exec_select(step_iter)?;
+            if step_rs.columns.len() != arity {
+                return Err(coded(
+                    codes::RECURSIVE_CTE_SCHEMA_MISMATCH,
+                    format!(
+                        "WITH RECURSIVE {}: el step proyecta {} columnas pero el anchor proyectó {}. \
+                         ANSI exige la misma arity posicional.",
+                        cte_name,
+                        step_rs.columns.len(),
+                        arity
+                    ),
+                ));
+            }
+
+            // Filtrar duplicados si es UNION (no ALL). Mantener el orden
+            // de aparición para que el output sea determinístico.
+            let mut new_delta: Vec<Vec<Value>> = Vec::new();
+            for row in step_rs.rows {
+                if cte.union_all || seen.insert(row_key(&row)) {
+                    new_delta.push(row);
+                }
+            }
+            accum.extend(new_delta.iter().cloned());
+            delta = new_delta;
+            iter += 1;
+        }
+
+        // Inject el accum final como virtual table en el body, vía el
+        // mismo helper de inlining de W1.
+        let virtual_select = rows_to_values_select(&cte_name, &anchor_columns, &accum);
+        let mut body_query = body;
+        inline_cte_into_query(&mut body_query, &cte_name, &virtual_select);
+        self.exec_select_query(body_query)
     }
 
     /// Bloque I (2026-05-26): entry-point del SELECT statement. Despacha
@@ -12468,6 +12616,77 @@ const MAX_PARSE_DEPTH: usize = 100;
 // materializa N veces (re-ejecución). Documentado en ADR-0025.
 // ---------------------------------------------------------------------
 
+/// Bloque W2 (2026-05-28): convierte filas materializadas (output del
+/// fixpoint de `WITH RECURSIVE`) en un `SelectStmt` que el executor
+/// puede tratar como derived table. La estrategia: envolver cada
+/// `Value` en `Expr::Literal` y armar un `values_source` con los
+/// column aliases del anchor.
+///
+/// Caso degenerado: si `rows` está vacío, generamos un select con
+/// `values_source` de UNA fila dummy de NULLs envuelto en un
+/// `derived_source` con `LIMIT 0`. ANSI exige al menos una fila en
+/// `VALUES`, pero queremos que un CTE vacío sea legal en el body.
+fn rows_to_values_select(name: &str, columns: &[String], rows: &[Vec<Value>]) -> SelectStmt {
+    if rows.is_empty() {
+        // 1 fila dummy de NULLs + LIMIT 0 = result-set vacío con schema preservado.
+        let dummy_row: Vec<Expr> = columns.iter().map(|_| Expr::Literal(Value::Null)).collect();
+        let inner = SelectStmt {
+            table: name.to_string(),
+            derived_source: None,
+            values_source: Some((
+                Box::new(ValuesClause {
+                    rows: vec![dummy_row],
+                }),
+                columns.to_vec(),
+            )),
+            table_alias: None,
+            joins: Vec::new(),
+            columns: vec![SelectItem::Star],
+            where_clause: None,
+            distinct: false,
+            group_by: Vec::new(),
+            having: None,
+            order_by: None,
+            limit: Some(0),
+            offset: 0,
+        };
+        return SelectStmt {
+            table: name.to_string(),
+            derived_source: Some(Box::new(inner)),
+            values_source: None,
+            table_alias: None,
+            joins: Vec::new(),
+            columns: vec![SelectItem::Star],
+            where_clause: None,
+            distinct: false,
+            group_by: Vec::new(),
+            having: None,
+            order_by: None,
+            limit: None,
+            offset: 0,
+        };
+    }
+    let expr_rows: Vec<Vec<Expr>> = rows
+        .iter()
+        .map(|row| row.iter().cloned().map(Expr::Literal).collect())
+        .collect();
+    SelectStmt {
+        table: name.to_string(),
+        derived_source: None,
+        values_source: Some((Box::new(ValuesClause { rows: expr_rows }), columns.to_vec())),
+        table_alias: None,
+        joins: Vec::new(),
+        columns: vec![SelectItem::Star],
+        where_clause: None,
+        distinct: false,
+        group_by: Vec::new(),
+        having: None,
+        order_by: None,
+        limit: None,
+        offset: 0,
+    }
+}
+
 fn inline_cte_into_query(query: &mut SelectQuery, cte_name: &str, cte_body: &SelectStmt) {
     match query {
         SelectQuery::Select(s) => inline_cte_into_select(s, cte_name, cte_body),
@@ -12646,12 +12865,65 @@ impl Parser {
             // [ADR-0025], futura memoización por nombre similar al fix
             // #1 del BENCHMARK. No requiere bump de VERSION on-disk.
             if self.match_keyword("RECURSIVE") {
-                return Err(coded(
-                    codes::CTE_RECURSIVE_NOT_SUPPORTED,
-                    "WITH RECURSIVE no está soportado en este release \
-                     (diferido al bloque W2 — fixpoint base+step sobre UNION ALL). \
-                     Workaround: WITH no-recursivo, o pre-materializar la jerarquía en una tabla auxiliar.",
-                ));
+                // Bloque W2 (2026-05-28): `WITH RECURSIVE name AS (anchor
+                // UNION [ALL] step) <main>`. Una sola CTE recursive por
+                // statement (multi → [GBY-4082]).
+                let name = self.expect_ident()?;
+                if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+                    return Err(coded(
+                        codes::CTE_COLUMN_ALIASES_NOT_SUPPORTED,
+                        format!(
+                            "WITH RECURSIVE {}(...) AS (...): column aliases en la cabecera diferidos. \
+                             Workaround: aliasar dentro del anchor (`SELECT x AS c1, y AS c2 ...`)",
+                            name
+                        ),
+                    ));
+                }
+                self.expect_keyword("AS")?;
+                self.expect_symbol("(")?;
+                self.expect_keyword("SELECT")?;
+                let anchor = self.parse_select_stmt()?;
+                if !self.match_keyword("UNION") {
+                    return Err(coded(
+                        codes::RECURSIVE_CTE_BODY_NOT_UNION,
+                        format!(
+                            "WITH RECURSIVE {}: el body de una CTE recursive debe ser `anchor UNION [ALL] step` — \
+                             se esperaba la keyword `UNION` después del anchor",
+                            name
+                        ),
+                    ));
+                }
+                let union_all = self.match_keyword("ALL");
+                self.expect_keyword("SELECT")?;
+                let step = self.parse_select_stmt()?;
+                self.expect_symbol(")")?;
+                if self.match_symbol(",") {
+                    return Err(coded(
+                        codes::RECURSIVE_CTE_MULTIPLE_NOT_SUPPORTED,
+                        "WITH RECURSIVE: soportamos exactamente UNA CTE recursive por statement en este release. \
+                         Workaround: anidar la segunda CTE como subquery o pre-materializar",
+                    ));
+                }
+                // Main body — SELECT [...set ops...]
+                if !self.match_keyword("SELECT") {
+                    return Err(coded(
+                        codes::RECURSIVE_CTE_BODY_NOT_UNION,
+                        "WITH RECURSIVE: tras la CTE se esperaba un SELECT como cuerpo principal",
+                    ));
+                }
+                let main = self.parse_select_stmt()?;
+                let lhs = SelectQuery::Select(Box::new(main));
+                let body = self.parse_set_ops_after(lhs)?;
+                let cte = RecursiveCte {
+                    name,
+                    anchor: Box::new(anchor),
+                    step: Box::new(step),
+                    union_all,
+                };
+                return Ok(Statement::SelectRecursive(Box::new(RecursiveSelectStmt {
+                    cte,
+                    body,
+                })));
             }
             let mut ctes: Vec<(String, SelectStmt)> = Vec::new();
             loop {

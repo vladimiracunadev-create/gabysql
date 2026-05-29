@@ -6,6 +6,55 @@
 
 ---
 
+## 2026-05-28 — Bloque W2: `WITH RECURSIVE` (fixpoint base+step)
+
+> **Un push a `main`.** Entrega la mitad recursive del bloque W del roadmap: `WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`. Sin bump de formato — la materialización vive solo en runtime. Detalle en [`docs/adr/0027-with-recursive.md`](docs/adr/0027-with-recursive.md).
+
+### 🆕 Sintaxis habilitada
+
+- Generador de números clásico:
+  ```sql
+  WITH RECURSIVE nums AS (
+      SELECT 1 AS n
+      UNION ALL
+      SELECT n + 1 FROM nums WHERE n < 100
+  )
+  SELECT n FROM nums;
+  ```
+- Traversal de jerarquías (descendientes de un nodo):
+  ```sql
+  WITH RECURSIVE descendants AS (
+      SELECT id FROM tree WHERE id = :root_id
+      UNION ALL
+      SELECT t.id FROM tree t INNER JOIN descendants d ON t.parent = d.id
+  )
+  SELECT id FROM descendants;
+  ```
+- La CTE materializada es JOINeable desde el body con tablas persistentes y participa en cualquier expresión de SELECT.
+
+### 🛠 Implementación
+
+- **Algoritmo de fixpoint con delta semantics ANSI** (no cumulative): cada iteración procesa solo las filas nuevas de la iteración anterior — terminación natural cuando `delta = ∅`.
+- **Bridge a través del inlining de W1**: el `accum` final se convierte a un `SelectStmt` con `values_source` (cada `Value` envuelto en `Expr::Literal`) vía `rows_to_values_select`, y se inyecta al body reusando `inline_cte_into_query` del bloque W1.
+- **Mismo bridge en cada iteración del fixpoint**: el step se clona, se inlinea con el delta como virtual table, y se ejecuta. El executor no necesita saber que hay recursión.
+- **Dedup vía `format!("{:?}", row)`** porque `Value` no implementa `Hash` (la variant `Float` no es totalmente ordenable). Suficiente para `UNION` (vs `UNION ALL`).
+- **Guards de runaway**: 1000 iteraciones máximas (`[GBY-4083]`), 100K filas acumuladas máximas (`[GBY-4084]`).
+
+### 🚫 Diferido (con código de error explícito)
+
+- Múltiples CTEs recursive en el mismo `WITH` → `[GBY-4082]`. Workaround: anidar.
+- Body que no es `anchor UNION [ALL] step` canónico → `[GBY-4086]`.
+- Schema mismatch entre anchor y step (arity distinta) → `[GBY-4085]`.
+- Column aliases en la cabecera (`WITH RECURSIVE name(c1, c2) AS ...`) → `[GBY-4081]` (mismo workaround que W1).
+
+### 🧪 Validación
+
+- 8 tests `w2_*` en `tests/integration_test.rs`: generador de números, dedup natural de UNION, max-iter guard, body no-UNION rechazado, multi-recursive rechazado, schema mismatch, JOIN desde el body, traversal de árbol.
+- El test `w1_cte_recursive_rejected` se removió (la sintaxis pasó de rechazada a soportada); el código `4080` queda **retirado** pero reservado.
+- Suite total: **395/395 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque W1: CTEs no-recursivas + fix residual Issue #3
 
 > **Un push a `main`** con dos cambios coherentes y chicos: el bloque W1 (CTEs) y un fix del residual del Issue #3 del benchmark (`WHERE col = val` sobre col no-PK / no-indexada caía a FullScan sin post-filter y devolvía TODAS las filas — bug detectado mientras se escribían los tests de W1). Sin bump de formato.
