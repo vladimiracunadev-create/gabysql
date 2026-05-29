@@ -595,6 +595,12 @@ pub mod codes {
     /// Bloque X4d: bloque `LOOP ... END LOOP` standalone malformado —
     /// falta END LOOP.
     pub const LOOP_BLOCK_MALFORMED: u32 = 4115;
+    /// Bloque X4e (2026-05-29): bloque `CASE WHEN ... THEN ... END CASE`
+    /// malformado — falta WHEN/THEN/END CASE, branches vacías, etc.
+    pub const CASE_STATEMENT_MALFORMED: u32 = 4116;
+    /// Bloque X4e: `EXCEPTION WHEN <filter>` con filtro inválido — no
+    /// es ni `OTHERS` ni un literal entero (código GBY-NNNN sin prefijo).
+    pub const EXCEPTION_FILTER_INVALID: u32 = 4117;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

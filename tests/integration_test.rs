@@ -11240,6 +11240,185 @@ fn x4d_exception_in_trigger_body() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X4e (2026-05-29): CASE statement + EXCEPTION WHEN code. -----
+
+fn x4e_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x4e-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x4e_case_statement_basic() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("case-basic")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE n INT DEFAULT 5;
+         CASE
+            WHEN n < 3 THEN INSERT INTO log (id) VALUES (1);
+            WHEN n < 10 THEN INSERT INTO log (id) VALUES (2);
+            ELSE INSERT INTO log (id) VALUES (3);
+         END CASE;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_case_statement_else_falls_through() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("case-else")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE n INT DEFAULT 100;
+         CASE
+            WHEN n < 10 THEN INSERT INTO log (id) VALUES (1);
+            WHEN n < 50 THEN INSERT INTO log (id) VALUES (2);
+            ELSE INSERT INTO log (id) VALUES (99);
+         END CASE;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_case_statement_no_match_no_else() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("case-nomatch")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE n INT DEFAULT 100;
+         CASE
+            WHEN n < 10 THEN INSERT INTO log (id) VALUES (1);
+         END CASE;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_exception_when_specific_code() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("exc-code")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         BEGIN
+            RAISE EXCEPTION 'boom';
+         EXCEPTION WHEN 4111 THEN
+            INSERT INTO log (id) VALUES (1);
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_exception_when_wrong_code_propagates() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("exc-wrong-code")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    // RAISE EXCEPTION emite 4111; handler filtra por 9999 → no matchea.
+    let err = run_sql(
+        &db,
+        "BEGIN
+            RAISE EXCEPTION 'boom';
+         EXCEPTION WHEN 9999 THEN
+            INSERT INTO t (id) VALUES (1);
+         END;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("boom"),
+        "esperaba propagación: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_exception_multiple_when_others_fallback() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("exc-multi")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY, src INT);
+         INSERT INTO log (id, src) VALUES (1, 0);
+         BEGIN
+            RAISE EXCEPTION 'unknown';
+         EXCEPTION
+            WHEN 9999 THEN INSERT INTO log (id, src) VALUES (99, 9999);
+            WHEN OTHERS THEN INSERT INTO log (id, src) VALUES (2, 4111);
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT id, src FROM log ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[1][0], Value::Integer(2));
+    assert_eq!(res[0].rows[1][1], Value::Integer(4111));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_case_in_procedure_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("case-in-proc")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY, lab TEXT);
+         CREATE PROCEDURE tier(p_id INT, p_amt INT) AS BEGIN
+            CASE
+                WHEN p_amt >= 100 THEN INSERT INTO log (id, lab) VALUES (p_id, 'gold');
+                WHEN p_amt >= 50 THEN INSERT INTO log (id, lab) VALUES (p_id, 'silver');
+                ELSE INSERT INTO log (id, lab) VALUES (p_id, 'bronze');
+            END CASE;
+         END;",
+    )?;
+    run_sql(&db, "CALL tier(1, 200);")?;
+    run_sql(&db, "CALL tier(2, 75);")?;
+    run_sql(&db, "CALL tier(3, 10);")?;
+    let res = run_sql(&db, "SELECT id, lab FROM log ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][1], Value::String("gold".to_string()));
+    assert_eq!(res[0].rows[1][1], Value::String("silver".to_string()));
+    assert_eq!(res[0].rows[2][1], Value::String("bronze".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4e_exception_handler_runtime_error_specific() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4e_setup("exc-runtime")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE TABLE log (id INT PRIMARY KEY);
+         BEGIN
+            INSERT INTO t (id) VALUES (1);
+         EXCEPTION WHEN 3001 THEN
+            INSERT INTO log (id) VALUES (3001);
+         END;",
+    )?;
+    // 3001 = DUPLICATE_PRIMARY_KEY
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3001));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

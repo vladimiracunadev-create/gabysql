@@ -57,7 +57,8 @@
 | [`DECLARE` + `SET` + `WHILE LOOP` + `EXIT [WHEN]`](#variables--while-loop-bloque-x4b) — variables locales con scope plano; vars visibles en Expr (no en INSERT VALUES) | TCL | 🟢 (bloque X4b) |
 | [`RAISE [EXCEPTION\|NOTICE] 'msg'` + `FOR i IN start TO end LOOP ... END LOOP`](#raise--for-loop-bloque-x4c) — aborto explícito + range loop con auto-decl | TCL | 🟢 (bloque X4c) |
 | [`BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` + `LOOP <body> END LOOP` standalone](#exception-handlers--loop-standalone-bloque-x4d) — try/catch catch-all + loop infinite hasta EXIT | TCL | 🟢 (bloque X4d) |
-| NEW mutable en BEFORE, `EXCEPTION WHEN <code>` filtrado, `FOR row IN SELECT`, `RETURN expr`, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`CASE WHEN cond THEN ... [ELSE ...] END CASE` + `EXCEPTION WHEN <code> THEN ...`](#case-statement--exception-filtrada-bloque-x4e) — CASE statement-level + filtros por código en EXCEPTION + OTHERS fallback | TCL | 🟢 (bloque X4e) |
+| NEW mutable en BEFORE, `EXCEPTION WHEN <name>` simbólico, `FOR row IN SELECT`, `RETURN expr`, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -2334,6 +2335,86 @@ END LOOP;
 - **`RETURN expr`** en functions — X4e.
 - **`CASE` statement** — diferido.
 - **Múltiples `WHEN` branches** en EXCEPTION.
+
+---
+
+## CASE statement + EXCEPTION filtrada (bloque X4e)
+
+> **`CASE WHEN cond THEN <stmts> [WHEN cond THEN <stmts>]* [ELSE <stmts>] END CASE`** — statement-level (vs CASE expression que vive en SELECT list). **`EXCEPTION WHEN <code> THEN <handler>`** — filtros por código numérico en BEGIN..END handlers, múltiples WHEN encadenados con OTHERS fallback opcional.
+
+### 📜 EBNF
+
+```
+case_stmt   ::= "CASE" "WHEN" expr "THEN" stmt_list
+                { "WHEN" expr "THEN" stmt_list }*
+                [ "ELSE" stmt_list ]
+                "END" "CASE"
+exc_handler ::= "WHEN" ( integer | "OTHERS" ) "THEN" stmt_list
+```
+
+### 🧠 Semántica
+
+**CASE statement:**
+
+- Searched form solo (no operando inicial — usar `CASE WHEN x = v THEN ...`).
+- Semánticamente idéntico a `IF/ELSIF/ELSE/END IF`.
+- Primer WHEN cuya cond evalúe TRUE corre; resto se ignora.
+- ELSE corre si ninguna WHEN matchea. Sin ELSE + sin match → no-op.
+
+**EXCEPTION WHEN \<code\>:**
+
+- Filtro = literal entero (`4111`, `3001`, etc.) — el código `[GBY-NNNN]` sin prefijo.
+- Múltiples WHEN encadenados → primer filter que matchee el código del error gana.
+- `OTHERS` matchea cualquier error no atrapado por filtros previos. Va al final.
+- Sin handler match → re-propaga el error.
+
+### ✅ Ejemplos
+
+```sql
+-- CASE statement con clasificación
+DECLARE amt INT DEFAULT 500;
+CASE
+    WHEN amt >= 1000 THEN INSERT INTO platinum VALUES (id);
+    WHEN amt >= 100  THEN INSERT INTO gold VALUES (id);
+    WHEN amt >= 10   THEN INSERT INTO silver VALUES (id);
+    ELSE INSERT INTO bronze VALUES (id);
+END CASE;
+
+-- EXCEPTION filtrada por código
+BEGIN
+    INSERT INTO orders (id, amount) VALUES (1, -5);
+EXCEPTION
+    WHEN 3008 THEN                                   -- CHECK violation
+        INSERT INTO bad_orders (id) VALUES (1);
+    WHEN 3001 THEN                                   -- duplicate PK
+        UPDATE orders SET amount = -5 WHERE id = 1;
+    WHEN OTHERS THEN
+        INSERT INTO err_log (msg) VALUES ('unknown');
+END;
+
+-- CASE dentro de procedure
+CREATE PROCEDURE tier(p_id INT, p_amt INT) AS BEGIN
+    CASE
+        WHEN p_amt >= 100 THEN INSERT INTO tier_log VALUES (p_id, 'gold');
+        WHEN p_amt >= 50  THEN INSERT INTO tier_log VALUES (p_id, 'silver');
+        ELSE INSERT INTO tier_log VALUES (p_id, 'bronze');
+    END CASE;
+END;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4116] CASE statement: se esperaba WHEN` | Falta la primera branch (searched form requiere WHEN). |
+| `[GBY-4116] CASE statement: se esperaba END CASE` | Falta el cierre. |
+| `[GBY-4117] EXCEPTION WHEN: se esperaba OTHERS o código entero` | Filtro inválido (ident, string, etc.). |
+
+### ⚠️ No soportado todavía
+
+- **`EXCEPTION WHEN <name>`** filtros simbólicos (`WHEN no_data_found`, `WHEN unique_violation`) — X4f.
+- **`CASE expr WHEN val THEN ...`** simple form como statement — diferido.
+- **Múltiples códigos en un mismo WHEN** (`WHEN 3001 OR 3002 THEN`) — diferido.
 
 ---
 

@@ -317,9 +317,12 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `FOR ident IN start TO end LOOP ... END LOOP` | ✅ (X4c, 2026-05-28; auto-decl var, ascendente step=1) | — |
 | `BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` (try/catch catch-all) | ✅ (X4d, 2026-05-28; lookahead distingue de BEGIN TRANSACTION) | — |
 | `LOOP <body> END LOOP` standalone (sin WHILE/FOR) | ✅ (X4d, 2026-05-28; infinite hasta EXIT o MAX_ITER) | — |
-| `EXCEPTION WHEN <code> THEN ...` filtros por código específico | ❌ (X4d solo WHEN OTHERS; diferido a X4e) | P3 |
-| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido a X4e) | P3 |
-| `RETURN expr` en functions, `CASE` statement, `STEP n` / `REVERSE` en FOR, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
+| `EXCEPTION WHEN <code> THEN <handler>` filtros por código numérico + múltiples WHEN encadenados + OTHERS fallback | ✅ (X4e, 2026-05-29; código `[GBY-NNNN]` sin prefijo) | — |
+| `CASE WHEN cond THEN <stmts> [ELSE <stmts>] END CASE` statement-level (searched form) | ✅ (X4e, 2026-05-29) | — |
+| `EXCEPTION WHEN <name>` filtros simbólicos (`WHEN no_data_found`) | ❌ (X4e solo numéricos; diferido) | P3 |
+| `CASE expr WHEN val THEN ...` simple form como statement | ❌ (diferido) | P3 |
+| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido a X4f) | P3 |
+| `RETURN expr` en functions, `STEP n` / `REVERSE` en FOR, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |
 | `CREATE PROCEDURE name(...) AS <body>` + `CALL name(args)` | ✅ (X3, 2026-05-28; VERSION 14→15; statement-only, params via token-sub) | — |

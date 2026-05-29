@@ -77,6 +77,11 @@ pub enum Statement {
     Block(Box<BlockStmt>),
     /// Bloque X4d: `LOOP <body> END LOOP` standalone (infinite hasta EXIT).
     Loop(Box<LoopStmt>),
+    /// Bloque X4e (2026-05-29): `CASE WHEN cond THEN <stmts> [WHEN cond
+    /// THEN <stmts>]* [ELSE <stmts>] END CASE` — control de flujo
+    /// statement-level (vs CASE expression que vive en `Expr::Case`).
+    /// Sólo soporta la forma "searched" (sin operando inicial).
+    Case(Box<CaseStmt>),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -487,17 +492,29 @@ pub struct ForStmt {
     pub body: Vec<Statement>,
 }
 
-/// Bloque X4d (2026-05-28): `BEGIN <body> [EXCEPTION WHEN OTHERS THEN
-/// <handler>] END`. Si hay handler, captura errores propagados desde
-/// el body (excepto EXIT que sigue su sentinel propio) y ejecuta el
-/// handler. Si no hay handler, los errores propagan normal.
+/// Bloque X4e (2026-05-29): filtro de un `EXCEPTION WHEN ... THEN`.
+/// `Code(n)` matchea el código `[GBY-NNNN]` del error. `Others` es
+/// catch-all (mismo comportamiento que X4d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExceptionFilter {
+    Code(u32),
+    Others,
+}
+
+/// Bloque X4d (2026-05-28) + extendido en X4e (2026-05-29): `BEGIN
+/// <body> [EXCEPTION WHEN <filter> THEN <handler> [WHEN ...]*] END`.
+/// Si hay handlers, se prueban en orden contra el código del error
+/// (`[GBY-NNNN]` extraído del mensaje); el primer match ejecuta su
+/// handler. `Others` matchea cualquier error no atrapado por filtros
+/// previos. Sin handler matching → propaga error.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockStmt {
     pub body: Vec<Statement>,
-    /// Handler `WHEN OTHERS THEN <stmts>`. En X4d solo soportamos
-    /// catch-all (`OTHERS`); filtros por código específico de error
-    /// quedan diferidos.
-    pub exception_handler: Option<Vec<Statement>>,
+    /// X4e: lista de (filter, handler-body). Vacía = sin handler =
+    /// propaga errores. X4d siempre creaba 1 entry con `Others`; X4e
+    /// admite N entries con filtros específicos + opcional `Others`
+    /// al final.
+    pub exception_handlers: Vec<(ExceptionFilter, Vec<Statement>)>,
 }
 
 /// Bloque X4d: `LOOP <body> END LOOP` standalone (sin WHILE/FOR).
@@ -505,6 +522,17 @@ pub struct BlockStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopStmt {
     pub body: Vec<Statement>,
+}
+
+/// Bloque X4e (2026-05-29): `CASE WHEN cond THEN <stmts> [WHEN cond
+/// THEN <stmts>]* [ELSE <stmts>] END CASE`. Statement-level case
+/// (vs `Expr::Case` que vive como expresión). Searched form solo
+/// (sin operando inicial — la forma simple `CASE x WHEN v THEN ...`
+/// se puede escribir como `CASE WHEN x = v THEN ...`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseStmt {
+    pub branches: Vec<(Expr, Vec<Statement>)>,
+    pub else_branch: Option<Vec<Statement>>,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1698,6 +1726,18 @@ const MAX_LOOP_ITERATIONS: usize = 100_000;
 /// código `[GBY-NNNN]` — viaja como string interno.
 const EXIT_SIGNAL: &str = "__GABYSQL_EXIT_SIGNAL__";
 
+/// Bloque X4e (2026-05-29): extrae el código `NNNN` del prefijo
+/// `[GBY-NNNN]` del mensaje de un DbError. Usado por `exec_block`
+/// para matching de filtros `EXCEPTION WHEN <code> THEN`.
+/// Retorna `None` si el mensaje no lleva el prefijo standard.
+fn extract_error_code(msg: &str) -> Option<u32> {
+    let s = msg.trim_start();
+    let rest = s.strip_prefix("[GBY-")?;
+    let close = rest.find(']')?;
+    let digits = &rest[..close];
+    digits.parse().ok()
+}
+
 #[derive(Debug, Clone)]
 struct OuterRow {
     table: String,
@@ -1741,6 +1781,7 @@ impl<'a> Engine<'a> {
             Statement::For(stmt) => self.exec_for(*stmt),
             Statement::Block(stmt) => self.exec_block(*stmt),
             Statement::Loop(stmt) => self.exec_loop(*stmt),
+            Statement::Case(stmt) => self.exec_case(*stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3766,6 +3807,51 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Bloque X4e (2026-05-29): `CASE WHEN cond THEN <stmts> [WHEN ...]*
+    /// [ELSE <stmts>] END CASE`. Idéntico semánticamente a IF (X4) pero
+    /// con sintaxis CASE.
+    fn exec_case(&mut self, stmt: CaseStmt) -> DbResult<ResultSet> {
+        let empty: HashMap<String, Value> = HashMap::new();
+        let chosen: Option<Vec<Statement>> = {
+            let mut found: Option<Vec<Statement>> = None;
+            for (cond, body) in stmt.branches.into_iter() {
+                let v = self.eval_expr_full(&cond, &empty, None)?;
+                let truthy = match v {
+                    Value::Bool(b) => b,
+                    Value::Null => false,
+                    other => {
+                        return Err(coded(
+                            codes::IF_CONDITION_NOT_BOOLEAN,
+                            format!(
+                                "CASE WHEN: la condición debe evaluar a BOOL, recibí {}",
+                                value_type_name(&other)
+                            ),
+                        ));
+                    }
+                };
+                if truthy {
+                    found = Some(body);
+                    break;
+                }
+            }
+            found.or(stmt.else_branch)
+        };
+        let mut last_msg = "OK · CASE · no match".to_string();
+        if let Some(body) = chosen {
+            for s in body {
+                let rs = self.exec(s)?;
+                if let Some(m) = rs.message {
+                    last_msg = m;
+                }
+            }
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(last_msg),
+        })
+    }
+
     /// Bloque X4b (2026-05-28): `DECLARE name TYPE [DEFAULT expr]`.
     fn exec_declare(&mut self, stmt: DeclareStmt) -> DbResult<ResultSet> {
         let key = stmt.name.to_ascii_lowercase();
@@ -4018,12 +4104,12 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// Bloque X4d (2026-05-28): `BEGIN <body> [EXCEPTION WHEN OTHERS
-    /// THEN <handler>] END`. Ejecuta body en orden; si algún statement
-    /// rebota AND hay handler, captura y ejecuta handler en su lugar.
-    /// Si no hay handler, propaga el error normal. EXIT (sentinel) NO
-    /// se atrapa — sigue burbujeando para que el WHILE/FOR/LOOP outer
-    /// pueda terminarse.
+    /// Bloque X4d/X4e: `BEGIN <body> [EXCEPTION WHEN <filter> THEN
+    /// <handler>]* END`. Ejecuta body; si error, prueba cada handler
+    /// en orden — el primer filter que matchee el código del error
+    /// (extraído del mensaje `[GBY-NNNN]`) corre su body. `Others`
+    /// matchea cualquier error no atrapado por filtros anteriores.
+    /// EXIT (sentinel) NO se atrapa — sigue burbujeando.
     fn exec_block(&mut self, stmt: BlockStmt) -> DbResult<ResultSet> {
         let mut last_msg = "OK · block".to_string();
         for s in stmt.body {
@@ -4034,16 +4120,30 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Err(e) => {
-                    // EXIT viaja como sentinel — debe seguir
-                    // burbujeando hasta el LOOP innermost (no es un
-                    // error real).
                     if e.to_string().contains(EXIT_SIGNAL) {
                         return Err(e);
                     }
-                    // Hay handler? Capturar y correr handler.
-                    if let Some(handler) = stmt.exception_handler.clone() {
+                    if stmt.exception_handlers.is_empty() {
+                        return Err(e);
+                    }
+                    let err_msg = e.to_string();
+                    let err_code = extract_error_code(&err_msg);
+                    let matched: Option<&Vec<Statement>> =
+                        stmt.exception_handlers
+                            .iter()
+                            .find_map(|(filter, handler)| match filter {
+                                ExceptionFilter::Others => Some(handler),
+                                ExceptionFilter::Code(c) => {
+                                    if err_code == Some(*c) {
+                                        Some(handler)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            });
+                    if let Some(handler) = matched {
                         let mut handler_msg = format!("OK · EXCEPTION caught: {}", e);
-                        for h in handler {
+                        for h in handler.clone() {
                             match self.exec(h) {
                                 Ok(rs) => {
                                     if let Some(m) = rs.message {
@@ -4059,6 +4159,7 @@ impl<'a> Engine<'a> {
                             message: Some(handler_msg),
                         });
                     }
+                    // Ningún filter matched → re-propagar.
                     return Err(e);
                 }
             }
@@ -9701,6 +9802,42 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             // tampoco — el splitter no debería incrementar para esos).
             // Heurística: IF block-open requiere que NO esté precedido
             // por DROP/CREATE/ALTER (los que usan `IF [NOT] EXISTS`).
+            // Bloque X4e (2026-05-29): `CASE` statement-level abre
+            // depth (cierra con `END CASE` — análogo a END IF/LOOP).
+            // El `CASE` expression vive solo dentro de Expr (parser de
+            // SELECT list etc.), nunca llega acá en posición top-level.
+            // Pero CASE puede aparecer DENTRO de Expr contexts (e.g.
+            // SELECT list, WHERE) — distinguimos por context: si
+            // depth==0 y el contexto es Expr, CASE no debería abrir.
+            // Para simplificar, siempre que veamos CASE keyword,
+            // incrementamos depth — la expression CASE acaba con END
+            // (no END CASE), y el END dentro del Expr (vía paréntesis
+            // o lista) no decrementaría correctamente. Manejarlo con
+            // cuidado: si justo después de CASE viene WHEN, es
+            // statement-level (abre); si no, probablemente expression.
+            // Para X4e, asumimos siempre que CASE WHEN al inicio de
+            // line/post-`;`/post-keyword es statement.
+            //
+            // Heurística simple y conservadora: CASE abre depth solo
+            // si está post-`;` / post-keyword-de-bloque (BEGIN/THEN/
+            // ELSE/LOOP) — no si está post-operator/operand. Por
+            // ahora, abre siempre — los tests existentes con CASE
+            // expression viven dentro de SELECTs que NO atraviesan
+            // split_statements (parse() splittea por `;` antes de
+            // entrar al parser de Expr).
+            if (ch == 'C' || ch == 'c')
+                && match_keyword_at(bytes, index, b"CASE")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 4)
+            {
+                if !just_saw_end {
+                    begin_depth += 1;
+                }
+                just_saw_end = false;
+                current.push_str(&sql[index..index + 4]);
+                index += 4;
+                continue;
+            }
             // Bloque X4d (2026-05-28) refactor: el block-open de loops
             // vive en el keyword `LOOP`, no en WHILE/FOR. Resultado
             // coherente: `WHILE cond LOOP body END LOOP`, `FOR i IN
@@ -15468,6 +15605,15 @@ impl Parser {
         if self.match_keyword("LOOP") {
             return self.parse_loop_stmt();
         }
+        // Bloque X4e (2026-05-29): `CASE WHEN ... THEN ... END CASE`
+        // statement-level. Diferenciar de `CASE WHEN ... THEN ... END`
+        // expression: la statement requiere `END CASE` (con keyword
+        // CASE), la expression solo `END`. El parser de Expr nunca se
+        // invoca al top de parse_statement, así que CASE acá siempre
+        // es statement-level.
+        if self.match_keyword("CASE") {
+            return self.parse_case_stmt();
+        }
         if self.match_keyword("INSERT") {
             return self.parse_insert();
         }
@@ -15974,14 +16120,18 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" || upper == "LOOP" {
+                    } else if upper == "IF" || upper == "LOOP" || upper == "CASE" {
                         // X4: IF abre depth (cierra con END IF).
                         // X4d refactor: LOOP abre depth (cierra con END
                         // LOOP). Cubre `WHILE cond LOOP ... END LOOP`,
                         // `FOR i IN ... LOOP ... END LOOP` y `LOOP ...
                         // END LOOP` standalone. WHILE/FOR son no-op.
-                        // `END LOOP` se distingue via just_saw_end: el
-                        // LOOP post-END es close-keyword, no abre.
+                        // X4e: CASE statement-level abre depth (cierra
+                        // con `END CASE`). CASE expression cierra solo
+                        // con END — el balance también funciona.
+                        // `END LOOP`/`END CASE` se distinguen via
+                        // just_saw_end: el keyword post-END es close,
+                        // no abre.
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -16138,14 +16288,18 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" || upper == "LOOP" {
+                    } else if upper == "IF" || upper == "LOOP" || upper == "CASE" {
                         // X4: IF abre depth (cierra con END IF).
                         // X4d refactor: LOOP abre depth (cierra con END
                         // LOOP). Cubre `WHILE cond LOOP ... END LOOP`,
                         // `FOR i IN ... LOOP ... END LOOP` y `LOOP ...
                         // END LOOP` standalone. WHILE/FOR son no-op.
-                        // `END LOOP` se distingue via just_saw_end: el
-                        // LOOP post-END es close-keyword, no abre.
+                        // X4e: CASE statement-level abre depth (cierra
+                        // con `END CASE`). CASE expression cierra solo
+                        // con END — el balance también funciona.
+                        // `END LOOP`/`END CASE` se distinguen via
+                        // just_saw_end: el keyword post-END es close,
+                        // no abre.
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -16422,36 +16576,61 @@ impl Parser {
         })))
     }
 
-    /// Bloque X4d (2026-05-28): parsea `BEGIN <stmts> [EXCEPTION WHEN
-    /// OTHERS THEN <handler>] END`. La `BEGIN` keyword ya fue
-    /// consumida. X4d soporta sólo `WHEN OTHERS` (catch-all); filtros
-    /// por código de error específico quedan diferidos.
+    /// Bloque X4d (2026-05-28) + X4e (2026-05-29): parsea `BEGIN <stmts>
+    /// [EXCEPTION WHEN <filter> THEN <handler> [WHEN ...]*] END`. La
+    /// `BEGIN` keyword ya fue consumida. X4e admite múltiples WHEN
+    /// branches con filtros por código (`WHEN 4111 THEN ...`) más el
+    /// catch-all `WHEN OTHERS THEN ...` opcional al final.
     fn parse_block_stmt(&mut self) -> DbResult<Statement> {
         let body = self.parse_block_body()?;
-        let exception_handler = if self.match_keyword("EXCEPTION") {
-            if !self.match_keyword("WHEN") {
-                return Err(coded(
-                    codes::EXCEPTION_HANDLER_MALFORMED,
-                    "BEGIN ... EXCEPTION: se esperaba WHEN",
-                ));
+        let mut exception_handlers: Vec<(ExceptionFilter, Vec<Statement>)> = Vec::new();
+        if self.match_keyword("EXCEPTION") {
+            loop {
+                if !self.match_keyword("WHEN") {
+                    return Err(coded(
+                        codes::EXCEPTION_HANDLER_MALFORMED,
+                        "EXCEPTION: se esperaba WHEN",
+                    ));
+                }
+                let filter = if self.match_keyword("OTHERS") {
+                    ExceptionFilter::Others
+                } else {
+                    // Espera literal entero (código GBY-NNNN sin prefijo).
+                    let tok = self.peek().clone();
+                    if tok.kind != TokenKind::Number {
+                        return Err(coded(
+                            codes::EXCEPTION_FILTER_INVALID,
+                            format!(
+                                "EXCEPTION WHEN <filter>: se esperaba OTHERS o código entero (vi '{}')",
+                                tok.text
+                            ),
+                        ));
+                    }
+                    self.pos += 1;
+                    let code: u32 = tok.text.parse().map_err(|_| {
+                        coded(
+                            codes::EXCEPTION_FILTER_INVALID,
+                            format!("EXCEPTION WHEN: código inválido '{}'", tok.text),
+                        )
+                    })?;
+                    ExceptionFilter::Code(code)
+                };
+                if !self.match_keyword("THEN") {
+                    return Err(coded(
+                        codes::EXCEPTION_HANDLER_MALFORMED,
+                        "EXCEPTION WHEN ...: se esperaba THEN",
+                    ));
+                }
+                let handler = self.parse_block_body_until_when()?;
+                exception_handlers.push((filter, handler));
+                // ¿Otro WHEN o cerramos?
+                let t = self.peek();
+                if t.kind == TokenKind::Ident && t.text.eq_ignore_ascii_case("WHEN") {
+                    continue;
+                }
+                break;
             }
-            if !self.match_keyword("OTHERS") {
-                return Err(coded(
-                    codes::EXCEPTION_HANDLER_MALFORMED,
-                    "EXCEPTION WHEN ...: solo se soporta `OTHERS` (catch-all) en X4d",
-                ));
-            }
-            if !self.match_keyword("THEN") {
-                return Err(coded(
-                    codes::EXCEPTION_HANDLER_MALFORMED,
-                    "EXCEPTION WHEN OTHERS: se esperaba THEN",
-                ));
-            }
-            let handler = self.parse_block_body()?;
-            Some(handler)
-        } else {
-            None
-        };
+        }
         if !self.match_keyword("END") {
             return Err(coded(
                 codes::EXCEPTION_HANDLER_MALFORMED,
@@ -16460,8 +16639,34 @@ impl Parser {
         }
         Ok(Statement::Block(Box::new(BlockStmt {
             body,
-            exception_handler,
+            exception_handlers,
         })))
+    }
+
+    /// X4e: como `parse_block_body` pero también termina ante `WHEN`
+    /// (siguiente handler). Usado por parse_block_stmt cuando hay
+    /// múltiples handlers EXCEPTION encadenados.
+    fn parse_block_body_until_when(&mut self) -> DbResult<Vec<Statement>> {
+        let mut stmts = Vec::new();
+        loop {
+            while self.match_symbol(";") {}
+            let t = self.peek();
+            if t.kind == TokenKind::Eof {
+                return Err(coded(
+                    codes::EXCEPTION_HANDLER_MALFORMED,
+                    "EXCEPTION ...: EOF antes de END",
+                ));
+            }
+            if t.kind == TokenKind::Ident {
+                let upper = t.text.to_ascii_uppercase();
+                if upper == "WHEN" || upper == "END" {
+                    break;
+                }
+            }
+            let stmt = self.parse_statement()?;
+            stmts.push(stmt);
+        }
+        Ok(stmts)
     }
 
     /// Bloque X4d: parsea body de un BEGIN..[EXCEPTION..]END. Termina
@@ -16480,6 +16685,80 @@ impl Parser {
             if t.kind == TokenKind::Ident {
                 let upper = t.text.to_ascii_uppercase();
                 if upper == "EXCEPTION" || upper == "END" {
+                    break;
+                }
+            }
+            let stmt = self.parse_statement()?;
+            stmts.push(stmt);
+        }
+        Ok(stmts)
+    }
+
+    /// Bloque X4e (2026-05-29): parsea `CASE WHEN cond THEN <stmts>
+    /// [WHEN cond THEN <stmts>]* [ELSE <stmts>] END CASE`. Searched
+    /// form solo (sin operando inicial — usar `CASE WHEN x = v THEN`).
+    /// La `CASE` keyword ya fue consumida.
+    fn parse_case_stmt(&mut self) -> DbResult<Statement> {
+        let mut branches: Vec<(Expr, Vec<Statement>)> = Vec::new();
+        if !self.match_keyword("WHEN") {
+            return Err(coded(
+                codes::CASE_STATEMENT_MALFORMED,
+                "CASE statement: se esperaba WHEN (searched form: `CASE WHEN cond THEN ...`)",
+            ));
+        }
+        loop {
+            let cond = self.parse_expr()?;
+            if !self.match_keyword("THEN") {
+                return Err(coded(
+                    codes::CASE_STATEMENT_MALFORMED,
+                    "CASE WHEN ...: se esperaba THEN después de la condición",
+                ));
+            }
+            let body = self.parse_case_branch_body()?;
+            branches.push((cond, body));
+            if !self.match_keyword("WHEN") {
+                break;
+            }
+        }
+        let else_branch = if self.match_keyword("ELSE") {
+            Some(self.parse_case_branch_body()?)
+        } else {
+            None
+        };
+        if !self.match_keyword("END") {
+            return Err(coded(
+                codes::CASE_STATEMENT_MALFORMED,
+                "CASE statement: se esperaba END CASE para cerrar",
+            ));
+        }
+        if !self.match_keyword("CASE") {
+            return Err(coded(
+                codes::CASE_STATEMENT_MALFORMED,
+                "CASE statement: se esperaba END CASE (vi END sin CASE)",
+            ));
+        }
+        Ok(Statement::Case(Box::new(CaseStmt {
+            branches,
+            else_branch,
+        })))
+    }
+
+    /// X4e: body de una branch de CASE statement — lista de stmts
+    /// terminada por WHEN/ELSE/END.
+    fn parse_case_branch_body(&mut self) -> DbResult<Vec<Statement>> {
+        let mut stmts = Vec::new();
+        loop {
+            while self.match_symbol(";") {}
+            let t = self.peek();
+            if t.kind == TokenKind::Eof {
+                return Err(coded(
+                    codes::CASE_STATEMENT_MALFORMED,
+                    "CASE ...: EOF antes de END CASE",
+                ));
+            }
+            if t.kind == TokenKind::Ident {
+                let upper = t.text.to_ascii_uppercase();
+                if upper == "WHEN" || upper == "ELSE" || upper == "END" {
                     break;
                 }
             }

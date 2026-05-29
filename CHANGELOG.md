@@ -6,6 +6,55 @@
 
 ---
 
+## 2026-05-29 — Bloque X4e: `CASE` statement + `EXCEPTION WHEN <code>`
+
+> **Un push a `main`** sin bump on-disk. Noveno sub-bloque del bloque X. CASE statement-level (vs CASE expression existente) + filtros por código en EXCEPTION handlers, con OTHERS como fallback opcional. Detalle en [`docs/adr/0037-case-exception-filter-x4e.md`](docs/adr/0037-case-exception-filter-x4e.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- CASE statement (searched form)
+CASE
+    WHEN amount >= 1000 THEN INSERT INTO platinum VALUES (id);
+    WHEN amount >= 100  THEN INSERT INTO gold VALUES (id);
+    ELSE INSERT INTO bronze VALUES (id);
+END CASE;
+
+-- EXCEPTION filtrada por código
+BEGIN
+    INSERT INTO t (id) VALUES (1);
+EXCEPTION
+    WHEN 3001 THEN INSERT INTO dup_log VALUES (1);    -- DUPLICATE_PRIMARY_KEY
+    WHEN 4111 THEN INSERT INTO raise_log VALUES (1);  -- RAISE EXCEPTION
+    WHEN OTHERS THEN INSERT INTO err_log VALUES (1);  -- fallback
+END;
+```
+
+### 🛠 Implementación
+
+- **AST**: `Statement::Case(Box<CaseStmt { branches, else_branch }>)`. `BlockStmt.exception_handler: Option<Vec<Statement>>` → `BlockStmt.exception_handlers: Vec<(ExceptionFilter, Vec<Statement>)>`. `ExceptionFilter = Code(u32) | Others`.
+- **Parser**: parse_case_stmt como IF pero con `END CASE` close. parse_block_stmt extendido — loop de WHEN branches con filtro entero/OTHERS, requiere THEN, body terminado por WHEN/END.
+- **Engine**:
+  - `exec_case`: idéntico a IF — eval cond, primer TRUE gana, ELSE fallback.
+  - `exec_block`: si error, extrae `[GBY-NNNN]` del mensaje via `extract_error_code`; itera handlers en orden; primer filter que matchee (`Code(n)` exacto o `Others`) corre handler. Sin match → propaga.
+- **Helper `extract_error_code`**: parsea prefijo `[GBY-NNNN]` y devuelve u32.
+- **Splitter + body parsers**: `CASE` keyword también abre depth (cierra con `END CASE`; CASE expression también queda balanceado porque `END` decrementa).
+
+### 🚫 Diferido (a X4f)
+
+- `RETURN expr` en functions (function body de Expr a Vec<Statement>).
+- `FOR row IN SELECT ... LOOP` (composite row scope).
+- `EXCEPTION WHEN <name>` filtros simbólicos (`WHEN no_data_found`).
+- `CASE expr WHEN val THEN ...` simple form como statement.
+- Formato `%` en RAISE.
+
+### 🧪 Validación
+
+- 8 tests `x4e_*`: CASE basic chain, ELSE fallback, no-match + no-ELSE (no-op), EXCEPTION WHEN 4111 atrapa RAISE, WHEN código incorrecto propaga, múltiples WHEN con OTHERS fallback, CASE en procedure body, EXCEPTION atrapa runtime error específico (3001).
+- Suite total: **483/483 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X4d: `BEGIN..EXCEPTION..END` + `LOOP` standalone
 
 > **Un push a `main`** sin bump on-disk. Octavo sub-bloque del bloque X. Try/catch con `BEGIN..EXCEPTION WHEN OTHERS THEN..END`, loop infinito standalone, y refactor del splitter unificando WHILE/FOR/LOOP. Detalle en [`docs/adr/0036-exception-loop-x4d.md`](docs/adr/0036-exception-loop-x4d.md).

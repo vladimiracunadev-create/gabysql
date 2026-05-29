@@ -88,6 +88,8 @@
 
 - ~~`BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` como `Statement::Block` — try/catch con catch-all. Lookahead distingue de transaction `BEGIN [TRANSACTION];`. El handler atrapa cualquier error que NO sea EXIT sentinel (RAISE, runtime, PK dup, type mismatch). `LOOP <body> END LOOP` standalone — infinite hasta EXIT o MAX_LOOP_ITERATIONS. Refactor del splitter: block-open de loops vive en `LOOP` (no en WHILE/FOR), unifica WHILE/FOR/LOOP en un solo branch. EXIT sigue burbujeando a través de Block para llegar al loop outer. `WHEN <code>` específico y `RETURN expr` diferidos a X4e~~ ✅ entregado (bloque **X4d**, 2026-05-28, [ADR-0036](docs/adr/0036-exception-loop-x4d.md)).
 
+- ~~`CASE WHEN cond THEN <stmts> [WHEN cond THEN <stmts>]* [ELSE <stmts>] END CASE` statement-level (searched form, semánticamente idéntico a IF/ELSIF/ELSE). `EXCEPTION WHEN <code> THEN <handler>` con filtros por código numérico (`WHEN 4111 THEN`), múltiples WHEN encadenados, OTHERS catch-all como fallback opcional. Helper `extract_error_code` parsea `[GBY-NNNN]` del mensaje. Sin bump on-disk. Filtros simbólicos (`WHEN no_data_found`), `RETURN expr`, `FOR row IN SELECT` diferidos a X4f~~ ✅ entregado (bloque **X4e**, 2026-05-29, [ADR-0037](docs/adr/0037-case-exception-filter-x4e.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`
