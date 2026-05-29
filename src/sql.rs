@@ -4317,7 +4317,7 @@ impl<'a> Engine<'a> {
                 ));
             }
             // Inyectar var.col1, var.col2, ... para esta fila.
-            for (k, v) in keys.iter().zip(row.into_iter()) {
+            for (k, v) in keys.iter().zip(row) {
                 self.var_scope.insert(k.clone(), v);
             }
             for s in stmt.body.clone() {
