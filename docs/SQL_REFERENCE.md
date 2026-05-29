@@ -53,7 +53,8 @@
 | [`CREATE TRIGGER name {BEFORE\|AFTER} {INSERT\|UPDATE\|DELETE} ON t FOR EACH ROW <body>` + `DROP TRIGGER`](#triggers-bloques-x1--x2) — body single-stmt o `BEGIN stmt; stmt; END` | DDL | 🟢 (bloques X1+X2 / VERSION 14) |
 | [`CREATE PROCEDURE name(p1 TYPE, ...) AS <body>` + `DROP PROCEDURE` + `CALL name(args)`](#stored-procedures-bloque-x3) | DDL+DML | 🟢 (bloque X3 / VERSION 15) |
 | [`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>` + `DROP FUNCTION`, invocable como `name(args)` en cualquier expresión](#user-defined-functions-bloque-x3b) | DDL+DML | 🟢 (bloque X3b / VERSION 16) |
-| NEW mutable en BEFORE, `IF`/`LOOP`/variables en body, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`IF expr THEN ... [ELSIF ...]* [ELSE ...] END IF`](#control-de-flujo-if-bloque-x4) — statement top-level + dentro de bodies; anidado | TCL | 🟢 (bloque X4) |
+| NEW mutable en BEFORE, variables/`LOOP`/`WHILE`/`EXCEPTION` en body, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -1979,6 +1980,82 @@ DROP FUNCTION IF EXISTS dbl;
 - **Type checking estricto** en args/return.
 - **`IMMUTABLE`/`STABLE`/`VOLATILE`** hints.
 - **PL/pgSQL body** (variables, IF, LOOP).
+
+---
+
+## Control de flujo `IF` (bloque X4)
+
+> **`IF expr THEN <stmts> [ELSIF expr THEN <stmts>]* [ELSE <stmts>] END IF`**: control de flujo como statement top-level. Funciona en cualquier contexto donde quepa un statement — batches SQL planos, bodies de trigger / procedure, branches de otro IF (anidado).
+
+### 📜 EBNF
+
+```
+if_stmt    ::= "IF" expr "THEN" stmt_list
+               { "ELSIF" expr "THEN" stmt_list }*
+               [ "ELSE" stmt_list ]
+               "END" "IF"
+stmt_list  ::= stmt {";" stmt}* [";"]
+```
+
+### 🧠 Semántica
+
+- La condición debe evaluar a `BOOL` o `NULL` (`NULL` se trata como `FALSE` — 3VL).
+- Otros tipos → `[GBY-4105]`.
+- Evalúa cada condición en orden; **primer TRUE** ejecuta su branch y sale (no evalúa las restantes).
+- Si ninguna fue TRUE y hay `ELSE`, ejecuta `ELSE`. Sino, no-op.
+
+### ✅ Ejemplos
+
+```sql
+-- Top-level
+IF (SELECT COUNT(*) FROM orders) > 1000 THEN
+    INSERT INTO alerts (msg) VALUES ('alta carga');
+END IF;
+
+-- Chain ELSIF
+IF total >= 1000 THEN INSERT INTO platinum VALUES (id);
+ELSIF total >= 100 THEN INSERT INTO gold VALUES (id);
+ELSIF total >= 10  THEN INSERT INTO silver VALUES (id);
+ELSE INSERT INTO bronze VALUES (id);
+END IF;
+
+-- Dentro de trigger
+CREATE TRIGGER classify AFTER INSERT ON t FOR EACH ROW BEGIN
+    IF NEW.v >= 100 THEN INSERT INTO big VALUES (NEW.id);
+    ELSE INSERT INTO small VALUES (NEW.id);
+    END IF;
+END;
+
+-- Dentro de procedure
+CREATE PROCEDURE classify(p_id INT, p_v INT) AS BEGIN
+    IF p_v >= 100 THEN INSERT INTO log (id, label) VALUES (p_id, 'big');
+    ELSE INSERT INTO log (id, label) VALUES (p_id, 'small');
+    END IF;
+END;
+
+-- Anidado
+IF cond1 THEN
+    IF cond2 THEN INSERT INTO log VALUES (1); END IF;
+END IF;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4105] IF: la condición debe evaluar a BOOL ...` | `IF 42 THEN ...` o similar. Usar comparación / `IS NULL` / función que devuelva BOOL. |
+| `[GBY-4106] IF: falta END IF para cerrar el bloque` | Falta `END IF` matching. |
+| `[GBY-4106] IF: se esperaba THEN después de la condición` | Falta `THEN`. |
+| `[GBY-4106] EOF antes de END IF` | El input se cortó dentro de un bloque IF abierto. |
+
+### ⚠️ No soportado todavía
+
+- **Variables locales** (`DECLARE x INT [DEFAULT expr]`) — X4b.
+- **Asignación** (`SET x = expr` / `x := expr`) — X4b.
+- **`WHILE` / `LOOP` / `FOR` / `EXIT [WHEN]` / `CONTINUE`** — X4b.
+- **`RAISE EXCEPTION` / `RAISE NOTICE`** — X4c.
+- **`EXCEPTION WHEN ... THEN`** handlers — X4c.
+- **`CASE` statement** (vs CASE expression que ya existe en SELECT list) — futuro.
 
 ---
 

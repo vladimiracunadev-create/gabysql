@@ -49,6 +49,12 @@ pub enum Statement {
     CreateFunction(CreateFunctionStmt),
     /// Bloque X3b: `DROP FUNCTION [IF EXISTS] name`.
     DropFunction(DropFunctionStmt),
+    /// Bloque X4 (2026-05-28): control de flujo `IF expr THEN ...
+    /// [ELSIF expr THEN ...]* [ELSE ...] END IF`. Existe principalmente
+    /// para bodies de trigger / procedure — al exec evalúa cada
+    /// condición contra row vacío (post-substitución de NEW/OLD/params)
+    /// y ejecuta la branch elegida.
+    If(Box<IfStmt>),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -379,6 +385,22 @@ pub struct CreateFunctionStmt {
 pub struct DropFunctionStmt {
     pub name: String,
     pub if_exists: bool,
+}
+
+/// Bloque X4 (2026-05-28): `IF expr THEN <stmts> [ELSIF expr THEN
+/// <stmts>]* [ELSE <stmts>] END IF`. Cada branch es una lista de
+/// statements (posiblemente conteniendo IF anidados). Se ejecuta como
+/// statement top-level dentro del body de un trigger / procedure /
+/// batch — eval cada cond en orden, primer true → ejecutar esa branch
+/// y salir. NULL se trata como FALSE (3VL).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfStmt {
+    /// Lista ordenada de (condición, cuerpo). El primer ítem es el IF
+    /// inicial; ítems subsiguientes son los ELSIF. La branch elegida es
+    /// la primera cuya cond evalúa a TRUE.
+    pub branches: Vec<(Expr, Vec<Statement>)>,
+    /// Cuerpo opcional del ELSE (corre si ninguna cond fue TRUE).
+    pub else_branch: Option<Vec<Statement>>,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1589,6 +1611,7 @@ impl<'a> Engine<'a> {
             Statement::Call(stmt) => self.exec_call(stmt),
             Statement::CreateFunction(stmt) => self.exec_create_function(stmt),
             Statement::DropFunction(stmt) => self.exec_drop_function(stmt),
+            Statement::If(stmt) => self.exec_if(*stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3564,6 +3587,54 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// Bloque X4 (2026-05-28): ejecuta un `IF ... THEN ... [ELSIF ...]*
+    /// [ELSE ...] END IF`. Evalúa cada condición en orden contra row
+    /// vacío (post-substitución de NEW/OLD/params hecha por el caller
+    /// antes del parse); primer TRUE → ejecuta esa branch y sale. NULL
+    /// se trata como FALSE (3VL). Si ninguna cond fue TRUE y hay ELSE
+    /// → ejecuta ELSE. Sino, no-op.
+    fn exec_if(&mut self, stmt: IfStmt) -> DbResult<ResultSet> {
+        let empty: HashMap<String, Value> = HashMap::new();
+        let chosen: Option<Vec<Statement>> = {
+            let mut found: Option<Vec<Statement>> = None;
+            for (cond, body) in stmt.branches.into_iter() {
+                let v = self.eval_expr_full(&cond, &empty, None)?;
+                let truthy = match v {
+                    Value::Bool(b) => b,
+                    Value::Null => false,
+                    other => {
+                        return Err(coded(
+                            codes::IF_CONDITION_NOT_BOOLEAN,
+                            format!(
+                                "IF: la condición debe evaluar a BOOL (o NULL → FALSE), recibí {}",
+                                value_type_name(&other)
+                            ),
+                        ));
+                    }
+                };
+                if truthy {
+                    found = Some(body);
+                    break;
+                }
+            }
+            found.or(stmt.else_branch)
+        };
+        let mut last_msg = "OK · IF · no-op".to_string();
+        if let Some(body) = chosen {
+            for s in body {
+                let rs = self.exec(s)?;
+                if let Some(m) = rs.message {
+                    last_msg = m;
+                }
+            }
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(last_msg),
+        })
     }
 
     /// Bloque X3b: evalúa una invocación a user-defined function.
@@ -9096,7 +9167,12 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     // keyword fuera de string +1, cada `END` -1. Mientras > 0 los `;`
     // viajan dentro del current chunk. No-nested en X2 (un solo nivel
     // de profundidad) pero el contador lo soporta naturalmente.
+    //
+    // Bloque X4 (2026-05-28): `IF` también abre un bloque (cierra con
+    // `END IF` — el END decrementa, el IF posterior se ignora). Track
+    // `just_saw_end` para no double-count el IF en `END IF`.
     let mut begin_depth: usize = 0;
+    let mut just_saw_end: bool = false;
     let bytes = sql.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -9142,6 +9218,43 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 index += 5;
                 continue;
             }
+            // Bloque X4 (2026-05-28): `IF` también abre un bloque (cierra
+            // con `END IF` que decrementa via el branch de `END` abajo).
+            // Solo si es el keyword IF (con boundaries de ident), no
+            // dentro de `IF EXISTS` / `IF NOT EXISTS` (no son block-open
+            // tampoco — el splitter no debería incrementar para esos).
+            // Heurística: IF block-open requiere que NO esté precedido
+            // por DROP/CREATE/ALTER (los que usan `IF [NOT] EXISTS`).
+            if (ch == 'I' || ch == 'i')
+                && match_keyword_at(bytes, index, b"IF")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 2)
+            {
+                // Lookahead: NOT EXISTS / EXISTS son DDL conditionals,
+                // no block-open. `END IF` tampoco — el IF acá es parte
+                // del close-keyword, no un nuevo block-open.
+                let mut la = index + 2;
+                while la < bytes.len() && (bytes[la] as char).is_whitespace() {
+                    la += 1;
+                }
+                let is_ddl_conditional = match_keyword_at(bytes, la, b"NOT")
+                    && !is_ident_byte_at(bytes, la + 3)
+                    || match_keyword_at(bytes, la, b"EXISTS") && !is_ident_byte_at(bytes, la + 6);
+                // `IF(...)` es función escalar (built-in `IF(cond, a, b)`),
+                // no un bloque IF/THEN. Tampoco abre depth.
+                let is_func_call = la < bytes.len() && bytes[la] as char == '(';
+                if !is_ddl_conditional && !is_func_call && !just_saw_end {
+                    begin_depth += 1;
+                }
+                just_saw_end = false;
+                current.push_str(&sql[index..index + 2]);
+                index += 2;
+                continue;
+            }
+            // Reset el flag al ver cualquier otro token significativo.
+            if !ch.is_whitespace() {
+                just_saw_end = false;
+            }
             if (ch == 'E' || ch == 'e')
                 && match_keyword_at(bytes, index, b"END")
                 && !is_ident_byte_at(bytes, index.wrapping_sub(1))
@@ -9149,6 +9262,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 && begin_depth > 0
             {
                 begin_depth -= 1;
+                just_saw_end = true;
                 current.push_str(&sql[index..index + 3]);
                 index += 3;
                 continue;
@@ -13724,6 +13838,9 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                             | "INTO"
                             | "DEFAULT"
                             | "IS"
+                            | "IF"
+                            | "ELSIF"
+                            | "THEN"
                     )
                 }
                 _ => false,
@@ -14821,6 +14938,14 @@ impl Parser {
         if self.match_keyword("CREATE") {
             return self.parse_create();
         }
+        // Bloque X4 (2026-05-28): control de flujo `IF expr THEN ...`.
+        // Es un statement top-level — vive principalmente dentro de
+        // bodies de trigger/procedure pero se puede usar también en un
+        // batch SQL plano. El `IF` de `DROP TABLE IF EXISTS` se
+        // consume DENTRO de `parse_drop`, así que nunca llega acá.
+        if self.match_keyword("IF") {
+            return self.parse_if_stmt();
+        }
         if self.match_keyword("INSERT") {
             return self.parse_insert();
         }
@@ -15288,10 +15413,13 @@ impl Parser {
         let body_sql = if head.kind == TokenKind::Ident && head.text.eq_ignore_ascii_case("BEGIN") {
             self.pos += 1; // consume BEGIN
             let start = self.pos;
-            // Consumir hasta el END matching (no soportamos nesting en X2;
-            // depth==0 al inicio del body, +1 por cada BEGIN dentro, -1
-            // por cada END dentro).
+            // Consumir hasta el END matching. Tracking de profundidad:
+            // BEGIN abre +1, END cierra -1. Bloque X4: IF también abre
+            // +1 (cierra con `END IF`, donde el END decrementa y el IF
+            // posterior se ignora). Mismo flag `just_saw_end` que el
+            // splitter para no double-count.
             let mut depth = 1usize;
+            let mut just_saw_end = false;
             while depth > 0 {
                 let t = self.peek().clone();
                 if t.kind == TokenKind::Eof {
@@ -15301,14 +15429,26 @@ impl Parser {
                     ));
                 }
                 if t.kind == TokenKind::Ident {
-                    if t.text.eq_ignore_ascii_case("BEGIN") {
+                    let upper = t.text.to_ascii_uppercase();
+                    if upper == "BEGIN" {
                         depth += 1;
-                    } else if t.text.eq_ignore_ascii_case("END") {
+                        just_saw_end = false;
+                    } else if upper == "END" {
                         depth -= 1;
+                        just_saw_end = true;
                         if depth == 0 {
                             break;
                         }
+                    } else if upper == "IF" {
+                        if !just_saw_end {
+                            depth += 1;
+                        }
+                        just_saw_end = false;
+                    } else {
+                        just_saw_end = false;
                     }
+                } else {
+                    just_saw_end = false;
                 }
                 self.pos += 1;
             }
@@ -15432,7 +15572,11 @@ impl Parser {
         let body_sql = if head.kind == TokenKind::Ident && head.text.eq_ignore_ascii_case("BEGIN") {
             self.pos += 1;
             let start = self.pos;
+            // X4: tracking idéntico al de trigger bodies — BEGIN/IF
+            // abren depth, END cierra; `just_saw_end` evita que el IF
+            // de `END IF` se cuente como block-open.
             let mut depth = 1usize;
+            let mut just_saw_end = false;
             while depth > 0 {
                 let t = self.peek().clone();
                 if t.kind == TokenKind::Eof {
@@ -15442,14 +15586,26 @@ impl Parser {
                     ));
                 }
                 if t.kind == TokenKind::Ident {
-                    if t.text.eq_ignore_ascii_case("BEGIN") {
+                    let upper = t.text.to_ascii_uppercase();
+                    if upper == "BEGIN" {
                         depth += 1;
-                    } else if t.text.eq_ignore_ascii_case("END") {
+                        just_saw_end = false;
+                    } else if upper == "END" {
                         depth -= 1;
+                        just_saw_end = true;
                         if depth == 0 {
                             break;
                         }
+                    } else if upper == "IF" {
+                        if !just_saw_end {
+                            depth += 1;
+                        }
+                        just_saw_end = false;
+                    } else {
+                        just_saw_end = false;
                     }
+                } else {
+                    just_saw_end = false;
                 }
                 self.pos += 1;
             }
@@ -15498,6 +15654,84 @@ impl Parser {
             params,
             body_sql,
         }))
+    }
+
+    /// Bloque X4 (2026-05-28): parsea `IF expr THEN <body> [ELSIF expr
+    /// THEN <body>]* [ELSE <body>] END IF`. Cada body es una lista de
+    /// statements separados por `;` (último `;` opcional). IF anidado
+    /// está soportado naturalmente porque `parse_if_body` recursivamente
+    /// llama a `parse_statement` que vuelve a entrar a `parse_if_stmt`.
+    fn parse_if_stmt(&mut self) -> DbResult<Statement> {
+        let mut branches: Vec<(Expr, Vec<Statement>)> = Vec::new();
+        let cond = self.parse_expr()?;
+        if !self.match_keyword("THEN") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "IF ...: se esperaba THEN después de la condición",
+            ));
+        }
+        let body = self.parse_if_body()?;
+        branches.push((cond, body));
+        while self.match_keyword("ELSIF") {
+            let cond = self.parse_expr()?;
+            if !self.match_keyword("THEN") {
+                return Err(coded(
+                    codes::IF_BLOCK_MALFORMED,
+                    "ELSIF ...: se esperaba THEN después de la condición",
+                ));
+            }
+            let body = self.parse_if_body()?;
+            branches.push((cond, body));
+        }
+        let else_branch = if self.match_keyword("ELSE") {
+            Some(self.parse_if_body()?)
+        } else {
+            None
+        };
+        if !self.match_keyword("END") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "IF ...: se esperaba END IF para cerrar el bloque",
+            ));
+        }
+        if !self.match_keyword("IF") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "IF ...: se esperaba END IF (vi END pero sin IF)",
+            ));
+        }
+        Ok(Statement::If(Box::new(IfStmt {
+            branches,
+            else_branch,
+        })))
+    }
+
+    /// Bloque X4: parsea el cuerpo de una branch IF/ELSIF/ELSE — una
+    /// lista de statements separados por `;`. Termina cuando ve
+    /// `ELSIF`, `ELSE`, o `END` (los tres son terminators de branch).
+    fn parse_if_body(&mut self) -> DbResult<Vec<Statement>> {
+        let mut stmts = Vec::new();
+        loop {
+            // Consumir cualquier `;` suelto (último de stmt anterior o
+            // separadores extra).
+            while self.match_symbol(";") {}
+            let t = self.peek();
+            if t.kind == TokenKind::Eof {
+                return Err(coded(
+                    codes::IF_BLOCK_MALFORMED,
+                    "IF ...: EOF antes de END IF",
+                ));
+            }
+            if t.kind == TokenKind::Ident {
+                let upper = t.text.to_ascii_uppercase();
+                if matches!(upper.as_str(), "ELSIF" | "ELSE" | "END") {
+                    break;
+                }
+            }
+            let stmt = self.parse_statement()?;
+            stmts.push(stmt);
+        }
+        Ok(stmts)
     }
 
     fn parse_if_exists(&mut self) -> DbResult<bool> {

@@ -80,6 +80,8 @@
 
 - ~~User-defined scalar functions (`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>`, `DROP FUNCTION [IF EXISTS]`). Invocables desde cualquier expresión (SELECT/WHERE/HAVING). Body es UNA `Expr` (desviación práctica de ANSI — sin SELECT/FROM). Persistencia: nuevo `ObjectKind::Function` (VERSION 15→16). AST: nuevo `Expr::UserFunc { name, args }` + arm en 17 walkers de Expr. Composición trivial (functions invocan otras functions). CHECK constraints rechazan user functions para preservar pureza~~ ✅ entregado (bloque **X3b**, 2026-05-28, [ADR-0032](docs/adr/0032-user-functions-x3b.md)). Con X3b cierran las **4 routines server-side clásicas**: triggers (X1+X2), procedures (X3), functions (X3b).
 
+- ~~Control de flujo `IF expr THEN <stmts> [ELSIF expr THEN <stmts>]* [ELSE <stmts>] END IF` como statement top-level. Útil sobre todo en bodies de trigger/procedure pero también funciona en batches SQL planos. Condición evalúa a BOOL (NULL→FALSE, 3VL). IF anidado soportado. NEW/OLD/params se substituyen por valores antes del parse, así que la condición ve literales y el engine la evalúa contra row vacío. Splitter de statements + body parsers extendidos para trackear `IF ... END IF` igual que `BEGIN ... END`. Sin bump on-disk. Variables/LOOP/EXCEPTION diferidos a X4b+~~ ✅ entregado (bloque **X4**, 2026-05-28, [ADR-0033](docs/adr/0033-if-then-else-x4.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

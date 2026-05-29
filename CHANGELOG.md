@@ -6,6 +6,73 @@
 
 ---
 
+## 2026-05-28 — Bloque X4: control de flujo `IF/THEN/ELSIF/ELSE/END IF`
+
+> **Un push a `main`** sin bump on-disk. Quinto sub-bloque del bloque X. Control de flujo `IF` como statement top-level — utilizable directamente en batches SQL y dentro de bodies de trigger/procedure. Variables locales, `LOOP`, `EXCEPTION` diferidos a X4b+. Detalle en [`docs/adr/0033-if-then-else-x4.md`](docs/adr/0033-if-then-else-x4.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- Statement top-level
+IF total >= 100 THEN
+    INSERT INTO big_log VALUES (id, total);
+ELSIF total >= 10 THEN
+    INSERT INTO med_log VALUES (id, total);
+ELSE
+    INSERT INTO small_log VALUES (id, total);
+END IF;
+
+-- Dentro de trigger body
+CREATE TRIGGER classify AFTER INSERT ON t FOR EACH ROW BEGIN
+    IF NEW.v >= 100 THEN
+        INSERT INTO big_log (id) VALUES (NEW.id);
+    ELSE
+        INSERT INTO small_log (id) VALUES (NEW.id);
+    END IF;
+END;
+
+-- Dentro de procedure body
+CREATE PROCEDURE classify(p_id INT, p_v INT) AS BEGIN
+    IF p_v >= 100 THEN INSERT INTO log VALUES (p_id, 'big');
+    ELSE INSERT INTO log VALUES (p_id, 'small');
+    END IF;
+END;
+
+-- Anidado
+IF cond1 THEN
+    IF cond2 THEN ... END IF;
+END IF;
+```
+
+### 🛠 Implementación
+
+- **AST**: nuevo `Statement::If(Box<IfStmt>)` con `branches: Vec<(Expr, Vec<Statement>)>` (IF + ELSIF chain) y `else_branch: Option<Vec<Statement>>`.
+- **Parser**: `parse_if_stmt` recursivo (IF anidado funciona naturalmente porque `parse_if_body` llama `parse_statement` que vuelve a entrar). `IF` se intercepta en `parse_statement` antes de INSERT — el `IF` de `DROP TABLE IF EXISTS` se consume DENTRO de `parse_drop` y nunca llega.
+- **Engine `exec_if`**: evalúa cada condition contra row vacío (NEW/OLD/params ya substituidos por el caller antes del parse del body). Primer TRUE gana; NULL → FALSE (3VL); no-bool → `[GBY-4105]`.
+- **`split_statements` extendido** (X2 BEGIN/END tracking → X4 también IF/END IF). Distingue:
+  - `IF expr THEN ...` → bloque (depth+1).
+  - `END IF` → close-keyword (depth-1; el IF posterior no abre — flag `just_saw_end`).
+  - `IF(...)` → función escalar `IF(cond, a, b)` — no abre.
+  - `IF [NOT] EXISTS` → DDL conditional — no abre.
+- **Body parsers de trigger/procedure** replican el mismo tracking IF/END IF (para capturar el body completo al CREATE-time, no parar antes en el END del IF interno).
+- **Tokenizer**: `IF`/`ELSIF`/`THEN` agregados a la lista de keywords que introducen un valor — habilita `IF -5 > 0 THEN` (literal negativo después de `IF`).
+
+### 🚫 Diferido (a X4b+)
+
+- **Variables locales** (`DECLARE x INT DEFAULT expr`).
+- **Asignación** (`SET x = expr` / `x := expr`).
+- **`WHILE`/`LOOP`/`FOR`** + **`EXIT [WHEN]`** / **`CONTINUE`**.
+- **`RAISE EXCEPTION` / `RAISE NOTICE`**.
+- **`EXCEPTION WHEN ... THEN`** handlers.
+- **`RETURN expr`** dentro de functions.
+
+### 🧪 Validación
+
+- 9 tests `x4_*`: IF simple, IF/ELSE, IF/ELSIF/ELSE chain, IF en trigger/procedure body, IF anidado, condición no-bool rechazada, IF sin END rechazado, IF con NEW dentro de trigger (incluye valores negativos post-subst).
+- Suite total: **450/450 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X3b: user-defined scalar functions [VERSION 15→16]
 
 > **Un push a `main`** con bump on-disk **VERSION 15 → 16**. Cuarto sub-bloque del bloque X. `CREATE FUNCTION RETURNS scalar` invocable desde cualquier expresión (SELECT/WHERE/HAVING). Cierra el cuarteto de routines server-side: triggers + procedures + functions. Detalle en [`docs/adr/0032-user-functions-x3b.md`](docs/adr/0032-user-functions-x3b.md).

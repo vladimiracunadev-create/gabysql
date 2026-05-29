@@ -553,6 +553,13 @@ pub mod codes {
     /// Bloque X3b: `name(args)` recibió un número de argumentos distinto
     /// al declarado en la signatura de la function.
     pub const FUNCTION_ARITY_MISMATCH: u32 = 4104;
+    /// Bloque X4 (2026-05-28): la condición de un `IF ... THEN` (en el
+    /// body de un trigger o procedure) no evaluó a BOOL. NULL se trata
+    /// como FALSE (3VL → la branch THEN no corre).
+    pub const IF_CONDITION_NOT_BOOLEAN: u32 = 4105;
+    /// Bloque X4: bloque `IF` malformado — falta `THEN`, falta `END IF`,
+    /// `ELSIF`/`ELSE` fuera de lugar, etc.
+    pub const IF_BLOCK_MALFORMED: u32 = 4106;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

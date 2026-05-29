@@ -10559,6 +10559,181 @@ fn x3b_function_calling_function() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X4 (2026-05-28): IF/THEN/ELSIF/ELSE/END IF. -----
+
+fn x4_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x4-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x4_if_then_simple() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("simple")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         IF 1 = 1 THEN INSERT INTO log (id) VALUES (1); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_then_else() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("else")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         IF 1 = 0 THEN INSERT INTO log (id) VALUES (1);
+         ELSE INSERT INTO log (id) VALUES (99);
+         END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_elsif_else_chain() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("elsif")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         IF 1 = 0 THEN INSERT INTO log (id) VALUES (1);
+         ELSIF 2 = 0 THEN INSERT INTO log (id) VALUES (2);
+         ELSIF 3 = 3 THEN INSERT INTO log (id) VALUES (3);
+         ELSE INSERT INTO log (id) VALUES (4);
+         END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_in_trigger_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("in-trigger")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         CREATE TABLE big_log (id INT PRIMARY KEY);
+         CREATE TABLE small_log (id INT PRIMARY KEY);
+         CREATE TRIGGER classify AFTER INSERT ON t FOR EACH ROW BEGIN \
+            IF NEW.v >= 100 THEN INSERT INTO big_log (id) VALUES (NEW.id); \
+            ELSE INSERT INTO small_log (id) VALUES (NEW.id); \
+            END IF; \
+         END;",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 50);")?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (2, 200);")?;
+    let big = run_sql(&db, "SELECT id FROM big_log;")?;
+    let small = run_sql(&db, "SELECT id FROM small_log;")?;
+    assert_eq!(big[0].rows.len(), 1);
+    assert_eq!(big[0].rows[0][0], Value::Integer(2));
+    assert_eq!(small[0].rows.len(), 1);
+    assert_eq!(small[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_in_procedure_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("in-proc")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY, label TEXT);
+         CREATE PROCEDURE classify(p_id INT, p_v INT) AS BEGIN \
+            IF p_v >= 100 THEN INSERT INTO log (id, label) VALUES (p_id, 'big'); \
+            ELSE INSERT INTO log (id, label) VALUES (p_id, 'small'); \
+            END IF; \
+         END;",
+    )?;
+    run_sql(&db, "CALL classify(1, 50);")?;
+    run_sql(&db, "CALL classify(2, 200);")?;
+    let res = run_sql(&db, "SELECT id, label FROM log ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][1], Value::String("small".to_string()));
+    assert_eq!(res[0].rows[1][1], Value::String("big".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_nested_if() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("nested")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         IF 1 = 1 THEN
+            IF 2 = 2 THEN INSERT INTO log (id) VALUES (42); END IF;
+         END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_condition_not_bool_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("not-bool")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "IF 42 THEN INSERT INTO t (id) VALUES (1); END IF;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4105"),
+        "esperaba GBY-4105, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_without_end_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("no-end")?;
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "IF 1=1 THEN INSERT INTO log (id) VALUES (1);").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4106"),
+        "esperaba GBY-4106, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4_if_with_new_in_trigger() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4_setup("new-in-if")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         CREATE TABLE flag (id INT PRIMARY KEY);
+         CREATE TRIGGER tag AFTER INSERT ON t FOR EACH ROW BEGIN \
+            IF NEW.v > 0 THEN INSERT INTO flag (id) VALUES (NEW.id); END IF; \
+         END;",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (1, 10);")?;
+    run_sql(&db, "INSERT INTO t (id, v) VALUES (2, -5);")?;
+    let res = run_sql(&db, "SELECT id FROM flag;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
