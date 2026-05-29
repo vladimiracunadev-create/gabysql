@@ -14799,15 +14799,21 @@ fn z1b_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
 
 #[test]
 fn z1b_create_user_persists_pbkdf2_meta() -> Result<(), Box<dyn Error>> {
+    // Test originalmente z1b. Z1c cambia el default a scheme=2 (scrypt).
+    // Mantenemos el test con shape genérica (verifica el layout, no la
+    // identidad del scheme — el shape es el mismo para scheme=1 y 2).
     let (db, wal) = z1b_setup("pbkdf2-shape")?;
     run_sql(&db, "CREATE USER alice WITH PASSWORD 'sup3r-secret';")?;
     let mut pager = Pager::open(&db)?;
     let mut cat = gabysql::catalog::Catalog::open(&mut pager);
     let u = cat.get_user("alice")?.unwrap();
-    assert_eq!(u.scheme, 1, "scheme=1 = PBKDF2-SHA256");
+    assert!(
+        u.scheme == 1 || u.scheme == 2,
+        "scheme∈{{1,2}} crypto-grade"
+    );
     assert_eq!(u.salt.len(), 16, "salt 16B (NIST)");
     assert_eq!(u.password_hash.len(), 32, "hash 32B (SHA-256 output)");
-    assert_eq!(u.iterations, 100_000, "100K iter (OWASP 2023)");
+    assert!(u.iterations > 0, "iterations o N > 0");
     pager.close()?;
     cleanup(&[&db, &wal]);
     Ok(())
@@ -15349,6 +15355,123 @@ fn z3c_update_no_policies_bypass() -> Result<(), Box<dyn Error>> {
         "SET SESSION AUTHORIZATION DEFAULT; SELECT n FROM t WHERE id = 1;",
     )?;
     assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque Z1c (2026-05-29): scrypt RFC 7914 reemplaza PBKDF2 como
+// default. Bump VERSION 27 → 28.
+// ============================================================
+
+fn z1c_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z1c-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z1c_default_scheme_is_scrypt() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1c_setup("default-scrypt")?;
+    run_sql(&db, "CREATE USER alice WITH PASSWORD 'pw';")?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let u = cat.get_user("alice")?.unwrap();
+    assert_eq!(u.scheme, 2, "Z1c default = scheme 2 (scrypt)");
+    assert_eq!(u.iterations, 16384, "N=16384 (interactive)");
+    assert_eq!(u.salt.len(), 16);
+    assert_eq!(u.password_hash.len(), 32);
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1c_scrypt_correct_password_authenticates() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1c_setup("auth-ok")?;
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'correct-horse';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'correct-horse';",
+    )?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1c_scrypt_wrong_password_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1c_setup("auth-bad")?;
+    let err = run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'correct';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'wrong';",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4137"),
+        "esperaba [GBY-4137], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1c_alter_user_password_uses_scrypt() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1c_setup("alter-scrypt")?;
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'old';
+         ALTER USER alice SET PASSWORD 'new';",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let u = cat.get_user("alice")?.unwrap();
+    assert_eq!(u.scheme, 2);
+    pager.close()?;
+    // Y la nueva password autentica.
+    run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'new';",
+    )?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1c_same_password_different_salt_different_hash() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z1c_setup("salt-uniq")?;
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'same';
+         CREATE USER bob WITH PASSWORD 'same';",
+    )?;
+    let mut pager = Pager::open(&db)?;
+    let mut cat = gabysql::catalog::Catalog::open(&mut pager);
+    let a = cat.get_user("alice")?.unwrap();
+    let b = cat.get_user("bob")?.unwrap();
+    assert_ne!(a.salt, b.salt);
+    assert_ne!(a.password_hash, b.password_hash);
+    pager.close()?;
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z1c_scrypt_deterministic() -> Result<(), Box<dyn Error>> {
+    // Si scrypt no fuera determinístico, el segundo SET con la misma
+    // password fallaría.
+    let (db, wal) = z1c_setup("determ")?;
+    run_sql(
+        &db,
+        "CREATE USER alice WITH PASSWORD 'same';
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'same';
+         SET SESSION AUTHORIZATION DEFAULT;
+         SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'same';",
+    )?;
     cleanup(&[&db, &wal]);
     Ok(())
 }

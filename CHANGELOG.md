@@ -6,6 +6,52 @@
 
 ---
 
+## 2026-05-29 — Bloque Z1c: scrypt (RFC 7914) memory-hard password hashing
+
+> **Un push a `main`**. Bump on-disk **VERSION 27 → 28** (corte semántico). Z1c cubre el defer de Z1b: KDF memory-hard scrypt reemplaza PBKDF2 como default. ~32 MB por hash, resistente a ASIC/GPU. Detalle en [`docs/adr/0056-z1c-scrypt-password-hashing.md`](docs/adr/0056-z1c-scrypt-password-hashing.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE USER alice WITH PASSWORD 'secret';
+-- Hash: scrypt RFC 7914, N=16384, r=8, p=1, salt 16B, hash 32B.
+-- Memoria: ~32 MB por hash (vs ~0 para PBKDF2).
+
+SET SESSION AUTHORIZATION 'alice' WITH PASSWORD 'secret';
+-- Engine dispatches on meta.scheme:
+--   1 → verify_password_pbkdf2 (Z1b legacy users)
+--   2 → verify_password_scrypt (Z1c default)
+```
+
+### 🛠 Implementación
+
+- **Salsa20/8 core** (Bernstein, ~30 LOC).
+- **BlockMix(B, r)** RFC 7914 §4 (~25 LOC).
+- **ROMix(B, N, r)** RFC 7914 §5 — la parte memory-hard. Aloca `N * 128 * r ≈ 32 MB` y hace N iteraciones de BlockMix + N saltos pseudo-aleatorios (~30 LOC).
+- **scrypt(P, S, N, r, p, dkLen)** RFC 7914 §6: pipeline PBKDF2 → ROMix por bloque → PBKDF2 final.
+- **pbkdf2_sha256_extended** — variante del PBKDF2 de Z1b con `dkLen` arbitrario para el output multi-block de scrypt.
+- `exec_create_user` y `exec_alter_user_password` ahora persisten con `scheme = PASSWORD_SCHEME_SCRYPT = 2`.
+- `exec_set_session_auth` con dispatch sobre `meta.scheme` para coexistencia legacy ↔ default.
+
+### ⚠️ Migración
+
+VERSION bump 27→28: el bump documenta un corte **semántico** (no estructural — el layout de `UserMeta` no cambió). Un .db V27 (Z1b o Z3b/Z3c) tiene users con scheme=1; un binario Z1c puede verificarlos sin problema gracias al dispatch. Pero un binario Z1b no sabe de scheme=2, por eso el bump.
+
+### 🚫 Diferido (Z1d y futuro)
+
+- **Argon2id** (scheme=3) — memory-hard también, con resistencia a side-channel + validación RFC 9106. Implementación ~800 LOC con Blake2b variant. Defer hasta caso de uso explícito.
+- Parámetros N/r/p configurables (`ALTER SYSTEM SET scrypt_n = ...`).
+- Migración silenciosa scheme=1 → scheme=2 on next login (re-hash con scrypt si auth exitosa).
+- Test vector RFC 7914 §8 explícito en los z1c tests.
+- Wire-up al server HTTP (`Authorization: Bearer user:password` con verify).
+
+### 🧪 Validación
+
+- Suite: **674 passing** (668 → +6 Z1c). Cubre: default scheme=2, autenticación correcta/incorrecta, ALTER USER mantiene scheme=2, uniqueness del salt, determinismo de scrypt.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z3c: UPDATE post-image WITH CHECK
 
 > **Un push a `main`** sin bump on-disk. Z3c cubre el último caso del trío PostgreSQL RLS: verificar que la fila resultante de un UPDATE (post-assignments) siga dentro del scope de las policies. Detalle en [`docs/adr/0055-z3c-update-post-image-check.md`](docs/adr/0055-z3c-update-post-image-check.md).

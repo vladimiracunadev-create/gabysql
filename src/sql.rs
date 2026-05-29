@@ -4430,15 +4430,16 @@ impl<'a> Engine<'a> {
                 ));
             }
         }
-        // Bloque Z1b (2026-05-29): PBKDF2-HMAC-SHA256 + salt aleatorio.
+        // Bloque Z1c (2026-05-29): scrypt memory-hard reemplaza PBKDF2
+        // como default. N=16384, r=8, p=1 (~32 MB, ~100ms).
         let salt = gen_password_salt_bytes();
-        let password_hash = hash_password_pbkdf2(stmt.password.as_deref().unwrap_or(""), &salt);
+        let password_hash = hash_password_scrypt(stmt.password.as_deref().unwrap_or(""), &salt);
         let meta = UserMeta {
             name: stmt.name.clone(),
-            scheme: PASSWORD_SCHEME_PBKDF2_SHA256,
+            scheme: PASSWORD_SCHEME_SCRYPT,
             salt,
             password_hash,
-            iterations: PBKDF2_ITERATIONS,
+            iterations: SCRYPT_N,
         };
         {
             let mut catalog = Catalog::open(self.pager);
@@ -4578,15 +4579,15 @@ impl<'a> Engine<'a> {
                 format!("ALTER USER '{}': no existe", stmt.name),
             ));
         };
-        // Bloque Z1b: rotamos salt + re-hasheamos con PBKDF2 al cambio.
+        // Bloque Z1c: rotamos salt + re-hasheamos con scrypt al cambio.
         let salt = gen_password_salt_bytes();
-        let password_hash = hash_password_pbkdf2(&stmt.password, &salt);
+        let password_hash = hash_password_scrypt(&stmt.password, &salt);
         let meta = UserMeta {
             name: stmt.name.clone(),
-            scheme: PASSWORD_SCHEME_PBKDF2_SHA256,
+            scheme: PASSWORD_SCHEME_SCRYPT,
             salt,
             password_hash,
-            iterations: PBKDF2_ITERATIONS,
+            iterations: SCRYPT_N,
         };
         {
             let mut catalog = Catalog::open(self.pager);
@@ -4724,23 +4725,31 @@ impl<'a> Engine<'a> {
                     format!("SET SESSION AUTHORIZATION '{}': el user no existe", user),
                 ));
             };
-            // Bloque Z1b: si el caller pasó `WITH PASSWORD '...'`, lo
-            // verificamos contra el hash persistido vía PBKDF2-SHA256.
-            // Sin password el modo es "trust" (compat Z2 — auth real
-            // de capa superior, e.g. token HTTP).
+            // Bloque Z1b/Z1c: si el caller pasó `WITH PASSWORD '...'`,
+            // lo verificamos contra el hash persistido. El dispatch
+            // sobre `meta.scheme` permite back-compat: users creados con
+            // Z1b (scheme=1, PBKDF2) y Z1c (scheme=2, scrypt) coexisten.
+            // Sin password el modo es "trust" (compat Z2).
             if let Some(ref pw) = stmt.password {
-                if meta.scheme != PASSWORD_SCHEME_PBKDF2_SHA256 {
-                    return Err(coded(
-                        codes::AUTH_PASSWORD_INCORRECT,
-                        format!(
-                            "SET SESSION AUTHORIZATION '{}': scheme de password \
-                             desconocido ({}); recrea el user con Z1b para habilitar \
-                             verificación",
-                            user, meta.scheme
-                        ),
-                    ));
-                }
-                if !verify_password_pbkdf2(pw, &meta.salt, &meta.password_hash) {
+                let ok = match meta.scheme {
+                    PASSWORD_SCHEME_PBKDF2_SHA256 => {
+                        verify_password_pbkdf2(pw, &meta.salt, &meta.password_hash)
+                    }
+                    PASSWORD_SCHEME_SCRYPT => {
+                        verify_password_scrypt(pw, &meta.salt, &meta.password_hash)
+                    }
+                    other => {
+                        return Err(coded(
+                            codes::AUTH_PASSWORD_INCORRECT,
+                            format!(
+                                "SET SESSION AUTHORIZATION '{}': scheme de password \
+                                 desconocido ({})",
+                                user, other
+                            ),
+                        ));
+                    }
+                };
+                if !ok {
                     return Err(coded(
                         codes::AUTH_PASSWORD_INCORRECT,
                         format!("SET SESSION AUTHORIZATION '{}': password incorrecta", user),
@@ -17138,13 +17147,21 @@ fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
     }
 }
 
-/// Bloque Z1b (2026-05-29): scheme byte de password hash.
-/// - `0` = legacy FNV-1a-64 (pre-Z1b, ya no se emite — sólo se lee si
-///   un .db viejo lo trae). Z1b bumpa VERSION, así que no hay path de
-///   lectura real; el byte queda reservado por compat documental.
+/// Bloque Z1b/Z1c (2026-05-29): scheme byte de password hash.
+/// - `0` = legacy FNV-1a-64 (pre-Z1b, ya no se emite).
 /// - `1` = PBKDF2-HMAC-SHA256, 100K iter, 16B salt, 32B hash (Z1b).
+/// - `2` = scrypt RFC 7914 (Z1c), memory-hard, N=16384 r=8 p=1
+///   (parámetros interactive login OWASP/RFC), 16B salt, 32B hash.
 pub const PASSWORD_SCHEME_FNV_LEGACY: u8 = 0;
 pub const PASSWORD_SCHEME_PBKDF2_SHA256: u8 = 1;
+pub const PASSWORD_SCHEME_SCRYPT: u8 = 2;
+
+/// Bloque Z1c: parámetros scrypt para interactive login. N=2^14=16384
+/// satisface OWASP/RFC 7914 §7 (32 MB memoria, ~100ms en CPU moderno).
+/// r=8 (block size factor), p=1 (paralelismo) son los estándar.
+pub const SCRYPT_N: u32 = 16384;
+pub const SCRYPT_R: u32 = 8;
+pub const SCRYPT_P: u32 = 1;
 
 /// Bloque Z1b: número de iteraciones de PBKDF2-SHA256 para password
 /// hashing. 100_000 es la recomendación OWASP 2023 para PBKDF2-SHA256;
@@ -17336,6 +17353,186 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= a[i] ^ b[i];
     }
     diff == 0
+}
+
+// ============================================================
+// Bloque Z1c (2026-05-29): scrypt (RFC 7914) — KDF memory-hard.
+// Resistente a ASIC porque el costo de memoria (~32 MB con N=16384,
+// r=8) hace prohibitivo paralelizarlo en hardware especializado.
+// Implementación pura en Rust sin deps. Reusa PBKDF2-HMAC-SHA256 (Z1b).
+// ============================================================
+
+/// Salsa20/8 core: 20 columnas/4 rondas de double-round = 8 rounds
+/// total. RFC 7914 §3 + Bernstein "Salsa20 specification".
+///
+/// `input` y `output` son 64 bytes; in-place no se admite (output
+/// puede ser el mismo buffer que input externamente, lo manejamos
+/// vía clone explícito acá).
+fn salsa20_8_core(input: &[u8; 64], output: &mut [u8; 64]) {
+    let mut x = [0u32; 16];
+    for i in 0..16 {
+        x[i] = u32::from_le_bytes([
+            input[i * 4],
+            input[i * 4 + 1],
+            input[i * 4 + 2],
+            input[i * 4 + 3],
+        ]);
+    }
+    let initial = x;
+    // 8 rondas = 4 double-rounds (column + row).
+    for _ in 0..4 {
+        // Column round.
+        x[4] ^= x[0].wrapping_add(x[12]).rotate_left(7);
+        x[8] ^= x[4].wrapping_add(x[0]).rotate_left(9);
+        x[12] ^= x[8].wrapping_add(x[4]).rotate_left(13);
+        x[0] ^= x[12].wrapping_add(x[8]).rotate_left(18);
+        x[9] ^= x[5].wrapping_add(x[1]).rotate_left(7);
+        x[13] ^= x[9].wrapping_add(x[5]).rotate_left(9);
+        x[1] ^= x[13].wrapping_add(x[9]).rotate_left(13);
+        x[5] ^= x[1].wrapping_add(x[13]).rotate_left(18);
+        x[14] ^= x[10].wrapping_add(x[6]).rotate_left(7);
+        x[2] ^= x[14].wrapping_add(x[10]).rotate_left(9);
+        x[6] ^= x[2].wrapping_add(x[14]).rotate_left(13);
+        x[10] ^= x[6].wrapping_add(x[2]).rotate_left(18);
+        x[3] ^= x[15].wrapping_add(x[11]).rotate_left(7);
+        x[7] ^= x[3].wrapping_add(x[15]).rotate_left(9);
+        x[11] ^= x[7].wrapping_add(x[3]).rotate_left(13);
+        x[15] ^= x[11].wrapping_add(x[7]).rotate_left(18);
+        // Row round.
+        x[1] ^= x[0].wrapping_add(x[3]).rotate_left(7);
+        x[2] ^= x[1].wrapping_add(x[0]).rotate_left(9);
+        x[3] ^= x[2].wrapping_add(x[1]).rotate_left(13);
+        x[0] ^= x[3].wrapping_add(x[2]).rotate_left(18);
+        x[6] ^= x[5].wrapping_add(x[4]).rotate_left(7);
+        x[7] ^= x[6].wrapping_add(x[5]).rotate_left(9);
+        x[4] ^= x[7].wrapping_add(x[6]).rotate_left(13);
+        x[5] ^= x[4].wrapping_add(x[7]).rotate_left(18);
+        x[11] ^= x[10].wrapping_add(x[9]).rotate_left(7);
+        x[8] ^= x[11].wrapping_add(x[10]).rotate_left(9);
+        x[9] ^= x[8].wrapping_add(x[11]).rotate_left(13);
+        x[10] ^= x[9].wrapping_add(x[8]).rotate_left(18);
+        x[12] ^= x[15].wrapping_add(x[14]).rotate_left(7);
+        x[13] ^= x[12].wrapping_add(x[15]).rotate_left(9);
+        x[14] ^= x[13].wrapping_add(x[12]).rotate_left(13);
+        x[15] ^= x[14].wrapping_add(x[13]).rotate_left(18);
+    }
+    for i in 0..16 {
+        let v = x[i].wrapping_add(initial[i]);
+        output[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// RFC 7914 §4 — BlockMix(B): procesa 2*r bloques de 64 bytes.
+/// `b` tiene 128*r bytes; el resultado in-place tiene la misma forma
+/// pero reordenado: primero los índices pares, luego los impares.
+fn block_mix(b: &mut [u8], r: usize) {
+    debug_assert_eq!(b.len(), 128 * r);
+    let mut x = [0u8; 64];
+    // X ← B_{2r-1} (último bloque).
+    x.copy_from_slice(&b[(2 * r - 1) * 64..]);
+    let mut y = vec![0u8; 128 * r];
+    for i in 0..2 * r {
+        // X ← Salsa20/8(X xor B_i)
+        let mut input = [0u8; 64];
+        for j in 0..64 {
+            input[j] = x[j] ^ b[i * 64 + j];
+        }
+        salsa20_8_core(&input, &mut x);
+        // Y_i ← X (luego reordenamos)
+        y[i * 64..(i + 1) * 64].copy_from_slice(&x);
+    }
+    // Reordenar Y: (Y_0, Y_2, ..., Y_{2r-2}, Y_1, Y_3, ..., Y_{2r-1}).
+    for i in 0..r {
+        b[i * 64..(i + 1) * 64].copy_from_slice(&y[(2 * i) * 64..(2 * i + 1) * 64]);
+        b[(r + i) * 64..(r + i + 1) * 64].copy_from_slice(&y[(2 * i + 1) * 64..(2 * i + 2) * 64]);
+    }
+}
+
+/// RFC 7914 §5 — ROMix(B, N): el corazón memory-hard. Aloca
+/// N * 128 * r bytes (32 MB para N=16384, r=8) y los llena via N
+/// iteraciones de BlockMix, después hace N "saltos" pseudo-aleatorios
+/// guiados por el contenido del propio bloque.
+fn ro_mix(b: &mut [u8], n: u32, r: usize) {
+    let block_len = 128 * r;
+    debug_assert_eq!(b.len(), block_len);
+    // V_i = i-th BlockMix^i(B). Aloca V[0..N].
+    let n_us = n as usize;
+    let mut v = vec![0u8; n_us * block_len];
+    let mut x = b.to_vec();
+    for i in 0..n_us {
+        v[i * block_len..(i + 1) * block_len].copy_from_slice(&x);
+        block_mix(&mut x, r);
+    }
+    // N saltos pseudo-aleatorios.
+    for _ in 0..n_us {
+        // j = Integerify(X) mod N — toma el último bloque B_{2r-1} y
+        // su primer u64 LE como índice.
+        let last = (2 * r - 1) * 64;
+        let j = u64::from_le_bytes(x[last..last + 8].try_into().unwrap()) as usize % n_us;
+        for k in 0..block_len {
+            x[k] ^= v[j * block_len + k];
+        }
+        block_mix(&mut x, r);
+    }
+    b.copy_from_slice(&x);
+}
+
+/// RFC 7914 §6 — scrypt(P, S, N, r, p, dkLen).
+/// Implementación con `dkLen = PASSWORD_HASH_LEN` (32B).
+/// Para p > 1 se procesaría cada bloque ROMix en paralelo; acá lo
+/// hacemos serial (p=1 default de Z1c, no hay overhead).
+fn scrypt_hash(password: &[u8], salt: &[u8], n: u32, r: u32, p: u32) -> Vec<u8> {
+    let r = r as usize;
+    let p = p as usize;
+    // Paso 1: B = PBKDF2-HMAC-SHA256(P, S, 1, p * 128 * r).
+    let mut b = pbkdf2_sha256_extended(password, salt, 1, p * 128 * r);
+    // Paso 2: para cada B_i (i=0..p), B_i ← ROMix(B_i, N).
+    for i in 0..p {
+        let slice = &mut b[i * 128 * r..(i + 1) * 128 * r];
+        ro_mix(slice, n, r);
+    }
+    // Paso 3: DK = PBKDF2-HMAC-SHA256(P, B, 1, dkLen).
+    pbkdf2_sha256_extended(password, &b, 1, PASSWORD_HASH_LEN)
+}
+
+/// PBKDF2-HMAC-SHA256 con `dkLen` variable (los bytes de output
+/// arbitrarios). El helper `pbkdf2_sha256` original sólo cubría
+/// dkLen=32 (un T_1); para scrypt necesitamos `p * 128 * r` bytes en
+/// el primer call (varios miles para N=16384, r=8, p=1).
+fn pbkdf2_sha256_extended(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
+    let h_len = 32usize;
+    let blocks = dk_len.div_ceil(h_len);
+    let mut out = Vec::with_capacity(blocks * h_len);
+    for i in 1..=blocks {
+        let mut salt_with_index = Vec::with_capacity(salt.len() + 4);
+        salt_with_index.extend_from_slice(salt);
+        salt_with_index.extend_from_slice(&(i as u32).to_be_bytes());
+        let mut u = hmac_sha256(password, &salt_with_index);
+        let mut t = u;
+        for _ in 1..iterations {
+            u = hmac_sha256(password, &u);
+            for j in 0..32 {
+                t[j] ^= u[j];
+            }
+        }
+        out.extend_from_slice(&t);
+    }
+    out.truncate(dk_len);
+    out
+}
+
+/// Bloque Z1c: hash de password con scrypt (interactive params).
+fn hash_password_scrypt(password: &str, salt: &[u8]) -> Vec<u8> {
+    scrypt_hash(password.as_bytes(), salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+}
+
+/// Bloque Z1c: verifica contra hash scrypt.
+fn verify_password_scrypt(password: &str, salt: &[u8], expected_hash: &[u8]) -> bool {
+    if expected_hash.len() != PASSWORD_HASH_LEN {
+        return false;
+    }
+    let computed = hash_password_scrypt(password, salt);
+    constant_time_eq(&computed, expected_hash)
 }
 
 fn gen_uuid_v7() -> String {
