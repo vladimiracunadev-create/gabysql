@@ -90,6 +90,8 @@
 
 - ~~`CASE WHEN cond THEN <stmts> [WHEN cond THEN <stmts>]* [ELSE <stmts>] END CASE` statement-level (searched form, semánticamente idéntico a IF/ELSIF/ELSE). `EXCEPTION WHEN <code> THEN <handler>` con filtros por código numérico (`WHEN 4111 THEN`), múltiples WHEN encadenados, OTHERS catch-all como fallback opcional. Helper `extract_error_code` parsea `[GBY-NNNN]` del mensaje. Sin bump on-disk. Filtros simbólicos (`WHEN no_data_found`), `RETURN expr`, `FOR row IN SELECT` diferidos a X4f~~ ✅ entregado (bloque **X4e**, 2026-05-29, [ADR-0037](docs/adr/0037-case-exception-filter-x4e.md)).
 
+- ~~`RETURN expr` en function bodies multi-statement (`CREATE FUNCTION ... AS BEGIN ... RETURN x; END`). Parser detecta `BEGIN` tras `AS` y conmuta a block body (compat X3b: single expression body sigue válido). Sentinel `RETURN_SIGNAL` + Engine.pending_return_value, mismo patrón que EXIT de X4b. Sin RETURN → devuelve NULL. Restore de pending_return_value por invocación habilita funciones que llaman funciones. Cierra el bloque X (procedural completo). FOR row IN SELECT, filtros simbólicos, formato `%` en RAISE y CASE expr simple form quedan diferidos~~ ✅ entregado (bloque **X4f**, 2026-05-29, [ADR-0038](docs/adr/0038-return-in-functions-x4f.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

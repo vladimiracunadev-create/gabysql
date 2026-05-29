@@ -58,6 +58,7 @@
 | [`RAISE [EXCEPTION\|NOTICE] 'msg'` + `FOR i IN start TO end LOOP ... END LOOP`](#raise--for-loop-bloque-x4c) — aborto explícito + range loop con auto-decl | TCL | 🟢 (bloque X4c) |
 | [`BEGIN <body> [EXCEPTION WHEN OTHERS THEN <handler>] END` + `LOOP <body> END LOOP` standalone](#exception-handlers--loop-standalone-bloque-x4d) — try/catch catch-all + loop infinite hasta EXIT | TCL | 🟢 (bloque X4d) |
 | [`CASE WHEN cond THEN ... [ELSE ...] END CASE` + `EXCEPTION WHEN <code> THEN ...`](#case-statement--exception-filtrada-bloque-x4e) — CASE statement-level + filtros por código en EXCEPTION + OTHERS fallback | TCL | 🟢 (bloque X4e) |
+| [`CREATE FUNCTION ... AS BEGIN ... RETURN expr; END`](#return-en-function-bodies-bloque-x4f) — function bodies multi-statement con RETURN como sentinel (compat single-expr body de X3b) | DDL | 🟢 (bloque X4f) |
 | NEW mutable en BEFORE, `EXCEPTION WHEN <name>` simbólico, `FOR row IN SELECT`, `RETURN expr`, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
@@ -2415,6 +2416,81 @@ END;
 - **`EXCEPTION WHEN <name>`** filtros simbólicos (`WHEN no_data_found`, `WHEN unique_violation`) — X4f.
 - **`CASE expr WHEN val THEN ...`** simple form como statement — diferido.
 - **Múltiples códigos en un mismo WHEN** (`WHEN 3001 OR 3002 THEN`) — diferido.
+
+---
+
+## RETURN en function bodies (bloque X4f)
+
+> **`CREATE FUNCTION ... AS BEGIN ... RETURN expr; END`** — function bodies multi-statement con `RETURN expr` como mecanismo de salida. La forma single-expression body de X3b (`AS x + 1`) sigue funcionando.
+
+### 📜 EBNF
+
+```
+create_function ::= "CREATE" "FUNCTION" ident "(" [ param { "," param }* ] ")"
+                    "RETURNS" type "AS" function_body
+function_body   ::= expr
+                  | "BEGIN" stmt_list "END"
+return_stmt     ::= "RETURN" expr
+```
+
+### 🧠 Semántica
+
+- El parser detecta `BEGIN` justo después de `AS` y conmuta a body multi-statement (depth tracking idéntico a procedure/trigger).
+- `RETURN expr` evalúa la expresión y termina la function devolviendo ese valor al caller.
+- RETURN burbujea a través de IF/WHILE/FOR/CASE/BEGIN sin código extra (mismo patrón de sentinel que EXIT).
+- Si la function llega al final sin RETURN, devuelve `NULL`.
+- `RETURN` fuera de un function body multi-statement → `[GBY-4118]`.
+- Funciones que llaman funciones funcionan correctamente — cada invocación snapshot-tea/restaura su pending RETURN.
+
+### ✅ Ejemplos
+
+```sql
+-- IF con early return
+CREATE FUNCTION sign(x INT) RETURNS TEXT AS BEGIN
+    IF x < 0 THEN
+        RETURN 'negative';
+    ELSIF x = 0 THEN
+        RETURN 'zero';
+    ELSE
+        RETURN 'positive';
+    END IF;
+END;
+
+SELECT sign(-3), sign(0), sign(7);  -- 'negative', 'zero', 'positive'
+
+-- Variables locales + loop + RETURN
+CREATE FUNCTION sum_to(n INT) RETURNS INT AS BEGIN
+    DECLARE i INT DEFAULT 1;
+    DECLARE total INT DEFAULT 0;
+    WHILE i <= n LOOP
+        SET total = total + i;
+        SET i = i + 1;
+    END LOOP;
+    RETURN total;
+END;
+
+SELECT sum_to(10);  -- 55
+
+-- Composición de functions
+CREATE FUNCTION dbl(x INT) RETURNS INT AS x * 2;
+CREATE FUNCTION quad(x INT) RETURNS INT AS BEGIN
+    RETURN dbl(dbl(x));
+END;
+
+SELECT quad(3);  -- 12
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4118] RETURN fuera de function body` | `RETURN expr` usado en script top-level o dentro de procedure. |
+
+### ⚠️ No soportado todavía
+
+- `RETURNS TABLE` (table-valued functions) — diferido.
+- `RETURN QUERY <select>` estilo PL/pgSQL — diferido.
+- `OUT` / `INOUT` parameters como mecanismo de retorno alternativo — diferido.
 
 ---
 

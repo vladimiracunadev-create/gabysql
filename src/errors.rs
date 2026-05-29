@@ -601,6 +601,10 @@ pub mod codes {
     /// Bloque X4e: `EXCEPTION WHEN <filter>` con filtro inválido — no
     /// es ni `OTHERS` ni un literal entero (código GBY-NNNN sin prefijo).
     pub const EXCEPTION_FILTER_INVALID: u32 = 4117;
+    /// Bloque X4f (2026-05-29): `RETURN expr` usado fuera del body de
+    /// una function. Solo válido dentro de `CREATE FUNCTION ... AS
+    /// BEGIN ... RETURN expr; END;` para retornar el valor al caller.
+    pub const RETURN_OUTSIDE_FUNCTION: u32 = 4118;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

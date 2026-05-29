@@ -6,6 +6,62 @@
 
 ---
 
+## 2026-05-29 — Bloque X4f: `RETURN expr` en function bodies
+
+> **Un push a `main`** sin bump on-disk. Décimo y último previsto sub-bloque del bloque X. Function bodies multi-statement con `RETURN expr` como sentinel — habilita lógica procedural completa dentro de functions. Detalle en [`docs/adr/0038-return-in-functions-x4f.md`](docs/adr/0038-return-in-functions-x4f.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- Block body con RETURN (X3b single-expr body sigue válido)
+CREATE FUNCTION sign(x INT) RETURNS TEXT AS BEGIN
+    IF x < 0 THEN
+        RETURN 'negative';
+    ELSIF x = 0 THEN
+        RETURN 'zero';
+    ELSE
+        RETURN 'positive';
+    END IF;
+END;
+
+-- Variables locales + loop + RETURN
+CREATE FUNCTION sum_to(n INT) RETURNS INT AS BEGIN
+    DECLARE i INT DEFAULT 1;
+    DECLARE total INT DEFAULT 0;
+    WHILE i <= n LOOP
+        SET total = total + i;
+        SET i = i + 1;
+    END LOOP;
+    RETURN total;
+END;
+
+SELECT sum_to(10);  -- 55
+```
+
+### 🛠 Implementación
+
+- **AST**: `Statement::Return(ReturnStmt { value: Expr })`. Engine field nuevo `pending_return_value: Option<Value>`. Constante `RETURN_SIGNAL = "__GABYSQL_RETURN_SIGNAL__"`.
+- **Parser**: `parse_create_function` detecta `BEGIN` tras `AS` → body multi-stmt con depth tracking idéntico a trigger/procedure body. `RETURN` keyword en parse_statement crea `Statement::Return`.
+- **Engine**:
+  - `exec_return`: evalúa expr, guarda en `pending_return_value`, lanza error sentinel.
+  - `eval_user_func` (block body): snapshot del `pending_return_value` previo, ejecuta stmts del body, atrapa el sentinel y retorna el valor, restaura el previo. Sin RETURN → NULL.
+  - Sentinel burbujea por IF/WHILE/FOR/CASE/BEGIN sin código extra (mismo patrón que EXIT de X4b).
+- **Compat**: single-expression body (X3b) sigue funcionando — el parser elige por lookahead.
+
+### 🚫 Diferido (post-X4f)
+
+- `FOR row IN SELECT ... LOOP` (composite row scope).
+- `EXCEPTION WHEN <name>` filtros simbólicos.
+- `CASE expr WHEN val THEN ...` simple form como statement.
+- Formato `%` en RAISE, `STEP n` / `REVERSE` en FOR range, `RAISE WARNING/INFO`.
+
+### 🧪 Validación
+
+- 6 tests `x4f_*`: single-expr body regression, multi-stmt + RETURN, early RETURN en IF, sin RETURN → NULL, WHILE + RETURN (sum_to(10)=55), function compose (quad = dbl(dbl(x))).
+- Suite total: **489/489 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque X4e: `CASE` statement + `EXCEPTION WHEN <code>`
 
 > **Un push a `main`** sin bump on-disk. Noveno sub-bloque del bloque X. CASE statement-level (vs CASE expression existente) + filtros por código en EXCEPTION handlers, con OTHERS como fallback opcional. Detalle en [`docs/adr/0037-case-exception-filter-x4e.md`](docs/adr/0037-case-exception-filter-x4e.md).

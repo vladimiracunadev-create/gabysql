@@ -321,8 +321,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `CASE WHEN cond THEN <stmts> [ELSE <stmts>] END CASE` statement-level (searched form) | ✅ (X4e, 2026-05-29) | — |
 | `EXCEPTION WHEN <name>` filtros simbólicos (`WHEN no_data_found`) | ❌ (X4e solo numéricos; diferido) | P3 |
 | `CASE expr WHEN val THEN ...` simple form como statement | ❌ (diferido) | P3 |
-| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido a X4f) | P3 |
-| `RETURN expr` en functions, `STEP n` / `REVERSE` en FOR, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
+| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido) | P3 |
+| `RETURN expr` en function bodies multi-statement (`AS BEGIN ... RETURN x; END`) | ✅ (X4f, 2026-05-29; sentinel pattern, single-expr body de X3b sigue válido) | — |
+| `STEP n` / `REVERSE` en FOR range, `RAISE WARNING`/`INFO`, formato `%` en RAISE | ❌ (diferido) | P3 |
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |
 | `CREATE PROCEDURE name(...) AS <body>` + `CALL name(args)` | ✅ (X3, 2026-05-28; VERSION 14→15; statement-only, params via token-sub) | — |

@@ -11419,6 +11419,134 @@ fn x4e_exception_handler_runtime_error_specific() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+// ----- Bloque X4f (2026-05-29): RETURN expr en function bodies. -----
+
+fn x4f_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x4f-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x4f_function_single_expr_body_still_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4f_setup("back-compat")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 5);
+         CREATE FUNCTION dbl(p_x INT) RETURNS INT AS p_x * 2;",
+    )?;
+    let res = run_sql(&db, "SELECT dbl(v) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(10));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4f_function_multistmt_body_with_return() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4f_setup("multistmt")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 5);
+         CREATE FUNCTION dbl(p_x INT) RETURNS INT AS BEGIN
+            RETURN p_x * 2;
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT dbl(v) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(10));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4f_function_early_return_in_if() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4f_setup("early-return")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, -3);
+         INSERT INTO t (id, v) VALUES (2, 10);
+         CREATE FUNCTION sign_label(p_x INT) RETURNS TEXT AS BEGIN
+            IF p_x < 0 THEN RETURN 'negative'; END IF;
+            IF p_x = 0 THEN RETURN 'zero'; END IF;
+            RETURN 'positive';
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT sign_label(v) FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("negative".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::String("positive".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4f_function_without_return_returns_null() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4f_setup("no-return")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE FUNCTION noop(p_x INT) RETURNS INT AS BEGIN
+            DECLARE z INT DEFAULT 0;
+            SET z = z + 1;
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT noop(id) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4f_function_with_loop_and_return() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4f_setup("loop-return")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE FUNCTION sum_to(p_n INT) RETURNS INT AS BEGIN
+            DECLARE total INT DEFAULT 0;
+            DECLARE i INT DEFAULT 0;
+            WHILE i < p_n LOOP
+                SET i = i + 1;
+                SET total = total + i;
+            END LOOP;
+            RETURN total;
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT sum_to(10) FROM t;")?;
+    // 1+2+3+...+10 = 55
+    assert_eq!(res[0].rows[0][0], Value::Integer(55));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4f_function_calling_function_with_return() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4f_setup("compose")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (3);
+         CREATE FUNCTION dbl(p_x INT) RETURNS INT AS BEGIN
+            RETURN p_x * 2;
+         END;
+         CREATE FUNCTION quad(p_x INT) RETURNS INT AS BEGIN
+            DECLARE r INT DEFAULT 0;
+            SET r = dbl(p_x);
+            RETURN dbl(r);
+         END;",
+    )?;
+    let res = run_sql(&db, "SELECT quad(id) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(12));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

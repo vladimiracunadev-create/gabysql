@@ -82,6 +82,10 @@ pub enum Statement {
     /// statement-level (vs CASE expression que vive en `Expr::Case`).
     /// Sólo soporta la forma "searched" (sin operando inicial).
     Case(Box<CaseStmt>),
+    /// Bloque X4f (2026-05-29): `RETURN expr` — termina ejecución del
+    /// body de una function devolviendo `expr` al caller. Sólo válido
+    /// dentro de function body multi-stmt; fuera, `[GBY-4118]`.
+    Return(ReturnStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -533,6 +537,15 @@ pub struct LoopStmt {
 pub struct CaseStmt {
     pub branches: Vec<(Expr, Vec<Statement>)>,
     pub else_branch: Option<Vec<Statement>>,
+}
+
+/// Bloque X4f (2026-05-29): `RETURN expr`. Eval `value` y termina la
+/// función con ese resultado. Se propaga vía un DbError sentinel
+/// (`RETURN_SIGNAL`) + el Value se deja en `Engine.pending_return_value`
+/// para que `eval_user_func` lo recoja.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnStmt {
+    pub value: Expr,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1703,6 +1716,11 @@ pub struct Engine<'a> {
     /// el row). Compartido entre procedure calls / trigger fires
     /// (simplificación X4b — no hay frames anidados; documentado).
     var_scope: HashMap<String, Value>,
+    /// Bloque X4f (2026-05-29): valor pendiente de `RETURN` dentro de
+    /// un function body multi-stmt. `exec_return` lo setea y emite
+    /// `Err(RETURN_SIGNAL)`; `eval_user_func` lo recoge cuando atrapa
+    /// el sentinel.
+    pending_return_value: Option<Value>,
 }
 
 /// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
@@ -1725,6 +1743,12 @@ const MAX_LOOP_ITERATIONS: usize = 100_000;
 /// como sentinel para distinguir `EXIT` de un error real. No es un
 /// código `[GBY-NNNN]` — viaja como string interno.
 const EXIT_SIGNAL: &str = "__GABYSQL_EXIT_SIGNAL__";
+
+/// Bloque X4f (2026-05-29): sentinel análogo para `RETURN` dentro de
+/// function body multi-stmt. El valor en sí viaja en
+/// `Engine.pending_return_value`; este string solo señala que el
+/// control debe terminar la function ya.
+const RETURN_SIGNAL: &str = "__GABYSQL_RETURN_SIGNAL__";
 
 /// Bloque X4e (2026-05-29): extrae el código `NNNN` del prefijo
 /// `[GBY-NNNN]` del mensaje de un DbError. Usado por `exec_block`
@@ -1753,6 +1777,7 @@ impl<'a> Engine<'a> {
             view_expansion_depth: 0,
             trigger_depth: 0,
             var_scope: HashMap::new(),
+            pending_return_value: None,
         }
     }
 
@@ -1782,6 +1807,7 @@ impl<'a> Engine<'a> {
             Statement::Block(stmt) => self.exec_block(*stmt),
             Statement::Loop(stmt) => self.exec_loop(*stmt),
             Statement::Case(stmt) => self.exec_case(*stmt),
+            Statement::Return(stmt) => self.exec_return(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -4202,6 +4228,18 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Bloque X4f (2026-05-29): `RETURN expr`. Evalúa `expr`, deja el
+    /// resultado en `self.pending_return_value`, y emite `Err(RETURN_SIGNAL)`
+    /// para que el caller (eval_user_func) lo recoja y termine la
+    /// function. Si nadie lo recoge (RETURN fuera de function),
+    /// transformamos el error en `[GBY-4118]` por contrato.
+    fn exec_return(&mut self, stmt: ReturnStmt) -> DbResult<ResultSet> {
+        let empty: HashMap<String, Value> = HashMap::new();
+        let v = self.eval_expr_full(&stmt.value, &empty, None)?;
+        self.pending_return_value = Some(v);
+        Err(DbError::new(RETURN_SIGNAL.to_string()))
+    }
+
     /// Bloque X3b: evalúa una invocación a user-defined function.
     /// Lookup en catálogo, arity check, evalúa cada arg contra el row
     /// actual (con outer_stack en juego para subqueries correlated),
@@ -4240,9 +4278,47 @@ impl<'a> Engine<'a> {
             bound.insert(pname.to_ascii_lowercase(), v);
         }
         let substituted = substitute_params_in_sql_text(&func.body_sql, &bound, &func.name)?;
-        let body_expr = parse_expr_str(&substituted)?;
         let empty: HashMap<String, Value> = HashMap::new();
-        self.eval_expr_full(&body_expr, &empty, None)
+        // Bloque X4f (2026-05-29): peek el primer token. Si arranca
+        // con `BEGIN`, body es multi-stmt (parse via parse(), exec
+        // cada stmt, watch for RETURN sentinel). Sino, single Expr
+        // (X3b path, back-compat).
+        let trimmed = substituted.trim_start();
+        let is_multi = trimmed
+            .get(..5)
+            .map(|s| s.eq_ignore_ascii_case("BEGIN"))
+            .unwrap_or(false)
+            && trimmed
+                .as_bytes()
+                .get(5)
+                .map(|b| !(*b as char).is_ascii_alphanumeric() && *b != b'_')
+                .unwrap_or(true);
+        if !is_multi {
+            let body_expr = parse_expr_str(&substituted)?;
+            return self.eval_expr_full(&body_expr, &empty, None);
+        }
+        // Multi-stmt path: parsea como batch, ejecuta cada stmt.
+        // RETURN viaja como sentinel + valor en pending_return_value.
+        // Si la function termina sin RETURN, devolvemos NULL.
+        let prev_pending = self.pending_return_value.take();
+        let stmts = parse(&substituted)?;
+        let mut returned: Option<Value> = None;
+        for stmt in stmts {
+            match self.exec(stmt) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains(RETURN_SIGNAL) => {
+                    returned = self.pending_return_value.take();
+                    break;
+                }
+                Err(e) => {
+                    // Restaurar prev_pending y propagar.
+                    self.pending_return_value = prev_pending;
+                    return Err(e);
+                }
+            }
+        }
+        self.pending_return_value = prev_pending;
+        Ok(returned.unwrap_or(Value::Null))
     }
 
     /// Bloque X1/X2: helper rápido — ¿hay algún trigger `timing` `event`
@@ -15591,6 +15667,14 @@ impl Parser {
         if self.match_keyword("EXIT") {
             return self.parse_exit_stmt();
         }
+        // Bloque X4f (2026-05-29): `RETURN expr` dentro de function
+        // body multi-stmt. El parser lo acepta como statement
+        // top-level; el engine valida que esté dentro de eval_user_func
+        // (sino [GBY-4118]).
+        if self.match_keyword("RETURN") {
+            let value = self.parse_expr()?;
+            return Ok(Statement::Return(ReturnStmt { value }));
+        }
         if self.match_keyword("SET") {
             return self.parse_set_stmt();
         }
@@ -16221,10 +16305,70 @@ impl Parser {
         let ret_raw = self.expect_ident()?;
         let return_type = ColumnType::from_sql(&ret_raw)?;
         self.expect_keyword("AS")?;
-        // Body: una expresión arbitraria. Validamos sintácticamente
-        // parseándola — pero descartamos el AST y guardamos el texto
-        // SQL desde los tokens (mismo enfoque que CREATE VIEW).
+        // Body puede ser:
+        //   X3b: una expresión arbitraria (`AS p_x * 2`).
+        //   X4f: un BEGIN..END block multi-stmt con RETURN (`AS BEGIN
+        //        DECLARE r INT; SET r = p_x * 2; RETURN r; END`).
+        // Detectamos vía el primer token: BEGIN → block, sino → expr.
         let start = self.pos;
+        let head = self.peek().clone();
+        if head.kind == TokenKind::Ident && head.text.eq_ignore_ascii_case("BEGIN") {
+            // X4f: parsea como block (consume hasta END matching con
+            // depth tracking idéntico a trigger/procedure body).
+            self.pos += 1; // consume BEGIN
+            let mut depth = 1usize;
+            let mut just_saw_end = false;
+            while depth > 0 {
+                let t = self.peek().clone();
+                if t.kind == TokenKind::Eof {
+                    return Err(coded(
+                        codes::FUNCTION_BODY_INVALID,
+                        "CREATE FUNCTION ... AS BEGIN: falta END que cierra",
+                    ));
+                }
+                if t.kind == TokenKind::Ident {
+                    let upper = t.text.to_ascii_uppercase();
+                    if upper == "BEGIN" {
+                        depth += 1;
+                        just_saw_end = false;
+                    } else if upper == "END" {
+                        depth -= 1;
+                        just_saw_end = true;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if upper == "IF" || upper == "LOOP" || upper == "CASE" {
+                        if !just_saw_end {
+                            depth += 1;
+                        }
+                        just_saw_end = false;
+                    } else {
+                        just_saw_end = false;
+                    }
+                } else {
+                    just_saw_end = false;
+                }
+                self.pos += 1;
+            }
+            let end = self.pos;
+            self.pos += 1; // consume END
+            if start == end {
+                return Err(coded(
+                    codes::FUNCTION_BODY_INVALID,
+                    "CREATE FUNCTION ... AS BEGIN END: body vacío",
+                ));
+            }
+            // Persistimos el body completo incluyendo BEGIN/END para
+            // que eval_user_func lo reconozca por el primer keyword.
+            let body_sql = reconstruct_sql_from_tokens(&self.tokens[start..=end]);
+            return Ok(Statement::CreateFunction(CreateFunctionStmt {
+                name,
+                params,
+                return_type,
+                body_sql,
+            }));
+        }
+        // X3b path: body es una expresión arbitraria.
         let _ = self.parse_expr()?;
         let end = self.pos;
         if start == end {
