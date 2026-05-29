@@ -25,6 +25,12 @@ pub enum ColumnType {
     /// raw bytes). No indexable (sin semántica de igualdad estable
     /// para bytes crudos en este release).
     Blob,
+    /// Bloque Y6 (2026-05-29): decimal exacto. `DECIMAL(p,s)` y
+    /// `NUMERIC(p,s)` mapean acá. **No** `stores_as_text` — usa
+    /// `Value::Decimal { value: i128, scale: u8 }` con encoding
+    /// propio (16 bytes LE para el i128 + 1 byte para el scale por
+    /// fila). El `scale` declarado vive en `Column.decimal_scale`.
+    Decimal,
 }
 
 impl ColumnType {
@@ -73,10 +79,12 @@ impl ColumnType {
             // INT family
             "INT" | "INTEGER" | "INT2" | "INT4" | "INT8" | "BIGINT" | "SMALLINT" | "TINYINT"
             | "MEDIUMINT" => Ok(Self::Int),
-            // FLOAT family (DECIMAL/NUMERIC son alias, no decimal exacto)
-            "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" | "DEC" => {
-                Ok(Self::Float)
-            }
+            // FLOAT family
+            "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" => Ok(Self::Float),
+            // Bloque Y6 (2026-05-29): DECIMAL/NUMERIC/DEC ahora son
+            // tipo Decimal exacto (no alias de Float). La precisión
+            // y scale viven en Column.decimal_scale.
+            "NUMERIC" | "DECIMAL" | "DEC" => Ok(Self::Decimal),
             // TEXT family
             "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "CHARACTER VARYING" | "NVARCHAR"
             | "NCHAR" | "STRING" | "CLOB" => Ok(Self::Text),
@@ -107,6 +115,7 @@ impl ColumnType {
             Self::Time => "TIME",
             Self::Uuid => "UUID",
             Self::Blob => "BLOB",
+            Self::Decimal => "DECIMAL",
         }
     }
 
@@ -122,6 +131,7 @@ impl ColumnType {
             Self::Time => 8,
             Self::Uuid => 9,
             Self::Blob => 10,
+            Self::Decimal => 11,
         }
     }
 
@@ -137,8 +147,9 @@ impl ColumnType {
             8 => Ok(Self::Time),
             9 => Ok(Self::Uuid),
             10 => Ok(Self::Blob),
+            11 => Ok(Self::Decimal),
             other => Err(DbError::new(format!(
-                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON, 8=TIME, 9=UUID, 10=BLOB)",
+                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON, 8=TIME, 9=UUID, 10=BLOB, 11=DECIMAL)",
                 other
             ))),
         }
@@ -271,6 +282,10 @@ const COLUMN_FLAG_HAS_MAX_LENGTH: u8 = 0x08;
 /// columnas INT — codifica TINYINT(1) / SMALLINT(2) / MEDIUMINT(3) /
 /// INT4(4). `INT`/`INTEGER`/`BIGINT`/`INT8` no setean el flag.
 const COLUMN_FLAG_HAS_INT_WIDTH: u8 = 0x10;
+/// Bloque Y6 (VERSION 22): si presente, después de `int_width` (si
+/// existe) se escriben 2 bytes con `(precision, scale)` (u8 cada
+/// uno). Solo aplica a columnas DECIMAL/NUMERIC.
+const COLUMN_FLAG_HAS_DECIMAL_META: u8 = 0x20;
 
 /// Action to take when the parent row a `FOREIGN KEY` points at is
 /// deleted.
@@ -475,6 +490,14 @@ pub struct Column {
     /// `INT`/`INTEGER`/`BIGINT`/`INT8`). El motor internamente
     /// siempre opera en i64; el chequeo de rango es en el encoder.
     pub int_width: Option<u8>,
+    /// Bloque Y6 (2026-05-29): para columnas DECIMAL/NUMERIC, lleva
+    /// el par `(precision, scale)` declarado. Precision: 1..=38
+    /// (máximo cabe en `i128`). Scale: 0..=precision. La validación
+    /// real es contra `10^(precision-scale)` en el encoder; un
+    /// valor que excede dispara `[GBY-4123]`. La parte decimal se
+    /// trunca silenciosamente al `scale` declarado (no es error).
+    /// `None` para columnas non-decimal.
+    pub decimal_meta: Option<(u8, u8)>,
 }
 
 impl Column {
@@ -487,6 +510,7 @@ impl Column {
             references: None,
             max_length: None,
             int_width: None,
+            decimal_meta: None,
         }
     }
 }
@@ -755,6 +779,9 @@ impl TableMeta {
             if column.int_width.is_some() {
                 flags |= COLUMN_FLAG_HAS_INT_WIDTH;
             }
+            if column.decimal_meta.is_some() {
+                flags |= COLUMN_FLAG_HAS_DECIMAL_META;
+            }
             out.push(flags);
             if let Some(default) = &column.default {
                 default.encode_into(&mut out)?;
@@ -813,6 +840,12 @@ impl TableMeta {
             // MEDIUMINT/INT4). 1 byte después de max_length si está.
             if let Some(w) = column.int_width {
                 out.push(w);
+            }
+            // Bloque Y6 (VERSION 22): decimal_meta (precision, scale).
+            // 2 bytes después de int_width si está.
+            if let Some((p, s)) = column.decimal_meta {
+                out.push(p);
+                out.push(s);
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -1016,6 +1049,22 @@ impl TableMeta {
             } else {
                 None
             };
+            // Bloque Y6 (VERSION 22): decimal_meta opcional (2 bytes:
+            // precision, scale) tras int_width.
+            let decimal_meta = if flags & COLUMN_FLAG_HAS_DECIMAL_META != 0 {
+                if offset + 2 > data.len() {
+                    return Err(DbError::new(format!(
+                        "TableMeta '{}' corrupta: faltan 2 bytes para decimal_meta de columna '{}' en offset {}",
+                        name, col_name, offset
+                    )));
+                }
+                let p = data[offset];
+                let s = data[offset + 1];
+                offset += 2;
+                Some((p, s))
+            } else {
+                None
+            };
             columns.push(Column {
                 name: col_name,
                 column_type,
@@ -1024,6 +1073,7 @@ impl TableMeta {
                 references,
                 max_length,
                 int_width,
+                decimal_meta,
             });
         }
         if offset + 2 > data.len() {
@@ -2018,6 +2068,12 @@ fn validate_default_against_type(
         (ColumnType::Float, DefaultLiteral::Float(_) | DefaultLiteral::Integer(_)) => true,
         (ColumnType::Bool, DefaultLiteral::Bool(_)) => true,
         (ct, DefaultLiteral::String(_)) if ct.stores_as_text() => true,
+        // Bloque Y6: DECIMAL DEFAULT acepta Integer/Float/String (textual).
+        // El encoder re-parsea al scale declarado.
+        (
+            ColumnType::Decimal,
+            DefaultLiteral::Integer(_) | DefaultLiteral::Float(_) | DefaultLiteral::String(_),
+        ) => true,
         _ => false,
     };
     if !ok {

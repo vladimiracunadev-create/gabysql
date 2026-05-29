@@ -629,6 +629,12 @@ pub mod codes {
     /// crudos length-prefixed; el input vía SQL se acepta como `X'hex'`
     /// (estándar) o convertido vía `CAST(text AS BLOB)`.
     pub const BLOB_LITERAL_INVALID: u32 = 4122;
+    /// Bloque Y6 (2026-05-29): `DECIMAL(p,s)` con valor que no cabe en
+    /// la precisión declarada — parte entera mayor que `10^(p-s)`. El
+    /// motor almacena exactamente como `i128 + scale`; un overflow de
+    /// i128 también dispara este código. La parte decimal se trunca
+    /// silenciosamente al `scale` (no es error).
+    pub const DECIMAL_OUT_OF_RANGE: u32 = 4123;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

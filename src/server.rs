@@ -1,6 +1,6 @@
 use crate::catalog::{Catalog, DefaultLiteral, TableMeta};
 use crate::errors::{coded, codes};
-use crate::sql::{decode_row, parse, Engine, ResultSet, Statement, Value};
+use crate::sql::{decimal_to_string, decode_row, parse, Engine, ResultSet, Statement, Value};
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::HashMap;
@@ -980,6 +980,10 @@ fn value_json(value: &Value) -> String {
             s.push('"');
             s
         }
+        // Bloque Y6: Decimal se serializa como string para preservar
+        // precisión exacta en el output JSON (los JSON numbers de
+        // varios runtimes son f64, que perdería precisión).
+        Value::Decimal { value, scale } => format!("\"{}\"", decimal_to_string(*value, *scale)),
     }
 }
 

@@ -11588,6 +11588,9 @@ fn y_int_family_aliases_work() -> Result<(), Box<dyn Error>> {
 #[test]
 fn y_float_family_aliases_work() -> Result<(), Box<dyn Error>> {
     let (db, wal) = y_setup("float-aliases")?;
+    // Y6 (2026-05-29): DECIMAL/NUMERIC ya no son aliases de FLOAT — son
+    // ColumnType::Decimal exacto. REAL/DOUBLE/DOUBLE PRECISION siguen
+    // siendo Float.
     run_sql(
         &db,
         "CREATE TABLE t (
@@ -11602,7 +11605,24 @@ fn y_float_family_aliases_work() -> Result<(), Box<dyn Error>> {
     )?;
     let res = run_sql(&db, "SELECT r, d, dp, n, dc FROM t;")?;
     assert_eq!(res[0].rows[0][0], Value::Float(1.5));
-    assert_eq!(res[0].rows[0][4], Value::Float(5.5));
+    assert_eq!(res[0].rows[0][1], Value::Float(2.5));
+    assert_eq!(res[0].rows[0][2], Value::Float(3.5));
+    // n NUMERIC(10,2) → 4.5 con scale=2 → value=450
+    assert_eq!(
+        res[0].rows[0][3],
+        Value::Decimal {
+            value: 450,
+            scale: 2
+        }
+    );
+    // dc DECIMAL(8,4) → 5.5 con scale=4 → value=55000
+    assert_eq!(
+        res[0].rows[0][4],
+        Value::Decimal {
+            value: 55000,
+            scale: 4
+        }
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -11790,7 +11810,14 @@ fn y_alter_table_add_column_with_alias() -> Result<(), Box<dyn Error>> {
     )?;
     let res = run_sql(&db, "SELECT nick, score, birth_time FROM t;")?;
     assert_eq!(res[0].rows[0][0], Value::String("neo".to_string()));
-    assert_eq!(res[0].rows[0][1], Value::Float(99.5));
+    // Y6: DECIMAL(8,2) → 99.5 con scale=2 → value=9950
+    assert_eq!(
+        res[0].rows[0][1],
+        Value::Decimal {
+            value: 9950,
+            scale: 2
+        }
+    );
     assert_eq!(res[0].rows[0][2], Value::String("07:30:00".to_string()));
     cleanup(&[&db, &wal]);
     Ok(())
@@ -13012,6 +13039,312 @@ fn y5_uuid_v4_alias_works() -> Result<(), Box<dyn Error>> {
     } else {
         panic!("esperaba String");
     }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque Y6 (2026-05-29): DECIMAL/NUMERIC exacto (i128 + scale).
+// Bump VERSION 21→22 — DECIMAL/NUMERIC ya NO son aliases de FLOAT.
+// ============================================================
+
+fn y6_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y6-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y6_decimal_roundtrip_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("rt")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 199.99);
+         INSERT INTO t (id, amount) VALUES (2, 0.01);
+         INSERT INTO t (id, amount) VALUES (3, 1000000.00);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t ORDER BY id;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 19999,
+            scale: 2
+        }
+    );
+    assert_eq!(res[0].rows[1][0], Value::Decimal { value: 1, scale: 2 });
+    assert_eq!(
+        res[0].rows[2][0],
+        Value::Decimal {
+            value: 100_000_000,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_preserves_money_precision() -> Result<(), Box<dyn Error>> {
+    // El caso clásico: 0.1 + 0.2 no es 0.30000000004 sino exactamente 0.30.
+    let (db, wal) = y6_setup("money")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 0.10);
+         INSERT INTO t (id, amount) VALUES (2, 0.20);
+         INSERT INTO t (id, amount) VALUES (3, 0.30);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t WHERE id = 3;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 30,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_truncates_extra_decimals() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("trunc")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 1.999);
+         INSERT INTO t (id, amount) VALUES (2, 1.001);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t ORDER BY id;")?;
+    // 1.999 → trunca a 1.99 (no redondea)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 199,
+            scale: 2
+        }
+    );
+    // 1.001 → trunca a 1.00
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 100,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_pads_fractional_part() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("pad")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,3));
+         INSERT INTO t (id, amount) VALUES (1, 7);
+         INSERT INTO t (id, amount) VALUES (2, 7.5);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t ORDER BY id;")?;
+    // 7 con scale=3 → 7000
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 7000,
+            scale: 3
+        }
+    );
+    // 7.5 con scale=3 → 7500
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 7500,
+            scale: 3
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_negative_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("neg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, -42.50);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: -4250,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_precision_exceeded_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("over")?;
+    // DECIMAL(5,2) → max parte entera = 999.99
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(5,2));",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, amount) VALUES (1, 1000.00);");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4123"), "esperaba GBY-4123, vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_at_precision_boundary_ok() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("boundary")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(5,2));
+         INSERT INTO t (id, amount) VALUES (1, 999.99);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 99999,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_numeric_alias_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("numeric")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC(8,3));
+         INSERT INTO t (id, amount) VALUES (1, 123.456);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 123456,
+            scale: 3
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_default_precision_when_no_params() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("default-ps")?;
+    // DECIMAL sin (p,s) usa default (10, 0) — solo enteros.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL);
+         INSERT INTO t (id, amount) VALUES (1, 12345);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 12345,
+            scale: 0
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_cast_text_to_decimal() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("cast")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT CAST('3.14' AS DECIMAL) FROM t;")?;
+    // scale inferido del input
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 314,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_null_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("null")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, NULL);
+         INSERT INTO t (id, amount) VALUES (2, 42.50);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][0], Value::Null);
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 4250,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_decimal_survives_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(12,4));
+         INSERT INTO t (id, amount) VALUES (1, 1234567.8901);",
+    )?;
+    // run_sql cierra entre invocaciones — el i128 + scale debe persistir.
+    let res = run_sql(&db, "SELECT amount FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 12345678901,
+            scale: 4
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y6_dec_alias_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y6_setup("dec")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DEC(6,2));
+         INSERT INTO t (id, amount) VALUES (1, 42.50);",
+    )?;
+    let res = run_sql(&db, "SELECT amount FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 4250,
+            scale: 2
+        }
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }

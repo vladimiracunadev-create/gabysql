@@ -6,6 +6,66 @@
 
 ---
 
+## 2026-05-29 — Bloque Y6: `DECIMAL(p,s)` exacto — fin de la precisión perdida
+
+> **Un push a `main`** con **bump on-disk 21 → 22**. `DECIMAL`/`NUMERIC` **dejan de ser aliases de FLOAT** y pasan a ser un tipo propio con representación exacta `i128 + scale`. Detalle en [`docs/adr/0046-decimal-exact-y6.md`](docs/adr/0046-decimal-exact-y6.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE TABLE pagos (
+    id     INT PRIMARY KEY,
+    monto  DECIMAL(10,2)
+);
+
+INSERT INTO pagos (id, monto) VALUES (1, 199.99);
+INSERT INTO pagos (id, monto) VALUES (2, 0.10);
+INSERT INTO pagos (id, monto) VALUES (3, 0.20);
+INSERT INTO pagos (id, monto) VALUES (4, 0.30);
+INSERT INTO pagos (id, monto) VALUES (5, 1000.00);   -- [GBY-4123] excede DECIMAL(5,2) sería
+
+SELECT monto FROM pagos WHERE id = 4;  -- exactamente 0.30, no 0.30000000004
+```
+
+### 🛠 Implementación
+
+- **`Value::Decimal { value: i128, scale: u8 }`**: variante nueva. ~16 matches exhaustivos del crate actualizados.
+- **`ColumnType::Decimal` code=11**: aliases `DECIMAL`, `NUMERIC`, `DEC` ahora mapean acá (antes eran alias de Float).
+- **Per-column `decimal_meta: Option<(u8, u8)>`** = `(precision, scale)`. Flag `COLUMN_FLAG_HAS_DECIMAL_META = 0x20` + 2 bytes tras `int_width`.
+- **Disk format por-fila**: `[present:u8=1][value:i128 LE = 16 bytes][scale:u8]`.
+- **Helpers**: `decimal_to_string` (pub), `parse_decimal`, `value_to_decimal`, `decimal_fits_precision`, `rescale_decimal`, `decimal_to_f64`, `extract_decimal_meta`.
+- **Encoder**: convierte Int/Float/String/Decimal al scale declarado. Trunca decimales extra (no redondea), padding automático cuando faltan, `[GBY-4123]` si la parte entera excede `10^(p-s)`.
+- **Aritmética mixta** (Decimal + Int/Float) promueve a f64 (lossy, documentado). Decimal-Decimal exacta diferida.
+- **CAST AS DECIMAL** infiere el scale del input (cuenta dígitos tras el `.`).
+- **Bump 21 → 22**: V21 no sabe decodificar columnas con code=11.
+
+### 🆕 Código de error
+
+| Código | Nombre | Cuándo |
+|---|---|---|
+| `GBY-4123` | `DECIMAL_OUT_OF_RANGE` | Parte entera de un `DECIMAL(p,s)` excede `10^(p-s)`, o overflow de i128 al parsear / multiplicar. |
+
+### ⚠️ Cambios incompatibles
+
+Tests `y_*` que asumían `DECIMAL` → `Value::Float` fueron actualizados a `Value::Decimal {...}`. El binario V22 no lee bases V21 (rechazo con `[GBY-1003]`, exportar+reimportar).
+
+### 🚫 Diferido
+
+- Aritmética Decimal-Decimal exacta (sin promoción a f64).
+- DECIMAL indexable (encoding lex-comparable).
+- UNSIGNED BIGINT real (u64).
+- CHAR(n) padding ANSI strict.
+- Code points en VARCHAR(n).
+- ARRAY/ENUM/INTERVAL/TZ types.
+- UUID v1/v6/v7.
+
+### 🧪 Validación
+
+- 13 tests `y6_*`: roundtrip exact, money precision (0.1+0.2=0.30 exacto), trunca extras (1.999→1.99), pad fraccional (7→7.000), negativos, precision excedida (4123), boundary (999.99 cabe en DECIMAL(5,2)), NUMERIC alias, default (10,0), CAST AS DECIMAL, NULL, reopen, DEC alias.
+- Suite total: **580/580 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y5: `UNSIGNED` enforcement + `gen_random_uuid()`
 
 > **Un push a `main`** con **bump on-disk 20 → 21**. Reusa el byte `int_width` de Y3 con high bit = unsigned. Sin nuevos códigos de error. Bundle con `gen_random_uuid()` (UUID v4 random). Detalle en [`docs/adr/0045-unsigned-and-uuid-y5.md`](docs/adr/0045-unsigned-and-uuid-y5.md).

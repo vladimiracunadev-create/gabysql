@@ -1,4 +1,4 @@
-use gabysql::sql::{parse, Engine, ResultSet, Statement, Value};
+use gabysql::sql::{decimal_to_string, parse, Engine, ResultSet, Statement, Value};
 use gabysql::storage::Pager;
 use gabysql::{DbError, DbResult};
 use std::env;
@@ -300,6 +300,8 @@ fn value_to_string(value: &Value) -> String {
             }
             s
         }
+        // Bloque Y6: Decimal se renderiza con punto decimal.
+        Value::Decimal { value, scale } => decimal_to_string(*value, *scale),
     }
 }
 

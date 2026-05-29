@@ -162,7 +162,15 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        para "sin width" (BIGINT UNSIGNED, rango 0..i64::MAX).
 //        V20 rechazados con `[GBY-1003]` porque podría haber bytes
 //        0x80+ que V20 interpreta como widths inválidos.
-pub const VERSION: u32 = 21;
+//  22 -> Bloque Y6 (2026-05-29): tipo decimal exacto. `DECIMAL` /
+//        `NUMERIC` / `DEC` ya no son aliases de FLOAT — son un
+//        ColumnType propio con code `11` y encoding propio
+//        (i128 LE = 16 bytes + scale u8 = 1 byte por fila). Por
+//        columna se persiste `(precision, scale)` opcional con
+//        nuevo flag `COLUMN_FLAG_HAS_DECIMAL_META = 0x20`. Value
+//        gana variante `Decimal { value: i128, scale: u8 }`. V21
+//        rechazados con `[GBY-1003]`.
+pub const VERSION: u32 = 22;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

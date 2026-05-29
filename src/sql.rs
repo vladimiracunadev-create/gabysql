@@ -811,6 +811,9 @@ pub struct ColumnDef {
     /// (`TINYINT`=1, `SMALLINT`/`INT2`=2, `MEDIUMINT`=3, `INT4`=4).
     /// `None` para `INT`/`INTEGER`/`BIGINT`/`INT8` (sin enforce, i64).
     pub int_width: Option<u8>,
+    /// Bloque Y6 (2026-05-29): `(precision, scale)` para columnas
+    /// DECIMAL/NUMERIC. `None` para non-decimal.
+    pub decimal_meta: Option<(u8, u8)>,
 }
 
 /// Parser-level representation of
@@ -1530,6 +1533,7 @@ fn expr_default_label(expr: &Expr) -> String {
             Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             Value::String(s) => format!("'{}'", s),
             Value::Bytes(b) => format!("X'{}'", &bytes_to_hex_display(b)[2..]),
+            Value::Decimal { value, scale } => decimal_to_string(*value, *scale),
         },
         Expr::Column(name) => name.clone(),
         Expr::Func(f, args) => {
@@ -1757,6 +1761,178 @@ pub enum Value {
     /// Encoding en disco: u32 LE length + raw bytes. Sin
     /// interpretación de encoding ni text — viajan opacos.
     Bytes(Vec<u8>),
+    /// Bloque Y6 (2026-05-29): decimal exacto. `value` es el entero
+    /// sin decimales (mantissa); `scale` indica cuántas posiciones
+    /// hacia la derecha del punto decimal. Ejemplo: `123.45` se
+    /// representa como `{ value: 12345, scale: 2 }`. Operaciones
+    /// `+`/`-`/`*`/comparación que mezclan `Decimal` con otros
+    /// `Value` numéricos promueven todo a `f64` (lossy, documentado).
+    Decimal {
+        value: i128,
+        scale: u8,
+    },
+}
+
+/// Bloque Y6 (2026-05-29): renderiza un Decimal como string ANSI:
+/// `value` con punto decimal insertado a `scale` posiciones desde la
+/// derecha. Ejemplos: `(12345, 2)` → `"123.45"`, `(5, 0)` → `"5"`,
+/// `(-1500, 3)` → `"-1.500"`, `(7, 4)` → `"0.0007"`.
+pub fn decimal_to_string(value: i128, scale: u8) -> String {
+    let s = scale as usize;
+    if s == 0 {
+        return value.to_string();
+    }
+    let negative = value < 0;
+    let abs_str = value.unsigned_abs().to_string();
+    // Pad con ceros a la izquierda hasta que tenga al menos `scale+1` chars.
+    let padded = if abs_str.len() <= s {
+        format!("{:0>width$}", abs_str, width = s + 1)
+    } else {
+        abs_str
+    };
+    let split = padded.len() - s;
+    let (int_part, frac_part) = padded.split_at(split);
+    let sign = if negative { "-" } else { "" };
+    format!("{}{}.{}", sign, int_part, frac_part)
+}
+
+/// Bloque Y6: parsea un string decimal (e.g. `"123.45"`, `"-7.5"`,
+/// `".5"`, `"42"`) a `(value: i128, scale: u8)`. Acepta opcional
+/// signo `+`/`-`. Trunca silenciosamente a `target_scale` (no
+/// redondea). Devuelve error si el parser ve caracteres inválidos
+/// o si la mantissa overflowea i128.
+pub(crate) fn parse_decimal(input: &str, target_scale: u8) -> Result<i128, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("decimal vacío".to_string());
+    }
+    let (sign, rest) = match trimmed.as_bytes()[0] {
+        b'+' => (1i128, &trimmed[1..]),
+        b'-' => (-1i128, &trimmed[1..]),
+        _ => (1i128, trimmed),
+    };
+    let parts: Vec<&str> = rest.splitn(2, '.').collect();
+    let int_part = parts[0];
+    let frac_part = parts.get(1).copied().unwrap_or("");
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(format!("decimal inválido: '{}'", input));
+    }
+    let mut value: i128 = 0;
+    for c in int_part.chars() {
+        let d = c
+            .to_digit(10)
+            .ok_or_else(|| format!("char no-decimal '{}' en '{}'", c, input))?;
+        value = value
+            .checked_mul(10)
+            .ok_or_else(|| format!("decimal overflow al parsear '{}'", input))?
+            .checked_add(d as i128)
+            .ok_or_else(|| format!("decimal overflow al parsear '{}'", input))?;
+    }
+    let s = target_scale as usize;
+    let mut frac_digits = 0usize;
+    for c in frac_part.chars() {
+        if frac_digits >= s {
+            // Trunca; el resto se ignora.
+            break;
+        }
+        let d = c
+            .to_digit(10)
+            .ok_or_else(|| format!("char no-decimal '{}' en '{}'", c, input))?;
+        value = value
+            .checked_mul(10)
+            .ok_or_else(|| format!("decimal overflow al parsear '{}'", input))?
+            .checked_add(d as i128)
+            .ok_or_else(|| format!("decimal overflow al parsear '{}'", input))?;
+        frac_digits += 1;
+    }
+    // Si el frac no llegó a target_scale, multiplicar por potencias de 10.
+    while frac_digits < s {
+        value = value
+            .checked_mul(10)
+            .ok_or_else(|| format!("decimal overflow al normalizar '{}'", input))?;
+        frac_digits += 1;
+    }
+    Ok(sign * value)
+}
+
+/// Bloque Y6: valida que la parte entera del `Decimal { value, scale }`
+/// quepa en `precision - scale` dígitos. Si excede, devuelve error.
+/// `precision == 0` significa sin enforcement (default).
+pub(crate) fn decimal_fits_precision(value: i128, scale: u8, precision: u8) -> bool {
+    if precision == 0 {
+        return true;
+    }
+    let int_digits = (precision as i32) - (scale as i32);
+    if int_digits <= 0 {
+        // p < s: solo decimales — la parte entera debe ser 0 (value
+        // ya está escalado a `scale`).
+        return value.abs() < 10i128.pow(precision as u32);
+    }
+    let max = 10i128.pow(precision as u32);
+    value > -max && value < max
+}
+
+/// Bloque Y6: convierte `Value::Integer`/`Float`/`String` a un
+/// `(value, scale)` apto para una columna `DECIMAL(p,s)`. Trunca
+/// la parte fraccionaria si excede el `scale` declarado. Para
+/// Float usa la representación textual estable de Rust.
+pub(crate) fn value_to_decimal(v: &Value, target_scale: u8) -> Result<i128, String> {
+    match v {
+        Value::Integer(n) => {
+            let mut x = *n as i128;
+            let pow = 10i128
+                .checked_pow(target_scale as u32)
+                .ok_or_else(|| format!("scale={} demasiado grande", target_scale))?;
+            x = x
+                .checked_mul(pow)
+                .ok_or_else(|| "decimal overflow".to_string())?;
+            Ok(x)
+        }
+        Value::Float(f) => {
+            // Truco: usar el repr textual estable de f64 y delegar al parser.
+            let s = format!("{}", f);
+            parse_decimal(&s, target_scale)
+        }
+        Value::String(s) => parse_decimal(s, target_scale),
+        Value::Decimal { value, scale } => {
+            // Re-escalar al target_scale.
+            rescale_decimal(*value, *scale, target_scale)
+        }
+        Value::Null | Value::Bool(_) | Value::Bytes(_) => {
+            Err(format!("no convertible a DECIMAL: {:?}", v))
+        }
+    }
+}
+
+/// Bloque Y6: re-escala un decimal `(value, from_scale)` a
+/// `(value', to_scale)`. Si `to_scale > from_scale` multiplica;
+/// si `to_scale < from_scale` divide (trunca, no redondea).
+pub(crate) fn rescale_decimal(value: i128, from_scale: u8, to_scale: u8) -> Result<i128, String> {
+    use std::cmp::Ordering;
+    match to_scale.cmp(&from_scale) {
+        Ordering::Equal => Ok(value),
+        Ordering::Greater => {
+            let diff = to_scale - from_scale;
+            let pow = 10i128
+                .checked_pow(diff as u32)
+                .ok_or_else(|| format!("scale diff {} demasiado grande", diff))?;
+            value
+                .checked_mul(pow)
+                .ok_or_else(|| "decimal overflow".to_string())
+        }
+        Ordering::Less => {
+            let diff = from_scale - to_scale;
+            let pow = 10i128.checked_pow(diff as u32).unwrap_or(i128::MAX);
+            Ok(value / pow)
+        }
+    }
+}
+
+/// Bloque Y6: convierte un Decimal a `f64` (lossy) para
+/// participar en aritmética con Int/Float.
+pub(crate) fn decimal_to_f64(value: i128, scale: u8) -> f64 {
+    let pow = 10f64.powi(scale as i32);
+    (value as f64) / pow
 }
 
 /// Bloque Y4 (2026-05-29): renderiza un slice de bytes como string hex
@@ -2075,6 +2251,12 @@ impl<'a> Engine<'a> {
             } else {
                 None
             };
+            // Bloque Y6: decimal_meta sólo aplica a Decimal columns
+            let decimal_meta = if column_type == ColumnType::Decimal {
+                column.decimal_meta
+            } else {
+                None
+            };
             columns.push(Column {
                 name: column.name,
                 column_type,
@@ -2087,6 +2269,7 @@ impl<'a> Engine<'a> {
                 references,
                 max_length,
                 int_width,
+                decimal_meta,
             });
         }
 
@@ -2628,6 +2811,11 @@ impl<'a> Engine<'a> {
             } else {
                 None
             },
+            decimal_meta: if column_type == ColumnType::Decimal {
+                stmt.column.decimal_meta
+            } else {
+                None
+            },
         };
         // Run the standard validation against a *prospective* meta so the
         // same DEFAULT/type compatibility rules used by CREATE TABLE
@@ -2847,6 +3035,7 @@ impl<'a> Engine<'a> {
                     Value::Bool(_) => ColumnType::Bool,
                     Value::String(_) => ColumnType::Text,
                     Value::Bytes(_) => ColumnType::Blob,
+                    Value::Decimal { .. } => ColumnType::Decimal,
                 };
                 match inferred[i] {
                     None => inferred[i] = Some(t),
@@ -2943,6 +3132,7 @@ impl<'a> Engine<'a> {
                 references: None,
                 max_length: None,
                 int_width: None,
+                decimal_meta: None,
             });
         }
         let mut meta = TableMeta {
@@ -6017,6 +6207,7 @@ impl<'a> Engine<'a> {
                     Value::Bool(_) => ColumnType::Bool,
                     Value::String(_) => ColumnType::Text,
                     Value::Bytes(_) => ColumnType::Blob,
+                    Value::Decimal { .. } => ColumnType::Decimal,
                 };
                 match inferred_types[i] {
                     None => inferred_types[i] = Some(t),
@@ -6527,6 +6718,7 @@ impl<'a> Engine<'a> {
                     Value::Bool(_) => ColumnType::Bool,
                     Value::String(_) => ColumnType::Text,
                     Value::Bytes(_) => ColumnType::Blob,
+                    Value::Decimal { .. } => ColumnType::Decimal,
                 };
                 match inferred[i] {
                     None => inferred[i] = Some(t),
@@ -9682,6 +9874,12 @@ fn encode_group_key(values: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 out.extend_from_slice(b);
             }
+            // Bloque Y6: Decimal — agrupar por (value, scale) pair.
+            Value::Decimal { value, scale } => {
+                out.push(0x06);
+                out.extend_from_slice(&value.to_le_bytes());
+                out.push(*scale);
+            }
         }
         out.push(0xFF); // separador
     }
@@ -10023,6 +10221,7 @@ fn infer_column_type(rows: &[Vec<Value>], col: usize) -> Option<ColumnType> {
             Value::Bool(_) => ColumnType::Bool,
             Value::String(_) => ColumnType::Text,
             Value::Bytes(_) => ColumnType::Blob,
+            Value::Decimal { .. } => ColumnType::Decimal,
         };
         match current {
             None => current = Some(t),
@@ -10416,7 +10615,8 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
             | (ColumnType::Json, Value::Null)
             | (ColumnType::Time, Value::Null)
             | (ColumnType::Uuid, Value::Null)
-            | (ColumnType::Blob, Value::Null) => out.push(0),
+            | (ColumnType::Blob, Value::Null)
+            | (ColumnType::Decimal, Value::Null) => out.push(0),
             (ColumnType::Float, Value::Float(number)) => {
                 out.push(1);
                 out.extend_from_slice(&number.to_le_bytes());
@@ -10482,6 +10682,34 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
                     "{} debe ser BLOB (esperado X'...' o CAST AS BLOB)",
                     column.name
                 )))
+            }
+            // Bloque Y6: DECIMAL — encoder convierte Int/Float/String/Decimal
+            // al scale declarado de la columna. Trunca silenciosamente la
+            // parte fraccionaria si excede el scale. Error 4123 si la
+            // parte entera no cabe en `precision - scale` dígitos.
+            (ColumnType::Decimal, val) => {
+                let (precision, scale) = column.decimal_meta.unwrap_or((10, 0));
+                let value_i128 = value_to_decimal(&val, scale).map_err(|m| {
+                    coded(
+                        codes::DECIMAL_OUT_OF_RANGE,
+                        format!("DECIMAL columna '{}': {}", column.name, m),
+                    )
+                })?;
+                if !decimal_fits_precision(value_i128, scale, precision) {
+                    return Err(coded(
+                        codes::DECIMAL_OUT_OF_RANGE,
+                        format!(
+                            "DECIMAL({},{}) en '{}': valor {} excede la precisión",
+                            precision,
+                            scale,
+                            column.name,
+                            decimal_to_string(value_i128, scale)
+                        ),
+                    ));
+                }
+                out.push(1);
+                out.extend_from_slice(&value_i128.to_le_bytes());
+                out.push(scale);
             }
             (ColumnType::Int, _) => {
                 return Err(DbError::new(format!("{} debe ser INT", column.name)))
@@ -10682,6 +10910,24 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
                 let bytes = data[offset..offset + len].to_vec();
                 offset += len;
                 Value::Bytes(bytes)
+            }
+            // Bloque Y6: DECIMAL — 16 bytes i128 LE + 1 byte scale.
+            ColumnType::Decimal => {
+                if offset + 17 > data.len() {
+                    return Err(DbError::new(format!(
+                        "fila corrupta en tabla '{}': campo '{}' (DECIMAL) necesita 17 bytes \
+                         en offset {}, solo quedan {}",
+                        meta.name,
+                        column.name,
+                        offset,
+                        data.len() - offset
+                    )));
+                }
+                let value = i128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
+                offset += 16;
+                let scale = data[offset];
+                offset += 1;
+                Value::Decimal { value, scale }
             }
         };
         out.insert(key, value);
@@ -11048,6 +11294,12 @@ fn value_to_default(value: &Value) -> DbResult<DefaultLiteral> {
             return Err(DbError::new(
                 "DEFAULT con valor BLOB (X'...') no soportado en esta versión",
             ));
+        }
+        // Bloque Y6: DEFAULT decimal se persiste como String (texto
+        // exacto). En column-default-apply, el encoder lo re-parsea
+        // al scale declarado de la columna.
+        Value::Decimal { value, scale } => {
+            DefaultLiteral::String(decimal_to_string(*value, *scale))
         }
     })
 }
@@ -11510,6 +11762,7 @@ fn value_repr_compact(v: &Value) -> String {
         Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         Value::String(s) => format!("'{}'", s),
         Value::Bytes(b) => format!("X'{}'", &bytes_to_hex_display(b)[2..]),
+        Value::Decimal { value, scale } => decimal_to_string(*value, *scale),
     }
 }
 
@@ -13402,6 +13655,7 @@ fn format_value_literal(v: &Value) -> String {
         }
         Value::String(s) => quote_string(s),
         Value::Bytes(b) => format!("X'{}'", &bytes_to_hex_display(b)[2..]),
+        Value::Decimal { value, scale } => decimal_to_string(*value, *scale),
     }
 }
 
@@ -14647,11 +14901,16 @@ fn value_fits_column_type(v: &Value, ct: ColumnType) -> bool {
         (Value::Null, _) => true,
         (Value::Integer(_), ColumnType::Int) => true,
         (Value::Integer(_), ColumnType::Float) => true,
+        (Value::Integer(_), ColumnType::Decimal) => true,
         (Value::Float(_), ColumnType::Float) => true,
+        (Value::Float(_), ColumnType::Decimal) => true,
         (Value::Bool(_), ColumnType::Bool) => true,
         (Value::String(_), t) if t.stores_as_text() => true,
         // Bloque Y4: Bytes encaja sólo en BLOB
         (Value::Bytes(_), ColumnType::Blob) => true,
+        // Bloque Y6: Decimal encaja en Decimal o Float (promueve a f64).
+        (Value::Decimal { .. }, ColumnType::Decimal) => true,
+        (Value::Decimal { .. }, ColumnType::Float) => true,
         _ => false,
     }
 }
@@ -14666,6 +14925,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Bool(_) => "BOOL",
         Value::String(_) => "TEXT",
         Value::Bytes(_) => "BLOB",
+        Value::Decimal { .. } => "DECIMAL",
     }
 }
 
@@ -14680,6 +14940,8 @@ fn value_to_text(v: &Value) -> String {
         Value::String(s) => s.clone(),
         // Bloque Y4: BLOB se serializa como hex `0xdeadbeef` (lowercase).
         Value::Bytes(b) => bytes_to_hex_display(b),
+        // Bloque Y6: Decimal con punto decimal en la posición correcta.
+        Value::Decimal { value, scale } => decimal_to_string(*value, *scale),
     }
 }
 
@@ -14705,6 +14967,9 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                 codes::CAST_INVALID,
                 "CAST AS INT desde BLOB no soportado".to_string(),
             )),
+            Value::Decimal { value, scale } => Ok(Value::Integer(
+                rescale_decimal(value, scale, 0).unwrap_or(0) as i64,
+            )),
             Value::Null => unreachable!(),
         },
         ColumnType::Float => match v {
@@ -14721,6 +14986,7 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                 codes::CAST_INVALID,
                 "CAST AS FLOAT desde BLOB no soportado".to_string(),
             )),
+            Value::Decimal { value, scale } => Ok(Value::Float(decimal_to_f64(value, scale))),
             Value::Null => unreachable!(),
         },
         ColumnType::Text => Ok(Value::String(value_to_text(&v))),
@@ -14854,7 +15120,56 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                 ),
             )),
         },
+        // Bloque Y6: CAST AS DECIMAL — sin scale declarado en el cast,
+        // usa scale = 0 (entero) por defecto si la fuente lo permite.
+        // Para preservar precisión, recomendamos declarar la columna
+        // como DECIMAL(p,s) y dejar que el encoder maneje el rescale.
+        ColumnType::Decimal => match v {
+            Value::Decimal { value, scale } => Ok(Value::Decimal { value, scale }),
+            Value::Integer(n) => Ok(Value::Decimal {
+                value: n as i128,
+                scale: 0,
+            }),
+            Value::Float(f) => {
+                // Reusa el textual del parser de decimales para no
+                // perder precisión en el f64 → string round-trip.
+                let s = format!("{}", f);
+                let (value, scale) = parse_decimal_with_inferred_scale(&s)
+                    .map_err(|m| coded(codes::CAST_INVALID, format!("CAST AS DECIMAL: {}", m)))?;
+                Ok(Value::Decimal { value, scale })
+            }
+            Value::String(s) => {
+                let (value, scale) = parse_decimal_with_inferred_scale(&s).map_err(|m| {
+                    coded(
+                        codes::CAST_INVALID,
+                        format!("CAST('{}' AS DECIMAL): {}", s, m),
+                    )
+                })?;
+                Ok(Value::Decimal { value, scale })
+            }
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS DECIMAL desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
     }
+}
+
+/// Bloque Y6 (2026-05-29): parsea un string decimal a `(value, scale)`
+/// infiriendo el scale del número de dígitos tras el punto. Usado por
+/// `CAST AS DECIMAL` cuando no hay un target scale declarado.
+pub(crate) fn parse_decimal_with_inferred_scale(input: &str) -> Result<(i128, u8), String> {
+    let trimmed = input.trim();
+    let dot = trimmed.find('.');
+    let inferred_scale = match dot {
+        Some(idx) => (trimmed.len() - idx - 1).min(38) as u8,
+        None => 0,
+    };
+    let value = parse_decimal(trimmed, inferred_scale)?;
+    Ok((value, inferred_scale))
 }
 
 /// Bloque X5 (2026-05-29): substituye cada `%` del template con el
@@ -14950,6 +15265,36 @@ pub(crate) fn extract_length_param(type_name: &str) -> Option<u32> {
         return None;
     }
     inner.parse::<u32>().ok()
+}
+
+/// Bloque Y6 (2026-05-29): para un `type_name` ya parseado que
+/// pertenezca a la familia DECIMAL/NUMERIC, extrae `(precision, scale)`.
+/// Default cuando no hay sufijo: `(10, 0)` (convención PG/MySQL).
+/// Devuelve `None` para tipos non-decimal.
+pub(crate) fn extract_decimal_meta(type_name: &str) -> Option<(u8, u8)> {
+    let upper = type_name.trim().to_ascii_uppercase();
+    let (base, params) = match upper.find('(') {
+        Some(idx) => {
+            let close = upper.find(')').unwrap_or(upper.len());
+            (
+                upper[..idx].trim_end().to_string(),
+                upper[idx + 1..close].to_string(),
+            )
+        }
+        None => (upper.clone(), String::new()),
+    };
+    if !matches!(base.as_str(), "DECIMAL" | "NUMERIC" | "DEC") {
+        return None;
+    }
+    if params.is_empty() {
+        return Some((10, 0));
+    }
+    let parts: Vec<&str> = params.split(',').map(str::trim).collect();
+    let p: u8 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let s: u8 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let p = p.clamp(1, 38);
+    let s = s.min(p);
+    Some((p, s))
 }
 
 /// Bloque Y3 (2026-05-29) + Y5 (2026-05-29): devuelve `(min, max)` para
@@ -18059,6 +18404,10 @@ impl Parser {
             (None, true) => Some(0x80),
             (None, false) => None,
         };
+        // Bloque Y6 (2026-05-29): extrae (precision, scale) si el tipo
+        // declarado es DECIMAL/NUMERIC/DEC con sufijo paramétrico.
+        // Default cuando no hay sufijo: (10, 0) (PG/MySQL convención).
+        let decimal_meta = extract_decimal_meta(&type_name);
         Ok(ColumnDef {
             name,
             type_name,
@@ -18069,6 +18418,7 @@ impl Parser {
             references,
             max_length,
             int_width,
+            decimal_meta,
         })
     }
 

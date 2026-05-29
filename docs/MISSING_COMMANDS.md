@@ -375,11 +375,13 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `TINYINT` / `SMALLINT` / `INT2` / `MEDIUMINT` / `INT4` | ✅ (Y, 2026-05-29 aliases) + **range enforcement** (Y3, 2026-05-29; VERSION 18→19; `[GBY-4121]` si fuera de rango) | — |
 | `VARCHAR(n)` / `CHAR(n)` / `CHARACTER VARYING(n)` / `NVARCHAR(n)` / `STRING` / `CLOB` | ✅ (Y, 2026-05-29; aliases de TEXT) + **enforcement de longitud** (Y2, 2026-05-29; VERSION 17→18; bytes UTF-8, `[GBY-4119]`) | — |
 | `REAL` / `DOUBLE` / `DOUBLE PRECISION` | ✅ (Y, 2026-05-29; aliases de FLOAT) | — |
-| `NUMERIC[(p,s)]` / `DECIMAL[(p,s)]` / `DEC[(p,s)]` | 🟡 (Y, 2026-05-29; aliases de FLOAT — **no es decimal exacto**, queda diferido a Y2) | P1 (exactitud) |
+| `NUMERIC[(p,s)]` / `DECIMAL[(p,s)]` / `DEC[(p,s)]` | ✅ (Y6, 2026-05-29; **decimal exacto** con `Value::Decimal { value: i128, scale: u8 }`; VERSION 21→22; `[GBY-4123]`) | — |
 | `BOOLEAN` | ✅ (Y, 2026-05-29; alias de BOOL) | — |
 | `TIMESTAMP` | ✅ (Y, 2026-05-29; alias de DATETIME) | — |
 | `BLOB` / `BYTEA` / `BINARY` / `VARBINARY` (binario crudo) | ✅ (Y4, 2026-05-29; VERSION 19→20; code=10; literal `X'hex'`; CAST AS BLOB; no indexable; no PK/FK/CHECK/DEFAULT) | — |
-| `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ❌ (diferido a Y2 — requiere `Value::Decimal`) | P1 |
+| `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ✅ (Y6, 2026-05-29) | — |
+| Aritmética `Decimal + Decimal` exacta (sin promoción a f64) | ❌ (Y6 sólo storage; aritmética mixta promueve; diferido) | P2 |
+| `DECIMAL` indexable | ❌ (encoding i128+scale no lex-comparable; diferido) | P3 |
 | Enforcement de longitud VARCHAR(n) / CHAR(n) | ✅ (Y2, 2026-05-29; bytes UTF-8) | — |
 | Enforcement de rango SMALLINT / TINYINT / MEDIUMINT / INT4 | ✅ (Y3, 2026-05-29) | — |
 | `TINYINT UNSIGNED` / `SMALLINT UNSIGNED` / `MEDIUMINT UNSIGNED` / `INT4 UNSIGNED` / `BIGINT UNSIGNED` | ✅ (Y5, 2026-05-29; reusa byte int_width con high bit 0x80; `[GBY-4121]`) | — |
