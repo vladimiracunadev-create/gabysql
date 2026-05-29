@@ -12650,8 +12650,14 @@ fn y4_blob_insert_and_select_roundtrip() -> Result<(), Box<dyn Error>> {
     )?;
     let res = run_sql(&db, "SELECT data FROM t ORDER BY id;")?;
     assert_eq!(res[0].rows.len(), 2);
-    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
-    assert_eq!(res[0].rows[1][0], Value::Bytes(vec![0x00, 0xff, 0x7f, 0x80]));
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+    );
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Bytes(vec![0x00, 0xff, 0x7f, 0x80])
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -12742,7 +12748,10 @@ fn y4_cast_text_to_blob() -> Result<(), Box<dyn Error>> {
         "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
     )?;
     let res = run_sql(&db, "SELECT CAST('0xdeadbeef' AS BLOB) FROM t;")?;
-    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -12812,7 +12821,10 @@ fn y4_blob_survives_reopen() -> Result<(), Box<dyn Error>> {
     )?;
     // run_sql cierra entre invocaciones — comprobamos que sigue ahí.
     let res = run_sql(&db, "SELECT data FROM t WHERE id = 1;")?;
-    assert_eq!(res[0].rows[0][0], Value::Bytes(vec![0x12, 0x34, 0xab, 0xcd]));
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Bytes(vec![0x12, 0x34, 0xab, 0xcd])
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }
