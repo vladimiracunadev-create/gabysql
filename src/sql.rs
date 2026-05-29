@@ -71,6 +71,9 @@ pub enum Statement {
     /// Bloque X4c: `FOR ident IN expr TO expr LOOP <body> END LOOP`.
     /// Auto-declara la variable de loop (shadowing si existe).
     For(Box<ForStmt>),
+    /// Bloque X6 (2026-05-29): `FOR ident IN (SELECT ...) LOOP <body> END LOOP`.
+    /// Itera filas de un resultset; expone `ident.col` por cada columna.
+    ForSelect(Box<ForSelectStmt>),
     /// Bloque X4d (2026-05-28): `BEGIN <body> [EXCEPTION WHEN OTHERS
     /// THEN <handler>] END`. Ejecuta body; si error y hay handler,
     /// captura y ejecuta handler en su lugar (catch-all).
@@ -513,6 +516,19 @@ pub struct ForStmt {
     /// X5: `REVERSE` invierte el sentido — start debe ser >= end y la
     /// variable se decrementa.
     pub reverse: bool,
+}
+
+/// Bloque X6 (2026-05-29): `FOR var IN (SELECT ...) LOOP <body> END LOOP`.
+/// Itera fila a fila sobre el resultset; en cada iteración inyecta
+/// `<var>.<col>` en `var_scope` para cada columna del SELECT.
+/// EXIT/RETURN propagan por sentinel como en el resto de loops.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForSelectStmt {
+    /// Nombre del record (`row` en `FOR row IN SELECT ...`).
+    pub var: String,
+    /// Subquery cuyo resultset se itera.
+    pub query: SelectStmt,
+    pub body: Vec<Statement>,
 }
 
 /// Bloque X4e (2026-05-29) + X5 (2026-05-29): filtro de un
@@ -1853,6 +1869,7 @@ impl<'a> Engine<'a> {
             Statement::Exit(stmt) => self.exec_exit(stmt),
             Statement::Raise(stmt) => self.exec_raise(stmt),
             Statement::For(stmt) => self.exec_for(*stmt),
+            Statement::ForSelect(stmt) => self.exec_for_select(*stmt),
             Statement::Block(stmt) => self.exec_block(*stmt),
             Statement::Loop(stmt) => self.exec_loop(*stmt),
             Statement::Case(stmt) => self.exec_case(*stmt),
@@ -4249,6 +4266,96 @@ impl<'a> Engine<'a> {
             rows: Vec::new(),
             message: Some(format!(
                 "OK · FOR LOOP {} iter ({})",
+                iter_count,
+                if early_exit { "exit" } else { "completo" }
+            )),
+        })
+    }
+
+    /// Bloque X6 (2026-05-29): `FOR var IN (SELECT ...) LOOP <body> END LOOP`.
+    /// Ejecuta el SELECT, itera fila por fila. En cada iteración:
+    ///
+    /// 1. Por cada columna del resultset, inserta `var.col` en
+    ///    `var_scope` (guardando el valor previo si existe).
+    /// 2. Ejecuta el body (EXIT / RETURN viajan como sentinels).
+    /// 3. Al terminar (normal o por EXIT), restaura los valores previos.
+    ///
+    /// El record entero (`var`) no se inserta como tal — sólo sus
+    /// columnas qualified. Resolución de `var.col` la hace `eval_expr`
+    /// vía fast-path qualified (ver `Expr::Column`).
+    fn exec_for_select(&mut self, stmt: ForSelectStmt) -> DbResult<ResultSet> {
+        let rs = self.exec_select(stmt.query)?;
+        let prefix = format!("{}.", stmt.var.to_ascii_lowercase());
+        // Pre-computamos las claves qualified — una por columna.
+        let keys: Vec<String> = rs
+            .columns
+            .iter()
+            .map(|c| format!("{}{}", prefix, c.to_ascii_lowercase()))
+            .collect();
+        // Snapshot de los valores previos de esas claves (si existían).
+        let saved: Vec<(String, Option<Value>)> = keys
+            .iter()
+            .map(|k| (k.clone(), self.var_scope.remove(k)))
+            .collect();
+        let mut iter_count = 0usize;
+        let mut early_exit = false;
+        for row in rs.rows {
+            if iter_count >= MAX_LOOP_ITERATIONS {
+                // Restaurar antes de propagar.
+                for (k, v) in saved {
+                    self.var_scope.remove(&k);
+                    if let Some(vv) = v {
+                        self.var_scope.insert(k, vv);
+                    }
+                }
+                return Err(coded(
+                    codes::LOOP_MAX_ITERATIONS_EXCEEDED,
+                    format!(
+                        "FOR ... IN (SELECT): superó el límite de {} iteraciones",
+                        MAX_LOOP_ITERATIONS
+                    ),
+                ));
+            }
+            // Inyectar var.col1, var.col2, ... para esta fila.
+            for (k, v) in keys.iter().zip(row.into_iter()) {
+                self.var_scope.insert(k.clone(), v);
+            }
+            for s in stmt.body.clone() {
+                match self.exec(s) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains(EXIT_SIGNAL) => {
+                        early_exit = true;
+                        break;
+                    }
+                    Err(e) => {
+                        // Restaurar y propagar (RETURN, errores reales, etc.).
+                        for (k, v) in saved {
+                            self.var_scope.remove(&k);
+                            if let Some(vv) = v {
+                                self.var_scope.insert(k, vv);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            if early_exit {
+                break;
+            }
+            iter_count += 1;
+        }
+        // Restaurar valores previos.
+        for (k, v) in saved {
+            self.var_scope.remove(&k);
+            if let Some(vv) = v {
+                self.var_scope.insert(k, vv);
+            }
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · FOR ... IN (SELECT) {} iter ({})",
                 iter_count,
                 if early_exit { "exit" } else { "completo" }
             )),
@@ -13380,6 +13487,20 @@ fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Column(name) => {
+            // X6 (2026-05-29): fast-path para nombres cualificados
+            // tipo `row.col`. Antes de normalizar (que tira el
+            // qualifier), probamos el nombre completo en lowercase
+            // — así `FOR row IN (SELECT id, ...) LOOP ... row.id ...`
+            // encuentra la clave `row.id` inyectada en var_scope.
+            // Sin colisiones porque las claves de columnas reales no
+            // suelen llevar `.` (las joineadas sí, pero matchearán
+            // exactamente igual).
+            if name.contains('.') {
+                let full = name.to_ascii_lowercase();
+                if let Some(v) = row.get(&full) {
+                    return Ok(v.clone());
+                }
+            }
             let key = normalize_ident(name);
             if let Some(v) = row.get(&key) {
                 return Ok(v.clone());
@@ -17016,8 +17137,12 @@ impl Parser {
         }))
     }
 
-    /// Bloque X4c + X5 (2026-05-29): parsea
-    /// `FOR ident IN [REVERSE] start TO end [STEP n] LOOP <body> END LOOP`.
+    /// Bloque X4c + X5 (2026-05-29) + X6 (2026-05-29): parsea
+    /// `FOR ident IN [REVERSE] start TO end [STEP n] LOOP <body> END LOOP`
+    /// (range loop, X4c/X5) o
+    /// `FOR ident IN (SELECT ...) LOOP <body> END LOOP` (X6, itera resultset).
+    /// La distinción se hace por lookahead tras `IN`: si lo siguiente
+    /// es `(` seguido por `SELECT`, conmuta a ForSelect.
     fn parse_for_stmt(&mut self) -> DbResult<Statement> {
         let var = self.expect_ident()?;
         if !self.match_keyword("IN") {
@@ -17025,6 +17150,50 @@ impl Parser {
                 codes::IF_BLOCK_MALFORMED,
                 "FOR ident ...: se esperaba IN",
             ));
+        }
+        // X6: lookahead `(SELECT ...)`. Si matchea, parseamos
+        // ForSelect; si no, caemos al range loop X4c/X5.
+        if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+            let next_after = self.tokens.get(self.pos + 1).map(|t| t.text.clone());
+            if next_after
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("SELECT"))
+            {
+                self.pos += 1; // consume "("
+                               // parse_select_stmt asume que `SELECT` ya fue consumido.
+                self.expect_keyword("SELECT")?;
+                let query = self.parse_select_stmt()?;
+                if !self.match_symbol(")") {
+                    return Err(coded(
+                        codes::IF_BLOCK_MALFORMED,
+                        "FOR ... IN (SELECT ...): se esperaba ')' de cierre",
+                    ));
+                }
+                if !self.match_keyword("LOOP") {
+                    return Err(coded(
+                        codes::IF_BLOCK_MALFORMED,
+                        "FOR ... IN (SELECT ...): se esperaba LOOP",
+                    ));
+                }
+                let body = self.parse_loop_body()?;
+                if !self.match_keyword("END") {
+                    return Err(coded(
+                        codes::IF_BLOCK_MALFORMED,
+                        "FOR ... IN (SELECT ...): se esperaba END LOOP para cerrar",
+                    ));
+                }
+                if !self.match_keyword("LOOP") {
+                    return Err(coded(
+                        codes::IF_BLOCK_MALFORMED,
+                        "FOR ... IN (SELECT ...): se esperaba END LOOP (vi END sin LOOP)",
+                    ));
+                }
+                return Ok(Statement::ForSelect(Box::new(ForSelectStmt {
+                    var,
+                    query,
+                    body,
+                })));
+            }
         }
         // X5: REVERSE opcional antes de start.
         let reverse = self.match_keyword("REVERSE");

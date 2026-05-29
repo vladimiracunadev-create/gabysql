@@ -6,6 +6,48 @@
 
 ---
 
+## 2026-05-29 — Bloque X6: `FOR row IN (SELECT ...) LOOP` — cierra el bloque X
+
+> **Un push a `main`** sin bump on-disk. Último item del bloque X — itera fila por fila sobre un resultset con composite row scope (`row.col`). Detalle en [`docs/adr/0042-for-row-in-select-x6.md`](docs/adr/0042-for-row-in-select-x6.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+DECLARE total INT DEFAULT 0;
+
+FOR r IN (SELECT id, val FROM src WHERE active = TRUE ORDER BY id) LOOP
+    SET total = total + r.val;
+    EXIT WHEN r.id = 999;
+END LOOP;
+
+IF total > 1000 THEN RAISE NOTICE 'sobrepasó umbral'; END IF;
+```
+
+### 🛠 Implementación
+
+- **AST**: `Statement::ForSelect(Box<ForSelectStmt { var, query: SelectStmt, body }>)` — hermano de `Statement::For` (range loop).
+- **Parser**: lookahead `(SELECT` tras `IN`. Si matchea, parsea como ForSelect; si no, cae al path range (X4c/X5). SELECT obligatorio entre paréntesis.
+- **Engine `exec_for_select`**: ejecuta el SELECT, computa `var.col` keys (lowercase), snapshot de valores previos, itera filas inyectando los valores en `var_scope`, ejecuta body (EXIT/RETURN propagan por sentinel), restaura al final. Guard `MAX_LOOP_ITERATIONS=100K` heredado.
+- **Fast-path en `eval_expr`**: si `Expr::Column(name)` contiene `.`, prueba el nombre completo en lowercase contra el row map ANTES de `normalize_ident` (que tira el qualifier). Permite resolver `r.id` contra la key `"r.id"` inyectada en var_scope.
+- **Composite scope sin tipo nuevo**: las columnas viven como variables flat en `var_scope`. No introducimos `Value::Record` — todo escalar.
+
+### 🚫 Sin nuevos códigos de error
+
+Reusa `[GBY-4110]` LOOP_MAX_ITERATIONS_EXCEEDED y `[GBY-2002]` COLUMN_NOT_FOUND para `row.col` referenciado pero ausente del resultset.
+
+### 🧪 Validación
+
+- 8 tests `x6_*`: iteración básica con count, suma de columnas via `r.col`, último valor persiste, EXIT WHEN funciona, resultset vacío no itera, SELECT con WHERE filtra, FOR ... IN (SELECT) dentro de CREATE PROCEDURE, var declarada antes preservada después del loop.
+- Suite total: **530/530 pass** (`cargo test --lib --tests`).
+
+### 🎉 Bloque X cerrado al 100%
+
+Con X6 el bloque X (PL/pgSQL) queda completo: triggers BEFORE/AFTER (X1+X2), stored procedures + CALL (X3), user functions con expr o block body (X3b+X4f), IF/CASE statement-level, DECLARE/SET/WHILE/EXIT, RAISE EXCEPTION/NOTICE/WARNING/INFO con formato `%`, FOR range con STEP/REVERSE, FOR row IN SELECT, BEGIN..EXCEPTION..END con filtros por código numérico/simbólico/OTHERS, LOOP standalone, RETURN expr.
+
+Lo único diferido a futuro: `FOR row IN SELECT` sin paréntesis (alinear con PG), `FOREACH SLICE` (requiere ARRAY type → Y3+), `EXECUTE 'dynamic SQL'`.
+
+---
+
 ## 2026-05-29 — Bloque X5: refinamientos PL/pgSQL (RAISE WARNING/INFO, formato `%`, FOR STEP/REVERSE, EXCEPTION WHEN simbólico)
 
 > **Un push a `main`** sin bump on-disk. Cleanup de los 4 items menores que quedaron diferidos al cerrar X4f. Detalle en [`docs/adr/0041-x5-procedural-refinements.md`](docs/adr/0041-x5-procedural-refinements.md).

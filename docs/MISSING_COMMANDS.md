@@ -321,7 +321,8 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `CASE WHEN cond THEN <stmts> [ELSE <stmts>] END CASE` statement-level (searched form) | ✅ (X4e, 2026-05-29) | — |
 | `EXCEPTION WHEN <name>` filtros simbólicos (`WHEN no_data_found`) | ❌ (X4e solo numéricos; diferido) | P3 |
 | `CASE expr WHEN val THEN ...` simple form como statement | ❌ (diferido) | P3 |
-| `FOR row IN SELECT ... LOOP` (resultset iteration) | ❌ (diferido) | P3 |
+| `FOR row IN (SELECT ...) LOOP` (resultset iteration con composite row scope `row.col`) | ✅ (X6, 2026-05-29; SELECT obligatorio entre paréntesis) | — |
+| `FOR row IN SELECT ... LOOP` sin paréntesis (estilo PG strict) | ❌ (diferido — X6 requiere paréntesis) | P3 |
 | `RETURN expr` en function bodies multi-statement (`AS BEGIN ... RETURN x; END`) | ✅ (X4f, 2026-05-29; sentinel pattern, single-expr body de X3b sigue válido) | — |
 | `STEP n` / `REVERSE` en FOR range | ✅ (X5, 2026-05-29; `STEP 0` rechazado con `[GBY-4120]`) | — |
 | `RAISE WARNING` / `RAISE INFO` (además de EXCEPTION/NOTICE) | ✅ (X5, 2026-05-29; mismo behavior que NOTICE, distinto prefijo) | — |

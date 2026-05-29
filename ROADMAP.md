@@ -98,6 +98,8 @@
 
 - ~~Refinamientos del bloque X (cleanup post-X4f de items menores): `RAISE WARNING|INFO` (además de EXCEPTION/NOTICE), formato `%` en RAISE (`RAISE EXCEPTION 'value % bad', x` con substitución posicional, `%%` escapa, arity strict), `STEP n` y `REVERSE` en `FOR i IN a TO b LOOP` (step magnitude + sign por REVERSE, STEP 0 rechazado), `EXCEPTION WHEN <name>` filtros simbólicos PG-style (`unique_violation`, `primary_key_violation`, `foreign_key_violation`, `check_violation`, `division_by_zero`, etc. — tabla `resolve_exception_name`). Sin bump on-disk. `FOR row IN SELECT` (composite row scope) diferido a X6~~ ✅ entregado (bloque **X5**, 2026-05-29, [ADR-0041](docs/adr/0041-x5-procedural-refinements.md)).
 
+- ~~`FOR row IN (SELECT ...) LOOP <body> END LOOP` — itera fila por fila sobre un resultset; en cada iteración inyecta `row.col` en `var_scope` con claves qualified (`"row.col"` lowercase). Fast-path en `eval_expr` para resolver `Expr::Column("row.id")` contra el lookup completo antes de normalizar (que tiraría el qualifier). SELECT obligatorio entre paréntesis. EXIT/RETURN propagan por sentinel; MAX_LOOP_ITERATIONS=100K como guard. Sin bump on-disk. **Cierra el bloque X al 100%** (procedural completo: triggers, procedures, functions, IF/CASE/WHILE/FOR range/FOR row/LOOP/DECLARE/SET/RAISE WARNING-NOTICE-INFO-EXCEPTION/EXCEPTION WHEN code-name-OTHERS/RETURN)~~ ✅ entregado (bloque **X6**, 2026-05-29, [ADR-0042](docs/adr/0042-for-row-in-select-x6.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

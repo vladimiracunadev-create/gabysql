@@ -11806,6 +11806,235 @@ fn y_unsupported_type_still_errors() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque X6 (2026-05-29): FOR row IN (SELECT ...) LOOP — composite
+// row scope (`row.col`) accesible vía var_scope qualified keys.
+// ============================================================
+
+fn x6_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x6-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x6_for_select_basic_iteration_counts() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("count")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY);
+         INSERT INTO src (id) VALUES (1);
+         INSERT INTO src (id) VALUES (2);
+         INSERT INTO src (id) VALUES (3);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    run_sql(
+        &db,
+        "DECLARE cnt INT DEFAULT 0;
+         FOR r IN (SELECT id FROM src) LOOP
+            SET cnt = cnt + 1;
+         END LOOP;
+         IF cnt = 3 THEN INSERT INTO log (id) VALUES (3); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_reads_row_col_in_expr() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("sum")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, val INT);
+         INSERT INTO src (id, val) VALUES (1, 10);
+         INSERT INTO src (id, val) VALUES (2, 20);
+         INSERT INTO src (id, val) VALUES (3, 30);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    // Suma de val (10+20+30=60) usando r.val dentro del SET.
+    run_sql(
+        &db,
+        "DECLARE total INT DEFAULT 0;
+         FOR r IN (SELECT id, val FROM src) LOOP
+            SET total = total + r.val;
+         END LOOP;
+         IF total = 60 THEN INSERT INTO log (id) VALUES (60); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(60));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_last_row_value_persists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("last")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY);
+         INSERT INTO src (id) VALUES (10);
+         INSERT INTO src (id) VALUES (20);
+         INSERT INTO src (id) VALUES (30);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    // El último valor de r.id debe ser 30 (orden de inserción / PK ASC).
+    run_sql(
+        &db,
+        "DECLARE last_id INT DEFAULT 0;
+         FOR r IN (SELECT id FROM src ORDER BY id ASC) LOOP
+            SET last_id = r.id;
+         END LOOP;
+         IF last_id = 30 THEN INSERT INTO log (id) VALUES (30); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(30));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_exit_when_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("exit")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY);
+         INSERT INTO src (id) VALUES (1);
+         INSERT INTO src (id) VALUES (2);
+         INSERT INTO src (id) VALUES (3);
+         INSERT INTO src (id) VALUES (4);
+         INSERT INTO src (id) VALUES (5);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    // EXIT cuando r.id = 3; debería procesar exactamente 3 filas.
+    run_sql(
+        &db,
+        "DECLARE cnt INT DEFAULT 0;
+         FOR r IN (SELECT id FROM src ORDER BY id ASC) LOOP
+            SET cnt = cnt + 1;
+            EXIT WHEN r.id = 3;
+         END LOOP;
+         IF cnt = 3 THEN INSERT INTO log (id) VALUES (3); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_empty_result_noop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("empty")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    // Sin filas, cnt queda en 0.
+    run_sql(
+        &db,
+        "DECLARE cnt INT DEFAULT 0;
+         FOR r IN (SELECT id FROM src) LOOP
+            SET cnt = cnt + 1;
+         END LOOP;
+         IF cnt = 0 THEN INSERT INTO log (id) VALUES (0); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_with_where_in_subquery() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("where")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, val INT);
+         INSERT INTO src (id, val) VALUES (1, 100);
+         INSERT INTO src (id, val) VALUES (2, 200);
+         INSERT INTO src (id, val) VALUES (3, 300);
+         INSERT INTO src (id, val) VALUES (4, 400);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    // SELECT filtrado: solo dos filas (val >= 200, id <= 3) → val ∈ {200, 300}.
+    run_sql(
+        &db,
+        "DECLARE total INT DEFAULT 0;
+         FOR r IN (SELECT id, val FROM src WHERE val >= 200 AND id <= 3) LOOP
+            SET total = total + r.val;
+         END LOOP;
+         IF total = 500 THEN INSERT INTO log (id) VALUES (500); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(500));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_inside_procedure() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("proc")?;
+    // X4b limitation: vars no se pueden meter dentro de INSERT VALUES.
+    // Verificamos el FOR ... IN (SELECT) dentro de procedure con un
+    // patrón de marcado: si la suma calculada es la esperada, marcamos
+    // un row en `marker` (no usamos el valor de `total`, sólo lo
+    // comparamos contra el literal esperado vía IF).
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY, val INT);
+         INSERT INTO src (id, val) VALUES (1, 5);
+         INSERT INTO src (id, val) VALUES (2, 7);
+         CREATE TABLE marker (id INT PRIMARY KEY);
+         CREATE PROCEDURE sum_all() AS BEGIN
+            DECLARE total INT DEFAULT 0;
+            FOR r IN (SELECT val FROM src) LOOP
+               SET total = total + r.val;
+            END LOOP;
+            IF total = 12 THEN INSERT INTO marker (id) VALUES (12); END IF;
+         END;
+         CALL sum_all();",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM marker;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(12));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x6_for_select_row_scope_restored_after() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x6_setup("shadow")?;
+    run_sql(
+        &db,
+        "CREATE TABLE src (id INT PRIMARY KEY);
+         INSERT INTO src (id) VALUES (42);
+         CREATE TABLE log (id INT PRIMARY KEY);",
+    )?;
+    // Shadowing: si declaramos r.id ANTES (no se puede directo — usamos un
+    // nombre tipo `r_id`), no aplica. Pero queremos comprobar que después
+    // del loop, `r.id` NO sigue en var_scope (un SELECT que lo use debería
+    // fallar). Como no podemos consultar var_scope directamente, hacemos:
+    // declarar `last_seen` ANTES y verificar que se preservó después.
+    run_sql(
+        &db,
+        "DECLARE last_seen INT DEFAULT 0;
+         FOR r IN (SELECT id FROM src) LOOP
+            SET last_seen = r.id;
+         END LOOP;
+         IF last_seen = 42 THEN INSERT INTO log (id) VALUES (42); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque X5 (2026-05-29): refinamientos del bloque X.
 // RAISE WARNING/INFO, formato `%` en RAISE, FOR STEP/REVERSE,
 // EXCEPTION WHEN <nombre> simbólico.
