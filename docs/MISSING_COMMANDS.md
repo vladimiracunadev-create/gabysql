@@ -313,7 +313,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |
 | `CREATE PROCEDURE name(...) AS <body>` + `CALL name(args)` | ✅ (X3, 2026-05-28; VERSION 14→15; statement-only, params via token-sub) | — |
-| `CREATE FUNCTION ... RETURNS scalar` invocable en SELECT | ❌ (diferido a X3b — requiere extender AST de Expr) | P3 |
+| `CREATE FUNCTION name(...) RETURNS TYPE AS <expr>` invocable en SELECT/WHERE | ✅ (X3b, 2026-05-28; VERSION 15→16; body es Expr no SELECT) | — |
+| `CREATE FUNCTION ... RETURNS TABLE` (table-valued functions) | ❌ | P3 |
+| Body de function como `SELECT` (con FROM) | ❌ (workaround: usar body Expr con built-ins) | P3 |
 | Args OUT/INOUT en procedures, `DECLARE` variables, `IF`/`LOOP`/`WHILE` en body | ❌ (diferido a X4 — PL/pgSQL completo) | P3 |
 | `CREATE TYPE` (enums, composites) | ❌ | P3 |
 

@@ -124,7 +124,13 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        Discriminator `3=Procedure`. Cada procedure guarda nombre,
 //        params (Vec<(String,ColumnType)>) y body como texto SQL.
 //        V14 rechazados con `[GBY-1003]` — migración manual.
-pub const VERSION: u32 = 15;
+//  16 -> Bloque X3b (2026-05-28): user-defined scalar functions
+//        (`CREATE FUNCTION name(params) RETURNS TYPE AS <expr>`,
+//        `DROP FUNCTION`, invocables en SELECT/WHERE/etc.).
+//        Discriminator `4=Function`. Payload: [name][return_type:u8]
+//        [param_count:u16] × ([pname][ptype:u8]) [body_sql].
+//        V15 rechazados con `[GBY-1003]` — migración manual.
+pub const VERSION: u32 = 16;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

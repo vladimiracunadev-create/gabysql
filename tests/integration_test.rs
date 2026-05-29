@@ -5055,11 +5055,13 @@ fn g1_errors_arity_type_unknown() -> Result<(), Box<dyn Error>> {
         "esperaba GBY-4035 por tipo: {}",
         err
     );
-    // función desconocida
+    // función desconocida — X3b: ahora el parser optimistamente la
+    // trata como user-defined function; al exec, no existe en catálogo
+    // y rebota con [GBY-4103].
     let err = run_sql(&db, "SELECT FOO(1) FROM t;").unwrap_err();
     assert!(
-        err.to_string().contains("[GBY-4037]"),
-        "esperaba GBY-4037 por función desconocida: {}",
+        err.to_string().contains("[GBY-4103]"),
+        "esperaba GBY-4103 por función desconocida (post-X3b): {}",
         err
     );
     cleanup(&[&db, &wal]);
@@ -10389,6 +10391,170 @@ fn x3_procedure_persists_across_reopen() -> Result<(), Box<dyn Error>> {
     run_sql(&db, "CALL p(2);")?;
     let res = run_sql(&db, "SELECT id FROM t ORDER BY id;")?;
     assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----- Bloque X3b (2026-05-28): user-defined scalar functions. -----
+
+fn x3b_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x3b-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x3b_simple_function_in_select() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("simple")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         CREATE FUNCTION dbl(p_x INT) RETURNS INT AS p_x * 2;",
+    )?;
+    let res = run_sql(&db, "SELECT id, dbl(v) AS doubled FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][1], Value::Integer(20));
+    assert_eq!(res[0].rows[1][1], Value::Integer(40));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_in_where() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("where")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 10);
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);
+         CREATE FUNCTION big(p_x INT) RETURNS BOOL AS p_x >= 20;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t WHERE big(v) ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    assert_eq!(res[0].rows[1][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_uses_builtin() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("builtin")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
+         INSERT INTO t (id, name) VALUES (1, 'Ana');
+         INSERT INTO t (id, name) VALUES (2, 'Beto');
+         CREATE FUNCTION greet(p_name TEXT) RETURNS TEXT AS CONCAT('Hi ', p_name);",
+    )?;
+    let res = run_sql(&db, "SELECT greet(name) FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("Hi Ana".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::String("Hi Beto".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_arity_mismatch() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("arity")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE FUNCTION inc(p_x INT) RETURNS INT AS p_x + 1;",
+    )?;
+    let err = run_sql(&db, "SELECT inc(1, 2) FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4104"),
+        "esperaba GBY-4104, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_not_found() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("not-found")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (1);")?;
+    let err = run_sql(&db, "SELECT nope(id) FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4103"),
+        "esperaba GBY-4103, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_drop_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         CREATE FUNCTION inc(p_x INT) RETURNS INT AS p_x + 1;",
+    )?;
+    run_sql(&db, "DROP FUNCTION inc;")?;
+    let err = run_sql(&db, "SELECT inc(id) FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4103"),
+        "esperaba GBY-4103, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_persists() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("persists")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 5);
+         CREATE FUNCTION sq(p_x INT) RETURNS INT AS p_x * p_x;",
+    )?;
+    let res = run_sql(&db, "SELECT sq(v) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(25));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_name_collision() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("collide")?;
+    run_sql(&db, "CREATE TABLE coll (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "CREATE FUNCTION coll(p_x INT) RETURNS INT AS p_x + 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4101"),
+        "esperaba GBY-4101, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x3b_function_calling_function() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x3b_setup("nested")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         INSERT INTO t (id, v) VALUES (1, 3);
+         CREATE FUNCTION dbl(p_x INT) RETURNS INT AS p_x * 2;
+         CREATE FUNCTION quad(p_x INT) RETURNS INT AS dbl(dbl(p_x));",
+    )?;
+    let res = run_sql(&db, "SELECT quad(v) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(12));
     cleanup(&[&db, &wal]);
     Ok(())
 }

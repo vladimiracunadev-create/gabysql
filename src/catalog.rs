@@ -1058,6 +1058,7 @@ pub enum ObjectKind {
     View,
     Trigger,
     Procedure,
+    Function,
 }
 
 impl ObjectKind {
@@ -1067,6 +1068,7 @@ impl ObjectKind {
             Self::View => 1,
             Self::Trigger => 2,
             Self::Procedure => 3,
+            Self::Function => 4,
         }
     }
 
@@ -1076,8 +1078,9 @@ impl ObjectKind {
             1 => Ok(Self::View),
             2 => Ok(Self::Trigger),
             3 => Ok(Self::Procedure),
+            4 => Ok(Self::Function),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function)",
                 other
             ))),
         }
@@ -1203,13 +1206,91 @@ impl ProcedureMeta {
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger o procedure.
+/// Bloque X3b (VERSION 16, 2026-05-28): user-defined scalar function.
+/// El body es UNA expresión (no un SELECT) — al call, se substituyen
+/// los params y se evalúa contra row vacío.
+///
+/// Layout on-disk:
+///     [name][return_type:u8][param_count:u16] · param_count × ([pname][ptype:u8]) · [body_sql]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionMeta {
+    pub name: String,
+    pub params: Vec<(String, ColumnType)>,
+    pub return_type: ColumnType,
+    pub body_sql: String,
+}
+
+impl FunctionMeta {
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::new();
+        push_string(&mut out, &self.name)?;
+        out.push(self.return_type.code());
+        if self.params.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "function '{}' tiene {} params, máximo {}",
+                self.name,
+                self.params.len(),
+                u16::MAX
+            )));
+        }
+        out.extend_from_slice(&(self.params.len() as u16).to_le_bytes());
+        for (n, t) in &self.params {
+            push_string(&mut out, n)?;
+            out.push(t.code());
+        }
+        push_string(&mut out, &self.body_sql)?;
+        Ok(out)
+    }
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        if offset >= data.len() {
+            return Err(DbError::new(format!(
+                "FunctionMeta '{}' corrupta: falta return_type",
+                name
+            )));
+        }
+        let return_type = ColumnType::from_code(data[offset])?;
+        offset += 1;
+        if offset + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "FunctionMeta '{}' corrupta: faltan 2 bytes param_count",
+                name
+            )));
+        }
+        let pcount = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let mut params = Vec::with_capacity(pcount);
+        for _ in 0..pcount {
+            let pname = take_string(data, &mut offset)?;
+            if offset >= data.len() {
+                return Err(DbError::new(format!(
+                    "FunctionMeta '{}': falta type_code de param '{}'",
+                    name, pname
+                )));
+            }
+            let ptype = ColumnType::from_code(data[offset])?;
+            offset += 1;
+            params.push((pname, ptype));
+        }
+        let body_sql = take_string(data, &mut offset)?;
+        Ok(Self {
+            name,
+            params,
+            return_type,
+            body_sql,
+        })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure o function.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
     View(ViewMeta),
     Trigger(TriggerMeta),
     Procedure(ProcedureMeta),
+    Function(FunctionMeta),
 }
 
 impl CatalogObject {
@@ -1219,6 +1300,7 @@ impl CatalogObject {
             Self::View(v) => &v.name,
             Self::Trigger(t) => &t.name,
             Self::Procedure(p) => &p.name,
+            Self::Function(f) => &f.name,
         }
     }
 }
@@ -1238,6 +1320,7 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
         ObjectKind::View => CatalogObject::View(ViewMeta::deserialize(rest)?),
         ObjectKind::Trigger => CatalogObject::Trigger(TriggerMeta::deserialize(rest)?),
         ObjectKind::Procedure => CatalogObject::Procedure(ProcedureMeta::deserialize(rest)?),
+        ObjectKind::Function => CatalogObject::Function(FunctionMeta::deserialize(rest)?),
     })
 }
 
@@ -1312,6 +1395,18 @@ impl<'a> Catalog<'a> {
             .collect())
     }
 
+    /// Bloque X3b: lista todas las functions del catálogo.
+    pub fn list_functions(&mut self) -> DbResult<Vec<FunctionMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::Function(f) => Some(f),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Lookup case-insensitive por nombre. Devuelve el objeto sea
     /// table o view; se usa cuando el caller no sabe (e.g. resolver
     /// de FROM, ALTER TABLE rechazando colisión con vista).
@@ -1366,6 +1461,13 @@ impl<'a> Catalog<'a> {
         }
     }
 
+    pub fn get_function(&mut self, name: &str) -> DbResult<Option<FunctionMeta>> {
+        match self.get_object(name)? {
+            Some(CatalogObject::Function(f)) => Ok(Some(f)),
+            _ => Ok(None),
+        }
+    }
+
     pub fn put_table(&mut self, meta: &TableMeta) -> DbResult<()> {
         let root = self.ensure_root()?;
         let key = hash_name(&meta.name);
@@ -1404,6 +1506,17 @@ impl<'a> Catalog<'a> {
         let key = hash_name(&meta.name);
         let mut payload = Vec::with_capacity(1 + 32);
         payload.push(ObjectKind::Procedure.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    pub fn put_function(&mut self, meta: &FunctionMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key = hash_name(&meta.name);
+        let mut payload = Vec::with_capacity(1 + 32);
+        payload.push(ObjectKind::Function.code());
         payload.extend_from_slice(&meta.serialize()?);
         let mut tree = Tree::new(self.pager);
         tree.upsert(root, key, payload)?;

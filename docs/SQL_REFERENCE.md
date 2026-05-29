@@ -52,7 +52,8 @@
 | [Window functions](#window-functions-bloque-w3) — `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` con `OVER (PARTITION BY ... ORDER BY ...)` | DML | 🟢 (bloque W3) |
 | [`CREATE TRIGGER name {BEFORE\|AFTER} {INSERT\|UPDATE\|DELETE} ON t FOR EACH ROW <body>` + `DROP TRIGGER`](#triggers-bloques-x1--x2) — body single-stmt o `BEGIN stmt; stmt; END` | DDL | 🟢 (bloques X1+X2 / VERSION 14) |
 | [`CREATE PROCEDURE name(p1 TYPE, ...) AS <body>` + `DROP PROCEDURE` + `CALL name(args)`](#stored-procedures-bloque-x3) | DDL+DML | 🟢 (bloque X3 / VERSION 15) |
-| NEW mutable en BEFORE, `IF`/`LOOP`/variables en body, `CREATE FUNCTION` invocable en SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>` + `DROP FUNCTION`, invocable como `name(args)` en cualquier expresión](#user-defined-functions-bloque-x3b) | DDL+DML | 🟢 (bloque X3b / VERSION 16) |
+| NEW mutable en BEFORE, `IF`/`LOOP`/variables en body, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -1917,6 +1918,67 @@ CREATE PROCEDURE add_log(p_id INT) AS INSERT INTO log (id) VALUES (p_id);
 - **Args OUT/INOUT**, **`DECLARE` variables locales**, **`IF`/`LOOP`/`WHILE`** — área de PL/pgSQL, X4+.
 - **Recursion guard** para procedures.
 - **`CREATE PROCEDURE ... RETURNS TABLE`** (tabla de salida).
+
+---
+
+## User-defined functions (bloque X3b)
+
+> **`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>`** + **`DROP FUNCTION`**: funciones escalares invocables desde cualquier expresión (SELECT, WHERE, HAVING, ORDER BY, body de otra function...). Body es UNA expresión (no SELECT — desviación práctica de ANSI). Persistido en catálogo (bump VERSION 15 → 16).
+
+### 📜 EBNF
+
+```
+create_function ::= "CREATE" "FUNCTION" ident "(" [param {"," param}*] ")"
+                    "RETURNS" type_name "AS" expr
+drop_function   ::= "DROP" "FUNCTION" ["IF" "EXISTS"] ident
+```
+
+### ✅ Ejemplos
+
+```sql
+-- Doble
+CREATE FUNCTION dbl(p_x INT) RETURNS INT AS p_x * 2;
+SELECT id, dbl(v) AS doubled FROM t;
+
+-- Saludar con CONCAT
+CREATE FUNCTION greet(p_name TEXT) RETURNS TEXT AS CONCAT('Hi ', p_name);
+SELECT greet(name) FROM users;
+
+-- Predicado en WHERE
+CREATE FUNCTION big(p_x INT) RETURNS BOOL AS p_x >= 100;
+SELECT * FROM t WHERE big(v);
+
+-- Composición
+CREATE FUNCTION quad(p_x INT) RETURNS INT AS dbl(dbl(p_x));
+SELECT quad(v) FROM t;  -- = dbl(dbl(v)) = v * 4
+
+-- Cleanup
+DROP FUNCTION IF EXISTS dbl;
+```
+
+### ⚠️ Restricciones
+
+- **Body es UNA Expr**, no un SELECT. Sin acceso a tablas dentro del body (workaround: pre-procesar con un trigger o usar CTE/view externos).
+- **NEW/OLD no aplican** (esos son scope de triggers).
+- **CHECK constraints rechazan user functions** para preservar pureza.
+- **Mismo workaround de procedures** para choque param/columna: prefijar (`p_x`).
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4101] CREATE FUNCTION '...': ya existe un objeto ...` | Colisión de nombre. |
+| `[GBY-4102] body vacío` | `AS` sin expr siguiente, params duplicados. |
+| `[GBY-4103] función '...' no existe` | Invocación a function inexistente; también `DROP` sin `IF EXISTS`. |
+| `[GBY-4104] '...': esperaba N args, recibí M` | Arity mismatch. |
+
+### ⚠️ No soportado todavía
+
+- **Body como SELECT** (`RETURNS ... AS $$ SELECT ... $$ LANGUAGE SQL`) — requiere SELECT sin FROM.
+- **`RETURNS TABLE`** (table-valued functions).
+- **Type checking estricto** en args/return.
+- **`IMMUTABLE`/`STABLE`/`VOLATILE`** hints.
+- **PL/pgSQL body** (variables, IF, LOOP).
 
 ---
 

@@ -1,8 +1,8 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
-    ColumnType, DefaultLiteral, ForeignKeyMeta, IndexKind, IndexMeta, OnDelete, OnUpdate,
-    ProcedureMeta, TableMeta, TriggerMeta, ViewMeta,
+    ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, IndexKind, IndexMeta, OnDelete,
+    OnUpdate, ProcedureMeta, TableMeta, TriggerMeta, ViewMeta,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -45,6 +45,10 @@ pub enum Statement {
     DropProcedure(DropProcedureStmt),
     /// Bloque X3: `CALL name(arg1, arg2, ...)`.
     Call(CallStmt),
+    /// Bloque X3b (2026-05-28): `CREATE FUNCTION name(params) RETURNS TYPE AS <expr>`.
+    CreateFunction(CreateFunctionStmt),
+    /// Bloque X3b: `DROP FUNCTION [IF EXISTS] name`.
+    DropFunction(DropFunctionStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -356,6 +360,25 @@ pub struct DropProcedureStmt {
 pub struct CallStmt {
     pub name: String,
     pub args: Vec<Expr>,
+}
+
+/// Bloque X3b (2026-05-28): `CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>`.
+/// El body es UNA expresión (NO un SELECT — desviación práctica de
+/// ANSI para evitar la necesidad de FROM en queries triviales). Al
+/// invocarse via `name(args)` en una expresión, se substituyen los
+/// params y se evalúa contra row vacío.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFunctionStmt {
+    pub name: String,
+    pub params: Vec<(String, ColumnType)>,
+    pub return_type: ColumnType,
+    pub body_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropFunctionStmt {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -986,6 +1009,14 @@ pub enum Expr {
     /// encuentra esta variante — el caller debe usar
     /// `Engine::eval_expr_full`.
     ScalarSubquery(Box<SelectStmt>),
+    /// Bloque X3b (2026-05-28): invocación a una user-defined scalar
+    /// function (`CREATE FUNCTION name(...) RETURNS TYPE AS <expr>`).
+    /// El parser la emite cuando `IDENT(args)` no matchea ningún
+    /// ScalarFunc/AggFunc/WindowFunc built-in. La resolución contra el
+    /// catálogo + ejecución del body sucede en `eval_expr_full`. Como
+    /// `ScalarSubquery`, requiere el engine — `eval_expr` puro devuelve
+    /// error si la encuentra.
+    UserFunc { name: String, args: Vec<Expr> },
 }
 
 /// Bloque G3: operadores binarios soportados por [`Expr::Arith`].
@@ -1298,6 +1329,7 @@ fn expr_default_label(expr: &Expr) -> String {
             )
         }
         Expr::ScalarSubquery(_) => "scalar_subquery".to_string(),
+        Expr::UserFunc { name, .. } => name.to_ascii_lowercase(),
     }
 }
 
@@ -1555,6 +1587,8 @@ impl<'a> Engine<'a> {
             Statement::CreateProcedure(stmt) => self.exec_create_procedure(stmt),
             Statement::DropProcedure(stmt) => self.exec_drop_procedure(stmt),
             Statement::Call(stmt) => self.exec_call(stmt),
+            Statement::CreateFunction(stmt) => self.exec_create_function(stmt),
+            Statement::DropFunction(stmt) => self.exec_drop_function(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3045,6 +3079,15 @@ impl<'a> Engine<'a> {
                     ),
                 ));
             }
+            Some(CatalogObject::Function(_)) => {
+                return Err(coded(
+                    codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
+                    format!(
+                        "CREATE VIEW '{}': ya existe una FUNCTION con ese nombre.",
+                        stmt.name
+                    ),
+                ));
+            }
             Some(CatalogObject::View(_)) => {
                 if stmt.if_not_exists {
                     return Ok(ResultSet {
@@ -3110,6 +3153,10 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a una PROCEDURE. Usá DROP PROCEDURE.",
                 stmt.name
             ))),
+            Some(CatalogObject::Function(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a una FUNCTION. Usá DROP FUNCTION.",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -3152,7 +3199,10 @@ impl<'a> Engine<'a> {
                         ),
                     ));
                 }
-                Some(CatalogObject::Trigger(_)) | Some(CatalogObject::Procedure(_)) | None => {
+                Some(CatalogObject::Trigger(_))
+                | Some(CatalogObject::Procedure(_))
+                | Some(CatalogObject::Function(_))
+                | None => {
                     return Err(coded(
                         codes::TABLE_NOT_FOUND,
                         format!(
@@ -3172,6 +3222,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::View(_) => "VISTA",
                     CatalogObject::Trigger(_) => "TRIGGER",
                     CatalogObject::Procedure(_) => "PROCEDURE",
+                    CatalogObject::Function(_) => "FUNCTION",
                 };
                 return Err(coded(
                     codes::TRIGGER_NAME_COLLIDES,
@@ -3280,6 +3331,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::View(_) => "VISTA",
                     CatalogObject::Trigger(_) => "TRIGGER",
                     CatalogObject::Procedure(_) => "PROCEDURE",
+                    CatalogObject::Function(_) => "FUNCTION",
                 };
                 return Err(coded(
                     codes::PROCEDURE_NAME_COLLIDES,
@@ -3410,6 +3462,151 @@ impl<'a> Engine<'a> {
             rows: Vec::new(),
             message: Some(last_msg),
         })
+    }
+
+    /// Bloque X3b (2026-05-28): `CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>`.
+    /// Valida nombre / colisión con otros objetos del catálogo. Body
+    /// se persiste como texto (re-parseado al call).
+    fn exec_create_function(&mut self, stmt: CreateFunctionStmt) -> DbResult<ResultSet> {
+        validate_identifier(&stmt.name, "function")?;
+        let mut seen: HashSet<String> = HashSet::new();
+        for (pname, _) in &stmt.params {
+            validate_identifier(pname, "param de function")?;
+            if !seen.insert(pname.to_ascii_lowercase()) {
+                return Err(coded(
+                    codes::FUNCTION_BODY_INVALID,
+                    format!(
+                        "CREATE FUNCTION '{}': el parámetro '{}' aparece más de una vez",
+                        stmt.name, pname
+                    ),
+                ));
+            }
+        }
+        {
+            let mut catalog = Catalog::open(self.pager);
+            if let Some(existing) = catalog.get_object(&stmt.name)? {
+                let kind = match existing {
+                    CatalogObject::Table(_) => "TABLA",
+                    CatalogObject::View(_) => "VISTA",
+                    CatalogObject::Trigger(_) => "TRIGGER",
+                    CatalogObject::Procedure(_) => "PROCEDURE",
+                    CatalogObject::Function(_) => "FUNCTION",
+                };
+                return Err(coded(
+                    codes::FUNCTION_NAME_COLLIDES,
+                    format!(
+                        "CREATE FUNCTION '{}': ya existe un objeto ({}) con ese nombre",
+                        stmt.name, kind
+                    ),
+                ));
+            }
+        }
+        let meta = FunctionMeta {
+            name: stmt.name.clone(),
+            params: stmt.params.clone(),
+            return_type: stmt.return_type,
+            body_sql: stmt.body_sql,
+        };
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_function(&meta)?;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · function '{}' creada ({} params, RETURNS {})",
+                stmt.name,
+                stmt.params.len(),
+                stmt.return_type.as_sql()
+            )),
+        })
+    }
+
+    /// Bloque X3b: `DROP FUNCTION [IF EXISTS] name`.
+    fn exec_drop_function(&mut self, stmt: DropFunctionStmt) -> DbResult<ResultSet> {
+        let existing = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_object(&stmt.name)?
+        };
+        match existing {
+            Some(CatalogObject::Function(_)) => {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.remove_object(&stmt.name)?;
+                Ok(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    message: Some(format!("OK · function '{}' eliminada", stmt.name)),
+                })
+            }
+            Some(_) => Err(coded(
+                codes::FUNCTION_NOT_FOUND,
+                format!(
+                    "DROP FUNCTION '{}': el nombre apunta a un objeto que no es una function",
+                    stmt.name
+                ),
+            )),
+            None => {
+                if stmt.if_exists {
+                    Ok(ResultSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        message: Some(format!(
+                            "OK · function '{}' no existía (IF EXISTS)",
+                            stmt.name
+                        )),
+                    })
+                } else {
+                    Err(coded(
+                        codes::FUNCTION_NOT_FOUND,
+                        format!("DROP FUNCTION '{}': no existe", stmt.name),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Bloque X3b: evalúa una invocación a user-defined function.
+    /// Lookup en catálogo, arity check, evalúa cada arg contra el row
+    /// actual (con outer_stack en juego para subqueries correlated),
+    /// substituye params via token-sub, re-parsea el body como Expr y
+    /// lo evalúa contra row vacío. Devuelve el Value.
+    fn eval_user_func(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        row: &HashMap<String, Value>,
+        outer_table_name: Option<&str>,
+    ) -> DbResult<Value> {
+        let func = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_function(name)?.ok_or_else(|| {
+                coded(
+                    codes::FUNCTION_NOT_FOUND,
+                    format!("función '{}' no existe", name),
+                )
+            })?
+        };
+        if func.params.len() != args.len() {
+            return Err(coded(
+                codes::FUNCTION_ARITY_MISMATCH,
+                format!(
+                    "{}: esperaba {} args, recibí {}",
+                    name,
+                    func.params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        let mut bound: HashMap<String, Value> = HashMap::new();
+        for ((pname, _), arg_expr) in func.params.iter().zip(args.iter()) {
+            let v = self.eval_expr_full(arg_expr, row, outer_table_name)?;
+            bound.insert(pname.to_ascii_lowercase(), v);
+        }
+        let substituted = substitute_params_in_sql_text(&func.body_sql, &bound, &func.name)?;
+        let body_expr = parse_expr_str(&substituted)?;
+        let empty: HashMap<String, Value> = HashMap::new();
+        self.eval_expr_full(&body_expr, &empty, None)
     }
 
     /// Bloque X1/X2: helper rápido — ¿hay algún trigger `timing` `event`
@@ -3605,6 +3802,15 @@ impl<'a> Engine<'a> {
                 self.memoize_uncorrelated_scalar_subqueries(l)?;
                 self.memoize_uncorrelated_scalar_subqueries(lo)?;
                 self.memoize_uncorrelated_scalar_subqueries(hi)
+            }
+            Expr::UserFunc { args, .. } => {
+                // X3b: el body de la function es solo Expr (sin
+                // subqueries en X3b), así que sólo recursamos en los
+                // args para memoizar subqueries que pasen como arg.
+                for a in args.iter_mut() {
+                    self.memoize_uncorrelated_scalar_subqueries(a)?;
+                }
+                Ok(())
             }
         }
     }
@@ -4701,6 +4907,9 @@ impl<'a> Engine<'a> {
                     _ => Ok(Value::Null),
                 }
             }
+            // X3b (2026-05-28): user-defined function — delegamos al
+            // helper que hace lookup, substitute, parse+eval del body.
+            Expr::UserFunc { name, args } => self.eval_user_func(name, args, row, outer_table_name),
         }
     }
 
@@ -9381,6 +9590,14 @@ fn validate_expr_columns(expr: &Expr, meta: &TableMeta) -> DbResult<()> {
         // schema en runtime, y además puede referenciar `outer.col`
         // que aún no está resuelto acá).
         Expr::ScalarSubquery(_) => Ok(()),
+        // X3b: user funcs validan sus args contra el schema actual;
+        // el body de la función se valida en runtime contra row vacío.
+        Expr::UserFunc { args, .. } => {
+            for a in args {
+                validate_expr_columns(a, meta)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -9889,6 +10106,13 @@ fn collect_check_columns(expr: &Expr, cb: &mut dyn FnMut(&str) -> DbResult<()>) 
         Expr::ScalarSubquery(_) => Err(coded(
             codes::CHECK_CONTAINS_SUBQUERY,
             "CHECK no admite subqueries",
+        )),
+        // X3b: CHECK no admite user-defined functions (porque el body
+        // de la function podría hacer cualquier cosa y rompería la
+        // pureza del CHECK). Las built-in son ok.
+        Expr::UserFunc { .. } => Err(coded(
+            codes::CHECK_CONTAINS_SUBQUERY,
+            "CHECK no admite user-defined functions; usar built-ins puras",
         )),
     }
 }
@@ -11205,6 +11429,16 @@ fn rewrite_expr_columns_for_join(expr: Expr, scope: &JoinScope) -> DbResult<Expr
         // de qualifiers no debe descender dentro de ella. El engine la
         // ejecuta con su propio `parse_select_stmt`/`build_join_scope`.
         Expr::ScalarSubquery(sub) => Ok(Expr::ScalarSubquery(sub)),
+        // X3b: re-escribimos columnas en los args (que sí ven el
+        // scope joineado); el body de la function vive en otro scope
+        // y se re-parsea al call.
+        Expr::UserFunc { name, args } => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                out.push(rewrite_expr_columns_for_join(a, scope)?);
+            }
+            Ok(Expr::UserFunc { name, args: out })
+        }
     }
 }
 
@@ -11860,6 +12094,14 @@ pub fn format_expr(expr: &Expr) -> DbResult<String> {
             codes::CHECK_CONTAINS_SUBQUERY,
             "CHECK no admite subqueries (ANSI; gabysql sigue la regla por consistencia con el evaluador).",
         )),
+        // X3b: serializar `name(arg1, arg2, ...)` para round-trip.
+        Expr::UserFunc { name, args } => {
+            let mut parts = Vec::with_capacity(args.len());
+            for a in args {
+                parts.push(format_expr(a)?);
+            }
+            Ok(format!("{}({})", name, parts.join(", ")))
+        }
     }
 }
 
@@ -12027,6 +12269,10 @@ fn expr_contains_correlated_subquery(expr: &Expr) -> bool {
                 || expr_contains_correlated_subquery(lo)
                 || expr_contains_correlated_subquery(hi)
         }
+        // X3b: el body de la function se ejecuta en su propio scope
+        // (sin outer refs), así que la function por sí sola no es
+        // correlated. Sí lo es si algún arg contiene una correlated.
+        Expr::UserFunc { args, .. } => args.iter().any(expr_contains_correlated_subquery),
     }
 }
 
@@ -12352,6 +12598,15 @@ fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
             "subquery escalar dentro de Expr requiere el path con engine \
              (`Engine::eval_expr_full`); este caller la invocó con la firma pura",
         )),
+        // X3b: user funcs requieren engine para lookup en catálogo.
+        Expr::UserFunc { name, .. } => Err(coded(
+            codes::FUNCTION_NOT_FOUND,
+            format!(
+                "función user-defined '{}' requiere el path con engine \
+                 (`Engine::eval_expr_full`); este caller la invocó con la firma pura",
+                name
+            ),
+        )),
     }
 }
 
@@ -12359,9 +12614,14 @@ fn eval_expr(expr: &Expr, row: &HashMap<String, Value>) -> DbResult<Value> {
 /// `ScalarSubquery` en cualquier nivel. Lo usa el dispatcher de
 /// proyección y de WHERE/HAVING para decidir si vale el fast-path
 /// `eval_expr` (sin engine) o si hay que ir por `eval_expr_full`.
+/// Returns true if `expr` contains anything that needs the engine to
+/// evaluate (subquery escalar O user-defined function). Pese al nombre
+/// histórico, post-X3b cubre ambos casos — el call-site lo usa para
+/// decidir entre el `eval_expr` puro y `eval_expr_full` (engine-aware).
 fn expr_contains_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::ScalarSubquery(_) => true,
+        Expr::UserFunc { .. } => true,
         Expr::Literal(_) | Expr::Column(_) => false,
         Expr::Func(_, args) => args.iter().any(expr_contains_subquery),
         Expr::Cast(inner, _) | Expr::IsNull(inner, _) => expr_contains_subquery(inner),
@@ -14032,6 +14292,12 @@ fn substitute_new_old_in_expr(
             substitute_new_old_in_expr(hi, new_row, old_row, trig_name)?;
         }
         Expr::Literal(_) | Expr::ScalarSubquery(_) => {}
+        // X3b: recursamos en los args (que pueden referenciar NEW/OLD).
+        Expr::UserFunc { args, .. } => {
+            for a in args {
+                substitute_new_old_in_expr(a, new_row, old_row, trig_name)?;
+            }
+        }
     }
     Ok(())
 }
@@ -14540,6 +14806,13 @@ fn inline_cte_into_expr(e: &mut Expr, cte_name: &str, cte_body: &SelectStmt) {
             inline_cte_into_expr(hi, cte_name, cte_body);
         }
         Expr::Literal(_) | Expr::Column(_) => {}
+        // X3b: recursamos en los args (un arg podría ser una subquery
+        // que use la CTE).
+        Expr::UserFunc { args, .. } => {
+            for a in args {
+                inline_cte_into_expr(a, cte_name, cte_body);
+            }
+        }
     }
 }
 
@@ -14904,6 +15177,15 @@ impl Parser {
                 if_exists,
             }));
         }
+        if self.match_keyword("FUNCTION") {
+            // Bloque X3b (2026-05-28).
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropFunction(DropFunctionStmt {
+                name,
+                if_exists,
+            }));
+        }
         self.expect_keyword("INDEX")?;
         let name = self.expect_ident()?;
         Ok(Statement::DropIndex(DropIndexStmt { name }))
@@ -15083,6 +15365,51 @@ impl Parser {
     /// `CREATE PROCEDURE name(p1 TYPE [, p2 TYPE]*) AS <body>`.
     /// El body sigue el mismo grammar que un trigger body — DML simple
     /// o `BEGIN stmt; stmt; END`.
+    /// Bloque X3b (2026-05-28): parsea
+    /// `CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>`.
+    /// El body es UNA expresión — capturada como texto desde los
+    /// tokens (re-parseada al call post-substitución de params).
+    fn parse_create_function(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        self.expect_symbol("(")?;
+        let mut params: Vec<(String, ColumnType)> = Vec::new();
+        if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
+            loop {
+                let pname = self.expect_ident()?;
+                let ptype_raw = self.expect_ident()?;
+                let ptype = ColumnType::from_sql(&ptype_raw)?;
+                params.push((pname, ptype));
+                if !self.match_symbol(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(")")?;
+        self.expect_keyword("RETURNS")?;
+        let ret_raw = self.expect_ident()?;
+        let return_type = ColumnType::from_sql(&ret_raw)?;
+        self.expect_keyword("AS")?;
+        // Body: una expresión arbitraria. Validamos sintácticamente
+        // parseándola — pero descartamos el AST y guardamos el texto
+        // SQL desde los tokens (mismo enfoque que CREATE VIEW).
+        let start = self.pos;
+        let _ = self.parse_expr()?;
+        let end = self.pos;
+        if start == end {
+            return Err(coded(
+                codes::FUNCTION_BODY_INVALID,
+                "CREATE FUNCTION ... AS: body vacío",
+            ));
+        }
+        let body_sql = reconstruct_sql_from_tokens(&self.tokens[start..end]);
+        Ok(Statement::CreateFunction(CreateFunctionStmt {
+            name,
+            params,
+            return_type,
+            body_sql,
+        }))
+    }
+
     fn parse_create_procedure(&mut self) -> DbResult<Statement> {
         let name = self.expect_ident()?;
         self.expect_symbol("(")?;
@@ -15616,6 +15943,10 @@ impl Parser {
         // Bloque X3 (2026-05-28): `CREATE PROCEDURE name(...) AS <body>`.
         if self.match_keyword("PROCEDURE") {
             return self.parse_create_procedure();
+        }
+        // Bloque X3b (2026-05-28): `CREATE FUNCTION name(...) RETURNS TYPE AS <expr>`.
+        if self.match_keyword("FUNCTION") {
+            return self.parse_create_function();
         }
         self.expect_keyword("TABLE")?;
         // Bloque K1: `IF NOT EXISTS` opcional. Sólo significativo en CTAS
@@ -17196,12 +17527,26 @@ impl Parser {
                 text: String::new(),
             });
             if next.kind == TokenKind::Symbol && next.text == "(" {
-                let func = ScalarFunc::from_ident(&head.text).ok_or_else(|| {
-                    coded(
-                        codes::SCALAR_FN_UNKNOWN,
-                        format!("función escalar desconocida: '{}'", head.text),
-                    )
-                })?;
+                // Bloque X3b (2026-05-28): fallback a Expr::UserFunc
+                // cuando el ident no matchea ningún built-in. La
+                // resolución contra el catálogo sucede en runtime.
+                let func = match ScalarFunc::from_ident(&head.text) {
+                    Some(f) => f,
+                    None => {
+                        let name = head.text.clone();
+                        self.pos += 1; // ident
+                        self.expect_symbol("(")?;
+                        let mut args = Vec::new();
+                        if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
+                            args.push(self.parse_expr()?);
+                            while self.match_symbol(",") {
+                                args.push(self.parse_expr()?);
+                            }
+                        }
+                        self.expect_symbol(")")?;
+                        return Ok(Expr::UserFunc { name, args });
+                    }
+                };
                 self.pos += 1; // ident
                 self.expect_symbol("(")?;
                 // Bloque G3: `EXTRACT(field FROM expr)` tiene sintaxis

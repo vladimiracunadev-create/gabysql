@@ -6,6 +6,65 @@
 
 ---
 
+## 2026-05-28 — Bloque X3b: user-defined scalar functions [VERSION 15→16]
+
+> **Un push a `main`** con bump on-disk **VERSION 15 → 16**. Cuarto sub-bloque del bloque X. `CREATE FUNCTION RETURNS scalar` invocable desde cualquier expresión (SELECT/WHERE/HAVING). Cierra el cuarteto de routines server-side: triggers + procedures + functions. Detalle en [`docs/adr/0032-user-functions-x3b.md`](docs/adr/0032-user-functions-x3b.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+CREATE FUNCTION dbl(p_x INT) RETURNS INT AS p_x * 2;
+CREATE FUNCTION greet(p_name TEXT) RETURNS TEXT AS CONCAT('Hi ', p_name);
+CREATE FUNCTION big(p_x INT) RETURNS BOOL AS p_x >= 100;
+
+-- Invocable en SELECT
+SELECT id, dbl(v) AS doubled FROM t;
+-- Invocable en WHERE
+SELECT * FROM t WHERE big(v);
+-- Composición
+CREATE FUNCTION quad(p_x INT) RETURNS INT AS dbl(dbl(p_x));
+
+DROP FUNCTION [IF EXISTS] dbl;
+```
+
+**Body es UNA expresión** (no un SELECT — desviación práctica de ANSI porque gabysql requiere FROM). Para funciones complejas que necesitan consultar tablas, queda para futuro (RETURNS TABLE / body SQL completo).
+
+### 🛠 Implementación
+
+- **Nuevo `Expr::UserFunc { name, args }` variant**: el parser lo emite cuando `IDENT(args)` no matchea ningún `ScalarFunc` built-in. Eval via `eval_expr_full` → `eval_user_func` (catalog lookup + arity + token-sub de params + parse del body como Expr + recursive eval).
+- **17 walkers de Expr actualizados** con arm para UserFunc (format, validate, inline_cte, substitute_new_old, rewrite_columns_for_join, memoize, etc.).
+- **Persistencia**: nuevo `ObjectKind::Function` (discriminator `4`). `FunctionMeta { name, params, return_type, body_sql }`. Bump VERSION 15→16.
+- **Composición trivial**: el body parseado puede contener `Expr::UserFunc` que dispara otro `eval_user_func` recursivamente.
+- **CHECK constraints rechazan UserFunc** para preservar pureza (las built-ins puras siguen permitidas).
+
+### 🚫 Diferido (a futuro)
+
+- Body como SELECT (ANSI-puro `AS $$ SELECT ... $$`) — requiere `SELECT` sin FROM o convención de invocación.
+- `RETURNS TABLE` (table-valued functions usables en FROM).
+- Type checking estricto en arg/return.
+- Recursion guard (`MAX_FUNCTION_DEPTH`).
+- `IMMUTABLE`/`STABLE`/`VOLATILE` hints para el planner.
+- Body PL/pgSQL (variables, IF, LOOP) — X4.
+
+### 🧪 Validación
+
+- 9 tests `x3b_*` (simple SELECT, WHERE, builtin dentro del body, arity, not_found, DROP, persistencia, name collision, composición).
+- Test pre-existente `g1_errors_arity_type_unknown` actualizado: `FOO(1)` ahora retorna `[GBY-4103]` (no `[GBY-4037]`) porque el parser optimistamente lo trata como user-defined.
+- Suite total: **441/441 pass** (`cargo test --lib --tests`).
+
+### 🎉 Routines server-side completas
+
+Con X3b cierran las 4 routines server-side clásicas:
+
+| Routine | Statement | Resultado | Bloque |
+|---|---|---|---|
+| Trigger AFTER | (auto-fire) | Side effect post-write | X1 |
+| Trigger BEFORE + multi-stmt | (auto-fire) | Side effect pre-write + multi-DML | X2 |
+| Procedure | `CALL name(args)` | Side effects parametrizados | X3 |
+| Function | `name(args)` en Expr | Valor escalar | X3b |
+
+---
+
 ## 2026-05-28 — Bloque X3: stored procedures (`CREATE PROCEDURE` + `CALL`) [VERSION 14→15]
 
 > **Un push a `main`** con bump on-disk **VERSION 14 → 15**. Tercer sub-bloque del bloque X. Stored procedures con `CALL`, persistidas en el catálogo (`ObjectKind::Procedure`). Funciones invocables desde SELECT diferidas a X3b. Detalle en [`docs/adr/0031-stored-procedures-x3.md`](docs/adr/0031-stored-procedures-x3.md).

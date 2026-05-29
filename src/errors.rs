@@ -537,6 +537,22 @@ pub mod codes {
     /// Bloque X3: `CALL name(args)` recibió un número de argumentos
     /// distinto al declarado en la signatura de la procedure.
     pub const PROCEDURE_ARITY_MISMATCH: u32 = 4100;
+    /// Bloque X3b (2026-05-28): `CREATE FUNCTION name ...` cuyo nombre
+    /// colisiona con tabla / vista / trigger / procedure / function
+    /// existente. Mismo namespace global.
+    pub const FUNCTION_NAME_COLLIDES: u32 = 4101;
+    /// Bloque X3b: el body de `CREATE FUNCTION ... AS <expr>` no es una
+    /// expresión válida, o falta el `AS` / `RETURNS`. También cuando
+    /// el body usa subqueries (diferido).
+    pub const FUNCTION_BODY_INVALID: u32 = 4102;
+    /// Bloque X3b: `name(args)` en una expresión sobre un nombre que no
+    /// matchea ningún ScalarFunc built-in NI una function user-defined
+    /// en el catálogo. También: `DROP FUNCTION` sin `IF EXISTS` sobre
+    /// nombre inexistente.
+    pub const FUNCTION_NOT_FOUND: u32 = 4103;
+    /// Bloque X3b: `name(args)` recibió un número de argumentos distinto
+    /// al declarado en la signatura de la function.
+    pub const FUNCTION_ARITY_MISMATCH: u32 = 4104;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

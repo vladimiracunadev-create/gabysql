@@ -78,6 +78,8 @@
 
 - ~~Stored procedures (`CREATE PROCEDURE name(p1 TYPE, ...) AS <body>`, `DROP PROCEDURE [IF EXISTS]`, `CALL name(args)`). Persistencia en catálogo: nuevo `ObjectKind::Procedure` (VERSION 14→15). Body single-stmt o `BEGIN ... END` multi-stmt (mismo grammar que triggers). Args en CALL son expresiones evaluadas contra fila vacía. Substitución de parámetros via token-sub bare-ident — limitación: choque con columnas del mismo nombre (workaround documentado: prefijar `p_`). CALL es statement standalone (no Expr); funciones escalares invocables en SELECT quedan para X3b~~ ✅ entregado (bloque **X3**, 2026-05-28, [ADR-0031](docs/adr/0031-stored-procedures-x3.md)).
 
+- ~~User-defined scalar functions (`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>`, `DROP FUNCTION [IF EXISTS]`). Invocables desde cualquier expresión (SELECT/WHERE/HAVING). Body es UNA `Expr` (desviación práctica de ANSI — sin SELECT/FROM). Persistencia: nuevo `ObjectKind::Function` (VERSION 15→16). AST: nuevo `Expr::UserFunc { name, args }` + arm en 17 walkers de Expr. Composición trivial (functions invocan otras functions). CHECK constraints rechazan user functions para preservar pureza~~ ✅ entregado (bloque **X3b**, 2026-05-28, [ADR-0032](docs/adr/0032-user-functions-x3b.md)). Con X3b cierran las **4 routines server-side clásicas**: triggers (X1+X2), procedures (X3), functions (X3b).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`
