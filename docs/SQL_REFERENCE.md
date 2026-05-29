@@ -55,7 +55,8 @@
 | [`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>` + `DROP FUNCTION`, invocable como `name(args)` en cualquier expresión](#user-defined-functions-bloque-x3b) | DDL+DML | 🟢 (bloque X3b / VERSION 16) |
 | [`IF expr THEN ... [ELSIF ...]* [ELSE ...] END IF`](#control-de-flujo-if-bloque-x4) — statement top-level + dentro de bodies; anidado | TCL | 🟢 (bloque X4) |
 | [`DECLARE` + `SET` + `WHILE LOOP` + `EXIT [WHEN]`](#variables--while-loop-bloque-x4b) — variables locales con scope plano; vars visibles en Expr (no en INSERT VALUES) | TCL | 🟢 (bloque X4b) |
-| NEW mutable en BEFORE, `FOR`/`LOOP` standalone, `RAISE`/`EXCEPTION` handlers, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`RAISE [EXCEPTION\|NOTICE] 'msg'` + `FOR i IN start TO end LOOP ... END LOOP`](#raise--for-loop-bloque-x4c) — aborto explícito + range loop con auto-decl | TCL | 🟢 (bloque X4c) |
+| NEW mutable en BEFORE, `LOOP` standalone, `EXCEPTION WHEN` handlers, `FOR row IN SELECT`, `RETURN expr`, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -2152,6 +2153,90 @@ END;
 - **Nested scope** real por BEGIN..END block — diferido.
 - **Type checking estricto** en DECLARE/SET — diferido.
 - **Variables en `INSERT VALUES`** — requiere lift de la restricción de VALUES.
+
+---
+
+## `RAISE` + `FOR LOOP` (bloque X4c)
+
+> **`RAISE [EXCEPTION|NOTICE] 'msg'`**: aborto explícito con mensaje (EXCEPTION) o info logging (NOTICE). **`FOR ident IN start TO end LOOP <body> END LOOP`**: range loop con auto-declaración de la variable de iteración.
+
+### 📜 EBNF
+
+```
+raise_stmt ::= "RAISE" [ "EXCEPTION" | "NOTICE" ] string_literal
+for_stmt   ::= "FOR" ident "IN" expr "TO" expr "LOOP" stmt_list "END" "LOOP"
+```
+
+### 🧠 Semántica
+
+**RAISE:**
+
+- Si no se especifica level, default es EXCEPTION.
+- EXCEPTION → `[GBY-4111]` con el mensaje del user. Propaga normalmente; el wrap caller hace rollback de la transacción.
+- NOTICE → ResultSet vacío con `message = "NOTICE: <msg>"`. No interrumpe el flujo.
+- En X4c no hay `EXCEPTION WHEN ...` handlers (diferido a X4d).
+
+**FOR:**
+
+- `i` se auto-declara en `var_scope` al inicio (shadowing si ya existe; se restaura al terminar).
+- Iteración inclusiva: `i = start, start+1, ..., end`.
+- Si `start > end`, no itera (sin error).
+- STEP fijo en 1, ascendente.
+- `start`/`end` deben ser INT (→ `[GBY-4113]` si no).
+- `EXIT [WHEN]` funciona dentro de FOR (mismo sentinel que WHILE).
+- Guard `MAX_LOOP_ITERATIONS = 100_000` compartido.
+
+**Sintaxis non-PG**: PG usa `FOR i IN 1..10 LOOP`. gabysql usa `start TO end` para evitar ambigüedad con qualifier ident (`tabla.col`).
+
+### ✅ Ejemplos
+
+```sql
+-- RAISE en validación
+CREATE TRIGGER validate AFTER INSERT ON orders FOR EACH ROW BEGIN
+    IF NEW.amount < 0 THEN
+        RAISE EXCEPTION 'negative amount not allowed';
+    END IF;
+END;
+
+-- NOTICE para logging
+RAISE NOTICE 'job started';
+
+-- FOR loop básico
+FOR i IN 1 TO 10 LOOP
+    INSERT INTO log SELECT i FROM (VALUES (1)) AS x;
+END LOOP;
+
+-- FOR + EXIT WHEN
+FOR i IN 1 TO 100 LOOP
+    EXIT WHEN i = 5;
+END LOOP;
+
+-- FOR en procedure
+CREATE PROCEDURE process_n(p_max INT) AS BEGIN
+    DECLARE total INT DEFAULT 0;
+    FOR i IN 1 TO p_max LOOP
+        SET total = total + i;
+    END LOOP;
+END;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4111] <msg-del-user>` | `RAISE EXCEPTION 'msg'` disparada por el código. |
+| `[GBY-4112] RAISE: se esperaba un literal STRING` | RAISE con ident o número en lugar de string. |
+| `[GBY-4113] FOR ...: start/end debe ser INT` | bounds non-INT. |
+
+### ⚠️ No soportado todavía
+
+- **`EXCEPTION WHEN ... THEN`** handlers (`BEGIN ... EXCEPTION ... END`) — X4d.
+- **`FOR row IN SELECT ... LOOP`** (resultset iteration) — X4d.
+- **`LOOP ... END LOOP`** standalone (sin WHILE/FOR) — X4d.
+- **`RETURN expr`** dentro de functions — X4d.
+- **`STEP n`** y **`REVERSE`** (descendente) en FOR — futuro.
+- **Formato `%`** en RAISE (`RAISE EXCEPTION 'value % invalid', x`) — futuro.
+- **`RAISE WARNING` / `INFO`** — futuro.
 
 ---
 

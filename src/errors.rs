@@ -576,6 +576,18 @@ pub mod codes {
     /// hace sentido dentro del cuerpo de un WHILE/LOOP — fuera, no
     /// hay loop al que salir.
     pub const EXIT_OUTSIDE_LOOP: u32 = 4110;
+    /// Bloque X4c (2026-05-28): `RAISE EXCEPTION 'msg'` disparada por
+    /// el código del usuario. El mensaje del DbError lleva el texto
+    /// que el usuario pasó después de RAISE EXCEPTION.
+    pub const RAISE_EXCEPTION: u32 = 4111;
+    /// Bloque X4c: `RAISE [...] msg` con `msg` que no es un literal
+    /// STRING. PG admite formato con `%`; en X4c solo string literal
+    /// crudo. Workaround: concatenar antes con CONCAT.
+    pub const RAISE_MESSAGE_INVALID: u32 = 4112;
+    /// Bloque X4c: `FOR ident IN expr TO expr LOOP` con bounds que no
+    /// son INT, o start > end (loop vacío es OK; X4c sólo ascendente
+    /// con step=1 — descendente diferido).
+    pub const FOR_RANGE_INVALID: u32 = 4113;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

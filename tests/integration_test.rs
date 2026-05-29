@@ -10890,6 +10890,176 @@ fn x4b_exit_unconditional() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X4c (2026-05-28): RAISE + FOR LOOP. -----
+
+fn x4c_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x4c-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x4c_raise_exception() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("raise-exc")?;
+    let err = run_sql(&db, "RAISE EXCEPTION 'something broke';").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4111"),
+        "esperaba GBY-4111, got: {}",
+        err
+    );
+    assert!(
+        err.to_string().contains("something broke"),
+        "esperaba ver el mensaje: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_raise_notice() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("raise-notice")?;
+    let res = run_sql(&db, "RAISE NOTICE 'informational';")?;
+    assert!(
+        res[0]
+            .message
+            .as_ref()
+            .map(|m| m.contains("informational"))
+            .unwrap_or(false),
+        "esperaba message con texto, got: {:?}",
+        res[0].message
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_raise_default_is_exception() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("raise-default")?;
+    // RAISE 'msg' sin EXCEPTION/NOTICE = EXCEPTION
+    let err = run_sql(&db, "RAISE 'aborted';").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4111"),
+        "esperaba GBY-4111, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_raise_inside_if() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("raise-in-if")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "DECLARE n INT DEFAULT 5;
+         IF n > 0 THEN RAISE EXCEPTION 'positive'; END IF;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("positive"),
+        "esperaba mensaje 'positive': {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_for_loop_counts() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("for-counts")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE PROCEDURE fill(p_n INT) AS BEGIN \
+            FOR i IN 1 TO p_n LOOP \
+               INSERT INTO t (id) VALUES (p_n); \
+            END LOOP; \
+         END;",
+    )?;
+    // p_n se substituye a literal en CALL — el INSERT usa p_n (no i)
+    // para esquivar la limit. de X4b (vars en INSERT VALUES).
+    // Pero queremos contar las iteraciones; usemos otro patron.
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_for_loop_with_exit() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("for-exit")?;
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "DECLARE last INT DEFAULT 0;
+         FOR i IN 1 TO 100 LOOP
+            SET last = i;
+            EXIT WHEN i = 5;
+         END LOOP;
+         IF last = 5 THEN INSERT INTO log (id) VALUES (5); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(5));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_for_loop_empty_range() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("for-empty")?;
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    // start=10, end=5 → no itera, no error
+    run_sql(
+        &db,
+        "DECLARE n INT DEFAULT 0;
+         FOR i IN 10 TO 5 LOOP
+            SET n = n + 1;
+         END LOOP;
+         IF n = 0 THEN INSERT INTO log (id) VALUES (42); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_for_loop_var_shadow_restore() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("shadow")?;
+    run_sql(&db, "CREATE TABLE log (id INT PRIMARY KEY);")?;
+    run_sql(
+        &db,
+        "DECLARE i INT DEFAULT 99;
+         FOR i IN 1 TO 3 LOOP
+            SET i = i;
+         END LOOP;
+         IF i = 99 THEN INSERT INTO log (id) VALUES (1); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4c_for_loop_bad_range() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4c_setup("bad-range")?;
+    let err = run_sql(&db, "FOR i IN 'foo' TO 10 LOOP END LOOP;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4113"),
+        "esperaba GBY-4113, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -6,6 +6,63 @@
 
 ---
 
+## 2026-05-28 — Bloque X4c: `RAISE` + `FOR LOOP`
+
+> **Un push a `main`** sin bump on-disk. Séptimo sub-bloque del bloque X. `RAISE EXCEPTION|NOTICE` para aborto/info, `FOR i IN start TO end LOOP` con auto-decl de la variable. EXCEPTION handlers + `FOR row IN SELECT` + `RETURN` diferidos a X4d. Detalle en [`docs/adr/0035-raise-for-x4c.md`](docs/adr/0035-raise-for-x4c.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- RAISE
+RAISE EXCEPTION 'something broke';   -- → [GBY-4111] con mensaje
+RAISE NOTICE 'informational';        -- → OK con message
+RAISE 'aborted';                     -- default = EXCEPTION
+
+-- FOR loop
+FOR i IN 1 TO 10 LOOP
+    INSERT INTO log SELECT i FROM (VALUES (1)) AS x;
+END LOOP;
+
+-- FOR + EXIT
+FOR i IN 1 TO 100 LOOP
+    EXIT WHEN i = 5;
+END LOOP;
+
+-- RAISE como validación en trigger
+CREATE TRIGGER validate AFTER INSERT ON orders FOR EACH ROW BEGIN
+    IF NEW.amount < 0 THEN
+        RAISE EXCEPTION 'negative amount not allowed';
+    END IF;
+END;
+```
+
+### 🛠 Implementación
+
+- **AST**: `Statement::Raise(RaiseStmt)` con `level: Exception|Notice` + `message: String`. `Statement::For(Box<ForStmt>)` con `var, start, end, body`.
+- **Parser**: `parse_raise_stmt` (acepta EXCEPTION/NOTICE/default-EXCEPTION). `parse_for_stmt` con sintaxis `FOR id IN start TO end LOOP body END LOOP` (no PG `..`, evita ambigüedad con qualifier).
+- **Engine**:
+  - `exec_raise`: EXCEPTION → `Err(coded(4111, msg))`; NOTICE → `Ok(message)`.
+  - `exec_for`: eval start/end (INT-only o `[GBY-4113]`), auto-decl `var` con save+restore previous, iterate inclusivo, propagar EXIT igual que WHILE.
+- **Splitter + body parsers** extendidos: `FOR` block-open (salvo `FOR EACH ROW` del trigger header).
+
+### 🚫 Diferido (a X4d)
+
+- `EXCEPTION WHEN ... THEN <body>` handlers (requiere `BEGIN..END` como Statement con handler field).
+- `FOR row IN SELECT ... LOOP` (composite row type en var_scope).
+- `LOOP ... END LOOP` standalone.
+- `RETURN expr` dentro de functions.
+- `CASE` statement.
+- `STEP n` y dirección descendente (`REVERSE`).
+- Formato `%` en RAISE.
+- `RAISE WARNING` / `INFO`.
+
+### 🧪 Validación
+
+- 9 tests `x4c_*`: RAISE EXCEPTION/NOTICE/default, RAISE dentro de IF, FOR counts, FOR + EXIT, FOR range vacío, FOR shadow+restore, FOR bounds inválidos.
+- Suite total: **467/467 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X4b: variables locales + `WHILE LOOP` + `EXIT`
 
 > **Un push a `main`** sin bump on-disk. Sexto sub-bloque del bloque X. `DECLARE`/`SET` para variables locales, `WHILE LOOP` con guard de runaway, `EXIT [WHEN]` para break. Detalle en [`docs/adr/0034-vars-loops-x4b.md`](docs/adr/0034-vars-loops-x4b.md).

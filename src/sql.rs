@@ -64,6 +64,13 @@ pub enum Statement {
     While(Box<WhileStmt>),
     /// Bloque X4b: `EXIT [WHEN cond]` — sale del LOOP innermost.
     Exit(ExitStmt),
+    /// Bloque X4c (2026-05-28): `RAISE [EXCEPTION|NOTICE] 'msg'`.
+    /// EXCEPTION rebota con `[GBY-4111]`; NOTICE devuelve OK con el
+    /// mensaje en el ResultSet.
+    Raise(RaiseStmt),
+    /// Bloque X4c: `FOR ident IN expr TO expr LOOP <body> END LOOP`.
+    /// Auto-declara la variable de loop (shadowing si existe).
+    For(Box<ForStmt>),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -443,6 +450,35 @@ pub struct WhileStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExitStmt {
     pub when: Option<Expr>,
+}
+
+/// Bloque X4c (2026-05-28): nivel de la directiva `RAISE`. EXCEPTION
+/// aborta con `[GBY-4111]` (propaga error); NOTICE es informativo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseLevel {
+    Exception,
+    Notice,
+}
+
+/// Bloque X4c: `RAISE [EXCEPTION|NOTICE] 'msg'`. Mensaje es un literal
+/// STRING — formato `%` estilo PG diferido a X4d.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RaiseStmt {
+    pub level: RaiseLevel,
+    pub message: String,
+}
+
+/// Bloque X4c: `FOR var IN start TO end LOOP <body> END LOOP`. La
+/// variable se auto-declara en `var_scope` al inicio (shadowing si
+/// existe; se restaura al terminar). Iteración inclusiva: `i` toma
+/// `start, start+1, ..., end`. Si `start > end`, no itera (no error).
+/// Step fijo en 1 en X4c — `STEP n` diferido.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForStmt {
+    pub var: String,
+    pub start: Expr,
+    pub end: Expr,
+    pub body: Vec<Statement>,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1675,6 +1711,8 @@ impl<'a> Engine<'a> {
             Statement::Set(stmt) => self.exec_set(stmt),
             Statement::While(stmt) => self.exec_while(*stmt),
             Statement::Exit(stmt) => self.exec_exit(stmt),
+            Statement::Raise(stmt) => self.exec_raise(stmt),
+            Statement::For(stmt) => self.exec_for(*stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3840,6 +3878,116 @@ impl<'a> Engine<'a> {
                 message: Some("OK · EXIT WHEN false — sigue loop".to_string()),
             })
         }
+    }
+
+    /// Bloque X4c (2026-05-28): `RAISE [EXCEPTION|NOTICE] 'msg'`.
+    /// EXCEPTION emite `[GBY-4111]` con el mensaje del user — el wrap
+    /// caller hace rollback de la transacción si el flow ascendente
+    /// no lo atrapa (X4c no tiene EXCEPTION handlers, diferido a X4d).
+    /// NOTICE devuelve OK con el mensaje en el ResultSet.
+    fn exec_raise(&mut self, stmt: RaiseStmt) -> DbResult<ResultSet> {
+        match stmt.level {
+            RaiseLevel::Exception => Err(coded(codes::RAISE_EXCEPTION, stmt.message)),
+            RaiseLevel::Notice => Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some(format!("NOTICE: {}", stmt.message)),
+            }),
+        }
+    }
+
+    /// Bloque X4c: `FOR var IN start TO end LOOP <body> END LOOP`.
+    /// Eval start/end (deben ser INT), auto-declara la variable
+    /// (guarda el valor previo si ya existe — shadowing temporal),
+    /// itera inclusivo de start a end. EXIT viaja como sentinel.
+    /// Si start > end, el loop no itera (sin error).
+    fn exec_for(&mut self, stmt: ForStmt) -> DbResult<ResultSet> {
+        let empty: HashMap<String, Value> = HashMap::new();
+        let start_v = self.eval_expr_full(&stmt.start, &empty, None)?;
+        let end_v = self.eval_expr_full(&stmt.end, &empty, None)?;
+        let start = match start_v {
+            Value::Integer(n) => n,
+            other => {
+                return Err(coded(
+                    codes::FOR_RANGE_INVALID,
+                    format!(
+                        "FOR ...: start debe ser INT, recibí {}",
+                        value_type_name(&other)
+                    ),
+                ));
+            }
+        };
+        let end = match end_v {
+            Value::Integer(n) => n,
+            other => {
+                return Err(coded(
+                    codes::FOR_RANGE_INVALID,
+                    format!(
+                        "FOR ...: end debe ser INT, recibí {}",
+                        value_type_name(&other)
+                    ),
+                ));
+            }
+        };
+        let key = stmt.var.to_ascii_lowercase();
+        // Shadowing: guardamos el valor anterior si existe y lo
+        // restauramos al final del loop (PG convention).
+        let saved = self.var_scope.remove(&key);
+        let mut iter_count = 0usize;
+        let mut early_exit = false;
+        let mut i = start;
+        while i <= end {
+            if iter_count >= MAX_LOOP_ITERATIONS {
+                self.var_scope.remove(&key);
+                if let Some(v) = saved {
+                    self.var_scope.insert(key, v);
+                }
+                return Err(coded(
+                    codes::LOOP_MAX_ITERATIONS_EXCEEDED,
+                    format!(
+                        "FOR LOOP: superó el límite de {} iteraciones",
+                        MAX_LOOP_ITERATIONS
+                    ),
+                ));
+            }
+            self.var_scope.insert(key.clone(), Value::Integer(i));
+            for s in stmt.body.clone() {
+                match self.exec(s) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains(EXIT_SIGNAL) => {
+                        early_exit = true;
+                        break;
+                    }
+                    Err(e) => {
+                        // Restaurar var antes de propagar.
+                        self.var_scope.remove(&key);
+                        if let Some(v) = saved {
+                            self.var_scope.insert(key, v);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            if early_exit {
+                break;
+            }
+            iter_count += 1;
+            i += 1;
+        }
+        // Restaurar var previa (o borrar si no existía).
+        self.var_scope.remove(&key);
+        if let Some(v) = saved {
+            self.var_scope.insert(key, v);
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · FOR LOOP {} iter ({})",
+                iter_count,
+                if early_exit { "exit" } else { "completo" }
+            )),
+        })
     }
 
     /// Bloque X3b: evalúa una invocación a user-defined function.
@@ -9457,6 +9605,29 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 just_saw_end = false;
                 current.push_str(&sql[index..index + 5]);
                 index += 5;
+                continue;
+            }
+            // Bloque X4c (2026-05-28): `FOR` también abre bloque (`END
+            // LOOP` cierra). Mismo patrón que WHILE.
+            if (ch == 'F' || ch == 'f')
+                && match_keyword_at(bytes, index, b"FOR")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 3)
+            {
+                // FOR EACH ROW (trigger) NO abre bloque — es parte del
+                // header del CREATE TRIGGER, ya tokenizado dentro.
+                let mut la = index + 3;
+                while la < bytes.len() && (bytes[la] as char).is_whitespace() {
+                    la += 1;
+                }
+                let is_trigger_each =
+                    match_keyword_at(bytes, la, b"EACH") && !is_ident_byte_at(bytes, la + 4);
+                if !is_trigger_each && !just_saw_end {
+                    begin_depth += 1;
+                }
+                just_saw_end = false;
+                current.push_str(&sql[index..index + 3]);
+                index += 3;
                 continue;
             }
             // `LOOP` después de END es parte del close-keyword `END LOOP`.
@@ -15207,6 +15378,12 @@ impl Parser {
         if self.match_keyword("SET") {
             return self.parse_set_stmt();
         }
+        if self.match_keyword("RAISE") {
+            return self.parse_raise_stmt();
+        }
+        if self.match_keyword("FOR") {
+            return self.parse_for_stmt();
+        }
         if self.match_keyword("INSERT") {
             return self.parse_insert();
         }
@@ -15700,10 +15877,14 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" || upper == "WHILE" {
-                        // X4/X4b: IF y WHILE abren depth (cierran con END
-                        // IF / END LOOP — el END decrementa, el keyword
-                        // post-END se ignora).
+                    } else if upper == "IF" || upper == "WHILE" || upper == "FOR" {
+                        // X4/X4b/X4c: IF/WHILE/FOR abren depth (cierran con
+                        // END IF / END LOOP — el END decrementa, el
+                        // keyword post-END se ignora).
+                        // Excepción: `FOR EACH ROW` (header de trigger
+                        // dentro de CREATE TRIGGER) NO abre — pero estos
+                        // body parsers ya están DENTRO del body, post
+                        // FOR EACH ROW, así que no aplica.
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -15860,10 +16041,14 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" || upper == "WHILE" {
-                        // X4/X4b: IF y WHILE abren depth (cierran con END
-                        // IF / END LOOP — el END decrementa, el keyword
-                        // post-END se ignora).
+                    } else if upper == "IF" || upper == "WHILE" || upper == "FOR" {
+                        // X4/X4b/X4c: IF/WHILE/FOR abren depth (cierran con
+                        // END IF / END LOOP — el END decrementa, el
+                        // keyword post-END se ignora).
+                        // Excepción: `FOR EACH ROW` (header de trigger
+                        // dentro de CREATE TRIGGER) NO abre — pero estos
+                        // body parsers ya están DENTRO del body, post
+                        // FOR EACH ROW, así que no aplica.
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -16067,6 +16252,77 @@ impl Parser {
             stmts.push(stmt);
         }
         Ok(stmts)
+    }
+
+    /// Bloque X4c (2026-05-28): parsea `RAISE [EXCEPTION|NOTICE] 'msg'`.
+    /// Si no se especifica el level, default es EXCEPTION (consistente
+    /// con PG). El mensaje debe ser un literal STRING.
+    fn parse_raise_stmt(&mut self) -> DbResult<Statement> {
+        let level = if self.match_keyword("NOTICE") {
+            RaiseLevel::Notice
+        } else {
+            let _ = self.match_keyword("EXCEPTION"); // opcional
+            RaiseLevel::Exception
+        };
+        let tok = self.peek().clone();
+        if tok.kind != TokenKind::String {
+            return Err(coded(
+                codes::RAISE_MESSAGE_INVALID,
+                format!(
+                    "RAISE: se esperaba un literal STRING para el mensaje (vi '{}')",
+                    tok.text
+                ),
+            ));
+        }
+        self.pos += 1;
+        Ok(Statement::Raise(RaiseStmt {
+            level,
+            message: tok.text,
+        }))
+    }
+
+    /// Bloque X4c: parsea `FOR ident IN start TO end LOOP <body> END LOOP`.
+    fn parse_for_stmt(&mut self) -> DbResult<Statement> {
+        let var = self.expect_ident()?;
+        if !self.match_keyword("IN") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "FOR ident ...: se esperaba IN",
+            ));
+        }
+        let start = self.parse_expr()?;
+        if !self.match_keyword("TO") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "FOR ident IN start ...: se esperaba TO end",
+            ));
+        }
+        let end = self.parse_expr()?;
+        if !self.match_keyword("LOOP") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "FOR ...: se esperaba LOOP después de end",
+            ));
+        }
+        let body = self.parse_loop_body()?;
+        if !self.match_keyword("END") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "FOR ...: se esperaba END LOOP para cerrar",
+            ));
+        }
+        if !self.match_keyword("LOOP") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "FOR ...: se esperaba END LOOP (vi END sin LOOP)",
+            ));
+        }
+        Ok(Statement::For(Box::new(ForStmt {
+            var,
+            start,
+            end,
+            body,
+        })))
     }
 
     /// Bloque X4b: parsea `EXIT [WHEN cond]`.

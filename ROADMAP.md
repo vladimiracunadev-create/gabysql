@@ -84,6 +84,8 @@
 
 - ~~Variables locales (`DECLARE name TYPE [DEFAULT expr]`), asignación (`SET name = expr`), `WHILE cond LOOP ... END LOOP` con guard `MAX_LOOP_ITERATIONS=100K`, `EXIT [WHEN cond]` con sentinel propagation. Engine field `var_scope: HashMap<String, Value>` plano (no anidado — limitación X4b). Variables visibles en `Expr` (cond de IF/WHILE, RHS de SET, WHERE, etc.) via merge en `eval_expr_full`. Variables NO visibles dentro de `INSERT VALUES` (parser exige Value literal — workaround: usar `INSERT ... SELECT` o procedure params). Sin bump on-disk~~ ✅ entregado (bloque **X4b**, 2026-05-28, [ADR-0034](docs/adr/0034-vars-loops-x4b.md)).
 
+- ~~`RAISE [EXCEPTION|NOTICE] 'msg'` (default EXCEPTION) — aborto explícito con mensaje (`[GBY-4111]`) o info logging. Funciona en cualquier contexto procedural (top-level, dentro de IF/WHILE/FOR, trigger/procedure body). `FOR ident IN start TO end LOOP <body> END LOOP` — range loop con auto-declaración de la variable de iteración (shadowing con restore), inclusivo, ascendente con step=1. `start > end` no itera (sin error). EXIT y guard MAX_LOOP_ITERATIONS heredados de X4b. EXCEPTION handlers + FOR row IN SELECT + LOOP standalone + RETURN diferidos a X4d~~ ✅ entregado (bloque **X4c**, 2026-05-28, [ADR-0035](docs/adr/0035-raise-for-x4c.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`
