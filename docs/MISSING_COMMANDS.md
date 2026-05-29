@@ -46,7 +46,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **V** ✅ | Vistas lógicas: `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS &lt;select_query&gt;`, `DROP VIEW [IF EXISTS] v`. Expansion como derived table en cualquier FROM. Read-only (`[GBY-4075]`). Bump VERSION 12→13 con discriminator byte tabla/vista. **Cerrado 2026-05-27** ([ADR-0025](adr/0025-views.md)). | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
 | **X** | Stored procedures + triggers: `CREATE FUNCTION`, `CREATE TRIGGER`, lenguaje procedural | Muy alto | T, F |
-| **Y** | Tipos faltantes: `DECIMAL`/`NUMERIC`, `BLOB`/`BYTEA`, `UUID`, `ARRAY[]`, `INTERVAL`, `ENUM` | Alto (toca formato disco) | — |
+| **Y** ✅ | Tipos extendidos: aliases (BIGINT, VARCHAR(n), DECIMAL(p,s), DOUBLE PRECISION, BOOLEAN, TIMESTAMP, REAL, …) + nuevos `TIME` y `UUID` con código en disco. `DECIMAL` exacto, `BLOB`/`BYTEA`, `ARRAY[]`, `INTERVAL`, `ENUM` diferidos a Y2 | Medio (bump 16→17) | Y2 |
 | **Z** | Control de acceso: `CREATE USER`/`ROLE`, `GRANT`/`REVOKE`, RLS | Muy alto (auth en server) | T |
 
 ---
@@ -365,15 +365,24 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Tipo | Soportado | Prioridad |
 |---|:---:|:---:|
 | `INT`, `TEXT`, `BOOL`, `FLOAT`, `DATE`, `DATETIME`, `JSON` | ✅ | — |
-| `DECIMAL(p, s)` / `NUMERIC` | ❌ | P1 |
-| `BIGINT` / `SMALLINT` / `TINYINT` separados | ❌ | P3 (hoy todo es i64) |
-| `BLOB` / `BYTEA` (binario) | ❌ | P1 |
-| `UUID` | ❌ | P2 (workaround: TEXT) |
-| `ARRAY[]` | ❌ | P3 |
-| `INTERVAL` | ❌ | P3 |
-| `ENUM` | ❌ | P2 |
+| `TIME` (HH:MM:SS[.fff]) | ✅ (Y, 2026-05-29; VERSION 16→17; code=8; validación lexical en CAST) | — |
+| `UUID` (8-4-4-4-12 hex canónico) | ✅ (Y, 2026-05-29; VERSION 16→17; code=9; CAST normaliza a lowercase) | — |
+| `BIGINT` / `SMALLINT` / `TINYINT` / `INTEGER` / `MEDIUMINT` / `INT2` / `INT4` / `INT8` | ✅ (Y, 2026-05-29; aliases puros de INT — sin range enforcement) | — |
+| `VARCHAR(n)` / `CHAR(n)` / `CHARACTER VARYING(n)` / `NVARCHAR(n)` / `STRING` / `CLOB` | ✅ (Y, 2026-05-29; aliases de TEXT — `(n)` aceptado, no enforce longitud) | — |
+| `REAL` / `DOUBLE` / `DOUBLE PRECISION` | ✅ (Y, 2026-05-29; aliases de FLOAT) | — |
+| `NUMERIC[(p,s)]` / `DECIMAL[(p,s)]` / `DEC[(p,s)]` | 🟡 (Y, 2026-05-29; aliases de FLOAT — **no es decimal exacto**, queda diferido a Y2) | P1 (exactitud) |
+| `BOOLEAN` | ✅ (Y, 2026-05-29; alias de BOOL) | — |
+| `TIMESTAMP` | ✅ (Y, 2026-05-29; alias de DATETIME) | — |
+| `BLOB` / `BYTEA` / `BINARY` (binario) | ❌ (requiere `Value::Bytes` + nueva serialización; diferido a Y2) | P1 |
+| `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ❌ (diferido a Y2 — requiere `Value::Decimal`) | P1 |
+| Enforcement de longitud VARCHAR(n)/CHAR(n) y rango SMALLINT/TINYINT | ❌ (diferido a Y2) | P2 |
+| `ARRAY[]` | ❌ (diferido) | P3 |
+| `INTERVAL` | ❌ (diferido) | P3 |
+| `ENUM` | ❌ (diferido) | P2 |
+| `TIME WITH TIME ZONE` / `TIMESTAMP WITH TIME ZONE` | ❌ (diferido) | P3 |
 | `GEOMETRY` / `GEOGRAPHY` (PostGIS-like) | ❌ | P3 |
 | `INET` / `CIDR` (red) | ❌ | P3 |
+| `gen_random_uuid()` / `uuid_v4()` (UUID auto-gen) | ❌ (diferido) | P2 |
 
 ---
 

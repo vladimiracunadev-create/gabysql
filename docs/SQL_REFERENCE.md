@@ -95,20 +95,26 @@ flowchart LR
     FLOAT["FLOAT<br/>f64 little-endian"]
     DATE["DATE<br/>texto ISO-8601"]
     DATETIME["DATETIME<br/>texto ISO-8601"]
+    TIME["TIME<br/>texto HH:MM:SS[.fff]"]
+    UUID["UUID<br/>texto 8-4-4-4-12 hex"]
     JSON["JSON<br/>texto, no indexable"]
     NULL["NULL<br/>solo en columnas no PK"]
 ```
 
-| Tipo | Almacenamiento | Indexable | Notas |
-| :--- | :--- | :---: | :--- |
-| `INT` | 8 bytes LE | ✅ | Único tipo válido como PK |
-| `TEXT` | bytes UTF-8 | ✅ | Hasta 65 535 bytes por valor |
-| `BOOL` | 1 byte | ✅ | `TRUE` / `FALSE` |
-| `FLOAT` | 8 bytes LE (`f64`) | ✅ | Acepta literales enteros |
-| `DATE` | texto | ✅ | Validación lexical, no semántica |
-| `DATETIME` | texto | ✅ | Idem |
-| `JSON` | texto | ❌ | Sin semántica de igualdad canónica |
-| `NULL` | tag de presencia | n/a | No admitido en columnas PK |
+| Tipo canónico | Almacenamiento | Indexable | Aliases sintácticos (bloque Y) | Notas |
+| :--- | :--- | :---: | :--- | :--- |
+| `INT` | 8 bytes LE | ✅ | `INTEGER`, `INT2`, `INT4`, `INT8`, `BIGINT`, `SMALLINT`, `TINYINT`, `MEDIUMINT` | Único tipo válido como PK. Sin enforcement de rango para SMALLINT/TINYINT (alias puro). |
+| `TEXT` | bytes UTF-8 | ✅ | `VARCHAR[(n)]`, `CHAR[(n)]`, `CHARACTER[(n)]`, `CHARACTER VARYING[(n)]`, `NVARCHAR[(n)]`, `NCHAR[(n)]`, `STRING`, `CLOB` | Hasta 65 535 bytes. **`(n)` se acepta pero no se enforce.** |
+| `BOOL` | 1 byte | ✅ | `BOOLEAN` | `TRUE` / `FALSE` |
+| `FLOAT` | 8 bytes LE (`f64`) | ✅ | `REAL`, `DOUBLE`, `DOUBLE PRECISION`, `NUMERIC[(p,s)]`, `DECIMAL[(p,s)]`, `DEC[(p,s)]` | **DECIMAL/NUMERIC son aliases — no son decimal exacto.** |
+| `DATE` | texto | ✅ | — | `YYYY-MM-DD`, validación lexical (no semántica). |
+| `DATETIME` | texto | ✅ | `TIMESTAMP` | `YYYY-MM-DD HH:MM:SS`, validación lexical. |
+| `TIME` (bloque Y) | texto | ✅ | — | `HH:MM:SS` o `HH:MM:SS.fff`. Validación lexical en `CAST`. No timezone. |
+| `UUID` (bloque Y) | texto | ✅ | — | Canónico `8-4-4-4-12` hex. `CAST AS UUID` normaliza a lowercase. |
+| `JSON` | texto | ❌ | — | Sin semántica de igualdad canónica |
+| `NULL` | tag de presencia | n/a | — | No admitido en columnas PK |
+
+> **No soportado todavía**: `BLOB`/`BYTEA`/`BINARY` (binario crudo), `DECIMAL` exacto, `ARRAY[T]`, `ENUM(...)`, `INTERVAL`, `TIME WITH TIME ZONE`, `TIMESTAMP WITH TIME ZONE`. Diferidos a Y2.
 
 ---
 

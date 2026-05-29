@@ -92,6 +92,8 @@
 
 - ~~`RETURN expr` en function bodies multi-statement (`CREATE FUNCTION ... AS BEGIN ... RETURN x; END`). Parser detecta `BEGIN` tras `AS` y conmuta a block body (compat X3b: single expression body sigue válido). Sentinel `RETURN_SIGNAL` + Engine.pending_return_value, mismo patrón que EXIT de X4b. Sin RETURN → devuelve NULL. Restore de pending_return_value por invocación habilita funciones que llaman funciones. Cierra el bloque X (procedural completo). FOR row IN SELECT, filtros simbólicos, formato `%` en RAISE y CASE expr simple form quedan diferidos~~ ✅ entregado (bloque **X4f**, 2026-05-29, [ADR-0038](docs/adr/0038-return-in-functions-x4f.md)).
 
+- ~~Tipos de columna extendidos: aliases sintácticos `BIGINT/SMALLINT/TINYINT/INTEGER/MEDIUMINT/INT2/INT4/INT8` (→ INT), `REAL/DOUBLE/DOUBLE PRECISION/NUMERIC(p,s)/DECIMAL(p,s)/DEC` (→ FLOAT), `VARCHAR(n)/CHAR(n)/CHARACTER VARYING(n)/NVARCHAR(n)/NCHAR(n)/STRING/CLOB` (→ TEXT), `BOOLEAN` (→ BOOL), `TIMESTAMP` (→ DATETIME). Dos tipos nuevos con código en disco: `TIME` (HH:MM:SS[.fff], code=8) y `UUID` (8-4-4-4-12 hex canónico, code=9), ambos `stores_as_text` con validación lexical en CAST. Bump VERSION 16→17. Helper `parse_type_name` único point of entry desde `parse_column_def` / `parse_create_function` / `parse_create_procedure` / `parse_declare_stmt` / `parse_cast_expr` — soporta sufijo paramétrico `(n)`/`(p,s)` (ignorado) y aliases compuestos (`DOUBLE PRECISION`, `CHARACTER VARYING`). BLOB/BYTEA, DECIMAL exacto, ARRAY, ENUM y enforcement de longitud diferidos a Y2~~ ✅ entregado (bloque **Y**, 2026-05-29, [ADR-0039](docs/adr/0039-extended-types-y.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

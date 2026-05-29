@@ -10065,7 +10065,9 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
             | (ColumnType::Text, Value::Null)
             | (ColumnType::Date, Value::Null)
             | (ColumnType::DateTime, Value::Null)
-            | (ColumnType::Json, Value::Null) => out.push(0),
+            | (ColumnType::Json, Value::Null)
+            | (ColumnType::Time, Value::Null)
+            | (ColumnType::Uuid, Value::Null) => out.push(0),
             (ColumnType::Float, Value::Float(number)) => {
                 out.push(1);
                 out.extend_from_slice(&number.to_le_bytes());
@@ -10221,7 +10223,12 @@ pub fn decode_row(meta: &TableMeta, data: &[u8]) -> DbResult<HashMap<String, Val
                 offset += 1;
                 Value::Bool(flag)
             }
-            ColumnType::Text | ColumnType::Date | ColumnType::DateTime | ColumnType::Json => {
+            ColumnType::Text
+            | ColumnType::Date
+            | ColumnType::DateTime
+            | ColumnType::Json
+            | ColumnType::Time
+            | ColumnType::Uuid => {
                 if offset + 2 > data.len() {
                     return Err(DbError::new(format!(
                         "fila corrupta en tabla '{}': campo '{}' ({}) necesita 2 bytes \
@@ -14320,7 +14327,92 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
                 ),
             )),
         },
+        ColumnType::Time => match v {
+            Value::String(s) => {
+                if looks_like_time(&s) {
+                    Ok(Value::String(s))
+                } else {
+                    Err(coded(
+                        codes::CAST_INVALID,
+                        format!("CAST('{}' AS TIME): formato esperado HH:MM:SS[.fff]", s),
+                    ))
+                }
+            }
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS TIME desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
+        ColumnType::Uuid => match v {
+            Value::String(s) => {
+                if looks_like_uuid(&s) {
+                    Ok(Value::String(s.to_ascii_lowercase()))
+                } else {
+                    Err(coded(
+                        codes::CAST_INVALID,
+                        format!(
+                            "CAST('{}' AS UUID): formato esperado 8-4-4-4-12 hex (canonical)",
+                            s
+                        ),
+                    ))
+                }
+            }
+            other => Err(coded(
+                codes::CAST_INVALID,
+                format!(
+                    "CAST AS UUID desde {} no soportado",
+                    value_type_name(&other)
+                ),
+            )),
+        },
     }
+}
+
+/// Bloque Y (2026-05-29): valida que `s` parezca una hora ISO 8601
+/// (`HH:MM:SS` o `HH:MM:SS.fff`). Validación lexical solo —
+/// no chequea rangos (24:00 no se rechaza por simplicidad).
+pub(crate) fn looks_like_time(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 8 {
+        return false;
+    }
+    let head_ok = b[..2].iter().all(u8::is_ascii_digit)
+        && b[2] == b':'
+        && b[3..5].iter().all(u8::is_ascii_digit)
+        && b[5] == b':'
+        && b[6..8].iter().all(u8::is_ascii_digit);
+    if !head_ok {
+        return false;
+    }
+    if b.len() == 8 {
+        return true;
+    }
+    // Opcional `.fff` con 1+ dígitos
+    b[8] == b'.' && b.len() > 9 && b[9..].iter().all(u8::is_ascii_digit)
+}
+
+/// Bloque Y: valida que `s` parezca un UUID canónico
+/// (`8-4-4-4-12` chars hex, total 36). Acepta mayúsculas y
+/// minúsculas. No valida la version/variant — sólo la forma.
+pub(crate) fn looks_like_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, ch) in b.iter().enumerate() {
+        let is_dash = matches!(i, 8 | 13 | 18 | 23);
+        if is_dash {
+            if *ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
 }
 
 fn looks_like_date(s: &str) -> bool {
@@ -16292,7 +16384,7 @@ impl Parser {
         if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
             loop {
                 let pname = self.expect_ident()?;
-                let ptype_raw = self.expect_ident()?;
+                let ptype_raw = self.parse_type_name()?;
                 let ptype = ColumnType::from_sql(&ptype_raw)?;
                 params.push((pname, ptype));
                 if !self.match_symbol(",") {
@@ -16302,7 +16394,7 @@ impl Parser {
         }
         self.expect_symbol(")")?;
         self.expect_keyword("RETURNS")?;
-        let ret_raw = self.expect_ident()?;
+        let ret_raw = self.parse_type_name()?;
         let return_type = ColumnType::from_sql(&ret_raw)?;
         self.expect_keyword("AS")?;
         // Body puede ser:
@@ -16393,7 +16485,7 @@ impl Parser {
         if !(self.peek().kind == TokenKind::Symbol && self.peek().text == ")") {
             loop {
                 let pname = self.expect_ident()?;
-                let ptype_raw = self.expect_ident()?;
+                let ptype_raw = self.parse_type_name()?;
                 let ptype = ColumnType::from_sql(&ptype_raw)?;
                 params.push((pname, ptype));
                 if !self.match_symbol(",") {
@@ -16584,7 +16676,7 @@ impl Parser {
     /// Bloque X4b (2026-05-28): parsea `DECLARE name TYPE [DEFAULT expr]`.
     fn parse_declare_stmt(&mut self) -> DbResult<Statement> {
         let name = self.expect_ident()?;
-        let ty_raw = self.expect_ident()?;
+        let ty_raw = self.parse_type_name()?;
         let ty = ColumnType::from_sql(&ty_raw)?;
         let default = if self.match_keyword("DEFAULT") {
             Some(self.parse_expr()?)
@@ -17077,7 +17169,7 @@ impl Parser {
         column_checks: &mut Vec<(Option<String>, Expr)>,
     ) -> DbResult<ColumnDef> {
         let name = self.expect_ident()?;
-        let type_name = self.expect_ident()?;
+        let type_name = self.parse_type_name()?;
         let mut primary_key = false;
         let mut not_null = false;
         let mut unique = false;
@@ -19086,7 +19178,7 @@ impl Parser {
         self.expect_symbol("(")?;
         let inner = self.parse_expr()?;
         self.expect_keyword("AS")?;
-        let type_ident = self.expect_ident()?;
+        let type_ident = self.parse_type_name()?;
         let ty = ColumnType::from_sql(&type_ident)?;
         self.expect_symbol(")")?;
         Ok(Expr::Cast(Box::new(inner), ty))
@@ -19693,6 +19785,56 @@ impl Parser {
         }
         self.pos += 1;
         Ok(token.text.parse()?)
+    }
+
+    /// Bloque Y (2026-05-29): parsea un nombre de tipo de columna,
+    /// con soporte para los aliases comunes que llevan dos palabras
+    /// (`DOUBLE PRECISION`, `CHARACTER VARYING`) o un sufijo
+    /// parametrizado (`VARCHAR(255)`, `DECIMAL(10,2)`, `NUMERIC(5)`).
+    /// El string devuelto se entrega tal cual a
+    /// [`ColumnType::from_sql`], que normaliza el case y descarta el
+    /// sufijo paramétrico (Y no enforza longitud/precisión).
+    fn parse_type_name(&mut self) -> DbResult<String> {
+        let mut name = self.expect_ident()?;
+        // Aliases SQL standard con dos palabras: "DOUBLE PRECISION" y
+        // "CHARACTER VARYING" (sinónimo de VARCHAR).
+        let upper = name.to_ascii_uppercase();
+        if upper == "DOUBLE" || upper == "CHARACTER" {
+            let nxt = self.peek().clone();
+            if nxt.kind == TokenKind::Ident {
+                let nxt_upper = nxt.text.to_ascii_uppercase();
+                if (upper == "DOUBLE" && nxt_upper == "PRECISION")
+                    || (upper == "CHARACTER" && nxt_upper == "VARYING")
+                {
+                    self.pos += 1;
+                    name = format!("{} {}", name, nxt.text);
+                }
+            }
+        }
+        // Sufijo paramétrico opcional: "(n)", "(p,s)".
+        if self.peek().kind == TokenKind::Symbol && self.peek().text == "(" {
+            self.pos += 1;
+            let mut depth = 1usize;
+            let mut inner = String::from("(");
+            while depth > 0 {
+                let t = self.peek().clone();
+                if t.kind == TokenKind::Eof {
+                    return Err(DbError::new(format!(
+                        "tipo de columna '{}': falta ')' de cierre del sufijo paramétrico",
+                        name
+                    )));
+                }
+                if t.kind == TokenKind::Symbol && t.text == "(" {
+                    depth += 1;
+                } else if t.kind == TokenKind::Symbol && t.text == ")" {
+                    depth -= 1;
+                }
+                inner.push_str(&t.text);
+                self.pos += 1;
+            }
+            name.push_str(&inner);
+        }
+        Ok(name)
     }
 
     fn expect_ident(&mut self) -> DbResult<String> {

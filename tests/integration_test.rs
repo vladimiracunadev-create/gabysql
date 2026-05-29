@@ -11547,6 +11547,260 @@ fn x4f_function_calling_function_with_return() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y (2026-05-29): tipos de columna extendidos.
+// Aliases sintácticos (BIGINT, SMALLINT, VARCHAR(n), DECIMAL(p,s),
+// DOUBLE PRECISION, BOOLEAN, TIMESTAMP, REAL, etc.) y dos tipos
+// nuevos con código en disco: TIME y UUID.
+// ============================================================
+
+fn y_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y_int_family_aliases_work() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("int-aliases")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id BIGINT PRIMARY KEY,
+            a SMALLINT,
+            b TINYINT,
+            c INTEGER,
+            d MEDIUMINT,
+            e INT8
+         );
+         INSERT INTO t (id, a, b, c, d, e) VALUES (1, 10, 20, 30, 40, 50);",
+    )?;
+    let res = run_sql(&db, "SELECT id, a, b, c, d, e FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][5], Value::Integer(50));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_float_family_aliases_work() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("float-aliases")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id INT PRIMARY KEY,
+            r REAL,
+            d DOUBLE,
+            dp DOUBLE PRECISION,
+            n NUMERIC(10,2),
+            dc DECIMAL(8,4)
+         );
+         INSERT INTO t (id, r, d, dp, n, dc) VALUES (1, 1.5, 2.5, 3.5, 4.5, 5.5);",
+    )?;
+    let res = run_sql(&db, "SELECT r, d, dp, n, dc FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Float(1.5));
+    assert_eq!(res[0].rows[0][4], Value::Float(5.5));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_text_family_aliases_work() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("text-aliases")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id INT PRIMARY KEY,
+            v VARCHAR(255),
+            c CHAR(10),
+            s STRING,
+            cv CHARACTER VARYING(50),
+            n NVARCHAR(100)
+         );
+         INSERT INTO t (id, v, c, s, cv, n) VALUES (1, 'hello', 'world', 'foo', 'bar', 'baz');",
+    )?;
+    let res = run_sql(&db, "SELECT v, c, s, cv, n FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("hello".to_string()));
+    assert_eq!(res[0].rows[0][4], Value::String("baz".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_bool_and_timestamp_aliases() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("bool-ts-aliases")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (
+            id INT PRIMARY KEY,
+            flag BOOLEAN,
+            ts TIMESTAMP
+         );
+         INSERT INTO t (id, flag, ts) VALUES (1, TRUE, '2026-05-29 12:00:00');",
+    )?;
+    let res = run_sql(&db, "SELECT flag, ts FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Bool(true));
+    assert_eq!(
+        res[0].rows[0][1],
+        Value::String("2026-05-29 12:00:00".to_string())
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_time_column_stores_and_queries() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("time-type")?;
+    run_sql(
+        &db,
+        "CREATE TABLE schedule (
+            id INT PRIMARY KEY,
+            start_at TIME,
+            end_at TIME
+         );
+         INSERT INTO schedule (id, start_at, end_at) VALUES (1, '09:30:00', '17:45:30');
+         INSERT INTO schedule (id, start_at, end_at) VALUES (2, '08:00:00.500', '12:00:00');",
+    )?;
+    let res = run_sql(&db, "SELECT start_at, end_at FROM schedule ORDER BY id;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("09:30:00".to_string()));
+    assert_eq!(res[0].rows[1][0], Value::String("08:00:00.500".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_uuid_column_stores_and_queries() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("uuid-type")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (
+            id INT PRIMARY KEY,
+            tag UUID
+         );
+         INSERT INTO u (id, tag) VALUES (1, '550e8400-e29b-41d4-a716-446655440000');
+         INSERT INTO u (id, tag) VALUES (2, 'f47ac10b-58cc-4372-a567-0e02b2c3d479');",
+    )?;
+    let res = run_sql(&db, "SELECT tag FROM u WHERE id = 1;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::String("550e8400-e29b-41d4-a716-446655440000".to_string())
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_cast_to_uuid_normalizes_lowercase() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("cast-uuid")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT CAST('550E8400-E29B-41D4-A716-446655440000' AS UUID) FROM t;",
+    )?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::String("550e8400-e29b-41d4-a716-446655440000".to_string())
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_cast_to_time_validates_format() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("cast-time")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )?;
+    let ok = run_sql(&db, "SELECT CAST('14:30:00' AS TIME) FROM t;")?;
+    assert_eq!(ok[0].rows[0][0], Value::String("14:30:00".to_string()));
+    let err = run_sql(&db, "SELECT CAST('not-a-time' AS TIME) FROM t;");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_cast_to_uuid_rejects_invalid() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("uuid-bad")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )?;
+    let err = run_sql(&db, "SELECT CAST('not-a-uuid' AS UUID) FROM t;");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_aliases_in_function_signature() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("fn-aliases")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v BIGINT);
+         INSERT INTO t (id, v) VALUES (1, 100);
+         CREATE FUNCTION add_one(p_x BIGINT) RETURNS BIGINT AS p_x + 1;
+         CREATE FUNCTION halve(p_n NUMERIC(10,2)) RETURNS DOUBLE PRECISION AS p_n;",
+    )?;
+    let res = run_sql(&db, "SELECT add_one(v) FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(101));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_declare_var_with_alias_type() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("declare-alias")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY, msg VARCHAR(200));
+         CREATE PROCEDURE add_log(p_id BIGINT) AS BEGIN
+            DECLARE m VARCHAR(50) DEFAULT 'hello';
+            INSERT INTO log (id, msg) VALUES (p_id, m);
+         END;
+         CALL add_log(1);",
+    )?;
+    let res = run_sql(&db, "SELECT msg FROM log WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("hello".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_alter_table_add_column_with_alias() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("alter-alias")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         ALTER TABLE t ADD COLUMN nick VARCHAR(50);
+         ALTER TABLE t ADD COLUMN score DECIMAL(8,2);
+         ALTER TABLE t ADD COLUMN birth_time TIME;
+         INSERT INTO t (id, nick, score, birth_time) VALUES (1, 'neo', 99.5, '07:30:00');",
+    )?;
+    let res = run_sql(&db, "SELECT nick, score, birth_time FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("neo".to_string()));
+    assert_eq!(res[0].rows[0][1], Value::Float(99.5));
+    assert_eq!(res[0].rows[0][2], Value::String("07:30:00".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y_unsupported_type_still_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y_setup("unsupported")?;
+    let res = run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, x GEOMETRY);");
+    assert!(res.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

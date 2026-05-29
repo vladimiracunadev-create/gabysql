@@ -6,6 +6,63 @@
 
 ---
 
+## 2026-05-29 — Bloque Y: tipos de columna extendidos
+
+> **Un push a `main`** con **bump on-disk 16 → 17**. Aliases sintácticos (BIGINT, VARCHAR(n), DECIMAL(p,s), DOUBLE PRECISION, BOOLEAN, TIMESTAMP, …) + dos tipos nuevos en disco: `TIME` y `UUID`. Detalle en [`docs/adr/0039-extended-types-y.md`](docs/adr/0039-extended-types-y.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- Aliases en CREATE TABLE
+CREATE TABLE personas (
+    id BIGINT PRIMARY KEY,
+    nombre VARCHAR(100),
+    edad SMALLINT,
+    altura DOUBLE PRECISION,
+    saldo DECIMAL(12,2),
+    activo BOOLEAN,
+    creado TIMESTAMP
+);
+
+-- Tipos nuevos con código propio
+CREATE TABLE jornadas (
+    id INT PRIMARY KEY,
+    apertura TIME,
+    cierre TIME,
+    request_id UUID
+);
+
+INSERT INTO jornadas VALUES (1, '09:00:00', '18:30:00', '550e8400-e29b-41d4-a716-446655440000');
+
+SELECT CAST('550E8400-E29B-41D4-A716-446655440000' AS UUID);  -- normaliza a lowercase
+```
+
+### 🛠 Implementación
+
+- **`ColumnType`** (catalog): variants nuevos `Time` (code=8) y `Uuid` (code=9), ambos `stores_as_text()=true`.
+- **`from_sql`** acepta los aliases (INT family / FLOAT family / TEXT family / BOOL family / DATETIME family). Normaliza case + colapsa whitespace + descarta sufijo paramétrico `(n)`/`(p,s)`.
+- **Parser**: helper único `parse_type_name` reemplaza el `expect_ident` para tipos en `parse_column_def`, `parse_create_function`, `parse_create_procedure`, `parse_declare_stmt`, `parse_cast_expr`. Soporta multi-word (`DOUBLE PRECISION`, `CHARACTER VARYING`) y sufijo paramétrico con depth tracking.
+- **Encoder/decoder**: `Time`/`Uuid` viajan por la rama `stores_as_text` existente (no hay código nuevo de serialización).
+- **CAST**: `CAST(x AS TIME)` valida lexical (`HH:MM:SS[.fff]`); `CAST(x AS UUID)` valida lexical (8-4-4-4-12 hex, total 36 chars) y normaliza a lowercase.
+- **Storage**: bump VERSION 16→17 — un V17 con columnas `Time`/`Uuid` no es legible por un binario V16. V16 → rechazado con `[GBY-1003]` UNSUPPORTED_FORMAT_VERSION (export/import manual).
+
+### 🚫 Diferido (Y2 y más allá)
+
+- **Length/range enforcement** en VARCHAR(n)/CHAR(n)/SMALLINT/TINYINT.
+- **`BLOB`/`BYTEA`/`BINARY`** (requiere `Value::Bytes` y cambio de serialización).
+- **`DECIMAL(p,s)` exacto** (requiere `Value::Decimal`; hoy es alias de FLOAT).
+- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**.
+- **`TIME WITH TIME ZONE`**, **`TIMESTAMP WITH TIME ZONE`**.
+- **Generación auto de UUID** (`gen_random_uuid()`, `uuid_v4()`).
+- **Validación semántica** de TIME (24:00 hoy se aceptaría).
+
+### 🧪 Validación
+
+- 13 tests `y_*`: aliases INT/FLOAT/TEXT/BOOL/TIMESTAMP families, columnas TIME, columnas UUID, CAST AS TIME/UUID (con normalización lowercase), aliases en function signature, DECLARE con alias, ALTER TABLE ADD COLUMN con alias, tipo inválido (GEOMETRY) sigue erroreando.
+- Suite total: **502/502 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque X4f: `RETURN expr` en function bodies
 
 > **Un push a `main`** sin bump on-disk. Décimo y último previsto sub-bloque del bloque X. Function bodies multi-statement con `RETURN expr` como sentinel — habilita lógica procedural completa dentro de functions. Detalle en [`docs/adr/0038-return-in-functions-x4f.md`](docs/adr/0038-return-in-functions-x4f.md).

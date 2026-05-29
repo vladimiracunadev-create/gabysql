@@ -130,7 +130,14 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        Discriminator `4=Function`. Payload: [name][return_type:u8]
 //        [param_count:u16] × ([pname][ptype:u8]) [body_sql].
 //        V15 rechazados con `[GBY-1003]` — migración manual.
-pub const VERSION: u32 = 16;
+//  17 -> Bloque Y (2026-05-29): tipos de columna extendidos. Aliases
+//        sintácticos sin cambio en disco (BIGINT/SMALLINT/VARCHAR(n)/
+//        DECIMAL(p,s)/TIMESTAMP/BOOLEAN/REAL/DOUBLE/etc. mapean a
+//        Int/Text/Float/Bool/DateTime existentes). Dos códigos
+//        nuevos en disco: `8=TIME`, `9=UUID` (ambos stores_as_text).
+//        V16 rechazados con `[GBY-1003]` porque un schema válido en
+//        V17 puede contener columnas TIME/UUID que V16 no sabe leer.
+pub const VERSION: u32 = 17;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

@@ -13,18 +13,76 @@ pub enum ColumnType {
     Date,
     DateTime,
     Json,
+    /// Bloque Y (2026-05-29): hora del día como texto. Validación
+    /// lexical (`HH:MM:SS[.fff]`), sin semántica de timezone.
+    Time,
+    /// Bloque Y: UUID en forma canónica `8-4-4-4-12` hex. Texto, no
+    /// binario. Validación lexical en encode.
+    Uuid,
 }
 
 impl ColumnType {
+    /// Bloque Y (2026-05-29): además del tipo canónico, acepta una
+    /// familia de aliases sintácticos comunes en SQL standard /
+    /// MySQL / PostgreSQL para reducir fricción al portar schemas:
+    ///
+    /// - INT family: `BIGINT`, `INTEGER`, `INT2`, `INT4`, `INT8`,
+    ///   `SMALLINT`, `TINYINT`, `MEDIUMINT` → `Int`.
+    /// - FLOAT family: `REAL`, `DOUBLE`, `DOUBLE PRECISION`,
+    ///   `NUMERIC[(p,s)]`, `DECIMAL[(p,s)]`, `DEC[(p,s)]` → `Float`.
+    /// - TEXT family: `VARCHAR[(n)]`, `CHAR[(n)]`, `CHARACTER[(n)]`,
+    ///   `CHARACTER VARYING[(n)]`, `NVARCHAR[(n)]`, `STRING`, `CLOB` → `Text`.
+    /// - BOOL family: `BOOLEAN` → `Bool`.
+    /// - DATETIME family: `TIMESTAMP` → `DateTime`.
+    ///
+    /// Los aliases con paréntesis (`VARCHAR(255)`, `DECIMAL(10,2)`)
+    /// se aceptan sintácticamente pero los parámetros `n`/`p`/`s`
+    /// se ignoran — la longitud / precisión no se enforcer en Y
+    /// (queda para un sub-bloque futuro).
     pub fn from_sql(value: &str) -> DbResult<Self> {
-        match value.trim().to_ascii_uppercase().as_str() {
-            "INT" => Ok(Self::Int),
-            "TEXT" => Ok(Self::Text),
-            "BOOL" => Ok(Self::Bool),
-            "FLOAT" => Ok(Self::Float),
+        let raw = value.trim().to_ascii_uppercase();
+        // Strip "(...)" suffix for typed parameters (VARCHAR(255), DECIMAL(10,2), etc.)
+        let base = match raw.find('(') {
+            Some(idx) => raw[..idx].trim_end().to_string(),
+            None => raw.clone(),
+        };
+        // Collapse runs of whitespace so "DOUBLE  PRECISION" → "DOUBLE PRECISION"
+        let normalized: String = {
+            let mut out = String::with_capacity(base.len());
+            let mut prev_space = false;
+            for c in base.chars() {
+                if c.is_whitespace() {
+                    if !prev_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    prev_space = true;
+                } else {
+                    out.push(c);
+                    prev_space = false;
+                }
+            }
+            out.trim_end().to_string()
+        };
+        match normalized.as_str() {
+            // INT family
+            "INT" | "INTEGER" | "INT2" | "INT4" | "INT8" | "BIGINT" | "SMALLINT" | "TINYINT"
+            | "MEDIUMINT" => Ok(Self::Int),
+            // FLOAT family (DECIMAL/NUMERIC son alias, no decimal exacto)
+            "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" | "DEC" => {
+                Ok(Self::Float)
+            }
+            // TEXT family
+            "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "CHARACTER VARYING" | "NVARCHAR"
+            | "NCHAR" | "STRING" | "CLOB" => Ok(Self::Text),
+            // BOOL family
+            "BOOL" | "BOOLEAN" => Ok(Self::Bool),
+            // Date/time family
             "DATE" => Ok(Self::Date),
-            "DATETIME" => Ok(Self::DateTime),
+            "DATETIME" | "TIMESTAMP" => Ok(Self::DateTime),
+            "TIME" => Ok(Self::Time),
+            // Other text-shaped
             "JSON" => Ok(Self::Json),
+            "UUID" => Ok(Self::Uuid),
             other => Err(DbError::new(format!("tipo no soportado: {}", other))),
         }
     }
@@ -38,6 +96,8 @@ impl ColumnType {
             Self::Date => "DATE",
             Self::DateTime => "DATETIME",
             Self::Json => "JSON",
+            Self::Time => "TIME",
+            Self::Uuid => "UUID",
         }
     }
 
@@ -50,6 +110,8 @@ impl ColumnType {
             Self::Date => 5,
             Self::DateTime => 6,
             Self::Json => 7,
+            Self::Time => 8,
+            Self::Uuid => 9,
         }
     }
 
@@ -62,15 +124,20 @@ impl ColumnType {
             5 => Ok(Self::Date),
             6 => Ok(Self::DateTime),
             7 => Ok(Self::Json),
+            8 => Ok(Self::Time),
+            9 => Ok(Self::Uuid),
             other => Err(DbError::new(format!(
-                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON)",
+                "tipo de columna inválido en disco: code={} (esperaba 1=INT, 2=TEXT, 3=BOOL, 4=FLOAT, 5=DATE, 6=DATETIME, 7=JSON, 8=TIME, 9=UUID)",
                 other
             ))),
         }
     }
 
     pub fn stores_as_text(&self) -> bool {
-        matches!(self, Self::Text | Self::Date | Self::DateTime | Self::Json)
+        matches!(
+            self,
+            Self::Text | Self::Date | Self::DateTime | Self::Json | Self::Time | Self::Uuid
+        )
     }
 }
 
