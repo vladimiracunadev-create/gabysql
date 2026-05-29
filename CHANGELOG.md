@@ -6,6 +6,57 @@
 
 ---
 
+## 2026-05-28 — Bloque X2: triggers BEFORE + body multi-statement
+
+> **Un push a `main`** sin bump on-disk (los slots ya estaban en `TriggerMeta` desde X1). Cierra los dos huecos más visibles que dejó X1: BEFORE triggers y body `BEGIN ... END` con múltiples sentencias. Detalle en [`docs/adr/0030-triggers-before-multistmt-x2.md`](docs/adr/0030-triggers-before-multistmt-x2.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- BEFORE triggers (X1 los rechazaba con [GBY-4093])
+CREATE TRIGGER log_pre BEFORE UPDATE ON products
+    FOR EACH ROW INSERT INTO change_log (id, op, oldv, newv)
+                 VALUES (NEW.id, 'before', OLD.price, NEW.price);
+
+-- Body multi-statement con BEGIN ... END
+CREATE TRIGGER multi AFTER INSERT ON t FOR EACH ROW BEGIN
+    INSERT INTO log_a (id) VALUES (NEW.id);
+    INSERT INTO log_b (id) VALUES (NEW.id);
+END;
+```
+
+### 🛠 Implementación
+
+- **BEFORE triggers**: lift del rechazo X1. Hooks BEFORE en `exec_insert/update/delete` antes del actual write.
+  - BEFORE INSERT: NEW = user-stated cols + NULL para no especificadas.
+  - BEFORE UPDATE: snapshot OLD del disco, NEW = OLD con assignments evaluados contra OLD (sin tocar disco).
+  - BEFORE DELETE: snapshot OLD del disco.
+  - NEW es **read-only** en X2 — para rellenar defaults o mutar NEW desde el trigger (`updated_at = NOW()`) hace falta X3.
+  - Aborto: si el body del BEFORE rebota, propaga el error y el DML principal aborta (transacción rollback del wrap caller).
+- **Body multi-statement**:
+  - `split_statements` ahora distingue `BEGIN [TRANSACTION];` (transaction, no abre block) de `BEGIN <dml>` (block-open, mantiene `;` internos juntos en el chunk). Lookahead post-`BEGIN`: si lo que sigue es `;`/EOF/`TRANSACTION` → tx; sino → block.
+  - Tokenizer acepta `;` como `Symbol(";")` (pre-X2 nunca llegaba a tokenize).
+  - Parser de `CREATE TRIGGER`: detecta `BEGIN` tras `FOR EACH ROW`, consume hasta `END` matching (con depth para potencial nesting), captura body como texto entre `BEGIN` y `END`.
+  - `fire_triggers`: tras la substitución NEW/OLD, parsea el body — `parse()` re-splittea por `;` y devuelve `Vec<Statement>`. Ejecuta cada uno en orden.
+- **Helper `has_trigger(table, event, timing)`**: generalización de `has_after_trigger` para evitar snapshots OLD/NEW innecesarios cuando no hay triggers BEFORE/AFTER registrados.
+
+### 🚫 Diferido (a X3+)
+
+- **NEW mutable en BEFORE** (típico use case: `NEW.updated_at = NOW()`).
+- **Control de flujo**: `IF`/`LOOP`/`WHILE`, variables locales (`DECLARE`).
+- **`RAISE EXCEPTION` / `RAISE NOTICE`**: aborto explícito con mensaje.
+- **`CREATE FUNCTION` / `CREATE PROCEDURE`**.
+- **OLD para UPSERT que terminó en UPDATE**.
+- **Triggers sobre vistas (`INSTEAD OF`)**.
+
+### 🧪 Validación
+
+- 7 nuevos tests `x2_*`: BEFORE INSERT/UPDATE/DELETE, multi-stmt body, BEFORE+AFTER en mismo INSERT, BEFORE que aborta via PK violation, `BEGIN` sin `END`.
+- Removido `x1_before_rejected_in_release` (la restricción ya no aplica).
+- Suite total: **423/423 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X1: triggers AFTER (`CREATE TRIGGER`)
 
 > **Un push a `main`** con bump on-disk **VERSION 13 → 14**. Entrega el primer sub-bloque del bloque X del roadmap: triggers AFTER con body single-statement, persistidos en el catálogo. Detalle en [`docs/adr/0029-triggers-after-x1.md`](docs/adr/0029-triggers-after-x1.md).

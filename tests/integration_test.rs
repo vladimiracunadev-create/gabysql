@@ -9991,24 +9991,6 @@ fn x1_drop_trigger_if_exists_noop() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn x1_before_rejected_in_release() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = x1_setup("before-reject")?;
-    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
-    let err = run_sql(
-        &db,
-        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW INSERT INTO t (id) VALUES (0);",
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("GBY-4093"),
-        "esperaba GBY-4093, got: {}",
-        err
-    );
-    cleanup(&[&db, &wal]);
-    Ok(())
-}
-
-#[test]
 fn x1_trigger_name_collides_with_table() -> Result<(), Box<dyn Error>> {
     let (db, wal) = x1_setup("name-collision")?;
     run_sql(&db, "CREATE TABLE collide (id INT PRIMARY KEY);")?;
@@ -10058,6 +10040,178 @@ fn x1_trigger_body_must_be_dml() -> Result<(), Box<dyn Error>> {
     let err = run_sql(
         &db,
         "CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW SELECT * FROM t;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4093"),
+        "esperaba GBY-4093, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ----- Bloque X2 (2026-05-28): triggers BEFORE + body multi-statement. -----
+
+fn x2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x2_before_insert_logs_user_stated_new() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("before-insert")?;
+    // INSERT VALUES no admite Expr literal, así que las dos copias
+    // tienen que insertar con keys distintas. Solución: usar dos
+    // tablas de log distintas (una para BEFORE, una para AFTER) en
+    // vez de jugar con aritmética sobre NEW.id.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE before_log (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE after_log (id INT PRIMARY KEY, name TEXT);
+         CREATE TRIGGER pre_b BEFORE INSERT ON t \
+            FOR EACH ROW INSERT INTO before_log (id, name) VALUES (NEW.id, NEW.name);
+         CREATE TRIGGER pre_a AFTER INSERT ON t \
+            FOR EACH ROW INSERT INTO after_log (id, name) VALUES (NEW.id, NEW.name);",
+    )?;
+    run_sql(&db, "INSERT INTO t (id, name) VALUES (1, 'A');")?;
+    let before = run_sql(&db, "SELECT id, name FROM before_log;")?;
+    let after = run_sql(&db, "SELECT id, name FROM after_log;")?;
+    assert_eq!(before[0].rows.len(), 1);
+    assert_eq!(after[0].rows.len(), 1);
+    assert_eq!(before[0].rows[0][0], Value::Integer(1));
+    assert_eq!(after[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x2_before_update_sees_old_and_computed_new() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("before-update")?;
+    run_sql(
+        &db,
+        "CREATE TABLE products (id INT PRIMARY KEY, price INT);
+         CREATE TABLE change_log (id INT PRIMARY KEY, op TEXT, oldv INT, newv INT);
+         INSERT INTO products (id, price) VALUES (1, 100);
+         CREATE TRIGGER log_before BEFORE UPDATE ON products \
+            FOR EACH ROW INSERT INTO change_log (id, op, oldv, newv) \
+                         VALUES (NEW.id, 'before', OLD.price, NEW.price);",
+    )?;
+    run_sql(&db, "UPDATE products SET price = 150 WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT id, op, oldv, newv FROM change_log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][1], Value::String("before".to_string()));
+    assert_eq!(res[0].rows[0][2], Value::Integer(100));
+    assert_eq!(res[0].rows[0][3], Value::Integer(150));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x2_before_delete_can_log_old() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("before-delete")?;
+    run_sql(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, n INT);
+         CREATE TABLE log (id INT PRIMARY KEY, n INT);
+         INSERT INTO items (id, n) VALUES (1, 42);
+         CREATE TRIGGER pre BEFORE DELETE ON items \
+            FOR EACH ROW INSERT INTO log (id, n) VALUES (OLD.id, OLD.n);",
+    )?;
+    run_sql(&db, "DELETE FROM items WHERE id = 1;")?;
+    let res = run_sql(&db, "SELECT id, n FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x2_multi_statement_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("multi-body")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE log_a (id INT PRIMARY KEY);
+         CREATE TABLE log_b (id INT PRIMARY KEY);
+         CREATE TRIGGER multi AFTER INSERT ON t FOR EACH ROW BEGIN \
+            INSERT INTO log_a (id) VALUES (NEW.id); \
+            INSERT INTO log_b (id) VALUES (NEW.id); \
+         END;",
+    )?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (7);")?;
+    let res_a = run_sql(&db, "SELECT id FROM log_a;")?;
+    let res_b = run_sql(&db, "SELECT id FROM log_b;")?;
+    assert_eq!(res_a[0].rows.len(), 1);
+    assert_eq!(res_a[0].rows[0][0], Value::Integer(7));
+    assert_eq!(res_b[0].rows.len(), 1);
+    assert_eq!(res_b[0].rows[0][0], Value::Integer(7));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x2_before_can_abort_via_uniqueness_violation() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("before-abort")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE block (id INT PRIMARY KEY);
+         INSERT INTO block (id) VALUES (99);
+         CREATE TRIGGER veto BEFORE INSERT ON t \
+            FOR EACH ROW INSERT INTO block (id) VALUES (99);",
+    )?;
+    // El trigger BEFORE intenta insertar id=99 en block → duplicate PK
+    // → propaga el error → el INSERT principal aborta.
+    let err = run_sql(&db, "INSERT INTO t (id) VALUES (1);").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("dup")
+            || err.to_string().contains("3001")
+            || err.to_string().contains("DUPLIC"),
+        "esperaba error de PK duplicada, got: {}",
+        err
+    );
+    // Como el BEFORE aborta, el INSERT no se aplica.
+    let res = run_sql(&db, "SELECT id FROM t;")?;
+    assert_eq!(res[0].rows.len(), 0);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x2_before_and_after_both_fire() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("before-after")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE log (id INT PRIMARY KEY, phase TEXT);
+         CREATE TRIGGER a_before BEFORE INSERT ON t \
+            FOR EACH ROW INSERT INTO log (id, phase) VALUES (1, 'B');
+         CREATE TRIGGER b_after AFTER INSERT ON t \
+            FOR EACH ROW INSERT INTO log (id, phase) VALUES (2, 'A');",
+    )?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (10);")?;
+    let res = run_sql(&db, "SELECT id, phase FROM log ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][1], Value::String("B".to_string()));
+    assert_eq!(res[0].rows[1][1], Value::String("A".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x2_begin_without_end_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x2_setup("no-end")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(
+        &db,
+        "CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO t (id) VALUES (1);",
     )
     .unwrap_err();
     assert!(

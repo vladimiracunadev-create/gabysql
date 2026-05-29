@@ -50,8 +50,8 @@
 | [`WITH name AS (SELECT ...)` (CTEs no-recursivas)](#ctes-no-recursivas-with-bloque-w1) — encadenables, en JOIN/subquery/set-ops, shadowing ANSI | DML | 🟢 (bloque W1) |
 | [`WITH RECURSIVE name AS (anchor UNION [ALL] step) <body>`](#ctes-recursivas-with-recursive-bloque-w2) — fixpoint base+step, delta semantics, guards de runaway | DML | 🟢 (bloque W2) |
 | [Window functions](#window-functions-bloque-w3) — `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` con `OVER (PARTITION BY ... ORDER BY ...)` | DML | 🟢 (bloque W3) |
-| [`CREATE TRIGGER name AFTER {INSERT\|UPDATE\|DELETE} ON t FOR EACH ROW <single_dml>` + `DROP TRIGGER`](#triggers-after-bloque-x1) | DDL | 🟢 (bloque X1 / VERSION 14) |
-| BEFORE triggers, body multi-statement, `CREATE FUNCTION`, `CREATE PROCEDURE`, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`CREATE TRIGGER name {BEFORE\|AFTER} {INSERT\|UPDATE\|DELETE} ON t FOR EACH ROW <body>` + `DROP TRIGGER`](#triggers-bloques-x1--x2) — body single-stmt o `BEGIN stmt; stmt; END` | DDL | 🟢 (bloques X1+X2 / VERSION 14) |
+| NEW mutable en BEFORE, `IF`/`LOOP`/variables en body, `CREATE FUNCTION`, `CREATE PROCEDURE`, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -1765,15 +1765,17 @@ FROM students;
 
 ---
 
-## Triggers AFTER (bloque X1)
+## Triggers (bloques X1 + X2)
 
-> **`CREATE TRIGGER ... AFTER ... FOR EACH ROW <single_dml>`**: ejecuta una sentencia INSERT/UPDATE/DELETE/REPLACE después de cada fila afectada por un INSERT/UPDATE/DELETE. Casos típicos: auditoría, log de cambios, denormalización, tombstone tables. Persistido en el catálogo (bump VERSION 13 → 14).
+> **`CREATE TRIGGER ... {BEFORE|AFTER} ... FOR EACH ROW <body>`**: ejecuta un body DML antes o después de cada fila afectada por un INSERT/UPDATE/DELETE. Body puede ser una sola sentencia (X1) o un bloque `BEGIN ... END` con múltiples sentencias (X2). Persistido en el catálogo (bump VERSION 13 → 14 en X1; X2 sin bump).
 
 ### 📜 EBNF
 
 ```
-create_trigger ::= "CREATE" "TRIGGER" ident "AFTER" ("INSERT"|"UPDATE"|"DELETE")
-                   "ON" ident "FOR" "EACH" "ROW" dml_stmt
+create_trigger ::= "CREATE" "TRIGGER" ident ("BEFORE"|"AFTER") ("INSERT"|"UPDATE"|"DELETE")
+                   "ON" ident "FOR" "EACH" "ROW" trigger_body
+trigger_body   ::= dml_stmt
+                 | "BEGIN" dml_stmt {";" dml_stmt}* [";"] "END"
 drop_trigger   ::= "DROP" "TRIGGER" ["IF" "EXISTS"] ident
 dml_stmt       ::= insert_stmt | update_stmt | delete_stmt | replace_stmt
 ```
@@ -1821,10 +1823,24 @@ DROP TRIGGER IF EXISTS audit_user_insert;
 | `[GBY-4095] cascada de triggers excedió la profundidad 16` | Recursión runaway (un trigger dispara otro DML que dispara más triggers). |
 | `[GBY-4096] DROP TRIGGER '...': no existe` | Nombre desconocido sin `IF EXISTS`. |
 
+### 🧠 BEFORE vs AFTER
+
+| Aspecto | BEFORE | AFTER |
+|---|---|---|
+| Cuándo corre | Antes del write | Después del write |
+| `NEW` construido | INSERT: user-stated + NULL; UPDATE: OLD + assignments | El row tal cual quedó persistido |
+| `NEW` mutable | ❌ (X2 read-only) | ❌ |
+| Aborta el DML principal si rebota | ✅ (no se escribe nada) | ✅ (lo escrito + el trigger se rollback-ean) |
+
+### 🧠 Body `BEGIN ... END` (X2)
+
+Las sentencias dentro del block se separan con `;` y se ejecutan en orden. Si alguna falla, las restantes NO se ejecutan y el error se propaga al DML principal — toda la transacción rollback. `BEGIN ... END` puede anidarse aunque no agrega expresividad en X2 (no hay scope ni control de flujo).
+
 ### ⚠️ No soportado todavía
 
-- **`BEFORE` triggers** — diferido a X2.
-- **Body multi-statement (`BEGIN ... END`)** — diferido a X2.
+- **NEW mutable en BEFORE** (`NEW.updated_at := NOW()`) — diferido a X3+.
+- **Control de flujo en el body** (`IF`/`LOOP`/`WHILE`, variables `DECLARE`) — diferido a X3+.
+- **`RAISE EXCEPTION` / `RAISE NOTICE`** — workaround: hacer un DML que falle.
 - **`FOR EACH STATEMENT`** (vs `FOR EACH ROW`) — fuera de scope.
 - **`INSTEAD OF` triggers** (sobre vistas) — fuera de scope.
 - **Lenguaje procedural** (variables, IF/THEN, LOOP, EXCEPTION) — X3+.

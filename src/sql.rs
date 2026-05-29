@@ -3085,17 +3085,9 @@ impl<'a> Engine<'a> {
     fn exec_create_trigger(&mut self, stmt: CreateTriggerStmt) -> DbResult<ResultSet> {
         // Validar nombre
         validate_identifier(&stmt.name, "trigger")?;
-        // X1: solo AFTER soportado en este release. BEFORE difiere a X2.
-        if matches!(stmt.timing, TriggerTiming::Before) {
-            return Err(coded(
-                codes::TRIGGER_BODY_INVALID,
-                format!(
-                    "CREATE TRIGGER '{}': BEFORE triggers no se soportan en este release (X1: solo AFTER). \
-                     Workaround: usar AFTER. BEFORE llega en X2.",
-                    stmt.name
-                ),
-            ));
-        }
+        // Bloque X2 (2026-05-28): BEFORE triggers habilitados. (X1
+        // los rechazaba acá; X2 los acepta y los dispara en los
+        // hooks BEFORE de exec_insert/update/delete.)
         // Tabla target debe existir y ser tabla (no vista)
         {
             let mut catalog = Catalog::open(self.pager);
@@ -3208,17 +3200,27 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Bloque X1: helper rápido — ¿hay algún trigger AFTER `event` sobre
-    /// `table`? Usado para skip de snapshots OLD/NEW cuando no aplica.
-    fn has_after_trigger(&mut self, table: &str, event: TriggerEvent) -> DbResult<bool> {
+    /// Bloque X1/X2: helper rápido — ¿hay algún trigger `timing` `event`
+    /// sobre `table`? Usado para skip de snapshots OLD/NEW cuando no
+    /// aplica.
+    fn has_trigger(
+        &mut self,
+        table: &str,
+        event: TriggerEvent,
+        timing: TriggerTiming,
+    ) -> DbResult<bool> {
         let table_norm = normalize_ident(table);
         let mut catalog = Catalog::open(self.pager);
         let trigs = catalog.list_triggers()?;
         Ok(trigs.iter().any(|t| {
             normalize_ident(&t.table) == table_norm
                 && t.event_code == event.code()
-                && t.timing_code == TriggerTiming::After.code()
+                && t.timing_code == timing.code()
         }))
+    }
+    /// Alias retro-compatible con X1.
+    fn has_after_trigger(&mut self, table: &str, event: TriggerEvent) -> DbResult<bool> {
+        self.has_trigger(table, event, TriggerTiming::After)
     }
 
     /// Bloque X1: dispara todos los triggers que matchean (table, event,
@@ -3273,22 +3275,27 @@ impl<'a> Engine<'a> {
             // depender del AST.
             let substituted =
                 substitute_new_old_in_sql_text(&trig.body_sql, new_row, old_row, &trig.name)?;
-            let mut parsed = parse(&substituted)?;
-            if parsed.len() != 1 {
+            let parsed = parse(&substituted)?;
+            if parsed.is_empty() {
                 return Err(coded(
                     codes::TRIGGER_BODY_INVALID,
                     format!(
-                        "trigger '{}': el body persistido contiene {} sentencias (esperaba 1)",
-                        trig.name,
-                        parsed.len()
+                        "trigger '{}': el body persistido está vacío post-substitución",
+                        trig.name
                     ),
                 ));
             }
-            let body_stmt = parsed.remove(0);
+            // Bloque X2 (2026-05-28): body multi-statement — ejecutamos
+            // cada uno en orden. Falla a mitad → propagamos el error;
+            // el wrap del caller hace rollback de toda la transacción.
             self.trigger_depth += 1;
-            let res = self.exec(body_stmt);
+            for body_stmt in parsed {
+                if let Err(e) = self.exec(body_stmt) {
+                    self.trigger_depth -= 1;
+                    return Err(e);
+                }
+            }
             self.trigger_depth -= 1;
-            res?;
         }
         Ok(())
     }
@@ -3950,7 +3957,36 @@ impl<'a> Engine<'a> {
         let mut inserted = 0usize;
         let mut skipped = 0usize;
         let mut replaced = 0usize;
+        // Bloque X2 (2026-05-28): hay BEFORE INSERT triggers?
+        let needs_before_insert =
+            self.has_trigger(&stmt.table, TriggerEvent::Insert, TriggerTiming::Before)?;
         for row_values in rows_to_insert {
+            // Bloque X2: fire BEFORE INSERT con NEW = user-stated cols.
+            // Las columnas no especificadas reciben NULL (los defaults
+            // aún no se aplicaron — limitación documentada).
+            if needs_before_insert {
+                let mut new_map: HashMap<String, Value> = HashMap::new();
+                for (i, col) in normalized_cols.iter().enumerate() {
+                    new_map.insert(
+                        col.clone(),
+                        row_values.get(i).cloned().unwrap_or(Value::Null),
+                    );
+                }
+                // Inicializar columnas no presentes a NULL para que
+                // referencias a NEW.col_no_stated no rebote con 4094.
+                for c in &meta.columns {
+                    new_map
+                        .entry(normalize_ident(&c.name))
+                        .or_insert(Value::Null);
+                }
+                self.fire_triggers(
+                    &stmt.table,
+                    TriggerEvent::Insert,
+                    TriggerTiming::Before,
+                    Some(&new_map),
+                    None,
+                )?;
+            }
             let outcome = self.apply_insert_row_with_conflict(
                 &meta,
                 &normalized_cols,
@@ -6882,11 +6918,13 @@ impl<'a> Engine<'a> {
 
         let mut updated = 0usize;
         let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
-        // Bloque X1 (2026-05-28): detectar si hay triggers AFTER UPDATE
-        // sobre esta tabla — si los hay, snapshot OLD antes de cada
-        // update para pasárselo al body. Si no hay, evitamos la lectura
-        // extra para no pagar el overhead.
-        let needs_old_snapshot = self.has_after_trigger(&meta.name, TriggerEvent::Update)?;
+        // Bloque X1/X2: detectar si hay triggers AFTER/BEFORE UPDATE
+        // sobre esta tabla — si los hay, necesitamos OLD y NEW.
+        let needs_after =
+            self.has_trigger(&meta.name, TriggerEvent::Update, TriggerTiming::After)?;
+        let needs_before =
+            self.has_trigger(&meta.name, TriggerEvent::Update, TriggerTiming::Before)?;
+        let needs_old_snapshot = needs_after || needs_before;
         for pk in &target_pks {
             let old_row: Option<HashMap<String, Value>> = if needs_old_snapshot {
                 let bytes = {
@@ -6897,22 +6935,46 @@ impl<'a> Engine<'a> {
             } else {
                 None
             };
+            // Bloque X2 (2026-05-28): fire BEFORE UPDATE con OLD y
+            // NEW = OLD + assignments evaluados contra OLD. Eso
+            // produce un NEW best-effort sin tocar disco; los efectos
+            // del trigger BEFORE quedan en otras tablas (X2 no
+            // permite mutar NEW desde el trigger).
+            if needs_before {
+                let new_pre: HashMap<String, Value> = if let Some(old) = &old_row {
+                    let mut new_map = old.clone();
+                    for (col, expr) in &expr_assignments {
+                        let v = self.eval_expr_full(expr, old, Some(meta.name.as_str()))?;
+                        new_map.insert(normalize_ident(col), v);
+                    }
+                    new_map
+                } else {
+                    HashMap::new()
+                };
+                self.fire_triggers(
+                    &meta.name,
+                    TriggerEvent::Update,
+                    TriggerTiming::Before,
+                    Some(&new_pre),
+                    old_row.as_ref(),
+                )?;
+            }
             self.apply_update_to_pk(&meta, *pk, &expr_assignments)?;
             updated += 1;
             // X1: re-leer la fila para tener NEW. Si la PK cambió, el
             // row movió a otra clave — para X1 firewall con NEW=None
             // (el body que use NEW.x devolverá [GBY-4094]).
-            let new_row: Option<HashMap<String, Value>> =
-                if needs_old_snapshot || stmt.returning.is_some() {
-                    let bytes = {
-                        let mut catalog = Catalog::open(self.pager);
-                        catalog.get_row(meta.root_page, *pk)?
-                    };
-                    bytes.map(|b| decode_row(&meta, &b)).transpose()?
-                } else {
-                    None
+            let new_row: Option<HashMap<String, Value>> = if needs_after || stmt.returning.is_some()
+            {
+                let bytes = {
+                    let mut catalog = Catalog::open(self.pager);
+                    catalog.get_row(meta.root_page, *pk)?
                 };
-            if needs_old_snapshot {
+                bytes.map(|b| decode_row(&meta, &b)).transpose()?
+            } else {
+                None
+            };
+            if needs_after {
                 self.fire_triggers(
                     &meta.name,
                     TriggerEvent::Update,
@@ -7754,10 +7816,13 @@ impl<'a> Engine<'a> {
                 continue;
             }
             // Bloque J2: snapshot de la fila ANTES del delete para RETURNING.
-            // Bloque X1 (2026-05-28): si hay triggers AFTER DELETE,
-            // necesitamos la fila ANTES del delete para pasar como OLD.
-            let needs_old = stmt.returning.is_some()
-                || self.has_after_trigger(&meta.name, TriggerEvent::Delete)?;
+            // Bloque X1/X2 (2026-05-28): si hay triggers BEFORE o AFTER
+            // DELETE necesitamos la fila para pasar como OLD.
+            let needs_after_del =
+                self.has_trigger(&meta.name, TriggerEvent::Delete, TriggerTiming::After)?;
+            let needs_before_del =
+                self.has_trigger(&meta.name, TriggerEvent::Delete, TriggerTiming::Before)?;
+            let needs_old = stmt.returning.is_some() || needs_after_del || needs_before_del;
             let old_row: Option<HashMap<String, Value>> = if needs_old {
                 let bytes = {
                     let mut catalog = Catalog::open(self.pager);
@@ -7772,16 +7837,28 @@ impl<'a> Engine<'a> {
                     affected_rows.push(r.clone());
                 }
             }
+            // Bloque X2: BEFORE DELETE con OLD.
+            if needs_before_del {
+                self.fire_triggers(
+                    &meta.name,
+                    TriggerEvent::Delete,
+                    TriggerTiming::Before,
+                    None,
+                    old_row.as_ref(),
+                )?;
+            }
             delete_with_cascade(self.pager, &meta.name, pk)?;
             deleted += 1;
             // Bloque X1: fire AFTER DELETE con OLD.
-            self.fire_triggers(
-                &meta.name,
-                TriggerEvent::Delete,
-                TriggerTiming::After,
-                None,
-                old_row.as_ref(),
-            )?;
+            if needs_after_del {
+                self.fire_triggers(
+                    &meta.name,
+                    TriggerEvent::Delete,
+                    TriggerTiming::After,
+                    None,
+                    old_row.as_ref(),
+                )?;
+            }
         }
 
         if let Some(returning) = &stmt.returning {
@@ -8592,6 +8669,13 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut in_string = false;
+    // Bloque X2 (2026-05-28): los `;` dentro de un bloque `BEGIN ... END`
+    // (cuerpo de un trigger multi-statement) NO terminan el statement
+    // outer. Llevamos un contador de BEGIN profundidad: cada `BEGIN`
+    // keyword fuera de string +1, cada `END` -1. Mientras > 0 los `;`
+    // viajan dentro del current chunk. No-nested en X2 (un solo nivel
+    // de profundidad) pero el contador lo soporta naturalmente.
+    let mut begin_depth: usize = 0;
     let bytes = sql.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -8607,7 +8691,49 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             index += 1;
             continue;
         }
-        if ch == ';' && !in_string {
+        if !in_string {
+            // Detectar keyword `BEGIN` o `END` con boundaries de
+            // ident a ambos lados (para no confundir con substring
+            // dentro de un ident más largo como `BEGINNING`).
+            if (ch == 'B' || ch == 'b')
+                && match_keyword_at(bytes, index, b"BEGIN")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 5)
+            {
+                // Disambiguar entre tx `BEGIN [TRANSACTION];` y bloque
+                // `BEGIN ... END` de trigger body. Lookahead: si lo
+                // que sigue (skipping whitespace) es `;`, EOF, o el
+                // keyword `TRANSACTION`, es transacción y NO opens
+                // block; cualquier otro keyword (INSERT/UPDATE/DELETE/
+                // REPLACE/SELECT/...) es block-open.
+                let mut la = index + 5;
+                while la < bytes.len() && (bytes[la] as char).is_whitespace() {
+                    la += 1;
+                }
+                let is_tx_begin = la >= bytes.len()
+                    || (bytes[la] as char) == ';'
+                    || match_keyword_at(bytes, la, b"TRANSACTION")
+                        && !is_ident_byte_at(bytes, la + 11);
+                if !is_tx_begin {
+                    begin_depth += 1;
+                }
+                current.push_str(&sql[index..index + 5]);
+                index += 5;
+                continue;
+            }
+            if (ch == 'E' || ch == 'e')
+                && match_keyword_at(bytes, index, b"END")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 3)
+                && begin_depth > 0
+            {
+                begin_depth -= 1;
+                current.push_str(&sql[index..index + 3]);
+                index += 3;
+                continue;
+            }
+        }
+        if ch == ';' && !in_string && begin_depth == 0 {
             let stmt = current.trim();
             if !stmt.is_empty() {
                 out.push(stmt.to_string());
@@ -8624,6 +8750,32 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         out.push(tail.to_string());
     }
     out
+}
+
+/// Bloque X2: ayuda a `split_statements` — chequea si en `bytes[idx..]`
+/// arranca exactamente el keyword `kw` (case-insensitive). Solo
+/// compara los bytes; el chequeo de boundaries lo hace el caller.
+fn match_keyword_at(bytes: &[u8], idx: usize, kw: &[u8]) -> bool {
+    if idx + kw.len() > bytes.len() {
+        return false;
+    }
+    for (i, &k) in kw.iter().enumerate() {
+        if bytes[idx + i].eq_ignore_ascii_case(&k) {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Bloque X2: ¿el byte en `idx` (si existe) es parte de un ident?
+/// Usado para detectar boundaries antes/después de un keyword.
+fn is_ident_byte_at(bytes: &[u8], idx: usize) -> bool {
+    if idx >= bytes.len() {
+        return false;
+    }
+    let ch = bytes[idx] as char;
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult<(i64, Vec<u8>)> {
@@ -13255,6 +13407,18 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                     ));
                 }
             }
+            // Bloque X2 (2026-05-28): `;` como Symbol. Pre-X2 nunca llegaba
+            // al tokenizer porque `split_statements` lo consumía antes.
+            // Con triggers multi-statement (`BEGIN s; s; END`) los `;`
+            // internos viajan dentro del chunk; el tokenizer los emite
+            // como Symbol(";") y el parser de bodies los maneja.
+            ';' => {
+                tokens.push(Token {
+                    kind: TokenKind::Symbol,
+                    text: ";".to_string(),
+                });
+                index += 1;
+            }
             _ => return Err(DbError::new(format!("carÃ¡cter no soportado: {}", ch))),
         }
     }
@@ -14564,39 +14728,79 @@ impl Parser {
         //    de NEW/OLD → literales) — el parser ahí ve SQL ya
         //    estándar y rechaza si es inválido.
         let head = self.peek().clone();
-        if head.kind != TokenKind::Ident
-            || !matches!(
-                head.text.to_ascii_uppercase().as_str(),
-                "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
-            )
-        {
-            return Err(coded(
-                codes::TRIGGER_BODY_INVALID,
-                format!(
-                    "CREATE TRIGGER ... FOR EACH ROW: el body debe arrancar con INSERT, UPDATE, DELETE o REPLACE (vi '{}')",
-                    head.text
-                ),
-            ));
-        }
-        let start = self.pos;
-        // Consumir tokens del body hasta `;` o EOF. El statement
-        // splitter de `parse()` ya separa por `;`, así que llegamos
-        // acá con un único statement-chunk; sólo necesitamos avanzar
-        // hasta el final del chunk.
-        while self.peek().kind != TokenKind::Eof {
-            if self.peek().kind == TokenKind::Symbol && self.peek().text == ";" {
-                break;
+        // Bloque X2 (2026-05-28): el body puede ser:
+        //   a) Single statement: INSERT/UPDATE/DELETE/REPLACE seguido de
+        //      tokens hasta `;` o EOF (X1 path, retrocompatible).
+        //   b) Multi statement: `BEGIN stmt; stmt; ... END` (X2 nuevo).
+        //      `split_statements` ya conserva los `;` internos cuando
+        //      hay BEGIN abierto, así que acá vemos toda la secuencia.
+        let body_sql = if head.kind == TokenKind::Ident && head.text.eq_ignore_ascii_case("BEGIN") {
+            self.pos += 1; // consume BEGIN
+            let start = self.pos;
+            // Consumir hasta el END matching (no soportamos nesting en X2;
+            // depth==0 al inicio del body, +1 por cada BEGIN dentro, -1
+            // por cada END dentro).
+            let mut depth = 1usize;
+            while depth > 0 {
+                let t = self.peek().clone();
+                if t.kind == TokenKind::Eof {
+                    return Err(coded(
+                        codes::TRIGGER_BODY_INVALID,
+                        "CREATE TRIGGER ... BEGIN: falta el END que cierra el bloque",
+                    ));
+                }
+                if t.kind == TokenKind::Ident {
+                    if t.text.eq_ignore_ascii_case("BEGIN") {
+                        depth += 1;
+                    } else if t.text.eq_ignore_ascii_case("END") {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                self.pos += 1;
             }
-            self.pos += 1;
-        }
-        let end = self.pos;
-        if start == end {
-            return Err(coded(
-                codes::TRIGGER_BODY_INVALID,
-                "CREATE TRIGGER ... FOR EACH ROW: body vacío",
-            ));
-        }
-        let body_sql = reconstruct_sql_from_tokens(&self.tokens[start..end]);
+            let end = self.pos;
+            self.pos += 1; // consume END
+            if start == end {
+                return Err(coded(
+                    codes::TRIGGER_BODY_INVALID,
+                    "CREATE TRIGGER ... BEGIN END: body vacío",
+                ));
+            }
+            reconstruct_sql_from_tokens(&self.tokens[start..end])
+        } else {
+            if head.kind != TokenKind::Ident
+                || !matches!(
+                    head.text.to_ascii_uppercase().as_str(),
+                    "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+                )
+            {
+                return Err(coded(
+                    codes::TRIGGER_BODY_INVALID,
+                    format!(
+                        "CREATE TRIGGER ... FOR EACH ROW: el body debe arrancar con INSERT, UPDATE, DELETE, REPLACE o BEGIN (vi '{}')",
+                        head.text
+                    ),
+                ));
+            }
+            let start = self.pos;
+            while self.peek().kind != TokenKind::Eof {
+                if self.peek().kind == TokenKind::Symbol && self.peek().text == ";" {
+                    break;
+                }
+                self.pos += 1;
+            }
+            let end = self.pos;
+            if start == end {
+                return Err(coded(
+                    codes::TRIGGER_BODY_INVALID,
+                    "CREATE TRIGGER ... FOR EACH ROW: body vacío",
+                ));
+            }
+            reconstruct_sql_from_tokens(&self.tokens[start..end])
+        };
         Ok(Statement::CreateTrigger(CreateTriggerStmt {
             name,
             table,
