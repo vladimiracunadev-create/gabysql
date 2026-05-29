@@ -382,7 +382,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ❌ (diferido a Y2 — requiere `Value::Decimal`) | P1 |
 | Enforcement de longitud VARCHAR(n) / CHAR(n) | ✅ (Y2, 2026-05-29; bytes UTF-8) | — |
 | Enforcement de rango SMALLINT / TINYINT / MEDIUMINT / INT4 | ✅ (Y3, 2026-05-29) | — |
-| `UNSIGNED TINYINT` / `UNSIGNED SMALLINT` / etc. (MySQL-style) | ❌ (Y3 sólo enforce signed; diferido) | P3 |
+| `TINYINT UNSIGNED` / `SMALLINT UNSIGNED` / `MEDIUMINT UNSIGNED` / `INT4 UNSIGNED` / `BIGINT UNSIGNED` | ✅ (Y5, 2026-05-29; reusa byte int_width con high bit 0x80; `[GBY-4121]`) | — |
+| `UNSIGNED BIGINT` real (u64, no limitado por i64) | ❌ (Y5 sólo enforce >= 0 con upper bound i64::MAX; diferido) | P3 |
+| `gen_random_uuid()` / `uuid_v4()` / `uuid_generate_v4()` / `random_uuid()` | ✅ (Y5, 2026-05-29; xorshift PRNG no-crypto, RFC 4122 §4.4) | — |
 | `CHAR(n)` con padding a la derecha (estándar SQL) | ❌ (diferido) | P3 |
 | Conteo por code points en VARCHAR(n) (vs bytes UTF-8) | ❌ (diferido) | P3 |
 | `ARRAY[]` | ❌ (diferido) | P3 |
@@ -391,7 +393,8 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `TIME WITH TIME ZONE` / `TIMESTAMP WITH TIME ZONE` | ❌ (diferido) | P3 |
 | `GEOMETRY` / `GEOGRAPHY` (PostGIS-like) | ❌ | P3 |
 | `INET` / `CIDR` (red) | ❌ | P3 |
-| `gen_random_uuid()` / `uuid_v4()` (UUID auto-gen) | ❌ (diferido) | P2 |
+| UUID auto-gen v4 random (`gen_random_uuid`/`uuid_v4`/`uuid_generate_v4`/`random_uuid`) | ✅ (Y5, 2026-05-29) | — |
+| UUID v1/v6/v7 timestamp-based | ❌ (Y5 sólo v4 random; diferido) | P3 |
 
 ---
 

@@ -155,7 +155,14 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        gana variante `Bytes(Vec<u8>)`. Literales SQL via `X'hex'`.
 //        V19 rechazados con `[GBY-1003]` porque un schema V20 puede
 //        tener columnas BLOB que V19 no sabe leer.
-pub const VERSION: u32 = 20;
+//  21 -> Bloque Y5 (2026-05-29): UNSIGNED enforcement para
+//        `TINYINT|SMALLINT|MEDIUMINT|INT4|INT|BIGINT` (sintaxis
+//        MySQL `<tipo> UNSIGNED`). Reutiliza el byte `int_width`:
+//        high bit 0x80 = unsigned, low 4 bits = width (1..=4) o 0
+//        para "sin width" (BIGINT UNSIGNED, rango 0..i64::MAX).
+//        V20 rechazados con `[GBY-1003]` porque podría haber bytes
+//        0x80+ que V20 interpreta como widths inválidos.
+pub const VERSION: u32 = 21;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

@@ -48,7 +48,8 @@
 
 | `VERSION` del header | Estado | Notas |
 | :--- | :--- | :--- |
-| `20` | 🟢 Actual | Bloque Y4 (2026-05-29). Nuevo `ColumnType::Blob` (code=10) con encoding propio (u32 LE length + raw bytes). `Value::Bytes(Vec<u8>)`. Aliases `BLOB`/`BYTEA`/`BINARY`/`VARBINARY`. Literal SQL `X'hex'` con nuevo `TokenKind::Blob`. `[GBY-4122]` para hex inválido (ADR-0044). Rechaza VERSION 19 con `[GBY-1003]`. |
+| `21` | 🟢 Actual | Bloque Y5 (2026-05-29). Reusa el byte `int_width` de Y3 con high bit `0x80` = unsigned (low 4 bits = width). Habilita `TINYINT UNSIGNED` / `SMALLINT UNSIGNED` / `MEDIUMINT UNSIGNED` / `INT4 UNSIGNED` / `BIGINT UNSIGNED`. Reutiliza `[GBY-4121]` para violaciones de rango (ADR-0045). Rechaza VERSION 20 con `[GBY-1003]`. |
+| `20` | 🔴 Rechazado | Bloque Y4 (2026-05-29). Nuevo `ColumnType::Blob` (code=10) con encoding propio (u32 LE length + raw bytes). `Value::Bytes(Vec<u8>)`. Aliases `BLOB`/`BYTEA`/`BINARY`/`VARBINARY`. Literal SQL `X'hex'` con nuevo `TokenKind::Blob`. `[GBY-4122]` para hex inválido (ADR-0044). Migrar via export/import. |
 | `19` | 🔴 Rechazado | Bloque Y3 (2026-05-29). Flag bit `COLUMN_FLAG_HAS_INT_WIDTH = 0x10` + `u8` por columna (1=TINYINT, 2=SMALLINT/INT2, 3=MEDIUMINT, 4=INT4). Habilita enforcement de rango con `[GBY-4121]` (ADR-0043). Migrar via export/import. |
 | `18` | 🔴 Rechazado | Bloque Y2 (2026-05-29). Flag bit `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08` + `u32` adicional por columna cuando está prendido. Habilita enforcement real de `VARCHAR(n)` / `CHAR(n)` en bytes UTF-8 con `[GBY-4119]` (ADR-0040). Migrar via export/import. |
 | `17` | 🔴 Rechazado | Bloque Y (2026-05-29). Dos códigos nuevos para tipos: `8 = TIME` y `9 = UUID` (ambos `stores_as_text`). Aliases sintácticos (`BIGINT`, `VARCHAR(n)`, `DECIMAL(p,s)`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, …) no requirieron bump por sí solos — mapean a tipos existentes (ADR-0039). Migrar via export/import. |

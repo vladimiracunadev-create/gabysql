@@ -12838,6 +12838,184 @@ fn y4_unsupported_type_geometry_still_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y5 (2026-05-29): UNSIGNED enforcement + gen_random_uuid().
+// Bump VERSION 20→21 — int_width gana high bit 0x80 = unsigned.
+// ============================================================
+
+fn y5_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y5-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y5_tinyint_unsigned_in_range_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("tiny-u-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT UNSIGNED);
+         INSERT INTO t (id, n) VALUES (1, 0);
+         INSERT INTO t (id, n) VALUES (2, 255);
+         INSERT INTO t (id, n) VALUES (3, 128);",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_tinyint_unsigned_negative_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("tiny-u-neg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT UNSIGNED);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, -1);");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4121"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_tinyint_unsigned_over_range_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("tiny-u-over")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n TINYINT UNSIGNED);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 300);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_smallint_unsigned_range() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("small-u")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n SMALLINT UNSIGNED);
+         INSERT INTO t (id, n) VALUES (1, 65535);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (2, 70000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_int4_unsigned_range() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("int4-u")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT4 UNSIGNED);
+         INSERT INTO t (id, n) VALUES (1, 4294967295);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (2, 5000000000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_bigint_unsigned_rejects_negative() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("big-u-neg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n BIGINT UNSIGNED);
+         INSERT INTO t (id, n) VALUES (1, 9223372036854775807);",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (2, -1);");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4121"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_unsigned_persists_across_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n SMALLINT UNSIGNED);",
+    )?;
+    // run_sql cierra entre invocaciones — reopen carga el catálogo y
+    // debe enforcer 70000 > 65535 → error.
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 70000);");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_signed_still_works_unchanged() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("signed")?;
+    // Regression Y3: SMALLINT sin UNSIGNED sigue siendo signed.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n SMALLINT);
+         INSERT INTO t (id, n) VALUES (1, -32768);
+         INSERT INTO t (id, n) VALUES (2, 32767);",
+    )?;
+    let res = run_sql(&db, "SELECT n FROM t ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_gen_random_uuid_returns_valid_uuid() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("uuid-shape")?;
+    run_sql(
+        &db,
+        "CREATE TABLE one (n INT PRIMARY KEY); INSERT INTO one (n) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT GEN_RANDOM_UUID() FROM one;")?;
+    let v = match &res[0].rows[0][0] {
+        Value::String(s) => s.clone(),
+        other => panic!("esperaba String, vi {other:?}"),
+    };
+    // 8-4-4-4-12 con guiones en posiciones 8,13,18,23
+    assert_eq!(v.len(), 36, "uuid len != 36: {v}");
+    assert_eq!(&v[8..9], "-");
+    assert_eq!(&v[13..14], "-");
+    assert_eq!(&v[18..19], "-");
+    assert_eq!(&v[23..24], "-");
+    // version 4 → char en pos 14 es '4'
+    assert_eq!(&v[14..15], "4", "version nibble no es 4: {v}");
+    // variant 10xx → char en pos 19 es '8','9','a' o 'b'
+    let variant = &v[19..20];
+    assert!(
+        matches!(variant, "8" | "9" | "a" | "b"),
+        "variant nibble inesperado: {v}"
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y5_uuid_v4_alias_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y5_setup("uuid-alias")?;
+    run_sql(
+        &db,
+        "CREATE TABLE one (n INT PRIMARY KEY); INSERT INTO one (n) VALUES (1);",
+    )?;
+    let res = run_sql(&db, "SELECT UUID_V4() FROM one;")?;
+    if let Value::String(s) = &res[0].rows[0][0] {
+        assert_eq!(s.len(), 36);
+    } else {
+        panic!("esperaba String");
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

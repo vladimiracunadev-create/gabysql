@@ -1333,6 +1333,11 @@ pub enum ScalarFunc {
     Nullif,
     Ifnull,
     If,
+    /// Bloque Y5 (2026-05-29): genera un UUID v4-shape (random) en
+    /// formato canónico `8-4-4-4-12`. Zero-arg. PRNG interno xorshift
+    /// seeded por SystemTime (no criptográfico — para tests / IDs
+    /// no-secretos).
+    GenRandomUuid,
 }
 
 impl ScalarFunc {
@@ -1367,6 +1372,7 @@ impl ScalarFunc {
             ScalarFunc::Nullif => "NULLIF",
             ScalarFunc::Ifnull => "IFNULL",
             ScalarFunc::If => "IF",
+            ScalarFunc::GenRandomUuid => "GEN_RANDOM_UUID",
         }
     }
 
@@ -1404,6 +1410,10 @@ impl ScalarFunc {
             "NULLIF" => Some(ScalarFunc::Nullif),
             "IFNULL" => Some(ScalarFunc::Ifnull),
             "IF" | "IIF" => Some(ScalarFunc::If),
+            // Bloque Y5: aliases comunes para UUID v4 random.
+            "GEN_RANDOM_UUID" | "UUID_V4" | "UUID_GENERATE_V4" | "RANDOM_UUID" => {
+                Some(ScalarFunc::GenRandomUuid)
+            }
             _ => None,
         }
     }
@@ -13249,7 +13259,10 @@ fn validate_scalar_arity(f: ScalarFunc, n: usize) -> DbResult<()> {
         | ScalarFunc::Extract
         | ScalarFunc::Strftime => n == 2,
         ScalarFunc::Replace | ScalarFunc::SplitPart | ScalarFunc::If => n == 3,
-        ScalarFunc::Now | ScalarFunc::CurrentDate | ScalarFunc::CurrentTimestamp => n == 0,
+        ScalarFunc::Now
+        | ScalarFunc::CurrentDate
+        | ScalarFunc::CurrentTimestamp
+        | ScalarFunc::GenRandomUuid => n == 0,
     };
     if ok {
         return Ok(());
@@ -14184,6 +14197,7 @@ fn eval_scalar_fn(f: ScalarFunc, args: Vec<Value>) -> DbResult<Value> {
             // primeros 10 chars son YYYY-MM-DD.
             Ok(Value::String(dt[..10].to_string()))
         }
+        ScalarFunc::GenRandomUuid => Ok(Value::String(gen_uuid_v4())),
         // -------- Bloque G3: string P2/P3 --------
         ScalarFunc::Trim => match &args[0] {
             Value::String(s) => Ok(Value::String(s.trim().to_string())),
@@ -14938,27 +14952,54 @@ pub(crate) fn extract_length_param(type_name: &str) -> Option<u32> {
     inner.parse::<u32>().ok()
 }
 
-/// Bloque Y3 (2026-05-29): devuelve `(min, max)` para un `int_width`
-/// dado (1=TINYINT, 2=SMALLINT, 3=MEDIUMINT, 4=INT4). Otros valores
-/// devuelven el rango i64 completo (no-op enforcement).
+/// Bloque Y3 (2026-05-29) + Y5 (2026-05-29): devuelve `(min, max)` para
+/// un `int_width` dado. El byte codifica:
+///
+/// - Low 4 bits: width signed → 1=TINYINT (i8), 2=SMALLINT (i16),
+///   3=MEDIUMINT (24-bit), 4=INT4 (i32), 0=sin width (i64 default).
+/// - High bit `0x80` (Y5): si está prendido, el rango es UNSIGNED
+///   sobre el width: TINYINT UNSIGNED 0..=255, SMALLINT UNSIGNED
+///   0..=65535, MEDIUMINT UNSIGNED 0..=16777215, INT4 UNSIGNED
+///   0..=u32::MAX, BIGINT UNSIGNED 0..=i64::MAX (el motor sigue
+///   usando i64 internamente — los u64 más grandes que i64::MAX
+///   no se pueden representar).
 pub(crate) fn int_width_range(width: u8) -> (i64, i64) {
-    match width {
-        1 => (i8::MIN as i64, i8::MAX as i64),
-        2 => (i16::MIN as i64, i16::MAX as i64),
-        3 => (-8_388_608, 8_388_607),
-        4 => (i32::MIN as i64, i32::MAX as i64),
-        _ => (i64::MIN, i64::MAX),
+    let unsigned = (width & 0x80) != 0;
+    let w = width & 0x0F;
+    if unsigned {
+        match w {
+            1 => (0, u8::MAX as i64),
+            2 => (0, u16::MAX as i64),
+            3 => (0, 16_777_215),
+            4 => (0, u32::MAX as i64),
+            _ => (0, i64::MAX),
+        }
+    } else {
+        match w {
+            1 => (i8::MIN as i64, i8::MAX as i64),
+            2 => (i16::MIN as i64, i16::MAX as i64),
+            3 => (-8_388_608, 8_388_607),
+            4 => (i32::MIN as i64, i32::MAX as i64),
+            _ => (i64::MIN, i64::MAX),
+        }
     }
 }
 
-/// Bloque Y3: label legible del ancho INT para mensajes de error.
+/// Bloque Y3 + Y5: label legible del ancho INT para mensajes de error.
 pub(crate) fn int_width_label(width: u8) -> &'static str {
-    match width {
-        1 => "TINYINT",
-        2 => "SMALLINT",
-        3 => "MEDIUMINT",
-        4 => "INT4",
-        _ => "INT",
+    let unsigned = (width & 0x80) != 0;
+    let w = width & 0x0F;
+    match (unsigned, w) {
+        (false, 1) => "TINYINT",
+        (false, 2) => "SMALLINT",
+        (false, 3) => "MEDIUMINT",
+        (false, 4) => "INT4",
+        (false, _) => "INT",
+        (true, 1) => "TINYINT UNSIGNED",
+        (true, 2) => "SMALLINT UNSIGNED",
+        (true, 3) => "MEDIUMINT UNSIGNED",
+        (true, 4) => "INT4 UNSIGNED",
+        (true, _) => "BIGINT UNSIGNED",
     }
 }
 
@@ -15057,6 +15098,50 @@ fn looks_like_datetime(s: &str) -> bool {
         && b[14..16].iter().all(u8::is_ascii_digit)
         && b[16] == b':'
         && b[17..19].iter().all(u8::is_ascii_digit)
+}
+
+/// Bloque Y5 (2026-05-29): genera un UUID v4 (random) en formato
+/// canónico `8-4-4-4-12` lowercase. El PRNG es xorshift64 seeded por
+/// `SystemTime` nanos — **no es criptográficamente seguro**, pero
+/// alcanza para IDs no-secretos (test data, surrogate keys, …).
+///
+/// El layout sigue RFC 4122 §4.4: 16 bytes random, version=4 en el
+/// nibble alto de byte[6], variant=10xx en el nibble alto de byte[8].
+fn gen_uuid_v4() -> String {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ 0xa5a5_a5a5_a5a5_a5a5;
+    let mut state = if seed == 0 {
+        0xdead_beef_cafe_babe
+    } else {
+        seed
+    };
+    let mut bytes = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let chunk = state.to_le_bytes();
+        let take = (16 - i).min(8);
+        bytes[i..i + take].copy_from_slice(&chunk[..take]);
+        i += take;
+    }
+    // version (4) en nibble alto de byte 6
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    // variant (10xx) en nibble alto de byte 8
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 /// Bloque G1: formatea el instante actual como `YYYY-MM-DD HH:MM:SS` en
@@ -17895,6 +17980,10 @@ impl Parser {
     ) -> DbResult<ColumnDef> {
         let name = self.expect_ident()?;
         let type_name = self.parse_type_name()?;
+        // Bloque Y5 (2026-05-29): keyword `UNSIGNED` opcional tras el
+        // type_name. Solo aplica a tipos INT — para otros tipos se
+        // ignora silentemente (se descartará en exec_create).
+        let unsigned = self.match_keyword("UNSIGNED");
         let mut primary_key = false;
         let mut not_null = false;
         let mut unique = false;
@@ -17960,7 +18049,16 @@ impl Parser {
             }
         }
         let max_length = extract_length_param(&type_name);
-        let int_width = extract_int_width(&type_name);
+        // Bloque Y5: si se vio `UNSIGNED`, settamos el high bit del
+        // int_width existente. Si extract_int_width devolvió None
+        // (BIGINT/INT/INTEGER/INT8), usamos 0x80 (= unsigned sin
+        // width restriction → rango 0..i64::MAX).
+        let int_width = match (extract_int_width(&type_name), unsigned) {
+            (Some(w), true) => Some(w | 0x80),
+            (Some(w), false) => Some(w),
+            (None, true) => Some(0x80),
+            (None, false) => None,
+        };
         Ok(ColumnDef {
             name,
             type_name,

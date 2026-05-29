@@ -6,6 +6,65 @@
 
 ---
 
+## 2026-05-29 — Bloque Y5: `UNSIGNED` enforcement + `gen_random_uuid()`
+
+> **Un push a `main`** con **bump on-disk 20 → 21**. Reusa el byte `int_width` de Y3 con high bit = unsigned. Sin nuevos códigos de error. Bundle con `gen_random_uuid()` (UUID v4 random). Detalle en [`docs/adr/0045-unsigned-and-uuid-y5.md`](docs/adr/0045-unsigned-and-uuid-y5.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- UNSIGNED MySQL-style
+CREATE TABLE eventos (
+    id          INT PRIMARY KEY,
+    counter     TINYINT UNSIGNED,     -- 0..=255
+    age_years   SMALLINT UNSIGNED,    -- 0..=65535
+    epoch_ms    BIGINT UNSIGNED       -- 0..=i64::MAX
+);
+
+INSERT INTO eventos (id, counter) VALUES (1, 200);   -- OK
+INSERT INTO eventos (id, counter) VALUES (2, -1);    -- [GBY-4121]
+INSERT INTO eventos (id, counter) VALUES (3, 300);   -- [GBY-4121]
+
+-- UUID v4 random
+SELECT GEN_RANDOM_UUID();    -- '5f8b1c2d-4e7a-4b8c-9d0e-1f2a3b4c5d6e'
+SELECT UUID_V4();            -- alias
+SELECT UUID_GENERATE_V4();   -- alias estilo PostgreSQL
+SELECT RANDOM_UUID();        -- alias
+```
+
+### 🛠 Implementación
+
+- **UNSIGNED**: reusa el byte `int_width` de Y3. High bit `0x80` = unsigned, low 4 bits = width existente.
+- **`int_width_range(byte)`**: extendido para chequear el sign bit y devolver el rango correcto (u8/u16/24-bit unsigned/u32/i64-positive).
+- **`int_width_label(byte)`**: devuelve `"TINYINT UNSIGNED"` etc. para mensajes de error legibles.
+- **Parser**: `parse_column_def` agrega `match_keyword("UNSIGNED")` tras `parse_type_name`. Si el tipo no es INT, el flag se ignora.
+- **`BIGINT UNSIGNED`** no llega a u64 real — limitado por el `i64` interno del motor. Documentado.
+- **`gen_random_uuid()`**: nueva `ScalarFunc::GenRandomUuid` con aliases `UUID_V4` / `UUID_GENERATE_V4` / `RANDOM_UUID`. PRNG interno xorshift64 seeded por `SystemTime::nanos` — **no criptográfico**. Sigue RFC 4122 §4.4 para los nibbles de version (4) y variant (10xx). Cero deps externas.
+- **Bump 20 → 21**: V20 no sabe interpretar los bytes `0x8X` en `int_width`. V20 rechazado con `[GBY-1003]`.
+
+### 🚫 Sin nuevos códigos de error
+
+Reutiliza `[GBY-4121]` `INT_RANGE_EXCEEDED` para violaciones de UNSIGNED — el mensaje identifica el tipo como `TINYINT UNSIGNED` etc.
+
+### 🚫 Diferido (Y6 y más allá)
+
+- **`DECIMAL(p,s)` exacto** — el item grande que queda.
+- **`UNSIGNED BIGINT` real (u64)** — requiere ampliar `Value::Integer`.
+- **`CHAR(n)` con padding** ANSI strict.
+- **Conteo por code points** en VARCHAR(n).
+- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**, **TZ types**.
+- **BLOB indexable** (overflow chain).
+- **`CONVERT(blob USING utf8)`**.
+- **UUID v1/v6/v7** timestamp-based.
+- **`gen_random_bytes(n)`**.
+
+### 🧪 Validación
+
+- 10 tests `y5_*`: TINYINT UNSIGNED in range / negative rejected / over range rejected, SMALLINT UNSIGNED, INT4 UNSIGNED (u32::MAX), BIGINT UNSIGNED rechaza negativo, reopen mantiene UNSIGNED, signed sigue funcionando (regression Y3), `GEN_RANDOM_UUID()` formato canónico + version/variant correctos, alias `UUID_V4()`.
+- Suite total: **567/567 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y4: `BLOB` / `BYTEA` / `BINARY` — bytes crudos
 
 > **Un push a `main`** con **bump on-disk 19 → 20**. Abre una **nueva familia** de tipos: binario crudo. Detalle en [`docs/adr/0044-blob-bytea-y4.md`](docs/adr/0044-blob-bytea-y4.md).
