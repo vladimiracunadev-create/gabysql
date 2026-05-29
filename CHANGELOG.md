@@ -6,6 +6,51 @@
 
 ---
 
+## 2026-05-29 — Bloque Y8: Mul/Div/Mod `DECIMAL` exactos
+
+> **Un push a `main`** sin bump on-disk. Cierra el ciclo Y6→Y7→Y8 con los 3 operadores que faltaban: `*`/`/`/`%` ahora son exactos en Decimal-puro. Detalle en [`docs/adr/0048-decimal-mul-div-mod-y8.md`](docs/adr/0048-decimal-mul-div-mod-y8.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+SELECT 0.10 * 0.10;                          -- 0.0100 EXACTO (no 0.01000000004)
+SELECT 1.00 / 3.00;                          -- 0.333333 (trunca, scale=6)
+SELECT 10.00 % 3.00;                         -- 1.00 exacto
+
+SELECT price * qty FROM line_items;          -- exacto, scale = a.scale + b.scale
+SELECT total / count FROM stats;             -- target_scale = max(a.scale, b.scale, 6)
+```
+
+### 🛠 Implementación
+
+- **Mul**: `result_scale = a.scale + b.scale`. Si excede 38 → `[GBY-4123]`. `result_value = a.value.checked_mul(b.value)`; overflow → `[GBY-4042]`.
+- **Div**: `target_scale = max(a.scale, b.scale, 6)` — mínimo 6 decimales (estilo SQL Server). Pre-shift del dividend con `checked_mul(10^shift)`, luego `i128::div` (trunca hacia cero, igual que SQLite/MySQL; **no** half-up de PG/Oracle). Div por cero → `[GBY-4043]`.
+- **Mod**: align scales + `checked_rem`. `result_scale = max(a.scale, b.scale)`. Mod por cero → `[GBY-4043]`.
+- **Cross-type Decimal/Int**: sigue exacto (Int = scale=0).
+- **Cross-type Decimal/Float**: sigue promoviendo a f64.
+- **Sin bump on-disk** — sólo extiende `eval_arith`.
+
+### 🚫 Sin nuevos códigos de error
+
+Reusa `[GBY-4042]` ARITH_OVERFLOW, `[GBY-4043]` DIVISION_BY_ZERO, `[GBY-4123]` DECIMAL_OUT_OF_RANGE.
+
+### 🚫 Diferido (Y9 y más allá)
+
+- Rounding alternativo en Div (half-up, half-even) opt-in.
+- `SUM(decimal)` / `AVG(decimal)` agregados Decimal-puros (hoy promueven a f64).
+- `WHERE col_a = col_b` sin subquery (limitación general del parser).
+- DECIMAL indexable (encoding lex-comparable).
+- `POWER(decimal, decimal)` exact.
+- Auto-rescale en Mul con scale grande (rescale prematuro al límite i128).
+- Notación científica en literales DECIMAL.
+
+### 🧪 Validación
+
+- 10 tests `y8_*`: mul exact (0.10*0.10=0.0100), mul by integer, div exact (1/3 = 0.333333 trunca), div by integer, div by zero (4043), mod exact, mod by zero (4043), chain arith (price * qty * tax → scale 8), scale overflow > 38 → 4123, mul negativo.
+- Suite total: **599/599 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y7: aritmética y comparación `DECIMAL` exactas
 
 > **Un push a `main`** sin bump on-disk. Follow-up de Y6: `+`/`-` Decimal-Decimal y Decimal-Int son exactos en i128; comparaciones alinean scales antes de comparar. Mul/Div/Mod siguen promoviendo a f64 (lossy). Detalle en [`docs/adr/0047-decimal-arith-compare-y7.md`](docs/adr/0047-decimal-arith-compare-y7.md).

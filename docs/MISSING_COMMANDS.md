@@ -381,7 +381,8 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `BLOB` / `BYTEA` / `BINARY` / `VARBINARY` (binario crudo) | ✅ (Y4, 2026-05-29; VERSION 19→20; code=10; literal `X'hex'`; CAST AS BLOB; no indexable; no PK/FK/CHECK/DEFAULT) | — |
 | `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ✅ (Y6, 2026-05-29) | — |
 | Aritmética `Decimal + Decimal` / `Decimal ± Int` exacta (Add/Sub) | ✅ (Y7, 2026-05-29; align scales + checked i128) | — |
-| Aritmética `Decimal * Decimal` / `Decimal / Decimal` exacta | ❌ (Y7 sólo Add/Sub; Mul/Div siguen promoviendo a f64; diferido) | P2 |
+| Aritmética `Decimal * Decimal` / `Decimal / Decimal` / `Decimal % Decimal` exacta | ✅ (Y8, 2026-05-29; Div trunca hacia cero con target_scale = max(a,b,6); Mul scale=a+b con `[GBY-4123]` si > 38) | — |
+| Rounding alternativo en Div (half-up, half-even) | ❌ (Y8 trunca; diferido) | P3 |
 | `DECIMAL` indexable | ❌ (encoding i128+scale no lex-comparable; diferido) | P3 |
 | Enforcement de longitud VARCHAR(n) / CHAR(n) | ✅ (Y2, 2026-05-29; bytes UTF-8) | — |
 | Enforcement de rango SMALLINT / TINYINT / MEDIUMINT / INT4 | ✅ (Y3, 2026-05-29) | — |

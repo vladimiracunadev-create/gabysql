@@ -14347,40 +14347,144 @@ fn eval_arith(a: Value, op: ArithOp, b: Value) -> DbResult<Value> {
             value_to_text(&b)
         )));
     }
-    // Bloque Y7 (2026-05-29): aritmética Decimal exacta para Add/Sub.
-    // Mul/Div/Mod y cualquier mezcla con Float promueven a f64 (lossy,
-    // documentado). El cliente que quiera precisión exacta para mul/div
-    // debe trabajar con scale alineado manualmente.
-    let decimal_exact_path = matches!(op, ArithOp::Add | ArithOp::Sub)
-        && matches!(
-            (&a, &b),
-            (Value::Decimal { .. }, Value::Decimal { .. })
-                | (Value::Decimal { .. }, Value::Integer(_))
-                | (Value::Integer(_), Value::Decimal { .. })
-        );
+    // Bloque Y7 (2026-05-29) + Y8 (2026-05-29): aritmética Decimal
+    // exacta para Add/Sub (Y7) y Mul/Div/Mod (Y8). Decimal/Float sigue
+    // promoviendo a f64 (lossy).
+    let decimal_exact_path = matches!(
+        op,
+        ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Div | ArithOp::Mod
+    ) && matches!(
+        (&a, &b),
+        (Value::Decimal { .. }, Value::Decimal { .. })
+            | (Value::Decimal { .. }, Value::Integer(_))
+            | (Value::Integer(_), Value::Decimal { .. })
+    );
     if decimal_exact_path {
         let (av, ascale) = decimal_extract_for_arith(&a);
         let (bv, bscale) = decimal_extract_for_arith(&b);
-        let target_scale = ascale.max(bscale);
-        let a_norm = rescale_decimal(av, ascale, target_scale)
-            .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
-        let b_norm = rescale_decimal(bv, bscale, target_scale)
-            .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
-        let r = match op {
-            ArithOp::Add => a_norm.checked_add(b_norm),
-            ArithOp::Sub => a_norm.checked_sub(b_norm),
+        match op {
+            ArithOp::Add | ArithOp::Sub => {
+                let target_scale = ascale.max(bscale);
+                let a_norm = rescale_decimal(av, ascale, target_scale)
+                    .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
+                let b_norm = rescale_decimal(bv, bscale, target_scale)
+                    .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
+                let r = match op {
+                    ArithOp::Add => a_norm.checked_add(b_norm),
+                    ArithOp::Sub => a_norm.checked_sub(b_norm),
+                    _ => unreachable!(),
+                };
+                return match r {
+                    Some(value) => Ok(Value::Decimal {
+                        value,
+                        scale: target_scale,
+                    }),
+                    None => Err(coded(
+                        codes::ARITH_OVERFLOW,
+                        format!("overflow aritmético en DECIMAL ({} {})", a_norm, b_norm),
+                    )),
+                };
+            }
+            ArithOp::Mul => {
+                // Bloque Y8: Multiplicación exacta.
+                // result_value = a.value * b.value (en i128, checked)
+                // result_scale = a.scale + b.scale
+                // Si scale > 38, error (excede precisión de i128).
+                let target_scale = ascale.saturating_add(bscale);
+                if target_scale > 38 {
+                    return Err(coded(
+                        codes::DECIMAL_OUT_OF_RANGE,
+                        format!(
+                            "DECIMAL mul: scale resultante {} excede el máximo 38",
+                            target_scale
+                        ),
+                    ));
+                }
+                match av.checked_mul(bv) {
+                    Some(value) => {
+                        return Ok(Value::Decimal {
+                            value,
+                            scale: target_scale,
+                        });
+                    }
+                    None => {
+                        return Err(coded(
+                            codes::ARITH_OVERFLOW,
+                            format!("overflow aritmético en DECIMAL mul ({} * {})", av, bv),
+                        ));
+                    }
+                }
+            }
+            ArithOp::Div => {
+                // Bloque Y8: División exacta con truncation.
+                // target_scale = max(a.scale, b.scale, 6) — mínimo 6
+                // decimales para preservar precisión razonable, estilo
+                // SQL Server/MySQL.
+                if bv == 0 {
+                    return Err(coded(
+                        codes::DIVISION_BY_ZERO,
+                        "división DECIMAL por cero".to_string(),
+                    ));
+                }
+                let target_scale = ascale.max(bscale).max(6);
+                // Para llegar a target_scale en el quotient:
+                //   q.value = (a.value * 10^(target_scale - a.scale + b.scale)) / b.value
+                let shift = (target_scale as i32) - (ascale as i32) + (bscale as i32);
+                if shift < 0 {
+                    return Err(coded(
+                        codes::DECIMAL_OUT_OF_RANGE,
+                        format!("DECIMAL div: shift negativo ({})", shift),
+                    ));
+                }
+                let pow = 10i128.checked_pow(shift as u32).ok_or_else(|| {
+                    coded(
+                        codes::ARITH_OVERFLOW,
+                        format!("DECIMAL div: 10^{} overflow", shift),
+                    )
+                })?;
+                let scaled = av.checked_mul(pow).ok_or_else(|| {
+                    coded(
+                        codes::ARITH_OVERFLOW,
+                        format!("DECIMAL div: scaled dividend overflow ({})", av),
+                    )
+                })?;
+                let value = scaled / bv;
+                return Ok(Value::Decimal {
+                    value,
+                    scale: target_scale,
+                });
+            }
+            ArithOp::Mod => {
+                // Bloque Y8: Módulo exacto alineando scales primero.
+                // result_scale = max(a.scale, b.scale)
+                if bv == 0 {
+                    return Err(coded(
+                        codes::DIVISION_BY_ZERO,
+                        "módulo DECIMAL por cero".to_string(),
+                    ));
+                }
+                let target_scale = ascale.max(bscale);
+                let a_norm = rescale_decimal(av, ascale, target_scale)
+                    .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
+                let b_norm = rescale_decimal(bv, bscale, target_scale)
+                    .map_err(|m| coded(codes::ARITH_OVERFLOW, format!("DECIMAL: {}", m)))?;
+                match a_norm.checked_rem(b_norm) {
+                    Some(value) => {
+                        return Ok(Value::Decimal {
+                            value,
+                            scale: target_scale,
+                        });
+                    }
+                    None => {
+                        return Err(coded(
+                            codes::ARITH_OVERFLOW,
+                            format!("overflow en DECIMAL mod ({} % {})", a_norm, b_norm),
+                        ));
+                    }
+                }
+            }
             _ => unreachable!(),
-        };
-        return match r {
-            Some(value) => Ok(Value::Decimal {
-                value,
-                scale: target_scale,
-            }),
-            None => Err(coded(
-                codes::ARITH_OVERFLOW,
-                format!("overflow aritmético en DECIMAL ({} {})", a_norm, b_norm),
-            )),
-        };
+        }
     }
     // Promoción numérica.
     let (af, bf, both_int) = match (&a, &b) {

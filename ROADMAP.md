@@ -110,6 +110,8 @@
 
 - ~~Aritmética `Decimal + Decimal` y `Decimal ± Int` **exactas** en i128: align scales via `rescale_decimal` + `checked_add`/`checked_sub`. Mul/Div/Mod siguen promoviendo a f64 (lossy, documentado — Decimal-pura para Mul/Div diferida a Y8 por la política de overflow/rounding). Comparaciones `compare_decimals(av, asc, bv, bsc)` alinean scales y comparan i128 normalizados (fallback a f64 si rescale overflowea). Actualizado en `compare_values`, `compare_values_nulls_last`, `eval_compare`, `values_equal`. Cross-type Decimal/Int también exacto (Int = scale=0). Cross-type Decimal/Float promueve a f64. Sin nuevos códigos de error (reusa `[GBY-4042]` ARITH_OVERFLOW). Sin bump on-disk~~ ✅ entregado (bloque **Y7**, 2026-05-29, [ADR-0047](docs/adr/0047-decimal-arith-compare-y7.md)).
 
+- ~~`Decimal * Decimal`, `Decimal / Decimal`, `Decimal % Decimal` **exactos**. Mul: `scale_result = a.scale + b.scale` (si > 38 → `[GBY-4123]`); `value_result = a.value * b.value` con `checked_mul` (si overflow → `[GBY-4042]`). Div: `target_scale = max(a.scale, b.scale, 6)` (mínimo 6 decimales, estilo SQL Server); pre-shift dividend a target_scale + b.scale + (target - a.scale); `value_result = scaled / b.value` con truncation hacia cero (política consistente con SQLite/MySQL, no half-up de PG/Oracle); div por cero → `[GBY-4043]`. Mod: align scales + `checked_rem`; mod por cero → `[GBY-4043]`. Cross-type Decimal/Int sigue exacto (Int = scale=0). Decimal/Float promueve a f64. Sin bump on-disk~~ ✅ entregado (bloque **Y8**, 2026-05-29, [ADR-0048](docs/adr/0048-decimal-mul-div-mod-y8.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

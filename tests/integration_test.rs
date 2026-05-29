@@ -13572,6 +13572,259 @@ fn y7_decimal_negative_arith() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y8 (2026-05-29): Mul/Div/Mod DECIMAL exactos.
+// Sin bump on-disk — sólo extiende eval_arith.
+// ============================================================
+
+fn y8_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y8-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y8_decimal_mul_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("mul")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 1.50, 2.00);
+         INSERT INTO t (id, a, b) VALUES (2, 0.10, 0.10);
+         INSERT INTO t (id, a, b) VALUES (3, 123.45, 100.00);",
+    )?;
+    let res = run_sql(&db, "SELECT a * b FROM t ORDER BY id;")?;
+    // 1.50 * 2.00 = 3.0000 (scale = 2+2 = 4)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 30000,
+            scale: 4
+        }
+    );
+    // 0.10 * 0.10 = 0.0100 EXACTO
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 100,
+            scale: 4
+        }
+    );
+    // 123.45 * 100.00 = 12345.0000
+    assert_eq!(
+        res[0].rows[2][0],
+        Value::Decimal {
+            value: 123_450_000,
+            scale: 4
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_mul_by_integer() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("mul-int")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 19.99);",
+    )?;
+    let res = run_sql(&db, "SELECT amount * 3 FROM t;")?;
+    // 19.99 * 3 = 59.97 (scale = 2+0 = 2)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 5997,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_div_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("div")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 10.00, 4.00);
+         INSERT INTO t (id, a, b) VALUES (2, 1.00, 3.00);",
+    )?;
+    let res = run_sql(&db, "SELECT a / b FROM t ORDER BY id;")?;
+    // 10.00 / 4.00 = 2.500000 (target_scale = max(2,2,6) = 6)
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 2_500_000,
+            scale: 6
+        }
+    );
+    // 1.00 / 3.00 = 0.333333 (trunca a 6 decimales)
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 333_333,
+            scale: 6
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_div_by_integer() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("div-int")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, amount DECIMAL(10,2));
+         INSERT INTO t (id, amount) VALUES (1, 100.00);",
+    )?;
+    let res = run_sql(&db, "SELECT amount / 4 FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 25_000_000,
+            scale: 6
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_div_by_zero_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("div-zero")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 10.00, 0.00);",
+    )?;
+    let err = run_sql(&db, "SELECT a / b FROM t;");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4043"), "esperaba GBY-4043, vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_mod_exact() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("mod")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 10.00, 3.00);
+         INSERT INTO t (id, a, b) VALUES (2, 7.50, 2.00);",
+    )?;
+    let res = run_sql(&db, "SELECT a % b FROM t ORDER BY id;")?;
+    // 10.00 % 3.00 = 1.00
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 100,
+            scale: 2
+        }
+    );
+    // 7.50 % 2.00 = 1.50
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 150,
+            scale: 2
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_mod_by_zero_errors() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("mod-zero")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, 10.00, 0.00);",
+    )?;
+    let err = run_sql(&db, "SELECT a % b FROM t;");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4043"), "vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_chain_arith() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("chain")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, price DECIMAL(10,2), qty DECIMAL(10,2), tax DECIMAL(10,4));
+         INSERT INTO t (id, price, qty, tax) VALUES (1, 99.99, 3.00, 0.2100);",
+    )?;
+    // (99.99 * 3.00) = 299.9700 (scale 4)
+    // (299.9700 * 0.2100) = 62.99370000 (scale 8)
+    let res = run_sql(&db, "SELECT price * qty * tax FROM t;")?;
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: 6_299_370_000,
+            scale: 8
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_mul_scale_overflow_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("mul-scale-over")?;
+    // Scale 20 * scale 20 = scale 40, supera el máximo 38 de i128 →
+    // error 4123 (DECIMAL_OUT_OF_RANGE).
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(38,20), b DECIMAL(38,20));
+         INSERT INTO t (id, a, b) VALUES (1, 0.00000000000000000001, 0.00000000000000000001);",
+    )?;
+    let err = run_sql(&db, "SELECT a * b FROM t;");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4123"), "esperaba GBY-4123, vi: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y8_decimal_mul_negative() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y8_setup("mul-neg")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(10,2));
+         INSERT INTO t (id, a, b) VALUES (1, -2.50, 4.00);
+         INSERT INTO t (id, a, b) VALUES (2, -3.00, -5.00);",
+    )?;
+    let res = run_sql(&db, "SELECT a * b FROM t ORDER BY id;")?;
+    // -2.50 * 4.00 = -10.0000
+    assert_eq!(
+        res[0].rows[0][0],
+        Value::Decimal {
+            value: -100_000,
+            scale: 4
+        }
+    );
+    // -3.00 * -5.00 = 15.0000
+    assert_eq!(
+        res[0].rows[1][0],
+        Value::Decimal {
+            value: 150_000,
+            scale: 4
+        }
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
