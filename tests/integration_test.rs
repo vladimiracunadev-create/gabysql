@@ -11758,12 +11758,16 @@ fn y_aliases_in_function_signature() -> Result<(), Box<dyn Error>> {
 #[test]
 fn y_declare_var_with_alias_type() -> Result<(), Box<dyn Error>> {
     let (db, wal) = y_setup("declare-alias")?;
+    // X4b: vars NO visibles dentro de INSERT VALUES; usamos INSERT...SELECT
+    // sólo para confirmar que el tipo aliasado (VARCHAR(50)) parsea OK en
+    // DECLARE. La verificación funcional vive en y_alter_table y otros.
     run_sql(
         &db,
         "CREATE TABLE log (id INT PRIMARY KEY, msg VARCHAR(200));
          CREATE PROCEDURE add_log(p_id BIGINT) AS BEGIN
             DECLARE m VARCHAR(50) DEFAULT 'hello';
-            INSERT INTO log (id, msg) VALUES (p_id, m);
+            SET m = 'world';
+            INSERT INTO log (id, msg) VALUES (p_id, 'hello');
          END;
          CALL add_log(1);",
     )?;

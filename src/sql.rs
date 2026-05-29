@@ -4339,10 +4339,6 @@ impl<'a> Engine<'a> {
                 && t.timing_code == timing.code()
         }))
     }
-    /// Alias retro-compatible con X1.
-    fn has_after_trigger(&mut self, table: &str, event: TriggerEvent) -> DbResult<bool> {
-        self.has_trigger(table, event, TriggerTiming::After)
-    }
 
     /// Bloque X1: dispara todos los triggers que matchean (table, event,
     /// timing) en orden alfabético por nombre. Para cada trigger:
@@ -14643,7 +14639,6 @@ fn tokenize(input: &str) -> DbResult<Vec<Token>> {
                             | "IS"
                             | "IF"
                             | "ELSIF"
-                            | "THEN"
                     )
                 }
                 _ => false,
@@ -15109,9 +15104,9 @@ fn substitute_new_old_in_where(
 
 fn substitute_new_old_in_clause(
     c: &mut WhereClause,
-    new_row: Option<&HashMap<String, Value>>,
-    old_row: Option<&HashMap<String, Value>>,
-    trig_name: &str,
+    _new_row: Option<&HashMap<String, Value>>,
+    _old_row: Option<&HashMap<String, Value>>,
+    _trig_name: &str,
 ) -> DbResult<()> {
     match c {
         WhereClause::Eq { value, .. } => {
@@ -15329,13 +15324,13 @@ fn compute_window_column(
     //    para eludir Hash de Value).
     let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
         std::collections::BTreeMap::new();
-    for i in 0..n {
+    for (i, row) in rows.iter().enumerate().take(n) {
         let key = if over.partition_by.is_empty() {
             String::new()
         } else {
             let mut parts = Vec::with_capacity(over.partition_by.len());
             for e in &over.partition_by {
-                let v = eval_expr(e, &rows[i])?;
+                let v = eval_expr(e, row)?;
                 parts.push(format!("{:?}", v));
             }
             parts.join("|")
