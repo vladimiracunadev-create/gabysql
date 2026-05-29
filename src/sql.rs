@@ -5022,6 +5022,81 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Bloque Z3d (2026-05-29): filtra una lista de rows-resultado de
+    /// INSERT/UPDATE/DELETE RETURNING contra las policies SELECT
+    /// aplicables. Sin policies → bypass (compat); current_user None →
+    /// bypass. PERMISSIVE OR: una fila aparece si al menos una policy
+    /// aplicable evalúa USING como TRUE. Si ninguna policy SELECT
+    /// aplica → row filtrado (silently omitted) — el caller verá menos
+    /// filas de RETURNING que las que se mutaron.
+    fn filter_rows_by_select_policies(
+        &mut self,
+        table: &str,
+        rows: Vec<HashMap<String, Value>>,
+    ) -> DbResult<Vec<HashMap<String, Value>>> {
+        let Some(user) = self.current_user.clone() else {
+            return Ok(rows);
+        };
+        let policies = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.list_policies_for_table(table)?
+        };
+        if policies.is_empty() {
+            return Ok(rows);
+        }
+        let applicable: Vec<PolicyMeta> = policies
+            .into_iter()
+            .filter(|p| {
+                let action_ok = p.action == POLICY_ACTION_ALL || p.action == POLICY_ACTION_SELECT;
+                let role_ok =
+                    p.roles.is_empty() || p.roles.iter().any(|r| r.eq_ignore_ascii_case(&user));
+                action_ok && role_ok
+            })
+            .collect();
+        if applicable.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut preds: Vec<Expr> = Vec::with_capacity(applicable.len());
+        for p in &applicable {
+            if p.using_sql.is_empty() {
+                continue;
+            }
+            let mut parser = Parser {
+                tokens: tokenize(&p.using_sql)?,
+                pos: 0,
+                where_depth: 0,
+                in_having: false,
+                pending_check_name: None,
+            };
+            preds.push(parser.parse_expr().map_err(|e| {
+                coded(
+                    codes::POLICY_PREDICATE_FAILED,
+                    format!(
+                        "POLICY '{}' ON '{}': USING expr inválido al filtrar RETURNING: {}",
+                        p.name, table, e
+                    ),
+                )
+            })?);
+        }
+        if preds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut row_passes = false;
+            for expr in &preds {
+                if let Ok(Value::Bool(true)) = self.eval_expr_full(expr, &row, None) {
+                    row_passes = true;
+                    break;
+                }
+            }
+            if row_passes {
+                kept.push(row);
+            }
+        }
+        Ok(kept)
+    }
+
     /// Bloque Z3b (2026-05-29): chequea que una fila satisfaga al menos
     /// una de las policies aplicables al `(table, action_write)` con
     /// semántica WITH CHECK. `action_write` es `POLICY_ACTION_INSERT`
@@ -6680,7 +6755,13 @@ impl<'a> Engine<'a> {
         // Bloque J2: con RETURNING devolvemos las filas; el message sigue
         // siendo informativo. Sin RETURNING devolvemos solo el message.
         if let Some(returning) = &stmt.returning {
-            let projected = project_returning(&meta, returning, &affected_rows)?;
+            // Bloque Z3d (2026-05-29): filtrar las filas insertadas
+            // contra policies SELECT antes del project_returning. Si el
+            // current_user no tiene visibility de la fila que acabó
+            // de insertar (e.g. policy SELECT distinta del WITH CHECK
+            // que permitió el INSERT), se omite del RETURNING.
+            let visible_rows = self.filter_rows_by_select_policies(&stmt.table, affected_rows)?;
+            let projected = project_returning(&meta, returning, &visible_rows)?;
             let columns = returning_column_names(&meta, returning);
             return Ok(ResultSet {
                 columns,
@@ -9731,7 +9812,10 @@ impl<'a> Engine<'a> {
         }
 
         if let Some(returning) = &stmt.returning {
-            let projected = project_returning(&meta, returning, &affected_rows)?;
+            // Bloque Z3d (2026-05-29): filtrar contra policies SELECT
+            // antes del project_returning.
+            let visible_rows = self.filter_rows_by_select_policies(&stmt.table, affected_rows)?;
+            let projected = project_returning(&meta, returning, &visible_rows)?;
             let columns = returning_column_names(&meta, returning);
             return Ok(ResultSet {
                 columns,
@@ -10616,7 +10700,11 @@ impl<'a> Engine<'a> {
         }
 
         if let Some(returning) = &stmt.returning {
-            let projected = project_returning(&meta, returning, &affected_rows)?;
+            // Bloque Z3d (2026-05-29): filtrar contra policies SELECT
+            // antes del project_returning. Para DELETE el row OLD se
+            // capturó pre-delete; visible si el current_user lo veía.
+            let visible_rows = self.filter_rows_by_select_policies(&stmt.table, affected_rows)?;
+            let projected = project_returning(&meta, returning, &visible_rows)?;
             let columns = returning_column_names(&meta, returning);
             return Ok(ResultSet {
                 columns,

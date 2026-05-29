@@ -6,6 +6,47 @@
 
 ---
 
+## 2026-05-29 — Bloque Z3d: RETURNING filtrado contra SELECT policies
+
+> **Un push a `main`** sin bump on-disk. Cierra el leak histórico de RETURNING en RLS: un INSERT/UPDATE/DELETE con RETURNING ya no expone columnas que el current_user no debería ver. Detalle en [`docs/adr/0057-z3d-returning-filter.md`](docs/adr/0057-z3d-returning-filter.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE POLICY ins_any ON t FOR INSERT WITH CHECK (TRUE);     -- permite cualquier insert
+CREATE POLICY sel_self ON t FOR SELECT USING (owner = 'alice');
+
+SET SESSION AUTHORIZATION 'alice';
+
+-- alice inserta una fila de bob (WITH CHECK = TRUE).
+-- Antes de Z3d: RETURNING expone la fila → leak.
+-- Después de Z3d: RETURNING vacío (la SELECT policy filtra).
+INSERT INTO t (id, owner) VALUES (1, 'bob') RETURNING *;
+-- → 0 rows
+```
+
+### 🛠 Implementación
+
+- Helper nuevo `filter_rows_by_select_policies(table, rows) -> rows_visibles` (~60 LOC). Reusa el patrón de Z3 USING evaluation con OR semantics, pero opera row-a-row sobre `affected_rows` (vs WHERE rewriting en SELECT).
+- 3 sitios actualizados: `exec_insert`, `exec_update`, `exec_delete`. Antes de `project_returning(meta, returning, &affected_rows)`, el `affected_rows` se filtra a `visible_rows`.
+- Sin policies en la tabla → no filtra (compat 100%).
+- `current_user is None` (superuser) → bypass.
+- Tabla con policies SELECT pero ninguna aplicable al user/role → RETURNING vacío (deny).
+
+### 🚫 Diferido (Z3e)
+
+- `INSERT ... ON CONFLICT DO UPDATE` con RETURNING del UPDATE path (validación end-to-end con upsert + policies).
+- Filter contra WITH CHECK además de USING (hoy sólo USING).
+- Statement-level abort cuando filter deja RETURNING vacío.
+- Column-level filter en RETURNING.
+
+### 🧪 Validación
+
+- Suite: **681 passing** (674 → +7 Z3d). Cubre: INSERT/UPDATE/DELETE RETURNING con visible/invisible rows, sin policies = compat, superuser bypass, deny cuando no hay policy SELECT aplicable.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z1c: scrypt (RFC 7914) memory-hard password hashing
 
 > **Un push a `main`**. Bump on-disk **VERSION 27 → 28** (corte semántico). Z1c cubre el defer de Z1b: KDF memory-hard scrypt reemplaza PBKDF2 como default. ~32 MB por hash, resistente a ASIC/GPU. Detalle en [`docs/adr/0056-z1c-scrypt-password-hashing.md`](docs/adr/0056-z1c-scrypt-password-hashing.md).

@@ -15476,6 +15476,152 @@ fn z1c_scrypt_deterministic() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Z3d (2026-05-29): RETURNING filtrado contra policies
+// SELECT en INSERT/UPDATE/DELETE. Sin bump on-disk.
+// ============================================================
+
+fn z3d_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z3d-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z3d_insert_returning_visible_row() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("ins-visible")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         GRANT INSERT, SELECT ON t TO alice;
+         CREATE POLICY ins_self ON t FOR INSERT WITH CHECK (owner = 'alice');
+         CREATE POLICY sel_self ON t FOR SELECT USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice') RETURNING id, owner;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3d_insert_returning_invisible_row_filtered() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("ins-invisible")?;
+    // WITH CHECK permite cualquier INSERT, pero SELECT policy filtra
+    // todo lo que no es de alice → RETURNING vacío.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         GRANT INSERT, SELECT ON t TO alice;
+         CREATE POLICY ins_any ON t FOR INSERT WITH CHECK (TRUE);
+         CREATE POLICY sel_self ON t FOR SELECT USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'bob') RETURNING id, owner;",
+    )?;
+    assert!(res.last().unwrap().rows.is_empty());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3d_update_returning_filters_invisible_rows() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("upd-filter")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT, n INT);
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 10);
+         INSERT INTO t (id, owner, n) VALUES (2, 'alice', 20);
+         CREATE USER alice;
+         GRANT SELECT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL
+           USING (owner = 'alice')
+           WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         UPDATE t SET n = n + 1 WHERE id > 0 RETURNING id, n;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3d_delete_returning_filters() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("del-filter")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         INSERT INTO t (id, owner) VALUES (2, 'alice');
+         CREATE USER alice;
+         GRANT SELECT, DELETE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         DELETE FROM t WHERE id > 0 RETURNING id, owner;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3d_returning_no_policies_compat() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("no-pol")?;
+    // Sin policies → RETURNING devuelve filas tal cual (compat 100%).
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         CREATE USER alice;
+         GRANT INSERT ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, n) VALUES (1, 42) RETURNING id, n;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3d_returning_superuser_bypass() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("super")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE POLICY block_select ON t FOR SELECT USING (FALSE);
+         INSERT INTO t (id, owner) VALUES (1, 'bob') RETURNING id, owner;",
+    )?;
+    assert_eq!(res.last().unwrap().rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3d_returning_filtered_to_empty_when_no_select_policy_match() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3d_setup("no-match")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         CREATE USER alice;
+         CREATE USER bob;
+         GRANT INSERT ON t TO alice;
+         CREATE POLICY ins_any ON t FOR INSERT WITH CHECK (TRUE);
+         CREATE POLICY sel_bob ON t FOR SELECT TO bob USING (TRUE);
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice') RETURNING id, owner;",
+    )?;
+    assert!(res.last().unwrap().rows.is_empty());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
