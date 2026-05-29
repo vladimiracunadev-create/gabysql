@@ -16036,6 +16036,251 @@ fn z3f_compat_sin_policies_sin_change() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque P1 (2026-05-29): EXPLAIN <statement> — describe el plan
+// de ejecución como ResultSet (cols step / detail). Sin bump
+// on-disk. Primer sub-bloque de Fase 3 (Performance/Planeación).
+// ============================================================
+
+fn p1_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("p1-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn p1_explain_select_full_scan() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("full-scan")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    let res = run_sql(&db, "EXPLAIN SELECT n FROM t;")?;
+    let last = res.last().unwrap();
+    assert_eq!(last.columns, vec!["step", "detail"]);
+    // Sin WHERE → full scan declarado en el plan.
+    let detail = match &last.rows[0][1] {
+        Value::String(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert!(
+        detail.contains("full scan") && detail.contains("sin WHERE"),
+        "esperaba 'full scan, sin WHERE' en {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_select_pk_lookup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("pk-lookup")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    let res = run_sql(&db, "EXPLAIN SELECT n FROM t WHERE id = 1;")?;
+    let last = res.last().unwrap();
+    let detail = match &last.rows[0][1] {
+        Value::String(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert!(
+        detail.contains("PK lookup"),
+        "esperaba 'PK lookup' en {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_select_index_eq() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("index-eq")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, code TEXT);
+         CREATE INDEX idx_code ON t (code);",
+    )?;
+    let res = run_sql(&db, "EXPLAIN SELECT id FROM t WHERE code = 'X';")?;
+    let detail = match &res.last().unwrap().rows[0][1] {
+        Value::String(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert!(
+        detail.contains("hash-index") || detail.contains("index"),
+        "esperaba 'index' en {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_select_join_and_order() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("join-order")?;
+    run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, n INT);
+         CREATE TABLE b (id INT PRIMARY KEY, a_id INT);",
+    )?;
+    let res = run_sql(
+        &db,
+        "EXPLAIN SELECT a.n FROM a INNER JOIN b ON a.id = b.a_id \
+         WHERE a.id = 1 ORDER BY a.n;",
+    )?;
+    let last = res.last().unwrap();
+    let plan: Vec<String> = last
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let joined = plan.join("\n");
+    assert!(
+        joined.contains("PK lookup"),
+        "esperaba 'PK lookup' en {}",
+        joined
+    );
+    assert!(
+        joined.contains("INNER JOIN"),
+        "esperaba 'INNER JOIN' en {}",
+        joined
+    );
+    assert!(
+        joined.contains("ORDER BY"),
+        "esperaba 'ORDER BY' en {}",
+        joined
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_insert_values() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("insert-values")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    let res = run_sql(&db, "EXPLAIN INSERT INTO t (id, n) VALUES (1, 1), (2, 2);")?;
+    let detail = match &res.last().unwrap().rows[0][1] {
+        Value::String(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert!(
+        detail.contains("INSERT INTO `t`") && detail.contains("2 filas fuente"),
+        "esperaba INSERT detail en {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_update_pk_lookup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("update-pk")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    let res = run_sql(&db, "EXPLAIN UPDATE t SET n = 99 WHERE id = 1;")?;
+    let plan: Vec<String> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let joined = plan.join("\n");
+    assert!(
+        joined.contains("UPDATE target"),
+        "esperaba UPDATE target en {}",
+        joined
+    );
+    assert!(
+        joined.contains("PK lookup"),
+        "esperaba PK lookup en {}",
+        joined
+    );
+    assert!(joined.contains("SET"), "esperaba SET en {}", joined);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_delete() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("delete")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let res = run_sql(&db, "EXPLAIN DELETE FROM t WHERE id = 1;")?;
+    let plan: Vec<String> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let joined = plan.join("\n");
+    assert!(
+        joined.contains("DELETE target"),
+        "esperaba DELETE target en {}",
+        joined
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_does_not_execute_statement() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("dry-run")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    // EXPLAIN INSERT no debería persistir nada.
+    run_sql(&db, "EXPLAIN INSERT INTO t (id, n) VALUES (1, 42);")?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM t;")?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_analyze_unsupported_clean_error() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("analyze")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY);")?;
+    let err = run_sql(&db, "EXPLAIN ANALYZE SELECT * FROM t;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4139"),
+        "esperaba [GBY-4139], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p1_explain_select_distinct_and_limit() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p1_setup("distinct-limit")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n INT);")?;
+    let res = run_sql(
+        &db,
+        "EXPLAIN SELECT DISTINCT n FROM t ORDER BY n LIMIT 10 OFFSET 5;",
+    )?;
+    let plan: Vec<String> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let joined = plan.join("\n");
+    assert!(joined.contains("ORDER BY"));
+    assert!(joined.contains("LIMIT"));
+    assert!(joined.contains("DISTINCT"));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

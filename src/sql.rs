@@ -123,6 +123,14 @@ pub enum Statement {
     CreatePolicy(CreatePolicyStmt),
     /// Bloque Z3: `DROP POLICY [IF EXISTS] name ON table`.
     DropPolicy(DropPolicyStmt),
+    /// Bloque P1 (2026-05-29): `EXPLAIN <statement>` — describe el
+    /// plan de ejecución como ResultSet textual (cols `step`, `detail`)
+    /// sin ejecutar el statement subyacente. Soporta SELECT, INSERT,
+    /// UPDATE, DELETE. Detecta fast-paths (PK lookup, ordered-index
+    /// range, hash-index equality) vs full scan. `EXPLAIN ANALYZE` no
+    /// está soportado en P1 (defer P2 — requiere instrumentación de
+    /// timings + row counts reales).
+    Explain(Box<Statement>),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -2344,6 +2352,7 @@ impl<'a> Engine<'a> {
             Statement::SetSessionAuth(stmt) => self.exec_set_session_auth(stmt),
             Statement::CreatePolicy(stmt) => self.exec_create_policy(stmt),
             Statement::DropPolicy(stmt) => self.exec_drop_policy(stmt),
+            Statement::Explain(inner) => self.exec_explain(*inner),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -4964,6 +4973,412 @@ impl<'a> Engine<'a> {
                 stmt.name, stmt.table
             )),
         })
+    }
+
+    // ============================================================
+    // Bloque P1 (2026-05-29): EXPLAIN — describe el plan de ejecución
+    // como ResultSet sin ejecutar el statement subyacente.
+    // ============================================================
+
+    fn exec_explain(&mut self, inner: Statement) -> DbResult<ResultSet> {
+        let mut steps: Vec<(String, String)> = Vec::new();
+        match inner {
+            Statement::Select(query) => self.explain_select_query(&query, &mut steps, 0)?,
+            Statement::SelectRecursive(stmt) => {
+                steps.push((
+                    "1".to_string(),
+                    format!(
+                        "WITH RECURSIVE {} (fixpoint hasta 10K iter, dedup u64 FNV-1a)",
+                        stmt.cte.name
+                    ),
+                ));
+                self.explain_select_query(&stmt.body, &mut steps, 1)?;
+            }
+            Statement::Insert(stmt) => {
+                steps.push((
+                    "1".to_string(),
+                    format!(
+                        "INSERT INTO `{}` ({} columna{}, {} fila{} fuente)",
+                        stmt.table,
+                        stmt.columns.len(),
+                        if stmt.columns.len() == 1 { "" } else { "s" },
+                        match &stmt.source {
+                            InsertSource::Values(rows) => rows.len(),
+                            InsertSource::Select(_) => 0,
+                        },
+                        match &stmt.source {
+                            InsertSource::Values(rows) =>
+                                if rows.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                            InsertSource::Select(_) => "",
+                        }
+                    ),
+                ));
+                if let Some(oc) = &stmt.on_conflict {
+                    let action = match &oc.action {
+                        OnConflictAction::DoNothing => "DO NOTHING".to_string(),
+                        OnConflictAction::DoUpdate { assignments } => {
+                            format!("DO UPDATE SET ({} assigns)", assignments.len())
+                        }
+                        OnConflictAction::Replace => "REPLACE".to_string(),
+                    };
+                    steps.push((
+                        "2".to_string(),
+                        format!(
+                            "ON CONFLICT ({}) {}",
+                            oc.target.as_deref().unwrap_or("auto-detect"),
+                            action
+                        ),
+                    ));
+                }
+                if let InsertSource::Select(sub) = stmt.source {
+                    steps.push((
+                        "fuente".to_string(),
+                        "SELECT subquery (ver sub-plan)".to_string(),
+                    ));
+                    self.explain_select(&sub, &mut steps, 100)?;
+                }
+            }
+            Statement::Update(stmt) => {
+                self.explain_dml_target(
+                    &stmt.table,
+                    "UPDATE",
+                    Some(&stmt.where_clause),
+                    &mut steps,
+                )?;
+                steps.push((
+                    format!("{}", steps.len() + 1),
+                    format!(
+                        "SET {} columna{}",
+                        stmt.assignments.len(),
+                        if stmt.assignments.len() == 1 { "" } else { "s" }
+                    ),
+                ));
+                if stmt.returning.is_some() {
+                    steps.push((
+                        format!("{}", steps.len() + 1),
+                        "RETURNING (Z3d: filtrado contra SELECT policies)".to_string(),
+                    ));
+                }
+            }
+            Statement::Delete(stmt) => {
+                self.explain_dml_target(
+                    &stmt.table,
+                    "DELETE",
+                    Some(&stmt.where_clause),
+                    &mut steps,
+                )?;
+                if stmt.returning.is_some() {
+                    steps.push((
+                        format!("{}", steps.len() + 1),
+                        "RETURNING (Z3d: filtrado contra SELECT policies)".to_string(),
+                    ));
+                }
+            }
+            Statement::Truncate(stmt) => {
+                steps.push((
+                    "1".to_string(),
+                    format!(
+                        "TRUNCATE `{}` (full scan + delete con cascade ON DELETE)",
+                        stmt.table
+                    ),
+                ));
+            }
+            Statement::Explain(_) => {
+                return Err(coded(
+                    codes::UNSUPPORTED_SYNTAX,
+                    "EXPLAIN EXPLAIN no tiene sentido; usá EXPLAIN <stmt>.",
+                ));
+            }
+            other => {
+                steps.push((
+                    "1".to_string(),
+                    format!(
+                        "{} (statement DDL/control — no es plan-able en P1)",
+                        format!("{:?}", other)
+                            .split('(')
+                            .next()
+                            .unwrap_or("Unknown")
+                    ),
+                ));
+            }
+        }
+        Ok(ResultSet {
+            columns: vec!["step".to_string(), "detail".to_string()],
+            rows: steps
+                .into_iter()
+                .map(|(s, d)| vec![Value::String(s), Value::String(d)])
+                .collect(),
+            message: Some("EXPLAIN: plan estimado (sin ejecutar el statement)".to_string()),
+        })
+    }
+
+    /// Bloque P1: describe el plan de un `SelectQuery` (SELECT, VALUES,
+    /// set-op). `base_step` es el offset numerico para steps anidados
+    /// (CTE recursivos, subqueries en INSERT...SELECT).
+    fn explain_select_query(
+        &mut self,
+        query: &SelectQuery,
+        steps: &mut Vec<(String, String)>,
+        base_step: usize,
+    ) -> DbResult<()> {
+        match query {
+            SelectQuery::Select(stmt) => self.explain_select(stmt, steps, base_step),
+            SelectQuery::Values(v) => {
+                steps.push((
+                    format!("{}", base_step + 1),
+                    format!(
+                        "VALUES literal ({} fila{} en memoria)",
+                        v.rows.len(),
+                        if v.rows.len() == 1 { "" } else { "s" }
+                    ),
+                ));
+                Ok(())
+            }
+            SelectQuery::SetOp {
+                lhs,
+                op,
+                all,
+                rhs,
+                order_by,
+                limit,
+                offset,
+            } => {
+                let op_name = op.keyword();
+                steps.push((
+                    format!("{}", base_step + 1),
+                    format!(
+                        "{}{} de 2 sub-queries (dedup hash-set si !ALL)",
+                        op_name,
+                        if *all { " ALL" } else { "" }
+                    ),
+                ));
+                self.explain_select_query(lhs, steps, base_step + 1)?;
+                self.explain_select_query(rhs, steps, base_step + 100)?;
+                if order_by.is_some() {
+                    steps.push((
+                        format!("{}", steps.len() + 1),
+                        "ORDER BY post-merge".to_string(),
+                    ));
+                }
+                if limit.is_some() || *offset > 0 {
+                    steps.push((
+                        format!("{}", steps.len() + 1),
+                        format!("LIMIT/OFFSET (limit={:?}, offset={})", limit, offset),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Bloque P1: describe el plan de un `SelectStmt` — scan type, joins,
+    /// WHERE, GROUP BY, HAVING, ORDER BY, LIMIT.
+    fn explain_select(
+        &mut self,
+        stmt: &SelectStmt,
+        steps: &mut Vec<(String, String)>,
+        base_step: usize,
+    ) -> DbResult<()> {
+        // Detección de fuente.
+        if stmt.derived_source.is_some() {
+            steps.push((
+                format!("{}", base_step + 1),
+                format!(
+                    "FROM derived `{}` (subquery materializada en mem)",
+                    stmt.table
+                ),
+            ));
+        } else if stmt.values_source.is_some() {
+            steps.push((
+                format!("{}", base_step + 1),
+                format!("FROM VALUES `{}` (literal)", stmt.table),
+            ));
+        } else {
+            // Tabla real: detectar fast-path del WHERE.
+            let scan_desc = self.classify_scan(&stmt.table, stmt.where_clause.as_ref())?;
+            steps.push((format!("{}", base_step + 1), scan_desc));
+        }
+        // Joins.
+        for (i, j) in stmt.joins.iter().enumerate() {
+            let kind = format!("{:?}", j.kind).to_uppercase();
+            let target = if j.right.derived.is_some() {
+                format!("derived `{}`", j.right.name)
+            } else if j.right.values.is_some() {
+                format!("VALUES `{}`", j.right.name)
+            } else {
+                format!("`{}`", j.right.name)
+            };
+            let predicate = if j.using.is_some() {
+                " USING(...)"
+            } else if j.natural {
+                " NATURAL"
+            } else if j.on.is_some() {
+                " ON (...)"
+            } else {
+                ""
+            };
+            steps.push((
+                format!("{}.join.{}", base_step + 1, i + 1),
+                format!("{} JOIN {}{} (nested-loop)", kind, target, predicate),
+            ));
+        }
+        // GROUP BY / HAVING.
+        if !stmt.group_by.is_empty() || stmt.having.is_some() {
+            let n = stmt.group_by.len();
+            steps.push((
+                format!("{}", steps.len() + 1),
+                format!(
+                    "GROUP BY {} col{}{} (hash-group)",
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    if stmt.having.is_some() {
+                        " + HAVING filter"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+        // ORDER BY.
+        if let Some(ref oc) = stmt.order_by {
+            steps.push((
+                format!("{}", steps.len() + 1),
+                format!(
+                    "ORDER BY `{}` {:?} (in-memory sort)",
+                    oc.column, oc.direction
+                ),
+            ));
+        }
+        // LIMIT/OFFSET.
+        if stmt.limit.is_some() || stmt.offset > 0 {
+            steps.push((
+                format!("{}", steps.len() + 1),
+                format!("LIMIT {:?} OFFSET {}", stmt.limit, stmt.offset),
+            ));
+        }
+        // DISTINCT.
+        if stmt.distinct {
+            steps.push((
+                format!("{}", steps.len() + 1),
+                "DISTINCT (hash-dedup post-projection)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bloque P1: clasifica el tipo de scan que el engine usaría para
+    /// `(table, where)`. Devuelve un string descriptivo. La lógica
+    /// refleja las fast-path checks que hace `exec_select` / `exec_update`
+    /// / `exec_delete` — si vos sabés cómo le pega el engine al WHERE,
+    /// EXPLAIN te lo confirma sin tener que leer el código.
+    fn classify_scan(&mut self, table: &str, where_clause: Option<&WhereExpr>) -> DbResult<String> {
+        let meta = {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.get_table(table)?
+        };
+        let Some(meta) = meta else {
+            return Ok(format!(
+                "SCAN `{}` (⚠ tabla no existe en el catálogo)",
+                table
+            ));
+        };
+        // Sin WHERE → full scan.
+        let Some(where_expr) = where_clause else {
+            return Ok(format!(
+                "SCAN `{}` (full scan, sin WHERE; ~todos los rows)",
+                table
+            ));
+        };
+        // Solo clasificamos átomos simples. AND/OR/NOT cae a full+filter.
+        let Some(atom) = where_expr.as_atom() else {
+            return Ok(format!(
+                "SCAN `{}` (full scan + WHERE AND/OR/NOT post-filter)",
+                table
+            ));
+        };
+        match atom {
+            WhereClause::Eq { column, .. } => {
+                let key = normalize_ident(column);
+                if key == normalize_ident(&meta.primary_key) {
+                    Ok(format!(
+                        "SCAN `{}` → PK lookup `{}` (B+tree get, ~O(log n))",
+                        table, column
+                    ))
+                } else {
+                    let idx_kind = self.find_index_kind(&meta, &key);
+                    match idx_kind {
+                        Some(IndexKind::Hash) => Ok(format!(
+                            "SCAN `{}` → hash-index equality `{}` (bucket lookup, ~O(1))",
+                            table, column
+                        )),
+                        Some(IndexKind::OrderedInt) => Ok(format!(
+                            "SCAN `{}` → ordered-int index equality `{}` (range walk)",
+                            table, column
+                        )),
+                        None => Ok(format!(
+                            "SCAN `{}` (full scan + WHERE {}=... post-filter; \
+                             considerá `CREATE INDEX` sobre `{}`)",
+                            table, column, column
+                        )),
+                    }
+                }
+            }
+            WhereClause::Between { column, .. } => {
+                let key = normalize_ident(column);
+                let idx_kind = self.find_index_kind(&meta, &key);
+                match idx_kind {
+                    Some(IndexKind::OrderedInt) => Ok(format!(
+                        "SCAN `{}` → ordered-int index BETWEEN range `{}` (sequential walk)",
+                        table, column
+                    )),
+                    _ => Ok(format!(
+                        "SCAN `{}` (full scan + WHERE {} BETWEEN ... post-filter)",
+                        table, column
+                    )),
+                }
+            }
+            WhereClause::Compare { column, op, .. } => Ok(format!(
+                "SCAN `{}` (full scan + WHERE {} {:?} ... post-filter)",
+                table, column, op
+            )),
+            _ => Ok(format!(
+                "SCAN `{}` (full scan + WHERE post-filter, predicate complejo)",
+                table
+            )),
+        }
+    }
+
+    /// Bloque P1: busca qué índice secundario cubre `column` y devuelve
+    /// su `IndexKind`. Si no hay índice, retorna None.
+    fn find_index_kind(&mut self, meta: &TableMeta, column: &str) -> Option<IndexKind> {
+        for idx in &meta.indexes {
+            if normalize_ident(&idx.column) == column {
+                return Some(idx.kind);
+            }
+        }
+        None
+    }
+
+    /// Bloque P1: agrega los pasos típicos de un UPDATE/DELETE target.
+    /// Reutiliza `classify_scan` para describir el WHERE.
+    fn explain_dml_target(
+        &mut self,
+        table: &str,
+        op_name: &str,
+        where_clause: Option<&WhereExpr>,
+        steps: &mut Vec<(String, String)>,
+    ) -> DbResult<()> {
+        steps.push((
+            format!("{}", steps.len() + 1),
+            format!("{} target `{}`", op_name, table),
+        ));
+        let scan_desc = self.classify_scan(table, where_clause)?;
+        steps.push((format!("{}", steps.len() + 1), scan_desc));
+        Ok(())
     }
 
     /// Bloque Z3: construye el `WhereExpr` que representa las policies
@@ -19605,6 +20020,20 @@ fn inline_cte_into_expr(e: &mut Expr, cte_name: &str, cte_body: &SelectStmt) {
 
 impl Parser {
     fn parse_statement(&mut self) -> DbResult<Statement> {
+        // Bloque P1 (2026-05-29): `EXPLAIN <statement>`. ANALYZE no
+        // está soportado en P1.
+        if self.match_keyword("EXPLAIN") {
+            if self.match_keyword("ANALYZE") {
+                return Err(coded(
+                    codes::UNSUPPORTED_SYNTAX,
+                    "EXPLAIN ANALYZE no está soportado en P1 (defer a P2 — \
+                     requiere instrumentación de timings + row counts reales). \
+                     Usá `EXPLAIN <stmt>` para ver el plan estimado.",
+                ));
+            }
+            let inner = self.parse_statement()?;
+            return Ok(Statement::Explain(Box::new(inner)));
+        }
         if self.match_keyword("CREATE") {
             return self.parse_create();
         }

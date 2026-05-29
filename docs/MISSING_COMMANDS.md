@@ -455,7 +455,9 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 
 | Feature | Soportado | Prioridad |
 |---|:---:|:---:|
-| `EXPLAIN` / `EXPLAIN ANALYZE` | ❌ | P1 |
+| `EXPLAIN <statement>` (plan textual sin ejecutar) | ✅ (P1, 2026-05-29; cols step/detail; clasifica scan type honestamente: PK lookup / hash-index / ordered-int / full scan + post-filter; soporta SELECT/INSERT/UPDATE/DELETE/JOIN/ORDER/LIMIT/DISTINCT; ver ADR-0063) | — |
+| `EXPLAIN ANALYZE` (timings + row counts reales) | ❌ (defer P2 — requiere instrumentación del exec loop) | P2 |
+| `EXPLAIN` con cost estimates (rows, pages, total cost) | ❌ (defer P3 — requiere stats del catálogo + planner-as-optimizer) | P3 |
 | `PREPARE` / `EXECUTE` (prepared statements) | ❌ | P2 |
 | Parámetros bind (`?`, `$1`) en API | ❌ | P1 |
 | `COPY FROM` / `COPY TO` (bulk load) | ❌ | P2 |

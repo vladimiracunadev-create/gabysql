@@ -6,6 +6,59 @@
 
 ---
 
+## 2026-05-29 — Bloque P1: `EXPLAIN <statement>` (Fase 3 arranca)
+
+> **Un push a `main`** sin bump on-disk. Primer sub-bloque de Fase 3 (Performance/Planeación). Nombrado **P1** para cortar limpio con la cadena Z. Detalle en [`docs/adr/0063-p1-explain-statement.md`](docs/adr/0063-p1-explain-statement.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+EXPLAIN SELECT n FROM t WHERE id = 1 ORDER BY n LIMIT 10;
+-- columns: step, detail
+-- 1 | SCAN `t` → PK lookup `id` (B+tree get, ~O(log n))
+-- 2 | ORDER BY `n` Asc (in-memory sort)
+-- 3 | LIMIT Some(10) OFFSET 0
+
+EXPLAIN INSERT INTO t (id, n) VALUES (1, 1), (2, 2);
+-- 1 | INSERT INTO `t` (2 columnas, 2 filas fuente)
+
+EXPLAIN UPDATE t SET n = 99 WHERE id = 1;
+-- 1 | UPDATE target `t`
+-- 2 | SCAN `t` → PK lookup `id` (B+tree get, ~O(log n))
+-- 3 | SET 1 columna
+
+EXPLAIN ANALYZE SELECT * FROM t;
+-- → [GBY-4139] UNSUPPORTED_SYNTAX (defer P2)
+```
+
+### 🛠 Implementación
+
+- AST: `Statement::Explain(Box<Statement>)` nuevo variant.
+- Parser: dispatch `EXPLAIN` recursivo; rechaza `ANALYZE` con código nuevo `4139`.
+- Engine: `exec_explain`, `explain_select_query`, `explain_select`, `classify_scan`, `find_index_kind`, `explain_dml_target` (~250 LOC).
+- Clasificación de scan **honesta**: espeja exactamente las fast-path checks que hace el engine (`PK lookup`, `hash-index equality`, `ordered-int index equality/range`, `full scan + WHERE post-filter`). Si EXPLAIN dice "PK lookup", el engine va a usar PK lookup. Si dice "full scan", eso ejecuta.
+- Garantiza dry-run: `EXPLAIN INSERT` no persiste.
+
+### 🆕 Códigos de error
+
+- `[GBY-4139]` `UNSUPPORTED_SYNTAX` — sintaxis aceptada por parser pero no implementada (usado por `EXPLAIN ANALYZE`).
+
+### 🚫 Diferido (P2/P3)
+
+- **`EXPLAIN ANALYZE`** con timings + row counts reales — requiere instrumentación del exec loop (P2).
+- **FORMAT JSON** / **FORMAT TEXT** — output parseable para tooling.
+- **Cost estimates** (row counts, page reads) — requiere stats del catálogo.
+- **Planner-as-optimizer** (reorden de joins, choice de índices, stats) — P3 dedicado.
+- **Plan tree** estilo PG `->` — hoy lista plana con step IDs.
+- **EXPLAIN sobre statements procedurales** (IF/WHILE/BEGIN..END) — hoy se imprimen como DDL/control.
+
+### 🧪 Validación
+
+- Suite: **708 passing + 1 ignored** (698 → +10 P1). Cubre: full scan, PK lookup, index lookups (hash/ordered), JOIN, INSERT VALUES, UPDATE/DELETE, dry-run guarantee, EXPLAIN ANALYZE rechazado, DISTINCT/ORDER/LIMIT acumulados.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z3f: DEFAULTs aplicados antes de WITH CHECK en INSERT
 
 > **Un push a `main`** sin bump on-disk. Cierra un gap sutil en el WITH CHECK que producía falsos rejects/accepts cuando policies referenciaban columnas con DEFAULT. Detalle en [`docs/adr/0062-z3f-defaults-before-with-check.md`](docs/adr/0062-z3f-defaults-before-with-check.md).

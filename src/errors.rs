@@ -697,6 +697,12 @@ pub mod codes {
     /// `current_user`. La row no se persiste; el statement entero
     /// rebota (no hay rollback parcial dentro del mismo statement).
     pub const POLICY_CHECK_VIOLATION: u32 = 4138;
+    /// Bloque P1 (2026-05-29): sintaxis SQL aceptada por el parser pero
+    /// no implementada todavía. Distinto de un parse error puro porque
+    /// el statement es estructuralmente válido. Hoy se usa para
+    /// `EXPLAIN ANALYZE` (defer P2). El mensaje detalla qué falta y
+    /// dónde se planea entregar.
+    pub const UNSUPPORTED_SYNTAX: u32 = 4139;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.
