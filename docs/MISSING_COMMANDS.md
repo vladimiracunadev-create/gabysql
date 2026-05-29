@@ -430,7 +430,7 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 | `DROP POLICY [IF EXISTS] name ON table` | ✅ (Z3, 2026-05-29) | — |
 | `WITH CHECK (expr)` clause + `FOR INSERT` POLICY | ✅ (Z3b, 2026-05-29; VERSION 26→27; `CREATE POLICY ... [USING (expr)] [WITH CHECK (expr)]`; enforcement en INSERT con PERMISSIVE OR; `[GBY-4138]` POLICY_CHECK_VIOLATION; ver ADR-0054) | — |
 | UPDATE post-image check con WITH CHECK | ✅ (Z3c, 2026-05-29; hook en exec_update pre-persist; reusa enforce_with_check de Z3b; sin bump on-disk; ver ADR-0055) | — |
-| `INSERT ... ON CONFLICT DO UPDATE` con WITH CHECK del UPDATE path | ❌ (defer Z3c) | P3 |
+| `INSERT ... ON CONFLICT DO UPDATE` con WITH CHECK del UPDATE path | ✅ (Z3e, 2026-05-29; sin bump on-disk; hook en apply_insert_row_with_conflict; reusa enforce_with_check de Z3b; ver ADR-0059) | — |
 | `INSERT/UPDATE/DELETE ... RETURNING` filtrado contra policies SELECT | ✅ (Z3d, 2026-05-29; sin bump on-disk; row visible si al menos una SELECT policy USING evalúa TRUE; visibility hiding silencioso; ver ADR-0057) | — |
 | `AS PERMISSIVE | RESTRICTIVE` modifier | ❌ (Z3 sólo PERMISSIVE = OR; defer) | P3 |
 | `ALTER TABLE ... ENABLE/FORCE ROW LEVEL SECURITY` | ❌ (Z3 activa implícitamente con cualquier policy; defer del flag) | P3 |

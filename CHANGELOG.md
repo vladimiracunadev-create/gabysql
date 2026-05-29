@@ -6,6 +6,45 @@
 
 ---
 
+## 2026-05-29 — Bloque Z3e: ON CONFLICT DO UPDATE con WITH CHECK
+
+> **Un push a `main`** sin bump on-disk. Cierra el último leak histórico del WITH CHECK en el upsert path. Detalle en [`docs/adr/0059-z3e-on-conflict-with-check.md`](docs/adr/0059-z3e-on-conflict-with-check.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE POLICY own ON t FOR UPDATE
+  USING (owner = 'alice')
+  WITH CHECK (owner = 'alice');
+
+SET SESSION AUTHORIZATION 'alice';
+
+-- Antes Z3e: pasaba (el upsert path no chequeaba WITH CHECK).
+-- Z3e: rebota con [GBY-4138].
+INSERT INTO t (id, owner) VALUES (1, 'alice')
+  ON CONFLICT (id) DO UPDATE SET owner = 'bob';
+```
+
+### 🛠 Implementación
+
+- Hook nuevo en `apply_insert_row_with_conflict`, branch `OnConflictAction::DoUpdate`.
+- Por cada PK conflictivo: recargar `old_row` del catálogo, construir `post_row` aplicando assignments, llamar `enforce_with_check(table, POLICY_ACTION_UPDATE, &post_row)` antes de `apply_update_to_pk`.
+- Reusa al 100% `enforce_with_check` de Z3b: OR PERMISSIVE + fallback USING-as-WITH-CHECK para policies sin WITH CHECK explícito.
+- Sin policies → bypass (compat 100% pre-Z3e). Superuser → bypass.
+
+### 🚫 Diferido (Z3f)
+
+- Statement-level rollback en RLS violation (requiere savepoint primitive, Bloque T).
+- Column-level filter en RETURNING.
+- `INSERT ... ON CONFLICT DO NOTHING` con check de SELECT policy sobre la fila existente (defenderse contra timing leaks de existence).
+
+### 🧪 Validación
+
+- Suite: **690 passing** (685 → +5 Z3e). Cubre: upsert pass/fail WITH CHECK, fallback USING→WITH CHECK, superuser bypass, sin policies = compat.
+- `cargo fmt --check` + `cargo clippy --lib --tests -- -D warnings` limpio.
+
+---
+
 ## 2026-05-29 — Bloque Z1d: Blake2b foundation + scheme=3 reservado para Argon2id
 
 > **Un push a `main`**. Bump on-disk **VERSION 28 → 29** (corte semántico). Z1d entrega la primitiva Blake2b RFC 7693 puro en Rust como foundation para Argon2id futuro (Z1e). Detalle en [`docs/adr/0058-z1d-blake2b-foundation.md`](docs/adr/0058-z1d-blake2b-foundation.md).

@@ -6848,6 +6848,37 @@ impl<'a> Engine<'a> {
                         // chocar contra más de una constraint).
                         let mut last_row: Option<HashMap<String, Value>> = None;
                         for pk in &conflict_pks {
+                            // Bloque Z3e (2026-05-29): WITH CHECK
+                            // post-image en el upsert path. Si current_user
+                            // está activo, computamos la fila resultante
+                            // (OLD + assignments aplicados) y la pasamos
+                            // por enforce_with_check con action=UPDATE
+                            // antes de persistir. Si falla → [GBY-4138]
+                            // y el INSERT entero rebota (no hay
+                            // statement-level partial rollback).
+                            if self.current_user.is_some() {
+                                let old_row: Option<HashMap<String, Value>> = {
+                                    let mut catalog = Catalog::open(self.pager);
+                                    let bytes = catalog.get_row(meta.root_page, *pk)?;
+                                    bytes.map(|b| decode_row(meta, &b)).transpose()?
+                                };
+                                if let Some(old) = old_row {
+                                    let mut new_map = old.clone();
+                                    for (col, expr) in &expr_assignments {
+                                        let v = self.eval_expr_full(
+                                            expr,
+                                            &old,
+                                            Some(meta.name.as_str()),
+                                        )?;
+                                        new_map.insert(normalize_ident(col), v);
+                                    }
+                                    self.enforce_with_check(
+                                        &meta.name,
+                                        POLICY_ACTION_UPDATE,
+                                        &new_map,
+                                    )?;
+                                }
+                            }
                             self.apply_update_to_pk(meta, *pk, &expr_assignments)?;
                             // Leer fila post-update para RETURNING.
                             let bytes = {

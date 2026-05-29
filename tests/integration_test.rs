@@ -15685,6 +15685,138 @@ fn z1d_scheme_3_argon2id_reserved_returns_clear_error() -> Result<(), Box<dyn Er
     Ok(())
 }
 
+// ============================================================
+// Bloque Z3e (2026-05-29): ON CONFLICT DO UPDATE con WITH CHECK
+// del UPDATE path. Sin bump on-disk.
+// ============================================================
+
+fn z3e_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("z3e-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn z3e_upsert_passing_with_check() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3e_setup("upsert-ok")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT, n INT);
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 10);
+         CREATE USER alice;
+         GRANT SELECT, INSERT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL
+           USING (owner = 'alice')
+           WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner, n) VALUES (1, 'alice', 99)
+           ON CONFLICT (id) DO UPDATE SET n = 99;",
+    )?;
+    let res = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION DEFAULT; SELECT n FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3e_upsert_violating_with_check_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3e_setup("upsert-bad")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         CREATE USER alice;
+         GRANT SELECT, INSERT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR ALL
+           USING (owner = 'alice')
+           WITH CHECK (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice')
+           ON CONFLICT (id) DO UPDATE SET owner = 'bob';",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138], vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3e_upsert_with_check_fallback_to_using() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3e_setup("upsert-fallback")?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         CREATE USER alice;
+         GRANT SELECT, INSERT, UPDATE ON t TO alice;
+         CREATE POLICY own ON t FOR UPDATE USING (owner = 'alice');
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, owner) VALUES (1, 'alice')
+           ON CONFLICT (id) DO UPDATE SET owner = 'bob';",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4138"),
+        "esperaba [GBY-4138] (USING reusado), vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3e_upsert_superuser_bypass() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3e_setup("upsert-super")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, owner TEXT);
+         INSERT INTO t (id, owner) VALUES (1, 'alice');
+         CREATE POLICY block ON t FOR UPDATE
+           USING (FALSE) WITH CHECK (FALSE);
+         INSERT INTO t (id, owner) VALUES (1, 'alice')
+           ON CONFLICT (id) DO UPDATE SET owner = 'bob';
+         SELECT owner FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(
+        res.last().unwrap().rows[0][0],
+        Value::String("bob".to_string())
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn z3e_upsert_no_policies_compat() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = z3e_setup("upsert-no-pol")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1, 10);
+         CREATE USER alice;
+         GRANT SELECT, INSERT, UPDATE ON t TO alice;
+         SET SESSION AUTHORIZATION 'alice';
+         INSERT INTO t (id, n) VALUES (1, 999)
+           ON CONFLICT (id) DO UPDATE SET n = 999;",
+    )?;
+    let res = run_sql(
+        &db,
+        "SET SESSION AUTHORIZATION DEFAULT; SELECT n FROM t WHERE id = 1;",
+    )?;
+    assert_eq!(res.last().unwrap().rows[0][0], Value::Integer(999));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
