@@ -310,7 +310,9 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | Trigger body multi-statement (`BEGIN stmt; stmt; END`) | ✅ (X2, 2026-05-28) | — |
 | NEW mutable en BEFORE triggers (`NEW.col := ...`) | ❌ (X2: NEW read-only; diferido a X3+) | P2 |
 | `IF expr THEN ... [ELSIF ...]* [ELSE ...] END IF` (statement top-level + en bodies) | ✅ (X4, 2026-05-28; anidado OK; NEW/OLD/params via substitución pre-parse) | — |
-| Variables locales (`DECLARE`), asignación (`SET x = ...`), `WHILE`/`LOOP`/`FOR` | ❌ (diferido a X4b+) | P3 |
+| Variables locales (`DECLARE name TYPE [DEFAULT expr]`) + asignación (`SET name = expr`) + `WHILE cond LOOP ... END LOOP` + `EXIT [WHEN cond]` | ✅ (X4b, 2026-05-28; scope plano, vars NO usables en INSERT VALUES) | — |
+| `FOR i IN a..b LOOP`, `FOR row IN SELECT ... LOOP`, `LOOP ... END LOOP` standalone | ❌ (diferido a X4c+) | P3 |
+| Nested scope real (BEGIN..END como block scope) | ❌ (X4b: scope plano) | P3 |
 | `RAISE EXCEPTION`/`RAISE NOTICE`, `EXCEPTION WHEN ... THEN` | ❌ (diferido a X4c) | P3 |
 | `RAISE EXCEPTION`/`RAISE NOTICE` desde trigger body | ❌ (workaround: hacer un DML que falle) | P3 |
 | Triggers sobre vistas (`INSTEAD OF`) | ❌ | P3 |

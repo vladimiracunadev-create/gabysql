@@ -54,7 +54,8 @@
 | [`CREATE PROCEDURE name(p1 TYPE, ...) AS <body>` + `DROP PROCEDURE` + `CALL name(args)`](#stored-procedures-bloque-x3) | DDL+DML | 🟢 (bloque X3 / VERSION 15) |
 | [`CREATE FUNCTION name(p1 TYPE, ...) RETURNS TYPE AS <expr>` + `DROP FUNCTION`, invocable como `name(args)` en cualquier expresión](#user-defined-functions-bloque-x3b) | DDL+DML | 🟢 (bloque X3b / VERSION 16) |
 | [`IF expr THEN ... [ELSIF ...]* [ELSE ...] END IF`](#control-de-flujo-if-bloque-x4) — statement top-level + dentro de bodies; anidado | TCL | 🟢 (bloque X4) |
-| NEW mutable en BEFORE, variables/`LOOP`/`WHILE`/`EXCEPTION` en body, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
+| [`DECLARE` + `SET` + `WHILE LOOP` + `EXIT [WHEN]`](#variables--while-loop-bloque-x4b) — variables locales con scope plano; vars visibles en Expr (no en INSERT VALUES) | TCL | 🟢 (bloque X4b) |
+| NEW mutable en BEFORE, `FOR`/`LOOP` standalone, `RAISE`/`EXCEPTION` handlers, RETURNS TABLE, body de function como SELECT, partial indexes, frame specs explícitas, `WINDOW w AS (...)`, múltiples CTEs `RECURSIVE` | — | 🔴 (ver [MISSING_COMMANDS](MISSING_COMMANDS.md)) |
 
 ---
 
@@ -2056,6 +2057,101 @@ END IF;
 - **`RAISE EXCEPTION` / `RAISE NOTICE`** — X4c.
 - **`EXCEPTION WHEN ... THEN`** handlers — X4c.
 - **`CASE` statement** (vs CASE expression que ya existe en SELECT list) — futuro.
+
+---
+
+## Variables + `WHILE LOOP` (bloque X4b)
+
+> **`DECLARE` + `SET` + `WHILE LOOP` + `EXIT [WHEN]`**: variables locales y loops. Top-level y dentro de bodies de trigger/procedure. Scope plano (limitación X4b — no nested scope por BEGIN..END).
+
+### 📜 EBNF
+
+```
+declare_stmt  ::= "DECLARE" ident type_name [ "DEFAULT" expr ]
+set_stmt      ::= "SET" ident "=" expr
+while_stmt    ::= "WHILE" expr "LOOP" stmt_list "END" "LOOP"
+exit_stmt     ::= "EXIT" [ "WHEN" expr ]
+```
+
+### 🧠 Semántica
+
+- **`DECLARE`** agrega variable al scope (init con `DEFAULT expr` o NULL). Redeclarar → `[GBY-4108]`.
+- **`SET`** actualiza variable existente (RHS = Expr eval'd contra scope actual). Variable no declarada → `[GBY-4107]`.
+- **`WHILE`** itera mientras cond TRUE. Guard `MAX_LOOP_ITERATIONS = 100_000` → `[GBY-4109]`.
+- **`EXIT`** sin WHEN: sale incondicional del loop innermost.
+- **`EXIT WHEN cond`**: sale solo si cond TRUE.
+
+### ⚠️ Limitación importante: variables NO en `INSERT VALUES`
+
+```sql
+DECLARE n INT DEFAULT 5;
+-- ❌ falla — el parser de VALUES exige Value literal, no Expr
+INSERT INTO t VALUES (n);
+```
+
+**Workarounds**:
+
+```sql
+-- ✅ INSERT SELECT acepta Expr
+INSERT INTO t SELECT n FROM (VALUES (1)) AS dummy;
+
+-- ✅ UPDATE SET acepta Expr (vars OK en RHS)
+UPDATE t SET col = n WHERE id = 1;
+
+-- ✅ En procedure: usar params (se substituyen a literal en CALL)
+CREATE PROCEDURE foo(p_n INT) AS INSERT INTO t VALUES (p_n);
+```
+
+### ✅ Ejemplos
+
+```sql
+-- Counter loop
+DECLARE i INT DEFAULT 0;
+WHILE i < 10 LOOP
+    SET i = i + 1;
+END LOOP;
+
+-- Loop con EXIT WHEN
+DECLARE counter INT DEFAULT 0;
+WHILE TRUE LOOP
+    SET counter = counter + 1;
+    EXIT WHEN counter >= 42;
+END LOOP;
+
+-- Loop con IF + EXIT incondicional
+DECLARE found INT DEFAULT 0;
+WHILE found = 0 LOOP
+    SET found = (SELECT COUNT(*) FROM t WHERE flag = 1);
+    IF found > 0 THEN EXIT; END IF;
+    -- ... resto del trabajo
+END LOOP;
+
+-- En procedure body
+CREATE PROCEDURE process(p_max INT) AS BEGIN
+    DECLARE i INT DEFAULT 0;
+    WHILE i < p_max LOOP
+        UPDATE counters SET v = v + 1 WHERE id = 1;
+        SET i = i + 1;
+    END LOOP;
+END;
+```
+
+### ❌ Errores típicos
+
+| Mensaje | Causa |
+| :--- | :--- |
+| `[GBY-4107] SET '...': variable no declarada` | Falta `DECLARE` previo. |
+| `[GBY-4108] DECLARE '...': ya declarada en el scope` | Redeclare. PG permite shadowing en sub-blocks; X4b scope plano no. |
+| `[GBY-4109] WHILE LOOP: superó el límite de 100000 iter` | Condición no converge. Agregar `EXIT WHEN` o revisar SET. |
+
+### ⚠️ No soportado todavía
+
+- **`FOR i IN a..b LOOP`** / **`FOR row IN SELECT ... LOOP`** — diferido a X4c.
+- **`LOOP ... END LOOP`** standalone (sin WHILE) — diferido.
+- **`RAISE EXCEPTION`** / **`EXCEPTION WHEN`** handlers — X4c.
+- **Nested scope** real por BEGIN..END block — diferido.
+- **Type checking estricto** en DECLARE/SET — diferido.
+- **Variables en `INSERT VALUES`** — requiere lift de la restricción de VALUES.
 
 ---
 

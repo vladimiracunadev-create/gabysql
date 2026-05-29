@@ -55,6 +55,15 @@ pub enum Statement {
     /// condición contra row vacío (post-substitución de NEW/OLD/params)
     /// y ejecuta la branch elegida.
     If(Box<IfStmt>),
+    /// Bloque X4b (2026-05-28): `DECLARE var TYPE [DEFAULT expr]`.
+    Declare(DeclareStmt),
+    /// Bloque X4b: `SET var = expr` — actualiza variable en el scope.
+    Set(SetStmt),
+    /// Bloque X4b: `WHILE cond LOOP <body> END LOOP`. Guard de
+    /// `MAX_LOOP_ITERATIONS`.
+    While(Box<WhileStmt>),
+    /// Bloque X4b: `EXIT [WHEN cond]` — sale del LOOP innermost.
+    Exit(ExitStmt),
     /// Bloque K1 (2026-05-26): `CREATE TABLE [IF NOT EXISTS] <name>
     /// [ (col1, col2, ...) ] AS <select>`. La fuente puede ser cualquier
     /// `SelectQuery` (SELECT, UNION/INTERSECT/EXCEPT, o VALUES). La
@@ -401,6 +410,39 @@ pub struct IfStmt {
     pub branches: Vec<(Expr, Vec<Statement>)>,
     /// Cuerpo opcional del ELSE (corre si ninguna cond fue TRUE).
     pub else_branch: Option<Vec<Statement>>,
+}
+
+/// Bloque X4b (2026-05-28): `DECLARE name TYPE [DEFAULT expr]`.
+/// Vive en el scope local del frame de trigger/procedure actual.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclareStmt {
+    pub name: String,
+    pub ty: ColumnType,
+    pub default: Option<Expr>,
+}
+
+/// Bloque X4b: `SET var = expr`. Actualiza el valor de una variable
+/// ya declarada en el scope actual. Si no fue declarada, `[GBY-4107]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetStmt {
+    pub name: String,
+    pub value: Expr,
+}
+
+/// Bloque X4b: `WHILE cond LOOP <body> END LOOP`. Itera mientras `cond`
+/// evalúa a TRUE. Guard de `MAX_LOOP_ITERATIONS` para abortar runaway.
+/// El body puede contener `EXIT [WHEN cond]` para salir antes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhileStmt {
+    pub cond: Expr,
+    pub body: Vec<Statement>,
+}
+
+/// Bloque X4b: `EXIT [WHEN cond]`. Sale del LOOP innermost. `when=None`
+/// = exit incondicional; `when=Some(expr)` = exit sólo si cond es TRUE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExitStmt {
+    pub when: Option<Expr>,
 }
 
 /// Bloque K1 (2026-05-26): AST de `CREATE TABLE [IF NOT EXISTS] <name>
@@ -1565,6 +1607,12 @@ pub struct Engine<'a> {
     /// INSERT que hace otro INSERT sobre la misma tabla). Límite duro:
     /// `MAX_TRIGGER_DEPTH`.
     trigger_depth: usize,
+    /// Bloque X4b (2026-05-28): scope plano de variables locales
+    /// declaradas con `DECLARE`. Visible desde Expr (via lookup
+    /// extendido en `eval_expr_full` cuando Column no aparece en
+    /// el row). Compartido entre procedure calls / trigger fires
+    /// (simplificación X4b — no hay frames anidados; documentado).
+    var_scope: HashMap<String, Value>,
 }
 
 /// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
@@ -1577,6 +1625,16 @@ const MAX_VIEW_DEPTH: usize = 32;
 /// encadenados; un valor superior casi siempre indica una recursión
 /// no intencionada que conviene atajar temprano.
 const MAX_TRIGGER_DEPTH: usize = 16;
+
+/// Bloque X4b (2026-05-28): límite duro de iteraciones en un `WHILE LOOP`.
+/// Suficiente para cualquier loop razonable; protege contra runaway
+/// (condición que nunca converge → consumo de recursos sin fin).
+const MAX_LOOP_ITERATIONS: usize = 100_000;
+
+/// Bloque X4b: prefijo del mensaje del DbError que `exec_while` usa
+/// como sentinel para distinguir `EXIT` de un error real. No es un
+/// código `[GBY-NNNN]` — viaja como string interno.
+const EXIT_SIGNAL: &str = "__GABYSQL_EXIT_SIGNAL__";
 
 #[derive(Debug, Clone)]
 struct OuterRow {
@@ -1592,6 +1650,7 @@ impl<'a> Engine<'a> {
             explicit_tx: false,
             view_expansion_depth: 0,
             trigger_depth: 0,
+            var_scope: HashMap::new(),
         }
     }
 
@@ -1612,6 +1671,10 @@ impl<'a> Engine<'a> {
             Statement::CreateFunction(stmt) => self.exec_create_function(stmt),
             Statement::DropFunction(stmt) => self.exec_drop_function(stmt),
             Statement::If(stmt) => self.exec_if(*stmt),
+            Statement::Declare(stmt) => self.exec_declare(stmt),
+            Statement::Set(stmt) => self.exec_set(stmt),
+            Statement::While(stmt) => self.exec_while(*stmt),
+            Statement::Exit(stmt) => self.exec_exit(stmt),
             Statement::CreateTableAs(stmt) => self.exec_create_table_as(stmt),
             Statement::RenameTable(stmt) => self.exec_rename_table(stmt),
             Statement::AlterTableDropColumn(stmt) => self.exec_alter_drop_column(stmt),
@@ -3637,6 +3700,148 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Bloque X4b (2026-05-28): `DECLARE name TYPE [DEFAULT expr]`.
+    fn exec_declare(&mut self, stmt: DeclareStmt) -> DbResult<ResultSet> {
+        let key = stmt.name.to_ascii_lowercase();
+        if self.var_scope.contains_key(&key) {
+            return Err(coded(
+                codes::VARIABLE_REDECLARED,
+                format!(
+                    "DECLARE '{}': variable ya declarada en el scope actual",
+                    stmt.name
+                ),
+            ));
+        }
+        let value = if let Some(expr) = stmt.default {
+            let empty: HashMap<String, Value> = HashMap::new();
+            self.eval_expr_full(&expr, &empty, None)?
+        } else {
+            Value::Null
+        };
+        // X4b best-effort type coerce: si el tipo declarado es FLOAT y
+        // el valor es Integer, lo promovemos. Otros mismatches se
+        // ignoran (trust user). Documentado.
+        let value = match (stmt.ty, value) {
+            (ColumnType::Float, Value::Integer(n)) => Value::Float(n as f64),
+            (_, v) => v,
+        };
+        self.var_scope.insert(key, value);
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!(
+                "OK · variable '{}' declarada ({})",
+                stmt.name,
+                stmt.ty.as_sql()
+            )),
+        })
+    }
+
+    /// Bloque X4b: `SET var = expr`. La variable debe haber sido
+    /// declarada antes (`[GBY-4107]` si no). La Expr se evalúa contra
+    /// el scope actual de variables (no row context).
+    fn exec_set(&mut self, stmt: SetStmt) -> DbResult<ResultSet> {
+        let key = stmt.name.to_ascii_lowercase();
+        if !self.var_scope.contains_key(&key) {
+            return Err(coded(
+                codes::VARIABLE_NOT_DECLARED,
+                format!(
+                    "SET '{}': variable no declarada (usar DECLARE antes)",
+                    stmt.name
+                ),
+            ));
+        }
+        let empty: HashMap<String, Value> = HashMap::new();
+        let value = self.eval_expr_full(&stmt.value, &empty, None)?;
+        self.var_scope.insert(key, value);
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("OK · '{}' actualizado", stmt.name)),
+        })
+    }
+
+    /// Bloque X4b: `WHILE cond LOOP <body> END LOOP`. Itera mientras
+    /// cond TRUE. Guard `MAX_LOOP_ITERATIONS`. `EXIT` viaja como
+    /// sentinel `DbError` que atrapamos acá.
+    fn exec_while(&mut self, stmt: WhileStmt) -> DbResult<ResultSet> {
+        let empty: HashMap<String, Value> = HashMap::new();
+        let mut iter = 0usize;
+        loop {
+            if iter >= MAX_LOOP_ITERATIONS {
+                return Err(coded(
+                    codes::LOOP_MAX_ITERATIONS_EXCEEDED,
+                    format!(
+                        "WHILE LOOP: superó el límite de {} iteraciones \
+                         (condición no converge — revisar SET o usar EXIT WHEN)",
+                        MAX_LOOP_ITERATIONS
+                    ),
+                ));
+            }
+            let v = self.eval_expr_full(&stmt.cond, &empty, None)?;
+            let truthy = match v {
+                Value::Bool(b) => b,
+                Value::Null => false,
+                other => {
+                    return Err(coded(
+                        codes::IF_CONDITION_NOT_BOOLEAN,
+                        format!(
+                            "WHILE: la condición debe evaluar a BOOL, recibí {}",
+                            value_type_name(&other)
+                        ),
+                    ));
+                }
+            };
+            if !truthy {
+                break;
+            }
+            for s in stmt.body.clone() {
+                match self.exec(s) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains(EXIT_SIGNAL) => {
+                        return Ok(ResultSet {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            message: Some(format!("OK · WHILE LOOP exit a iter {}", iter)),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            iter += 1;
+        }
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("OK · WHILE LOOP completó {} iter", iter)),
+        })
+    }
+
+    /// Bloque X4b: `EXIT [WHEN cond]`. Si no hay WHEN, sale del LOOP
+    /// innermost. Con WHEN, evalúa la condición y sale sólo si TRUE.
+    /// La salida se propaga via `DbError` con prefijo `EXIT_SIGNAL`
+    /// que `exec_while` reconoce. Si el EXIT escapa del WHILE
+    /// matcher, sigue como error pero se transforma a `[GBY-4110]`.
+    fn exec_exit(&mut self, stmt: ExitStmt) -> DbResult<ResultSet> {
+        let should_exit = match stmt.when {
+            None => true,
+            Some(cond) => {
+                let empty: HashMap<String, Value> = HashMap::new();
+                let v = self.eval_expr_full(&cond, &empty, None)?;
+                matches!(v, Value::Bool(true))
+            }
+        };
+        if should_exit {
+            Err(DbError::new(EXIT_SIGNAL.to_string()))
+        } else {
+            Ok(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                message: Some("OK · EXIT WHEN false — sigue loop".to_string()),
+            })
+        }
+    }
+
     /// Bloque X3b: evalúa una invocación a user-defined function.
     /// Lookup en catálogo, arity check, evalúa cada arg contra el row
     /// actual (con outer_stack en juego para subqueries correlated),
@@ -4763,8 +4968,20 @@ impl<'a> Engine<'a> {
         row: &HashMap<String, Value>,
         outer_table_name: Option<&str>,
     ) -> DbResult<Value> {
+        // X4b: si hay variables en scope, no podemos usar el path puro
+        // (`eval_expr` no las ve). Inyectamos las variables en una
+        // copia del row para que `Expr::Column(name)` las encuentre
+        // cuando no es una columna real. Las claves del row reales
+        // ganan (no las shadowamos).
         if !expr_contains_subquery(expr) {
-            return eval_expr(expr, row);
+            if self.var_scope.is_empty() {
+                return eval_expr(expr, row);
+            }
+            let mut merged: HashMap<String, Value> = self.var_scope.clone();
+            for (k, v) in row {
+                merged.insert(k.clone(), v.clone());
+            }
+            return eval_expr(expr, &merged);
         }
         match expr {
             Expr::ScalarSubquery(sub) => {
@@ -9225,6 +9442,37 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             // tampoco — el splitter no debería incrementar para esos).
             // Heurística: IF block-open requiere que NO esté precedido
             // por DROP/CREATE/ALTER (los que usan `IF [NOT] EXISTS`).
+            // Bloque X4b (2026-05-28): `WHILE` también abre un bloque
+            // (cierra con `END LOOP` — el LOOP keyword después de END
+            // se ignora igual que el IF de END IF). Heurística mismo
+            // patrón.
+            if (ch == 'W' || ch == 'w')
+                && match_keyword_at(bytes, index, b"WHILE")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 5)
+            {
+                if !just_saw_end {
+                    begin_depth += 1;
+                }
+                just_saw_end = false;
+                current.push_str(&sql[index..index + 5]);
+                index += 5;
+                continue;
+            }
+            // `LOOP` después de END es parte del close-keyword `END LOOP`.
+            // No abre nada por sí solo (`LOOP ... END LOOP` standalone
+            // sin WHILE no se soporta en X4b — sería loop infinito hasta
+            // EXIT WHEN, diferido a X4c).
+            if (ch == 'L' || ch == 'l')
+                && match_keyword_at(bytes, index, b"LOOP")
+                && !is_ident_byte_at(bytes, index.wrapping_sub(1))
+                && !is_ident_byte_at(bytes, index + 4)
+            {
+                just_saw_end = false;
+                current.push_str(&sql[index..index + 4]);
+                index += 4;
+                continue;
+            }
             if (ch == 'I' || ch == 'i')
                 && match_keyword_at(bytes, index, b"IF")
                 && !is_ident_byte_at(bytes, index.wrapping_sub(1))
@@ -14946,6 +15194,19 @@ impl Parser {
         if self.match_keyword("IF") {
             return self.parse_if_stmt();
         }
+        // Bloque X4b (2026-05-28): DECLARE / SET / WHILE / EXIT.
+        if self.match_keyword("DECLARE") {
+            return self.parse_declare_stmt();
+        }
+        if self.match_keyword("WHILE") {
+            return self.parse_while_stmt();
+        }
+        if self.match_keyword("EXIT") {
+            return self.parse_exit_stmt();
+        }
+        if self.match_keyword("SET") {
+            return self.parse_set_stmt();
+        }
         if self.match_keyword("INSERT") {
             return self.parse_insert();
         }
@@ -15439,7 +15700,10 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" {
+                    } else if upper == "IF" || upper == "WHILE" {
+                        // X4/X4b: IF y WHILE abren depth (cierran con END
+                        // IF / END LOOP — el END decrementa, el keyword
+                        // post-END se ignora).
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -15596,7 +15860,10 @@ impl Parser {
                         if depth == 0 {
                             break;
                         }
-                    } else if upper == "IF" {
+                    } else if upper == "IF" || upper == "WHILE" {
+                        // X4/X4b: IF y WHILE abren depth (cierran con END
+                        // IF / END LOOP — el END decrementa, el keyword
+                        // post-END se ignora).
                         if !just_saw_end {
                             depth += 1;
                         }
@@ -15732,6 +15999,84 @@ impl Parser {
             stmts.push(stmt);
         }
         Ok(stmts)
+    }
+
+    /// Bloque X4b (2026-05-28): parsea `DECLARE name TYPE [DEFAULT expr]`.
+    fn parse_declare_stmt(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        let ty_raw = self.expect_ident()?;
+        let ty = ColumnType::from_sql(&ty_raw)?;
+        let default = if self.match_keyword("DEFAULT") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Declare(DeclareStmt { name, ty, default }))
+    }
+
+    /// Bloque X4b: parsea `SET var = expr`.
+    fn parse_set_stmt(&mut self) -> DbResult<Statement> {
+        let name = self.expect_ident()?;
+        self.expect_symbol("=")?;
+        let value = self.parse_expr()?;
+        Ok(Statement::Set(SetStmt { name, value }))
+    }
+
+    /// Bloque X4b: parsea `WHILE cond LOOP <stmts> END LOOP`.
+    fn parse_while_stmt(&mut self) -> DbResult<Statement> {
+        let cond = self.parse_expr()?;
+        if !self.match_keyword("LOOP") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "WHILE ...: se esperaba LOOP después de la condición",
+            ));
+        }
+        let body = self.parse_loop_body()?;
+        if !self.match_keyword("END") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "WHILE ...: se esperaba END LOOP para cerrar el bloque",
+            ));
+        }
+        if !self.match_keyword("LOOP") {
+            return Err(coded(
+                codes::IF_BLOCK_MALFORMED,
+                "WHILE ...: se esperaba END LOOP (vi END sin LOOP)",
+            ));
+        }
+        Ok(Statement::While(Box::new(WhileStmt { cond, body })))
+    }
+
+    /// Bloque X4b: parsea body de un LOOP — lista de statements
+    /// terminada por `END`.
+    fn parse_loop_body(&mut self) -> DbResult<Vec<Statement>> {
+        let mut stmts = Vec::new();
+        loop {
+            while self.match_symbol(";") {}
+            let t = self.peek();
+            if t.kind == TokenKind::Eof {
+                return Err(coded(
+                    codes::IF_BLOCK_MALFORMED,
+                    "WHILE ...: EOF antes de END LOOP",
+                ));
+            }
+            if t.kind == TokenKind::Ident && t.text.eq_ignore_ascii_case("END") {
+                break;
+            }
+            let stmt = self.parse_statement()?;
+            stmts.push(stmt);
+        }
+        Ok(stmts)
+    }
+
+    /// Bloque X4b: parsea `EXIT [WHEN cond]`.
+    fn parse_exit_stmt(&mut self) -> DbResult<Statement> {
+        let when = if self.match_keyword("WHEN") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Exit(ExitStmt { when }))
     }
 
     fn parse_if_exists(&mut self) -> DbResult<bool> {

@@ -6,6 +6,72 @@
 
 ---
 
+## 2026-05-28 — Bloque X4b: variables locales + `WHILE LOOP` + `EXIT`
+
+> **Un push a `main`** sin bump on-disk. Sexto sub-bloque del bloque X. `DECLARE`/`SET` para variables locales, `WHILE LOOP` con guard de runaway, `EXIT [WHEN]` para break. Detalle en [`docs/adr/0034-vars-loops-x4b.md`](docs/adr/0034-vars-loops-x4b.md).
+
+### 🆕 Sintaxis habilitada
+
+```sql
+-- Variables locales
+DECLARE counter INT DEFAULT 0;
+DECLARE label TEXT;
+
+-- Asignación
+SET counter = counter + 1;
+
+-- Loop con guard
+WHILE counter < 100 LOOP
+    SET counter = counter + 1;
+    IF counter >= 50 THEN EXIT; END IF;
+END LOOP;
+
+-- Loop con EXIT WHEN
+WHILE TRUE LOOP
+    SET counter = counter + 1;
+    EXIT WHEN counter = 42;
+END LOOP;
+```
+
+### 🛠 Implementación
+
+- **AST**: Statement::Declare/Set/While(Box)/Exit + structs.
+- **Parser**: detección al top de parse_statement; parse_while_stmt usa parse_loop_body que termina en `END`.
+- **Engine**: nuevo field `var_scope: HashMap<String, Value>` (scope plano por instancia de Engine — limitación X4b documentada).
+  - `exec_declare`: agrega var, error si redeclare ([GBY-4108]).
+  - `exec_set`: actualiza var, error si no declarada ([GBY-4107]).
+  - `exec_while`: itera con guard `MAX_LOOP_ITERATIONS = 100_000` ([GBY-4109]). EXIT viaja como `DbError` sentinel string que el matcher atrapa.
+  - `exec_exit`: emite el sentinel `Err` (Optional WHEN cond pre-eval).
+- **eval_expr_full extendido**: cuando `var_scope` no-vacío, hace merge `vars + row` (row gana) y delega a `eval_expr`. Permite que `Expr::Column("counter")` resuelva a la variable cuando no hay columna real homónima.
+- **Splitter + body parsers** extendidos para trackear `WHILE ... END LOOP` (junto con BEGIN/END y IF/END IF).
+
+### ⚠️ Limitación conocida — variables en `INSERT VALUES`
+
+`INSERT INTO t VALUES (counter)` **NO** funciona — el parser de VALUES exige Value literal (no Expr), y `counter` aparece como Ident no reconocido. **Workarounds**:
+- `INSERT INTO t SELECT counter FROM (VALUES (1)) AS x` (SELECT subquery acepta Expr).
+- Usar `UPDATE` (SET acepta Expr).
+- En procedures: usar params (`p_n`) en vez de variables locales (los params SÍ se substituyen a literal en CALL).
+
+Lift de esta restricción está fuera de scope de X4b.
+
+### 🚫 Diferido (a X4c+)
+
+- `RAISE EXCEPTION` / `RAISE NOTICE`.
+- `EXCEPTION WHEN ... THEN` handlers.
+- `FOR i IN a..b LOOP`, `FOR row IN SELECT ... LOOP`.
+- `LOOP ... END LOOP` standalone (sin WHILE).
+- `RETURN expr` dentro de functions.
+- `CASE` statement (vs CASE expression).
+- Nested scope real (BEGIN..END como block scope).
+- Type checking estricto en DECLARE/SET.
+
+### 🧪 Validación
+
+- 8 tests `x4b_*`: DECLARE+SET+IF, WHILE counter, EXIT WHEN, EXIT unconditional, SET sin DECLARE rechazado, redeclare rechazado, max-iter guard, DECLARE+WHILE dentro de procedure.
+- Suite total: **458/458 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-28 — Bloque X4: control de flujo `IF/THEN/ELSIF/ELSE/END IF`
 
 > **Un push a `main`** sin bump on-disk. Quinto sub-bloque del bloque X. Control de flujo `IF` como statement top-level — utilizable directamente en batches SQL y dentro de bodies de trigger/procedure. Variables locales, `LOOP`, `EXCEPTION` diferidos a X4b+. Detalle en [`docs/adr/0033-if-then-else-x4.md`](docs/adr/0033-if-then-else-x4.md).

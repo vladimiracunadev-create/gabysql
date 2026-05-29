@@ -10734,6 +10734,162 @@ fn x4_if_with_new_in_trigger() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ----- Bloque X4b (2026-05-28): DECLARE/SET/WHILE/EXIT. -----
+
+fn x4b_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("x4b-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn x4b_declare_and_set() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("decl-set")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE x INT DEFAULT 5;
+         SET x = x + 10;
+         IF x = 15 THEN INSERT INTO log (id) VALUES (1); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_while_loop_counter() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("while")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE i INT DEFAULT 0;
+         WHILE i < 5 LOOP
+            IF i = 2 THEN INSERT INTO log (id) VALUES (99); END IF;
+            SET i = i + 1;
+         END LOOP;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(99));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_exit_when() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("exit-when")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE i INT DEFAULT 0;
+         WHILE i < 1000 LOOP
+            SET i = i + 1;
+            EXIT WHEN i = 3;
+         END LOOP;
+         IF i = 3 THEN INSERT INTO log (id) VALUES (42); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(42));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_set_undeclared_var_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("undecl")?;
+    let err = run_sql(&db, "SET x = 1;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4107"),
+        "esperaba GBY-4107, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_redeclare_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("redecl")?;
+    let err = run_sql(&db, "DECLARE x INT; DECLARE x INT;").unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4108"),
+        "esperaba GBY-4108, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_while_max_iter_guard() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("max-iter")?;
+    // Loop sin condición de corte: i nunca cambia.
+    let err = run_sql(
+        &db,
+        "DECLARE i INT DEFAULT 0; WHILE i = 0 LOOP SET i = 0; END LOOP;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GBY-4109"),
+        "esperaba GBY-4109, got: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_declare_in_procedure_body() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("in-proc")?;
+    // X4b limitación: variables locales NO se substituyen dentro de
+    // INSERT VALUES (requiere literales). El INSERT usa el param
+    // `p_n` (substituido a literal en CALL) en vez de la variable
+    // `i` para esquivar la limitación.
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         CREATE PROCEDURE loop_n(p_n INT) AS BEGIN \
+            DECLARE i INT DEFAULT 0; \
+            WHILE i < p_n LOOP \
+               SET i = i + 1; \
+            END LOOP; \
+            IF i = p_n THEN INSERT INTO log (id) VALUES (p_n); END IF; \
+         END;",
+    )?;
+    run_sql(&db, "CALL loop_n(7);")?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(7));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn x4b_exit_unconditional() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = x4b_setup("exit-uncond")?;
+    run_sql(
+        &db,
+        "CREATE TABLE log (id INT PRIMARY KEY);
+         DECLARE i INT DEFAULT 0;
+         WHILE i < 1000 LOOP
+            SET i = i + 1;
+            IF i = 2 THEN EXIT; END IF;
+         END LOOP;
+         IF i = 2 THEN INSERT INTO log (id) VALUES (42); END IF;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM log;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

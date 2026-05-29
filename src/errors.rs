@@ -560,6 +560,22 @@ pub mod codes {
     /// Bloque X4: bloque `IF` malformado — falta `THEN`, falta `END IF`,
     /// `ELSIF`/`ELSE` fuera de lugar, etc.
     pub const IF_BLOCK_MALFORMED: u32 = 4106;
+    /// Bloque X4b (2026-05-28): `SET var = ...` sobre una variable que
+    /// no fue declarada previamente con `DECLARE` en el scope actual.
+    pub const VARIABLE_NOT_DECLARED: u32 = 4107;
+    /// Bloque X4b: `DECLARE name ...` con un nombre ya declarado en el
+    /// scope actual. PG permite shadowing dentro de sub-blocks; X4b
+    /// no tiene sub-blocks (todas las DECLARE viven en un único scope
+    /// por frame de trigger/procedure), así que redeclarar rebota.
+    pub const VARIABLE_REDECLARED: u32 = 4108;
+    /// Bloque X4b: `WHILE cond LOOP ... END LOOP` superó el límite de
+    /// iteraciones (`MAX_LOOP_ITERATIONS`). Causa típica: condición
+    /// que no converge. Workaround: usar `EXIT WHEN` con un contador.
+    pub const LOOP_MAX_ITERATIONS_EXCEEDED: u32 = 4109;
+    /// Bloque X4b: `EXIT [WHEN cond]` fuera de un `LOOP`. EXIT solo
+    /// hace sentido dentro del cuerpo de un WHILE/LOOP — fuera, no
+    /// hay loop al que salir.
+    pub const EXIT_OUTSIDE_LOOP: u32 = 4110;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.
