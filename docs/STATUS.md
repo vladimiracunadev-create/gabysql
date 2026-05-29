@@ -1,13 +1,23 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-27 contra `main` post-bloques E1+E2+E3+F+T+J+J2 (sesión 2026-05-25) + G1+G2+G3+H+I+K1+K2 (sesión 2026-05-26) + L1+L2+L3 + residuales constraint-naming/FK multi-col/ON UPDATE activo + V (sesión 2026-05-27): CHECK constraints column/table-level con ALTER ADD CHECK, FK referential actions completas (`SET NULL` / `SET DEFAULT` / `NO ACTION` / `ON UPDATE` activo), nombres explícitos de constraint + `ALTER TABLE DROP CONSTRAINT`, FK multi-col, UPDATE de PK con re-encode + cascade, vistas lógicas (`CREATE VIEW` / `DROP VIEW` + cycle guard) — VERSION 8 → 13.
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-29 contra `main` post-bloques W1+W2+W3 (CTEs no-rec / `WITH RECURSIVE` / window functions), X1+X2+X3+X3b+X4+X4b+X4c+X4d+X4e+X4f (triggers AFTER/BEFORE, stored procedures, user functions, IF/CASE/WHILE/FOR/LOOP/DECLARE/SET/RAISE/EXCEPTION/RETURN), Y + Y2 (tipos extendidos + aliases sintácticos + TIME + UUID + enforcement VARCHAR(n)/CHAR(n)). **VERSION 13 → 18** (bumps: 14 = procedures, 15 = procedures payload, 16 = functions, 17 = TIME/UUID, 18 = max_length).
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-13-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-377%2F377-brightgreen)](../tests/integration_test.rs)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-18-2d7a66)](TECHNICAL_SPECS.md)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-510%2F510-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
+
+> **2026-05-29 — Bloques W/X/Y entregados.** Esta tabla se mantiene mayormente como estaba al cierre de 2026-05-27 (V13). Los subsistemas nuevos del 2026-05-29 son:
+> - **CTEs**: `WITH name AS (...)` (W1) y `WITH RECURSIVE` (W2, fixpoint con guard 10K). 🟢
+> - **Window functions**: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `SUM/AVG/MIN/MAX/COUNT OVER` (W3). 🟢 *(sin frame explícito, `[GBY-4088]`)*.
+> - **Triggers `BEFORE`/`AFTER` con body multi-statement** (X1+X2). 🟢
+> - **Stored procedures + `CALL`** (X3). 🟢
+> - **User-defined scalar functions `CREATE FUNCTION ... RETURNS ... AS <expr|BEGIN..END>`** (X3b+X4f). 🟢 *(invocables en SELECT/WHERE, RETURN con sentinel)*.
+> - **Control de flujo procedural completo**: `IF/THEN/ELSIF/ELSE/END IF`, `DECLARE/SET/WHILE/EXIT [WHEN]`, `RAISE EXCEPTION/NOTICE`, `FOR i IN a..b LOOP`, `BEGIN..EXCEPTION WHEN .. END`, `LOOP..END LOOP`, `CASE..WHEN..END CASE`, `EXCEPTION WHEN <code>` (X4 → X4f). 🟢 *(diferidos: `FOR row IN SELECT`, filtros simbólicos, formato `%` en RAISE)*.
+> - **Tipos extendidos**: aliases (`BIGINT`, `VARCHAR(n)`, `DECIMAL(p,s)`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, …) + nuevos `TIME` y `UUID` (Y). 🟢
+> - **Enforcement de `VARCHAR(n)`/`CHAR(n)`** (Y2): `[GBY-4119]` si excede. 🟢 *(diferidos: range SMALLINT/TINYINT, BLOB, DECIMAL exacto, ARRAY, ENUM)*.
 
 ---
 

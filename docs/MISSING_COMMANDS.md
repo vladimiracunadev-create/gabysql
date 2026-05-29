@@ -368,14 +368,17 @@ Hoy soportadas: INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING (1 col), NATURAL (1
 | `TIME` (HH:MM:SS[.fff]) | ✅ (Y, 2026-05-29; VERSION 16→17; code=8; validación lexical en CAST) | — |
 | `UUID` (8-4-4-4-12 hex canónico) | ✅ (Y, 2026-05-29; VERSION 16→17; code=9; CAST normaliza a lowercase) | — |
 | `BIGINT` / `SMALLINT` / `TINYINT` / `INTEGER` / `MEDIUMINT` / `INT2` / `INT4` / `INT8` | ✅ (Y, 2026-05-29; aliases puros de INT — sin range enforcement) | — |
-| `VARCHAR(n)` / `CHAR(n)` / `CHARACTER VARYING(n)` / `NVARCHAR(n)` / `STRING` / `CLOB` | ✅ (Y, 2026-05-29; aliases de TEXT — `(n)` aceptado, no enforce longitud) | — |
+| `VARCHAR(n)` / `CHAR(n)` / `CHARACTER VARYING(n)` / `NVARCHAR(n)` / `STRING` / `CLOB` | ✅ (Y, 2026-05-29; aliases de TEXT) + **enforcement de longitud** (Y2, 2026-05-29; VERSION 17→18; bytes UTF-8, `[GBY-4119]`) | — |
 | `REAL` / `DOUBLE` / `DOUBLE PRECISION` | ✅ (Y, 2026-05-29; aliases de FLOAT) | — |
 | `NUMERIC[(p,s)]` / `DECIMAL[(p,s)]` / `DEC[(p,s)]` | 🟡 (Y, 2026-05-29; aliases de FLOAT — **no es decimal exacto**, queda diferido a Y2) | P1 (exactitud) |
 | `BOOLEAN` | ✅ (Y, 2026-05-29; alias de BOOL) | — |
 | `TIMESTAMP` | ✅ (Y, 2026-05-29; alias de DATETIME) | — |
 | `BLOB` / `BYTEA` / `BINARY` (binario) | ❌ (requiere `Value::Bytes` + nueva serialización; diferido a Y2) | P1 |
 | `DECIMAL(p,s)` **exacto** (no alias de FLOAT) | ❌ (diferido a Y2 — requiere `Value::Decimal`) | P1 |
-| Enforcement de longitud VARCHAR(n)/CHAR(n) y rango SMALLINT/TINYINT | ❌ (diferido a Y2) | P2 |
+| Enforcement de longitud VARCHAR(n) / CHAR(n) | ✅ (Y2, 2026-05-29; bytes UTF-8) | — |
+| Enforcement de rango SMALLINT / TINYINT | ❌ (diferido a Y3) | P2 |
+| `CHAR(n)` con padding a la derecha (estándar SQL) | ❌ (diferido) | P3 |
+| Conteo por code points en VARCHAR(n) (vs bytes UTF-8) | ❌ (diferido) | P3 |
 | `ARRAY[]` | ❌ (diferido) | P3 |
 | `INTERVAL` | ❌ (diferido) | P3 |
 | `ENUM` | ❌ (diferido) | P2 |

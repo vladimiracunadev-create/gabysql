@@ -172,6 +172,47 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `4076` | `VIEW_EXPANSION_DEPTH_EXCEEDED` | Bloque V: la cadena de vistas anidadas excedió `MAX_VIEW_DEPTH` (32). Típicamente un ciclo. | Romper el ciclo o materializar en una tabla. |
 | `4077` | `VIEW_NAME_COLLIDES_WITH_OBJECT` | Bloque V: `CREATE VIEW` con un nombre ya tomado por una tabla o vista. | Elegir otro nombre o usar `IF NOT EXISTS` (sólo aplica si la colisión es con otra vista). |
 | `4078` | `VIEW_SOURCE_NOT_SIMPLE_SELECT` | Bloque V: el source de la vista es un set op (UNION/INTERSECT/EXCEPT) o VALUES; sólo SELECT simple en este release. | Refactorizar la vista como SELECT plano o esperar al soporte futuro. |
+| `4079` | `CTE_NAME_DUPLICATED` | Bloque W1 (2026-05-28): dos CTEs con el mismo nombre en la misma cláusula `WITH`. | Renombrar uno de los CTEs. |
+| `4080` | `CTE_COLUMN_ARITY_MISMATCH` | W1: `WITH t (a, b) AS (SELECT 1)` — la lista de columnas no matchea la arity del SELECT. | Igualar la arity. |
+| `4081` | `CTE_NOT_REFERENCED` | W1 (reservado): un CTE declarado pero no usado en el main query. | (no emite hoy — reservado para warning futuro). |
+| `4082` | `RECURSIVE_CTE_REQUIRES_UNION` | Bloque W2 (2026-05-28): `WITH RECURSIVE` cuyo body no es `anchor UNION [ALL] step`. | Reescribir como `SELECT ... UNION ALL SELECT ...`. |
+| `4083` | `RECURSIVE_CTE_ANCHOR_REFERENCES_SELF` | W2: el anchor (lado izquierdo del UNION) referencia el CTE — solo el step puede. | Quitar la auto-referencia del anchor. |
+| `4084` | `RECURSIVE_CTE_FIXPOINT_DIVERGE` | W2: el fixpoint no converge dentro del límite (10K iteraciones). Típicamente un step que crece sin terminar. | Agregar una condición de parada en el step (e.g. `WHERE n < 100`). |
+| `4085` | `RECURSIVE_CTE_ARITY_MISMATCH` | W2: anchor y step tienen distinta arity. | Igualar el número de columnas en ambos lados. |
+| `4086` | _(slot reservado)_ | — | — |
+| `4087` | `WINDOW_FUNC_UNKNOWN` | Bloque W3 (2026-05-28): función window no soportada. Catálogo W3: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `SUM/AVG/MIN/MAX/COUNT OVER`. | Usar una función del catálogo o re-armar con subqueries. |
+| `4088` | `WINDOW_FRAME_UNSUPPORTED` | W3: `OVER (... ROWS BETWEEN ...)` con frame explícito. Solo el frame default (UNBOUNDED PRECEDING → CURRENT ROW para agregados, sin frame para ranking). | Quitar el `ROWS BETWEEN`. |
+| `4089` | `WINDOW_ARG_INVALID` | W3: argumento inválido de una función window (e.g. `LAG()` sin args, `ROW_NUMBER(x)` con args). | Ajustar a la signatura. |
+| `4090` | `WINDOW_ORDER_BY_REQUIRED` | W3: funciones que requieren orden total (`LAG`, `LEAD`, `RANK`, `DENSE_RANK`) sin `ORDER BY` en el `OVER`. | Agregar `ORDER BY` dentro del `OVER (...)`. |
+| `4091` | `WINDOW_IN_WHERE` | W3: función window en `WHERE` / `HAVING` / `GROUP BY` (solo se permite en SELECT list y ORDER BY). | Mover a una subquery y filtrar afuera. |
+| `4092` | `TRIGGER_NAME_DUPLICATED` | Bloque X1 (2026-05-28): `CREATE TRIGGER` con un nombre ya tomado. | Usar `DROP TRIGGER` primero o elegir otro nombre. |
+| `4093` | `TRIGGER_TARGET_NOT_TABLE` | X1: el `ON <obj>` apunta a una vista u otro objeto no-tabla. | Crear el trigger sobre la tabla base. |
+| `4094` | `TRIGGER_EVENT_UNSUPPORTED` | X1: evento fuera de `INSERT`/`UPDATE`/`DELETE`. | Usar uno de los tres soportados. |
+| `4095` | `TRIGGER_NOT_FOUND` | X1: `DROP TRIGGER` que no existe (sin `IF EXISTS`). | Usar `DROP TRIGGER IF EXISTS` o verificar el nombre. |
+| `4096` | `TRIGGER_DEPTH_EXCEEDED` | X1: cascada de triggers excedió `MAX_TRIGGER_DEPTH` (16). Típicamente un trigger que dispara DML sobre la misma tabla. | Romper la recursión o agregar guard en el body. |
+| `4097` | `PROCEDURE_NAME_DUPLICATED` | Bloque X3 (2026-05-28): `CREATE PROCEDURE` con nombre ya tomado. | `DROP PROCEDURE` primero o elegir otro nombre. |
+| `4098` | `PROCEDURE_NOT_FOUND` | X3: `CALL` o `DROP PROCEDURE` sobre uno inexistente. | Verificar el nombre. |
+| `4099` | `PROCEDURE_ARITY_MISMATCH` | X3: `CALL p(a, b)` con cantidad de args distinta a los declarados. | Igualar la arity. |
+| `4100` | `PROCEDURE_PARAM_TYPE_MISMATCH` | X3: arg con tipo incompatible para el param declarado. | Ajustar el tipo o envolver con `CAST`. |
+| `4101` | `FUNCTION_NAME_DUPLICATED` | Bloque X3b (2026-05-28): `CREATE FUNCTION` con nombre ya tomado. | `DROP FUNCTION` primero. |
+| `4102` | `FUNCTION_NOT_FOUND` | X3b: invocación o `DROP FUNCTION` sobre una inexistente. | Verificar el nombre. |
+| `4103` | `FUNCTION_ARITY_MISMATCH` | X3b: invocación con cantidad de args distinta. | Igualar la arity. |
+| `4104` | `FUNCTION_PARAM_TYPE_MISMATCH` | X3b: arg con tipo incompatible. | Ajustar el tipo o `CAST`. |
+| `4105` | `IF_THEN_MALFORMED` | Bloque X4 (2026-05-28): bloque `IF ... THEN ... [ELSIF ...]* [ELSE ...] END IF` malformado — falta `THEN`/`END IF`/`ELSIF`. | Revisar la sintaxis. |
+| `4106` | `IF_COND_NOT_BOOLEAN` | X4: condición de `IF`/`ELSIF` que no evalúa a BOOL. | Reescribir como comparación. |
+| `4107` | `DECLARE_DUPLICATE` | Bloque X4b (2026-05-28): variable declarada dos veces en el mismo scope. | Renombrar o quitar el duplicado. |
+| `4108` | `SET_VAR_NOT_DECLARED` | X4b: `SET name = expr` sobre una variable que no fue declarada. | Agregar `DECLARE name TYPE [DEFAULT expr]` antes. |
+| `4109` | `SET_VAR_TYPE_MISMATCH` | X4b: RHS de `SET` con tipo incompatible. | Ajustar tipo o `CAST`. |
+| `4110` | `LOOP_MAX_ITERATIONS_EXCEEDED` | X4b: `WHILE`/`LOOP`/`FOR` excedió `MAX_LOOP_ITERATIONS` (100K). Guard contra runaway. | Agregar condición de salida (`EXIT WHEN ...`) o reducir el rango. |
+| `4111` | `RAISE_EXCEPTION` | Bloque X4c (2026-05-28): `RAISE EXCEPTION 'msg'` — aborto user-triggered. | Capturar con `EXCEPTION WHEN 4111 THEN ...` si querés handler. |
+| `4112` | `RAISE_NOTICE` | X4c: `RAISE NOTICE 'msg'` — info-level, no aborta. | (no es error en sentido estricto). |
+| `4113` | `FOR_RANGE_INVALID` | X4c: `FOR i IN start TO end LOOP` con `start`/`end` no-INT. | Usar literales INT o variables INT. |
+| `4114` | `EXCEPTION_HANDLER_MALFORMED` | Bloque X4d (2026-05-28): `BEGIN..EXCEPTION..END` con WHEN/THEN faltante. | Revisar sintaxis. |
+| `4115` | `LOOP_BLOCK_MALFORMED` | X4d: `LOOP ... END LOOP` standalone sin cierre. | Agregar `END LOOP`. |
+| `4116` | `CASE_STATEMENT_MALFORMED` | Bloque X4e (2026-05-29): `CASE WHEN ... THEN ... END CASE` malformado. | Revisar sintaxis. |
+| `4117` | `EXCEPTION_FILTER_INVALID` | X4e: `EXCEPTION WHEN <filter>` con filtro que no es `OTHERS` ni un entero. | Usar `OTHERS` o un código numérico (`WHEN 4111 THEN`). |
+| `4118` | `RETURN_OUTSIDE_FUNCTION` | Bloque X4f (2026-05-29): `RETURN expr` fuera del body de una function. | Mover el `RETURN` al body de un `CREATE FUNCTION ... AS BEGIN ... END`. |
+| `4119` | `VALUE_LENGTH_EXCEEDED` | Bloque Y2 (2026-05-29): INSERT/UPDATE de string que excede `VARCHAR(n)`/`CHAR(n)`. La longitud se mide en bytes UTF-8. | Truncar el string o ampliar el `n` con `ALTER TABLE` (no soportado todavía — usar `DROP COLUMN` + `ADD COLUMN`). |
 
 ---
 

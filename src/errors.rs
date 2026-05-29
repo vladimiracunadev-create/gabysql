@@ -605,6 +605,11 @@ pub mod codes {
     /// una function. Solo válido dentro de `CREATE FUNCTION ... AS
     /// BEGIN ... RETURN expr; END;` para retornar el valor al caller.
     pub const RETURN_OUTSIDE_FUNCTION: u32 = 4118;
+    /// Bloque Y2 (2026-05-29): `INSERT`/`UPDATE` de un string que excede
+    /// la longitud declarada por `VARCHAR(n)` o `CHAR(n)`. La longitud
+    /// se mide en bytes UTF-8 (no en code points), igual que el
+    /// length-prefixed encoding global.
+    pub const VALUE_LENGTH_EXCEEDED: u32 = 4119;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

@@ -94,6 +94,8 @@
 
 - ~~Tipos de columna extendidos: aliases sintácticos `BIGINT/SMALLINT/TINYINT/INTEGER/MEDIUMINT/INT2/INT4/INT8` (→ INT), `REAL/DOUBLE/DOUBLE PRECISION/NUMERIC(p,s)/DECIMAL(p,s)/DEC` (→ FLOAT), `VARCHAR(n)/CHAR(n)/CHARACTER VARYING(n)/NVARCHAR(n)/NCHAR(n)/STRING/CLOB` (→ TEXT), `BOOLEAN` (→ BOOL), `TIMESTAMP` (→ DATETIME). Dos tipos nuevos con código en disco: `TIME` (HH:MM:SS[.fff], code=8) y `UUID` (8-4-4-4-12 hex canónico, code=9), ambos `stores_as_text` con validación lexical en CAST. Bump VERSION 16→17. Helper `parse_type_name` único point of entry desde `parse_column_def` / `parse_create_function` / `parse_create_procedure` / `parse_declare_stmt` / `parse_cast_expr` — soporta sufijo paramétrico `(n)`/`(p,s)` (ignorado) y aliases compuestos (`DOUBLE PRECISION`, `CHARACTER VARYING`). BLOB/BYTEA, DECIMAL exacto, ARRAY, ENUM y enforcement de longitud diferidos a Y2~~ ✅ entregado (bloque **Y**, 2026-05-29, [ADR-0039](docs/adr/0039-extended-types-y.md)).
 
+- ~~Enforcement de longitud `VARCHAR(n)` / `CHAR(n)`: persiste `max_length: Option<u32>` por columna (nuevo flag `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08`, 4 bytes LE adicionales). Helper `extract_length_param` re-parsea `(n)` desde el `type_name` y lo asigna sólo a tipos de familia TEXT. Encoder valida en INSERT/UPDATE/INSERT...SELECT/CTAS — un solo check en `encode_row`. Conteo en **bytes UTF-8** (no code points). Bump VERSION 17→18. Range enforcement SMALLINT/TINYINT, BLOB/BYTEA, DECIMAL exacto, ARRAY, ENUM diferidos a Y3~~ ✅ entregado (bloque **Y2**, 2026-05-29, [ADR-0040](docs/adr/0040-varchar-length-enforcement-y2.md)).
+
 ### Fase 3 — Planeación y rendimiento
 - planner básico con stats
 - `EXPLAIN`

@@ -243,6 +243,10 @@ impl DefaultLiteral {
 const COLUMN_FLAG_NOT_NULL: u8 = 0x01;
 const COLUMN_FLAG_HAS_DEFAULT: u8 = 0x02;
 const COLUMN_FLAG_HAS_FK: u8 = 0x04;
+/// Bloque Y2 (VERSION 18): si presente, después de DEFAULT y FK se
+/// escriben 4 bytes LE con `max_length` (u32). Solo aplica a columnas
+/// de familia TEXT (`VARCHAR(n)`, `CHAR(n)`, etc.).
+const COLUMN_FLAG_HAS_MAX_LENGTH: u8 = 0x08;
 
 /// Action to take when the parent row a `FOREIGN KEY` points at is
 /// deleted.
@@ -433,6 +437,13 @@ pub struct Column {
     pub not_null: bool,
     pub default: Option<DefaultLiteral>,
     pub references: Option<ForeignKeyMeta>,
+    /// Bloque Y2 (2026-05-29): para columnas de familia TEXT
+    /// declaradas con `VARCHAR(n)` o `CHAR(n)`, guarda `n` (en
+    /// bytes UTF-8) y se enforce en el encoder. `None` significa
+    /// sin límite por columna (queda el límite global de 65 535
+    /// bytes que da el length-prefixed encoding). Para tipos
+    /// non-text el valor es ignorado.
+    pub max_length: Option<u32>,
 }
 
 impl Column {
@@ -443,6 +454,7 @@ impl Column {
             not_null: false,
             default: None,
             references: None,
+            max_length: None,
         }
     }
 }
@@ -705,6 +717,9 @@ impl TableMeta {
             if column.references.is_some() {
                 flags |= COLUMN_FLAG_HAS_FK;
             }
+            if column.max_length.is_some() {
+                flags |= COLUMN_FLAG_HAS_MAX_LENGTH;
+            }
             out.push(flags);
             if let Some(default) = &column.default {
                 default.encode_into(&mut out)?;
@@ -751,6 +766,13 @@ impl TableMeta {
                 for c in &fk.extra_target_columns {
                     push_string(&mut out, c)?;
                 }
+            }
+            // Bloque Y2 (VERSION 18): max_length para columnas TEXT
+            // declaradas con VARCHAR(n)/CHAR(n). Va al final del bloque
+            // de la columna, después del FK opcional, para no romper
+            // el orden con columnas pre-Y2.
+            if let Some(n) = column.max_length {
+                out.extend_from_slice(&n.to_le_bytes());
             }
         }
         out.extend_from_slice(&(self.indexes.len() as u16).to_le_bytes());
@@ -925,12 +947,28 @@ impl TableMeta {
             } else {
                 None
             };
+            // Bloque Y2 (VERSION 18): max_length opcional al final del bloque
+            // de la columna. Sólo si el flag está prendido.
+            let max_length = if flags & COLUMN_FLAG_HAS_MAX_LENGTH != 0 {
+                if offset + 4 > data.len() {
+                    return Err(DbError::new(format!(
+                        "TableMeta '{}' corrupta: faltan 4 bytes para max_length de columna '{}' en offset {}",
+                        name, col_name, offset
+                    )));
+                }
+                let n = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+                Some(n)
+            } else {
+                None
+            };
             columns.push(Column {
                 name: col_name,
                 column_type,
                 not_null,
                 default,
                 references,
+                max_length,
             });
         }
         if offset + 2 > data.len() {

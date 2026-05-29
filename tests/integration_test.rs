@@ -11805,6 +11805,131 @@ fn y_unsupported_type_still_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque Y2 (2026-05-29): enforcement de VARCHAR(n) / CHAR(n).
+// Bump VERSION 17→18 — persiste max_length por columna.
+// ============================================================
+
+fn y2_setup(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let db = temp_db_path(&format!("y2-{}", label));
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    Ok((db, wal))
+}
+
+#[test]
+fn y2_varchar_under_limit_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("under")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, nick VARCHAR(10));
+         INSERT INTO t (id, nick) VALUES (1, 'hello');",
+    )?;
+    let res = run_sql(&db, "SELECT nick FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("hello".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_varchar_exact_limit_works() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("exact")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, nick VARCHAR(5));
+         INSERT INTO t (id, nick) VALUES (1, 'abcde');",
+    )?;
+    let res = run_sql(&db, "SELECT nick FROM t WHERE id = 1;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("abcde".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_varchar_over_limit_rejected() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("over")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, nick VARCHAR(5));")?;
+    let err = run_sql(&db, "INSERT INTO t (id, nick) VALUES (1, 'too-long-text');");
+    assert!(err.is_err());
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("4119"), "esperaba GBY-4119, recibí: {msg}");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_char_n_enforces_too() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("char")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, code CHAR(3));")?;
+    run_sql(&db, "INSERT INTO t (id, code) VALUES (1, 'abc');")?;
+    let err = run_sql(&db, "INSERT INTO t (id, code) VALUES (2, 'abcd');");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_text_without_n_has_no_limit() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("text-noop")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, body TEXT);")?;
+    // 500 bytes — sin (n) no hay límite Y2; queda el límite global TEXT
+    let long = "x".repeat(500);
+    run_sql(
+        &db,
+        &format!("INSERT INTO t (id, body) VALUES (1, '{}');", long),
+    )?;
+    let res = run_sql(&db, "SELECT body FROM t WHERE id = 1;")?;
+    if let Value::String(s) = &res[0].rows[0][0] {
+        assert_eq!(s.len(), 500);
+    } else {
+        panic!("esperaba String");
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_update_also_enforced() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("update")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, nick VARCHAR(5));
+         INSERT INTO t (id, nick) VALUES (1, 'ok');",
+    )?;
+    let err = run_sql(&db, "UPDATE t SET nick = 'way-too-long' WHERE id = 1;");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_alter_add_varchar_n_persists_limit() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("alter")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         ALTER TABLE t ADD COLUMN tag VARCHAR(4);
+         INSERT INTO t (id, tag) VALUES (1, 'abcd');",
+    )?;
+    let err = run_sql(&db, "INSERT INTO t (id, tag) VALUES (2, 'abcde');");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn y2_limit_survives_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = y2_setup("reopen")?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, n VARCHAR(3));")?;
+    // Cierra y vuelve a abrir — el max_length debe persistir.
+    let err = run_sql(&db, "INSERT INTO t (id, n) VALUES (1, 'abcd');");
+    assert!(err.is_err());
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 fn temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

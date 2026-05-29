@@ -48,7 +48,12 @@
 
 | `VERSION` del header | Estado | Notas |
 | :--- | :--- | :--- |
-| `13` | 🟢 Actual | Bloque V (2026-05-27). Catalog gana un **discriminator byte por record** (table vs view) y persiste `ViewMeta { name, source_sql, column_aliases }`. Habilita `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v` (ADR-0025). Rechaza VERSION 12 con `[GBY-1003]`. |
+| `18` | 🟢 Actual | Bloque Y2 (2026-05-29). Flag bit `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08` + `u32` adicional por columna cuando está prendido. Habilita enforcement real de `VARCHAR(n)` / `CHAR(n)` en bytes UTF-8 con `[GBY-4119]` (ADR-0040). Rechaza VERSION 17 con `[GBY-1003]`. |
+| `17` | 🔴 Rechazado | Bloque Y (2026-05-29). Dos códigos nuevos para tipos: `8 = TIME` y `9 = UUID` (ambos `stores_as_text`). Aliases sintácticos (`BIGINT`, `VARCHAR(n)`, `DECIMAL(p,s)`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, …) no requirieron bump por sí solos — mapean a tipos existentes (ADR-0039). Migrar via export/import. |
+| `16` | 🔴 Rechazado | Bloque X3b (2026-05-28). `ObjectKind::Function` con payload `[name][return_type][param_count]×[pname][ptype][body_sql]`. Habilita `CREATE FUNCTION name(params) RETURNS type AS <expr\|BEGIN..END>` invocable en SELECT/WHERE (ADR-0032). Migrar via export/import. |
+| `15` | 🔴 Rechazado | Bloque X3 (2026-05-28). `ObjectKind::Procedure` con payload `[name][param_count]×[pname][ptype][body_sql]`. Habilita `CREATE PROCEDURE name(params) AS <body>` + `CALL name(args)` (ADR-0031). Migrar via export/import. |
+| `14` | 🔴 Rechazado | Bloque X3 reservaba este slot; el bump efectivo fue 14→15 con el payload final de procedures. |
+| `13` | 🔴 Rechazado | Bloque V (2026-05-27). Catalog gana un **discriminator byte por record** (table vs view) y persiste `ViewMeta { name, source_sql, column_aliases }`. Habilita `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS SELECT ...` / `DROP VIEW [IF EXISTS] v` (ADR-0025). Migrar via export/import. |
 | `12` | 🔴 Rechazado | Residual #3 (2026-05-27). `ForeignKeyMeta` gana `extra_source_columns` + `extra_target_columns` para FK multi-col `FOREIGN KEY (a, b) REFERENCES p (x, y)`; lookup O(log n) via fingerprint K2 (ADR-0023). Migrar via backup + dump + recreate. |
 | `11` | 🔴 Rechazado | Residual #2 (2026-05-27). Persiste nombres opcionales para PK/UNIQUE/FK/CHECK (`pk_name`, `fk_name`, etc.) y habilita `ALTER TABLE DROP CONSTRAINT [IF EXISTS] <name>` (ADR-0022). Migrar via backup + dump + recreate. |
 | `10` | 🔴 Rechazado | Bloque L2 (2026-05-27). Agregaba `CHECK (expr)` column-level y table-level, persistido como texto canónico vía `format_expr` (ADR-0021). Migrar via backup + dump + recreate. |

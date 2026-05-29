@@ -6,6 +6,54 @@
 
 ---
 
+## 2026-05-29 — Bloque Y2: enforcement de longitud `VARCHAR(n)` / `CHAR(n)`
+
+> **Un push a `main`** con **bump on-disk 17 → 18**. Cierra la deuda más visible de Y: ahora una columna `VARCHAR(254)` realmente rechaza strings de 300 bytes en vez de aceptarlos silenciosamente. Detalle en [`docs/adr/0040-varchar-length-enforcement-y2.md`](docs/adr/0040-varchar-length-enforcement-y2.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+CREATE TABLE usuarios (
+    id   INT PRIMARY KEY,
+    nick VARCHAR(20)
+);
+
+INSERT INTO usuarios (id, nick) VALUES (1, 'gaby');                        -- OK
+INSERT INTO usuarios (id, nick) VALUES (2, 'string-de-mas-de-20-bytes');   -- [GBY-4119] VALUE_LENGTH_EXCEEDED
+UPDATE  usuarios SET nick = 'tampoco-cabe-asi' WHERE id = 1;               -- [GBY-4119] también
+```
+
+### 🛠 Implementación
+
+- **`Column`** (catalog): nuevo campo `pub max_length: Option<u32>`. Se setea en CREATE TABLE / ALTER TABLE ADD COLUMN cuando el tipo es familia TEXT y trae `(n)`.
+- **Helper `extract_length_param(type_name) -> Option<u32>`**: re-parsea el `(n)` desde el string ya capturado por `parse_type_name`. Solo devuelve `Some(_)` para tipos TEXT family (`VARCHAR`, `CHAR`, `CHARACTER`, `CHARACTER VARYING`, `NVARCHAR`, `NCHAR`, `STRING`, `CLOB`). `NUMERIC(10,2)` y `INT(11)` devuelven `None`.
+- **Disk format (V18)**: nuevo flag bit `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08`. Cuando está prendido, después del bloque FK opcional se escriben 4 bytes LE con el `u32`. Columnas sin `max_length` son byte-idénticas a V17.
+- **Enforcement en encoder**: una línea agregada al arm `stores_as_text` en `encode_row`. INSERT, UPDATE, INSERT...SELECT y CTAS pasan por el mismo path — el check cubre todos sin duplicación.
+- **Conteo en bytes UTF-8** (no code points), igual que el length-prefixed encoding global.
+- **Bump 17 → 18**: V17 no sabría saltar los 4 bytes extra y leería el `idx_count` desde un offset inválido. V17 rechazado con `[GBY-1003]`.
+
+### 🆕 Códigos de error
+
+| Código | Nombre | Cuándo |
+|---|---|---|
+| `GBY-4119` | `VALUE_LENGTH_EXCEEDED` | INSERT/UPDATE de string que excede `VARCHAR(n)` / `CHAR(n)`. |
+
+### 🚫 Diferido (Y3 y más allá)
+
+- **Range enforcement** para `SMALLINT` / `TINYINT`.
+- **Conteo por code points** (opt-in vía `CHARACTER SET`).
+- **`CHAR(n)` con padding** a la derecha (estándar SQL).
+- **`BLOB` / `BYTEA`** (requiere `Value::Bytes`).
+- **`DECIMAL(p,s)` exacto** (requiere `Value::Decimal`).
+- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**.
+
+### 🧪 Validación
+
+- 8 tests `y2_*`: under limit, exact limit, over limit (4119), `CHAR(n)`, TEXT sin `(n)` sin límite, UPDATE también enforce, ALTER ADD COLUMN persiste, reopen mantiene el límite.
+- Suite total: **510/510 pass** (`cargo test --lib --tests`).
+
+---
+
 ## 2026-05-29 — Bloque Y: tipos de columna extendidos
 
 > **Un push a `main`** con **bump on-disk 16 → 17**. Aliases sintácticos (BIGINT, VARCHAR(n), DECIMAL(p,s), DOUBLE PRECISION, BOOLEAN, TIMESTAMP, …) + dos tipos nuevos en disco: `TIME` y `UUID`. Detalle en [`docs/adr/0039-extended-types-y.md`](docs/adr/0039-extended-types-y.md).

@@ -742,6 +742,9 @@ pub struct ColumnDef {
     pub unique: bool,
     pub default: Option<Value>,
     pub references: Option<ForeignKeyDef>,
+    /// Bloque Y2 (2026-05-29): `n` declarado en `VARCHAR(n)`/`CHAR(n)`.
+    /// Sólo se setea para tipos de familia TEXT; ignorado en non-text.
+    pub max_length: Option<u32>,
 }
 
 /// Parser-level representation of
@@ -1925,6 +1928,12 @@ impl<'a> Engine<'a> {
                 inline_unique_columns.push(column.name.clone());
             }
             let references = column.references.as_ref().map(fk_def_to_meta);
+            // Bloque Y2: max_length sólo aplica a familia TEXT
+            let max_length = if column_type.stores_as_text() {
+                column.max_length
+            } else {
+                None
+            };
             columns.push(Column {
                 name: column.name,
                 column_type,
@@ -1935,6 +1944,7 @@ impl<'a> Engine<'a> {
                     None => None,
                 },
                 references,
+                max_length,
             });
         }
 
@@ -2466,6 +2476,11 @@ impl<'a> Engine<'a> {
             not_null: stmt.column.not_null,
             default: default.clone(),
             references: stmt.column.references.as_ref().map(fk_def_to_meta),
+            max_length: if column_type.stores_as_text() {
+                stmt.column.max_length
+            } else {
+                None
+            },
         };
         // Run the standard validation against a *prospective* meta so the
         // same DEFAULT/type compatibility rules used by CREATE TABLE
@@ -2778,6 +2793,7 @@ impl<'a> Engine<'a> {
                 not_null: i == 0,
                 default: None,
                 references: None,
+                max_length: None,
             });
         }
         let mut meta = TableMeta {
@@ -10081,6 +10097,20 @@ pub fn encode_row(meta: &TableMeta, values: &HashMap<String, Value>) -> DbResult
                 if bytes.len() > u16::MAX as usize {
                     return Err(DbError::new(format!("{} demasiado largo", column.name)));
                 }
+                // Bloque Y2: enforcement de VARCHAR(n)/CHAR(n).
+                if let Some(max) = column.max_length {
+                    if bytes.len() > max as usize {
+                        return Err(coded(
+                            codes::VALUE_LENGTH_EXCEEDED,
+                            format!(
+                                "valor para columna '{}' excede {} bytes declarados ({} bytes recibidos)",
+                                column.name,
+                                max,
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                }
                 out.push(1);
                 out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                 out.extend_from_slice(bytes);
@@ -14367,6 +14397,57 @@ fn cast_value(v: Value, ty: ColumnType) -> DbResult<Value> {
     }
 }
 
+/// Bloque Y2 (2026-05-29): extrae el primer parámetro entero de un
+/// type_name como `VARCHAR(255)` o `CHAR(10)` y lo devuelve como
+/// `u32` para usar como `max_length`. Solo retorna `Some(_)` si el
+/// tipo base (después de normalizar) pertenece a la familia TEXT —
+/// `(n)` en NUMERIC/DECIMAL/etc. se ignora porque no enforce nada
+/// hoy. Devuelve `None` si no hay paréntesis, si el contenido no es
+/// un entero válido, o si el tipo no es TEXT.
+pub(crate) fn extract_length_param(type_name: &str) -> Option<u32> {
+    let upper = type_name.trim().to_ascii_uppercase();
+    let open = upper.find('(')?;
+    let base: String = {
+        let raw = upper[..open].trim_end();
+        let mut out = String::with_capacity(raw.len());
+        let mut prev_space = false;
+        for c in raw.chars() {
+            if c.is_whitespace() {
+                if !prev_space && !out.is_empty() {
+                    out.push(' ');
+                }
+                prev_space = true;
+            } else {
+                out.push(c);
+                prev_space = false;
+            }
+        }
+        out.trim_end().to_string()
+    };
+    let is_text_family = matches!(
+        base.as_str(),
+        "TEXT"
+            | "VARCHAR"
+            | "CHAR"
+            | "CHARACTER"
+            | "CHARACTER VARYING"
+            | "NVARCHAR"
+            | "NCHAR"
+            | "STRING"
+            | "CLOB"
+    );
+    if !is_text_family {
+        return None;
+    }
+    let close = upper[open + 1..].find(')')?;
+    let inner = upper[open + 1..open + 1 + close].trim();
+    // Solo aceptamos un entero simple (no `(n,m)`). Si lleva coma, ignoramos.
+    if inner.contains(',') {
+        return None;
+    }
+    inner.parse::<u32>().ok()
+}
+
 /// Bloque Y (2026-05-29): valida que `s` parezca una hora ISO 8601
 /// (`HH:MM:SS` o `HH:MM:SS.fff`). Validación lexical solo —
 /// no chequea rangos (24:00 no se rechaza por simplicidad).
@@ -17229,6 +17310,7 @@ impl Parser {
                 break;
             }
         }
+        let max_length = extract_length_param(&type_name);
         Ok(ColumnDef {
             name,
             type_name,
@@ -17237,6 +17319,7 @@ impl Parser {
             unique,
             default,
             references,
+            max_length,
         })
     }
 

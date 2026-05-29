@@ -104,7 +104,7 @@ flowchart LR
 | Tipo canónico | Almacenamiento | Indexable | Aliases sintácticos (bloque Y) | Notas |
 | :--- | :--- | :---: | :--- | :--- |
 | `INT` | 8 bytes LE | ✅ | `INTEGER`, `INT2`, `INT4`, `INT8`, `BIGINT`, `SMALLINT`, `TINYINT`, `MEDIUMINT` | Único tipo válido como PK. Sin enforcement de rango para SMALLINT/TINYINT (alias puro). |
-| `TEXT` | bytes UTF-8 | ✅ | `VARCHAR[(n)]`, `CHAR[(n)]`, `CHARACTER[(n)]`, `CHARACTER VARYING[(n)]`, `NVARCHAR[(n)]`, `NCHAR[(n)]`, `STRING`, `CLOB` | Hasta 65 535 bytes. **`(n)` se acepta pero no se enforce.** |
+| `TEXT` | bytes UTF-8 | ✅ | `VARCHAR[(n)]`, `CHAR[(n)]`, `CHARACTER[(n)]`, `CHARACTER VARYING[(n)]`, `NVARCHAR[(n)]`, `NCHAR[(n)]`, `STRING`, `CLOB` | Hasta 65 535 bytes globalmente. Si la columna se declara con `(n)`, **el `n` se enforce en bytes UTF-8** desde el bloque Y2 — `[GBY-4119]` si se excede. |
 | `BOOL` | 1 byte | ✅ | `BOOLEAN` | `TRUE` / `FALSE` |
 | `FLOAT` | 8 bytes LE (`f64`) | ✅ | `REAL`, `DOUBLE`, `DOUBLE PRECISION`, `NUMERIC[(p,s)]`, `DECIMAL[(p,s)]`, `DEC[(p,s)]` | **DECIMAL/NUMERIC son aliases — no son decimal exacto.** |
 | `DATE` | texto | ✅ | — | `YYYY-MM-DD`, validación lexical (no semántica). |

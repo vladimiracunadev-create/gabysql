@@ -137,7 +137,13 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        nuevos en disco: `8=TIME`, `9=UUID` (ambos stores_as_text).
 //        V16 rechazados con `[GBY-1003]` porque un schema válido en
 //        V17 puede contener columnas TIME/UUID que V16 no sabe leer.
-pub const VERSION: u32 = 17;
+//  18 -> Bloque Y2 (2026-05-29): enforcement de longitud para
+//        `VARCHAR(n)` / `CHAR(n)`. Se persiste `max_length: u32`
+//        opcional por columna, indicado por el nuevo flag
+//        `COLUMN_FLAG_HAS_MAX_LENGTH = 0x08`. V17 rechazados con
+//        `[GBY-1003]` — un V18 puede tener bytes extra que V17 no
+//        sabe saltar al decodificar el bloque de columnas.
+pub const VERSION: u32 = 18;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;
