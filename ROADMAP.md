@@ -8,6 +8,68 @@
 
 ---
 
+## 📊 Snapshot 2026-05-29 — qué está cerrado por Fase
+
+| Fase | Subsistema | Estado | Detalle |
+|---|---|:---:|---|
+| **Fase 1** | Core (Pager, B+Tree, WAL, catálogo, índices) | 🟢 | VERSION on-disk 31, CRC32 trailer, replay, autovacuum no-impl |
+| **Fase 1** | SQL declarativo y procedural | 🟢 | DDL+DML+JOINs+CTEs+window functions+triggers+procedures+functions+IF/CASE/WHILE/FOR/RAISE/EXCEPTION |
+| **Fase 1** | Tipos extendidos (Y1→Y9) | 🟢 | INT widths, DECIMAL exacto i128, BLOB, TIME, UUID, UNSIGNED, aliases ANSI |
+| **Fase 2** | Identidad SQL-level (Z1+Z1b+Z1c+Z1d+Z1e+Z1f) | 🟡 | USERS+ROLES, PBKDF2 default, scrypt scheme=2, Blake2b RFC 7693, Argon2id estructural (no matchea vector RFC 9106 §A.3, mar­cado en ADR-0061) |
+| **Fase 2** | Authz (Z2 + Z3+Z3b+Z3c+Z3d+Z3e+Z3f) | 🟢 | GRANT/REVOKE bitmask + SET SESSION AUTH + RLS USING/WITH CHECK + RETURNING filter + DEFAULTs antes de check |
+| **Fase 3** | Plan textual (P1+P2+P3) | 🟢 | EXPLAIN dry-run + EXPLAIN ANALYZE con Instant + ANALYZE TABLE con stats session-scoped |
+| **Fase 3** | Cost estimates per-column | 🔴 | P4 (NDV/MCV/histogramas) |
+| **Fase 3** | Stats persistidas en catálogo | 🔴 | P3b |
+| **Fase 3** | Planner-as-optimizer | 🔴 | P5 (reorden de joins, choice de índice por costo) |
+| **Fase 4** | Operación de producto, release, backups | 🟡 | gabysql backup/restore/verify funciona, falta release process formal |
+| **Fase 5** | AI-native (MCP gateway) | 🟡 | binario `gabysql-mcp` existe, falta endurecer |
+
+**Tests integración: 723 verdes + 1 ignored** (Argon2id RFC test marcado por la limitación arriba).
+
+---
+
+## 🔭 Próximas proyecciones (orden sugerido)
+
+> Orden recomendado pero no rígido. Cada bloque ≤ 1-2 sesiones de trabajo y cierra como un push a `main`.
+
+### Cierre inmediato de Fase 3 — performance / planeación
+
+1. **P3b — Persistir stats en el catálogo.** Nuevo `ObjectKind::TableStats` + bump VERSION 31→32. Lifecycle ligado a la tabla (DROP TABLE borra; CREATE no crea). Migración: catálogo legacy no trae stats, se generan on-demand al primer ANALYZE.
+2. **P4 — Stats por-columna.** NDV vía HyperLogLog (8KB por columna), top-K MCV (K=10), histogramas equi-depth (50 buckets). Habilita estimación de selectividad real: `WHERE col = 'X'` puede estimar rows en lugar de mostrar solo `est.rows=total`.
+3. **P5 — Planner-as-optimizer.** Reordena INNER JOINs por costo (selectividad acumulada × cardinalidad), elige índice cuando hay varios candidatos sobre la misma tabla, decide hash-join vs nested-loop por tamaño relativo. Sin esto, gabysql sigue siendo "ejecutor con plan fijo".
+4. **P6 — `gabybench` con benchmarks reproducibles** + tracking de regresiones en CI.
+
+### Fase 4 — operación de producto
+
+5. **R1 — Release process formal.** GitHub Releases con changelog auto-generado del CHANGELOG.md + binarios multi-OS + tags semver.
+6. **R2 — Backups online incrementales.** Hoy `gabysql backup` requiere DB cerrada o snapshot consistente; agregar WAL-streaming.
+7. **R3 — Política de compatibilidad on-disk.** Documentar matriz VERSION ↔ migración auto vs manual; herramienta `gabysql migrate`.
+8. **R4 — Admin web endurecido.** CSP estricta, rate-limit por IP, audit log de cambios desde la UI.
+
+### Fase 5 — AI-native (MCP)
+
+9. **M1 — `gabysql-mcp` con schema discovery automático**: tools `schema()`, `tables()`, `columns(table)`, `query(sql, args)`, `explain(sql)`.
+10. **M2 — Query budget per-tool-call** (max rows, max ms, max cost-estimate vía P5).
+11. **M3 — Audit trail por session/tool-call** para reproducibilidad de agentes.
+
+### Hilos cruzados pendientes (no atan a una Fase)
+
+- **Z1g — Argon2id RFC 9106 §A.3 fix definitivo.** Hoy estructural (matchea Blake2b H', G compression, indexing híbrido) pero no matchea el vector oficial. ADR-0061 documenta honestamente. Cambio: scheme=3 sigue disponible pero el default sigue siendo scrypt hasta que el vector pase.
+- **T1 — Savepoints + ROLLBACK TO SAVEPOINT.** Hoy `ROLLBACK` descarta TODO el batch.
+- **T2 — Cross-request transactions** en el server HTTP (mantener tx abierta entre llamadas `/exec`).
+- **N1 — Parámetros bind (`?`, `$1`) en API.** Hoy hay que concatenar SQL → vulnerable a inyección si el caller no escapa.
+- **N2 — `PREPARE` / `EXECUTE` + plan cache.** Reuso de planes parseados/optimizados.
+- **N3 — `COPY FROM` / `COPY TO`** para bulk load/dump streaming.
+- **N4 — `SAVEPOINT` + nested transactions** (depende de T1).
+- **Y10 — ARRAY type + JSONB**. Y cierra tipos numéricos pero no compuestos.
+- **X5 — Cursores explícitos** (`DECLARE c CURSOR FOR ... ; FETCH ; CLOSE`).
+
+### Investigación abierta (no son entregables corto plazo)
+
+Ver [docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md): schema semántico, plan-as-data, embedded variants (gabysql-wasm), time-travel queries.
+
+---
+
 ## 🚦 Estado actual
 
 - Core reescrito en Rust

@@ -2,7 +2,9 @@
 
 > **Inventario exhaustivo de la superficie SQL no soportada hoy.** Sirve como roadmap concreto para cerrar el gap con un motor SQL relacional clásico. Cada feature lleva una **prioridad** (P0 = impacto crítico, P3 = nicho), un **bloque sugerido** (1 bloque = 1 push a `main`) y notas técnicas de implementación.
 >
-> Última verificación: 2026-05-26 contra `main` post-bloque **K2** (PK e índices compuestos, VERSION 7 → 8). Bloques cerrados en esta sesión: G1 + G2 + G3 + H + I + K1 + K2.
+> Última verificación: 2026-05-29 contra `main` post-Fase 3 P3. Stack acumulado de bloques cerrados desde la última auditoría del documento (~K2): G/H/I (subqueries+set-ops+derived), J (multi-row INSERT+UPSERT+RETURNING+TRUNCATE), K1/K2 (CTAS+composite PK), V (VIEW), W1/W2/W3 (CTEs+RECURSIVE+window functions), X1→X4f+X6 (triggers+procedures+functions+IF/CASE/WHILE/FOR/LOOP/DECLARE/RAISE/EXCEPTION/RETURN), Y1→Y9 (tipos extendidos+DECIMAL exacto+BLOB+UUID+UNSIGNED), Z1→Z3f (USERS+ROLES+PBKDF2/scrypt/Blake2b/Argon2id+GRANT/REVOKE+RLS), P1/P2/P3 (EXPLAIN+ANALYZE).
+>
+> **Cobertura SQL hoy**: >85% de los comandos de un motor SQL clásico están implementados. Los huecos remanentes son específicos (savepoints, prepared statements, bind params, ARRAY/JSONB, cursores, planner real, COPY). Ver tabla "Resumen por prioridad" abajo y la sección "Próximas proyecciones" en [ROADMAP.md](../ROADMAP.md).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
@@ -474,10 +476,10 @@ Hoy: solo token compartido en el server HTTP. Nada de SQL-level.
 
 | Prioridad | Cantidad | Significado |
 |:---:|:---:|---|
-| **P0** | ~25 | Bloquea uso real; cualquier app SQL clásica los necesita |
-| **P1** | ~30 | Comunes en cualquier base, esperables |
-| **P2** | ~25 | Nice-to-have, no críticos |
-| **P3** | ~20 | Nicho / avanzado / opcional |
+| **P0** | ~0 | Cerrado: todos los P0 históricos (AND/OR/NOT, comparaciones, GROUP BY, UPDATE/DELETE indexed, transacciones) entregados durante 2026-05-25..29 |
+| **P1** | ~12 | Restantes: bind params (`?`,`$1`), `PREPARE`/`EXECUTE`, `SAVEPOINT`, cross-request tx, `COPY FROM/TO`, `EXPLAIN` cost estimates (P4), planner-as-optimizer (P5), `DELETE ... USING` join, ALL/ANY/SOME, LATERAL |
+| **P2** | ~15 | `CREATE SEQUENCE`/`nextval`, cursores explícitos, `MERGE` puro, isolation levels, `BEGIN READ ONLY`, materialized views con REFRESH, FOR UPDATE row-locking, índices funcionales / partial / expression |
+| **P3** | ~20 | ARRAY/JSONB, ENUM, time-travel, tablespaces, partitioning, replicación, foreign data wrappers, percentile_disc/cont, JSON path queries, full-text |
 
 ---
 
