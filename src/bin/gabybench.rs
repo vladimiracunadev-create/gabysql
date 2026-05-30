@@ -1184,16 +1184,14 @@ fn setup_analytics(path: &Path) -> DbResult<()> {
     let mut pager = Pager::create(path)?;
     exec_batch(
         &mut pager,
-        &[
-            "CREATE TABLE sales (
+        &["CREATE TABLE sales (
                 id INT PRIMARY KEY,
                 region TEXT NOT NULL,
                 salesperson_id INT NOT NULL,
                 qty INT NOT NULL,
                 revenue INT NOT NULL,
                 sold_at DATE NOT NULL
-             )",
-        ],
+             )"],
     )?;
     let mut rng = Lcg::new(SEED ^ 0xA1A1_BCBC);
     let regions = ["NORTH", "SOUTH", "EAST", "WEST", "CENTER"];
@@ -1295,10 +1293,7 @@ fn setup_graph(path: &Path) -> DbResult<()> {
         ],
     )?;
     bulk_load(&mut pager, GRAPH_NODES, 500, |i| {
-        format!(
-            "INSERT INTO nodes (id, label) VALUES ({}, 'n{}')",
-            i, i
-        )
+        format!("INSERT INTO nodes (id, label) VALUES ({}, 'n{}')", i, i)
     })?;
     let mut rng = Lcg::new(SEED ^ 0xBEEF_F00D);
     bulk_load(&mut pager, GRAPH_EDGES, 500, |i| {
@@ -1391,7 +1386,11 @@ fn setup_procflow(path: &Path) -> DbResult<()> {
         ],
     )?;
     bulk_load(&mut pager, PROCFLOW_ROWS, 500, |i| {
-        format!("INSERT INTO accounts (id, balance) VALUES ({}, {})", i, i * 10)
+        format!(
+            "INSERT INTO accounts (id, balance) VALUES ({}, {})",
+            i,
+            i * 10
+        )
     })?;
     pager.close()?;
     Ok(())
@@ -1462,7 +1461,10 @@ fn suite_procflow(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         let rs = engine.exec(parse("SELECT COUNT(*) FROM audit_log")?.remove(0))?;
         if let Some(crate_value) = rs.rows.first().and_then(|r| r.first()) {
             // sanity: confirma que los trigger fires escribieron en audit_log
-            eprintln!("   [procflow] audit_log rows post-UPDATE: {:?}", crate_value);
+            eprintln!(
+                "   [procflow] audit_log rows post-UPDATE: {:?}",
+                crate_value
+            );
         }
     }
     pager.commit()?;
@@ -1492,8 +1494,7 @@ fn setup_types_zoo(path: &Path) -> DbResult<()> {
     let mut pager = Pager::create(path)?;
     exec_batch(
         &mut pager,
-        &[
-            "CREATE TABLE specimens (
+        &["CREATE TABLE specimens (
                 id INT PRIMARY KEY,
                 tiny_val TINYINT NOT NULL,
                 small_val SMALLINT NOT NULL,
@@ -1505,8 +1506,7 @@ fn setup_types_zoo(path: &Path) -> DbResult<()> {
                 event_time TIME NOT NULL,
                 event_ts DATETIME NOT NULL,
                 payload BLOB
-             )",
-        ],
+             )"],
     )?;
     let mut rng = Lcg::new(SEED ^ 0x7773_5200);
     bulk_load(&mut pager, TYPES_ROWS, 500, |i| {
@@ -1899,10 +1899,7 @@ fn run() -> DbResult<()> {
             db_size_bytes(&p7)
         );
 
-        println!(
-            "== setup procflow (accounts={}, X1-X3b) ==",
-            PROCFLOW_ROWS
-        );
+        println!("== setup procflow (accounts={}, X1-X3b) ==", PROCFLOW_ROWS);
         let t0 = Instant::now();
         setup_procflow(&p8)?;
         println!(
@@ -1911,7 +1908,10 @@ fn run() -> DbResult<()> {
             db_size_bytes(&p8)
         );
 
-        println!("== setup types_zoo (specimens={}, Y completo) ==", TYPES_ROWS);
+        println!(
+            "== setup types_zoo (specimens={}, Y completo) ==",
+            TYPES_ROWS
+        );
         let t0 = Instant::now();
         setup_types_zoo(&p9)?;
         println!(

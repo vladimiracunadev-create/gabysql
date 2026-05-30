@@ -203,13 +203,24 @@ Mientras tanto, el bench bajó `iters` para esas 2 queries (de 5 → 2 en la sig
 
 ### 🔎 Huecos del motor expuestos por el bench
 
-| Hueco | Código | Defer |
-|---|---|---|
-| Agregados sobre `SELECT con JOIN` | `[GBY-4028]` | F2 |
-| `BETWEEN` sin índice ordenado | `[GBY-4002]` | F3 |
-| `SELECT (subquery)` sin FROM | parser | E5 |
-| `UNIQUE` multi-col exige all-INT | `[GBY-4067]` | K3 (futuro: composite unique multi-tipo) |
-| `WITH RECURSIVE` requiere FROM en anchor (no bare `SELECT 1 AS x`) | `[GBY-4081]` | W2b |
+**Catálogo completo, auditado y priorizado**: [ADR-0066 — Gaps del motor expuestos por el benchmark](docs/adr/0066-bench-exposed-gaps.md).
+
+Resumen (10 gaps identificados, cada uno con código de error + query del bench que lo dispara + workaround + bloque/prioridad de fix):
+
+| # | Gap | Código | Bloque defer | Prioridad |
+|---|---|---|---|---:|
+| 1 | Agregados sobre `SELECT con JOIN` | `[GBY-4028]` | F2 | **P1** |
+| 2 | `BETWEEN` sin índice ordenado | `[GBY-4002]` | F3 | **P1** |
+| 3 | `SELECT (subquery)` sin FROM | parser | E5 | P2 |
+| 4 | `UNIQUE` multi-col exige all-INT | `[GBY-4067]` | K3 | P2 |
+| 5 | `WITH RECURSIVE` requiere FROM en anchor | `[GBY-4081]` | (depende de E5) | P2 |
+| 6 | Trigger PK auto-gen (sin SERIAL / DEFAULT con función) | bench design | N5 | P2 |
+| 7 | `COUNT(*) FROM <view>` | `[GBY-4028]` | (sub-caso de F2) | P1 |
+| 8 | **`RANK()` y `SUM OVER (PARTITION BY)` son O(n²)** | sin código | **W4 crítico** | **P1** |
+| 9 | PK compuesta partial scan no usa idx | sin código | K4 | P2 |
+| 10 | Composite index no detecta `WHERE A AND B` | sin código | P5b | P1 (con P5) |
+
+**Política**: el bench tiene `bench_sql_or_skip` para los gaps documentados — la suite **no aborta** por una limitación conocida. Si aparece un gap NUEVO, agregarlo a ADR-0066 antes de aplicar el workaround.
 
 ### 🐛 Bugs del propio `gabybench` encontrados y fixeados
 

@@ -5,6 +5,8 @@
 > Última verificación: 2026-05-29 contra `main` post-Fase 3 P3. Stack acumulado de bloques cerrados desde la última auditoría del documento (~K2): G/H/I (subqueries+set-ops+derived), J (multi-row INSERT+UPSERT+RETURNING+TRUNCATE), K1/K2 (CTAS+composite PK), V (VIEW), W1/W2/W3 (CTEs+RECURSIVE+window functions), X1→X4f+X6 (triggers+procedures+functions+IF/CASE/WHILE/FOR/LOOP/DECLARE/RAISE/EXCEPTION/RETURN), Y1→Y9 (tipos extendidos+DECIMAL exacto+BLOB+UUID+UNSIGNED), Z1→Z3f (USERS+ROLES+PBKDF2/scrypt/Blake2b/Argon2id+GRANT/REVOKE+RLS), P1/P2/P3 (EXPLAIN+ANALYZE).
 >
 > **Cobertura SQL hoy**: >85% de los comandos de un motor SQL clásico están implementados. Los huecos remanentes son específicos (savepoints, prepared statements, bind params, ARRAY/JSONB, cursores, planner real, COPY). Ver tabla "Resumen por prioridad" abajo y la sección "Próximas proyecciones" en [ROADMAP.md](../ROADMAP.md).
+>
+> 📊 **Gaps específicos identificados por el benchmark 2026-05-30**: catálogo cerrado de 10 gaps en [ADR-0066](adr/0066-bench-exposed-gaps.md) — cada uno con código de error, query del bench que lo dispara, workaround y bloque/prioridad de fix definitivo. El más crítico: `RANK()` y `SUM OVER` cuadráticos (W4).
 > Fuentes de verdad complementarias: [SQL_REFERENCE.md](SQL_REFERENCE.md) (lo que SÍ se soporta), [STATUS.md](STATUS.md) (madurez por subsistema), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) (formato + subset exacto).
 
 ---
