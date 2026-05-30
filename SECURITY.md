@@ -14,8 +14,8 @@
 
 | Línea | Estado | Formato en disco |
 |---|---|---|
-| `0.1.x` (último binario en `main`) | soportada | `VERSION = 8` |
-| `0.1.x` previos | sin soporte de seguridad | `VERSION = 1` a `7` (cada bump rechaza explícitamente las DBs anteriores; ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco)) |
+| `0.1.x` (último binario en `main`) | soportada | `VERSION = 31` (Z1f Argon2id partial fix, corte semántico — ver ADR-0061) |
+| `0.1.x` previos | sin soporte de seguridad | `VERSION = 1` a `30` (cada bump rechaza explícitamente las DBs anteriores; ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco)) |
 | implementación previa al rewrite en Rust | no soportada | n/a |
 
 > Cualquier reporte de vulnerabilidad debe estar reproducido contra el `HEAD` de `main` o el último release publicado. No se publicarán parches retroactivos para versiones anteriores del formato en disco.

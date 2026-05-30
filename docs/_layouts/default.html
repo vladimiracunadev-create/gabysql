@@ -44,5 +44,41 @@
       </div>
     </div>
   </footer>
+
+  {% comment %}
+    Mermaid renderer. kramdown (GFM) emite los bloques ```mermaid como
+    `<div class="language-mermaid"><pre class="highlight"><code>...</code></pre></div>`.
+    Mermaid espera `<div class="mermaid">...</div>` con el código como
+    texto plano. Transformamos antes de inicializar.
+
+    Carga ESM desde jsDelivr — sin SRI fijo a propósito: mermaid se
+    actualiza con frecuencia y el integrity hash se rompe a cada bump.
+    Si la política del repo cambia a "self-host only", reemplazar por
+    /assets/js/mermaid.min.js (≈2.5 MB descargado).
+
+    El usuario reportó 2026-05-29 que los gráficos no se veían en
+    GitHub Pages. La causa era que este layout custom (sin tema cayman)
+    no incluía mermaid. Fix concreto agregado abajo.
+  {% endcomment %}
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+
+    document.querySelectorAll('.language-mermaid').forEach((el) => {
+      const code = el.querySelector('code');
+      if (!code) return;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      el.replaceWith(container);
+    });
+
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: prefersDark ? 'dark' : 'default',
+      securityLevel: 'strict',
+      flowchart: { curve: 'basis', useMaxWidth: true },
+    });
+  </script>
 </body>
 </html>

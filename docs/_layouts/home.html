@@ -36,7 +36,7 @@
     <div class="container hero-grid">
       <div class="hero-copy">
         <div class="eyebrow">
-          <span class="dot"></span> v0.1.0 · Fase 2 cerrada · 2026-05-25
+          <span class="dot"></span> v0.1.0 · Fase 2 cerrada + Fase 3 P1+P2+P3 · 2026-05-29
         </div>
         <h1>Una base de datos relacional<br><span class="grad">en un solo archivo</span>.</h1>
         <p class="lede">
@@ -254,5 +254,32 @@
       </div>
     </div>
   </footer>
+
+  {% comment %}
+    Mermaid renderer (mismo patrón que `default.html`). La landing no suele
+    incluir bloques mermaid hoy, pero los layouts deben ser consistentes —
+    si mañana metemos un diagrama en `index.md`, debe rendear igual.
+    Fix de 2026-05-29 para el problema reportado de "no veo las gráficas".
+  {% endcomment %}
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+
+    document.querySelectorAll('.language-mermaid').forEach((el) => {
+      const code = el.querySelector('code');
+      if (!code) return;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      el.replaceWith(container);
+    });
+
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: prefersDark ? 'dark' : 'default',
+      securityLevel: 'strict',
+      flowchart: { curve: 'basis', useMaxWidth: true },
+    });
+  </script>
 </body>
 </html>

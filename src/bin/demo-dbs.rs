@@ -169,7 +169,9 @@ fn build_inventory() -> DbResult<()> {
     pager.close()?;
     println!("   ok — 5 productos con DECIMAL(12,2)+(12,4), BLOB X'hex', UUID generadas");
     println!("   probar: SELECT * FROM inventory_summary;  -- margin_abs y margin_ratio exact");
-    println!("           SELECT SUM(price), AVG(cost) FROM products;  -- agregados Decimal-exact (Y9)");
+    println!(
+        "           SELECT SUM(price), AVG(cost) FROM products;  -- agregados Decimal-exact (Y9)"
+    );
     println!("           EXPLAIN SELECT * FROM products;  -- [est.rows=5]");
     Ok(())
 }
@@ -201,7 +203,8 @@ fn build_analytics() -> DbResult<()> {
     // Cargamos 30 ventas distribuidas en 3 regiones, 5 vendedores cada una.
     let regions = ["NORTH", "SOUTH", "CENTER"];
     let names = ["Ana", "Luis", "Maria", "Pedro", "Sofia"];
-    let mut sql = String::from("INSERT INTO sales (id, region, salesperson, qty, revenue, sold_at) VALUES\n");
+    let mut sql =
+        String::from("INSERT INTO sales (id, region, salesperson, qty, revenue, sold_at) VALUES\n");
     let mut id = 1;
     let mut first = true;
     for r in &regions {
