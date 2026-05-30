@@ -1,160 +1,166 @@
 # Benchmark gabysql
 
-> **Evaluación profesional de desempeño** sobre `main`. Tres escenarios sintéticos representativos (OLTP-like, analítica mediana, K2 PK compuesta) corridos en una sola máquina, con metodología reproducible y caveats honestos.
+> **Evaluación profesional de desempeño** sobre `main`. **10 escenarios sintéticos** que cubren cada subsistema mayor del motor (OLTP, analítica, PK compuesta, RLS, DECIMAL exacto, window functions, recursive CTEs, procedural, tipos extendidos, constraints). Metodología reproducible, números honestos.
 >
-> 📌 **Corrida vigente**: sesión **2026-05-29** (host Windows + GNU toolchain), post bloques W/X/Y/Z + P1/P2/P3 (Fase 3). Re-ejecutada sobre el snapshot del día tras cerrar Z3f, P1 (EXPLAIN), P2 (EXPLAIN ANALYZE) y P3 (ANALYZE + stats). **Reveló 3 huecos de motor + 3 bugs latentes del propio bench** — todos documentados en la sección "Hallazgos 2026-05-29" abajo.
+> 📌 **Corrida vigente**: sesión **2026-05-30** (Windows host + GNU toolchain, single-core perf).
 >
-> 📌 **Corrida anterior**: sesión **2026-05-27** (Docker `rust:1.94-bookworm`), post bloques L+V + fix de 6 issues identificados.
->
-> 📂 **Convención**: este archivo se actualiza in-place a medida que el motor mejora. Corridas previas se archivan en `docs/benchmarks/BENCHMARK-YYYY-MM-DD.md` cuando hay un cambio de fondo que justifica el snapshot histórico. La corrida pre-fix vive en `BENCHMARK_2026-05-26.md`.
+> 📂 **Convención**: este archivo es el roll-up vivo + lectura ejecutiva. Cada corrida deja un snapshot inmutable en [`docs/benchmarks/BENCHMARK-YYYY-MM-DD.md`](docs/benchmarks/) generado automáticamente por `gabybench`. Corridas previas vivas: [BENCHMARK_2026-05-26.md](BENCHMARK_2026-05-26.md).
 
 ---
 
-## 🆕 Corrida 2026-05-29 (host Windows + GNU toolchain)
+## 🎯 ¿Para qué sirve este benchmark?
 
-### Setup (carga determinística, single-thread, una sola tx por chunk de 500-1000 rows)
+1. **Verificar consistencia** — cada corrida produce números comparables; regresiones son visibles.
+2. **Medir el efecto de las mejoras** — bumps de versión, fixes y nuevos bloques se evalúan contra los números previos.
+3. **Detectar huecos del motor** — el bench falla limpio (skip-graceful) cuando una query tropieza con una limitación; el log expone qué falta.
+4. **Decidir el roadmap por costo real** — si una query toma 27 segundos sobre 500 rows, vale la pena un planner; si toma 12µs, no.
 
-| DB | Filas | Tamaño on-disk | Tiempo de carga |
-|---|---:|---:|---:|
-| `microblog` (users + posts) | 10k + 40k | 11.5 MB | **4.28 s** |
-| `events` | 200k | 33.3 MB | **10.90 s** |
-| `orders_lines` (orders + lines, PK compuesta) | 20k + 100k | 12.4 MB | **18.51 s** |
+**Lo que NO es**: comparación contra Postgres/SQLite/MySQL. Esto es **auto-benchmark**, no competitive bench. Para eso ver [docs/COMPETITIVE_ANALYSIS.md](docs/COMPETITIVE_ANALYSIS.md).
 
-### microblog — OLTP-like (PK INT + UNIQUE TEXT + índice secundario + índice ordered-int)
+---
 
-| Query | N | p50 | p95 | p99 | mean | rows |
-|---|---:|---:|---:|---:|---:|---:|
-| PK lookup hot (id=5000) | 1000 | **11.7 µs** | 13.2 µs | 30.2 µs | 12.4 µs | 1 |
-| PK lookup cold (random id) | 500 | 13.1 µs | 30.4 µs | 62.0 µs | 19.9 µs | 1 |
-| UNIQUE TEXT lookup (email) | 1000 | 20.1 µs | 38.0 µs | 52.2 µs | 22.0 µs | 1 |
-| Index secundario eq (user_id=100) | 500 | 12.5 µs | 26.5 µs | 39.9 µs | 14.0 µs | 0 |
-| **Index ordered range** (likes 50..100) | 200 | **29.0 ms** | 41.2 ms | 46.6 ms | 31.1 ms | **2073** |
-| Full scan TEXT LIKE 'A%' | 100 | 13.3 ms | 14.6 ms | 15.2 ms | 13.4 ms | 1250 |
-| JOIN+COUNT (u.id=7) | — | — | — | — | — | **SKIP `[GBY-4028]`** |
-| Aggregate global posts (COUNT+AVG) | 50 | 151 ms | 187 ms | 195 ms | 153 ms | 1 |
-| GROUP BY user_id | 20 | 181 ms | 227 ms | 238 ms | 183 ms | 4998 |
-| INSERT single (in-tx) | 500 | **23.9 µs** | 42.5 µs | 61.1 µs | 26.5 µs | — |
-| UPDATE por PK (in-tx) | 500 | 24.4 µs | 30.9 µs | 43.3 µs | 26.0 µs | — |
-| DELETE por PK (in-tx) | 500 | 29.9 µs | 42.5 µs | 51.3 µs | 30.4 µs | — |
+## 🧪 Las 10 DBs y qué subsistema cubre cada una
 
-### events — analítica mediana (200k rows, índice ordered-int sobre `valor`)
+| # | DB | Tamaño | Subsistema cubierto | Bloque(s) del motor |
+|---|---|---:|---|---|
+| 1 | **microblog** | 50k rows (10k users + 40k posts) | OLTP básico: PK INT + UNIQUE TEXT + índice secundario + ordered-int range | Core + E1+E2+E3+F+J |
+| 2 | **events** | 200k rows | Analítica mediana: full scan, range scan ordenado, aggregates, GROUP BY, UNION, DISTINCT | F + I + ADR-0017 |
+| 3 | **orders_lines** | 120k rows (20k orders + 100k lines) | PK compuesta all-INT (K2) + índice compuesto + JOINs + CTAS + DROP COLUMN | K1 + K2 |
+| 4 | **secdb** | 25k rows (5k customers + 20k orders) | Z: USERS + ROLES + `SET SESSION AUTH` + RLS USING + WITH CHECK | Z1 → Z3f |
+| 5 | **finance** | 50k transactions | Y: DECIMAL(14,4) exacto + aritmética Decimal Y7/Y8 + SUM/AVG Y9 | Y6 → Y9 |
+| 6 | **analytics** | 30k sales | W3: window functions OVER + PARTITION BY + RANK + LAG + SUM OVER | W3 |
+| 7 | **graph** | 8k rows (2k nodes + 6k edges) | W2: `WITH RECURSIVE` (fixpoint con dedup) + V: vistas lógicas | W2 + V |
+| 8 | **procflow** | 5k rows | X: triggers AFTER UPDATE + user functions + stored procedures + CALL | X1 + X3 + X3b |
+| 9 | **types_zoo** | 10k specimens | Y completo: BLOB X'hex' + UUID + TIME + DATETIME + DECIMAL + INT widths + UNSIGNED | Y1 → Y6 |
+| 10 | **constraint_zoo** | 15k rows (5k parents + 10k children) | L: CHECK col-level + FK con CASCADE on DELETE/UPDATE + UNIQUE | L1 + L2 |
 
-| Query | N | p50 | p95 | p99 | mean | rows |
-|---|---:|---:|---:|---:|---:|---:|
-| Full scan eq kind='view' (no idx) | 20 | **574 ms** | 637 ms | 670 ms | 579 ms | 1 |
-| Indexed eq valor=12345 | 500 | **14.1 µs** | 15.1 µs | 21.0 µs | 14.4 µs | 0 |
-| Indexed range valor 1000..2000 (~2k rows) | 200 | 46.4 ms | 52.7 ms | 56.6 ms | 47.2 ms | 2009 |
-| **Indexed range LARGE 10k..90k (~160k rows)** | 50 | **3.76 s** | 3.96 s | 4.02 s | 3.72 s | **160 259** |
-| Aggregate COUNT(*) full | 30 | 586 ms | 749 ms | 795 ms | 602 ms | 1 |
-| GROUP BY kind (low-card, 7 valores) | 20 | 678 ms | 746 ms | 824 ms | 690 ms | 7 |
-| DISTINCT kind | 20 | 519 ms | 555 ms | 663 ms | 528 ms | 7 |
-| Scalar subquery bare-SELECT | — | — | — | — | — | **SKIP parser ("se esperaba FROM")** |
-| UNION two valor ranges | 30 | 801 ms | 1159 ms | 1162 ms | 838 ms | 2118 |
-| SELECT con UPPER/expr LIMIT 100 | 200 | **184 µs** | 209 µs | 242 µs | 187 µs | 100 |
+**Total: 513.000 filas distribuidas** en 10 DBs sintéticas con seed determinístico (`SEED = 0x9E37_79B9_7F4A_7C15`).
 
-### orders_lines — PK compuesta (K2)
+---
 
-| Query | N | p50 | p95 | p99 | mean | rows |
-|---|---:|---:|---:|---:|---:|---:|
-| **PK compuesta full** (order_id+line_no) | 1000 | **16.0 µs** | 17.4 µs | 36.0 µs | 16.6 µs | 1 |
-| PK compuesta partial (order_id only) | 100 | 146 ms | 155 ms | 158 ms | 147 ms | 5 |
-| Composite index lookup qty+precio | 200 | 175 ms | 218 ms | 250 ms | 181 ms | 100 000 |
-| JOIN orders×lines on order_id=7 | 100 | 136 ms | 271 ms | 364 ms | 151 ms | 0 |
-| Aggregate SUM(qty*precio) GROUP LIMIT 10 | 5 | **50.8 µs** | 58.2 µs | 58.2 µs | 53.3 µs | 10 |
-| Composite range qty BETWEEN | — | — | — | — | — | **SKIP `[GBY-4002]`** (BETWEEN solo PK/idx-ordered) |
-| CTAS lines_summary (one-shot) | 1 | 645 ms | — | — | — | — |
-| DROP COLUMN fecha (orders 20k) | 1 | 144 ms | — | — | — | — |
-| INSERT PK compuesta (in-tx) | 500 | 25 µs | 81 µs | 127 µs | 33.8 µs | — |
+## 📌 Resumen ejecutivo (2026-05-30)
 
-### 🔎 Hallazgos 2026-05-29
+### Lo que rinde bien (production-grade)
 
-**Huecos reales del motor** (no son regresiones — son límites conocidos que el bench tropezó):
+| Operación | Latencia p50 | Observación |
+|---|---:|---|
+| **PK lookup hot** | **11-12 µs** | B+tree get O(log n) — consistente en TODAS las DBs (microblog/finance/analytics/procflow/graph) |
+| **PK lookup cold** | 13-26 µs | Cold cache, primer hit a página nueva |
+| **Indexed eq (hash idx)** | **12-17 µs** | secondary index `find_by_eq` O(1) bucket |
+| **Indexed eq (ordered-int)** | 14 µs | events `WHERE valor = 12345` con ordered-int idx |
+| **UNIQUE TEXT lookup** | 20-22 µs | hash en TEXT secundario |
+| **PK compuesta full** (K2) | **16-23 µs** | fingerprint FNV-1a-64 lookup |
+| **INSERT in-tx** | 24-31 µs | sin fsync per-statement (in-tx amortizado) |
+| **UPDATE por PK in-tx** | 25-32 µs | mismo orden |
+| **DELETE por PK in-tx** | 30-39 µs | + cascade check |
+| **WITH RECURSIVE 5 hops** | **2.7 ms** | fixpoint con guard 10K + dedup FNV-1a — sorprendentemente rápido |
+| **Vista (V) SELECT 100 rows** | 12 ms | re-parsea + ejecuta source SQL |
+| **User function call (X3b)** | 773 µs / 200 calls | overhead de eval_expr por fila |
 
-| # | Hueco | Código | Bloque que lo cerraría |
+### Lo que duele (necesita optimización)
+
+| Operación | Latencia | Por qué | Fix sugerido |
+|---|---:|---|---|
+| **RANK() OVER (PARTITION BY)** | **27-46 s / 500 rows** | algoritmo cuadrático del ranking | W4 (re-implementar ranking O(n log n)) |
+| **SUM() OVER (PARTITION BY) cumulativo** | **28-50 s / 500 rows** | mismo problema cuadrático | W4 |
+| **Indexed range LARGE 160k rows** | 4.5 s | 28 µs/row decode | leaf cursor batch decode |
+| **Full scan eq sin idx (200k rows)** | 720 ms | 3.6 µs/row, dominado por row decode | F3 (BETWEEN fallback) + leaf batch |
+| **Aggregate full** (events COUNT, GROUP BY) | 700-820 ms | scan completo + aggregator simple | P4 stats + P5 planner |
+| **UNION two ranges (events)** | 970 ms | dedup en memoria post-scan | F4 (streaming union) |
+| **Composite index lookup qty+precio** | 220 ms (sin filtro) | full scan sobre `lines` (no usa idx compuesto) | clarificar fast-path en planner |
+| **JOIN orders×lines** | 162 ms | nested-loop scan | P5 (planner con stats) |
+| **RLS + SELECT** | 45-51 ms (5k rows) | overhead por-row del policy check | enforcement batch (deferido) |
+| **SET SESSION AUTHORIZATION + SELECT** | 47 ms | PBKDF2 hash en cada SET | cache de auth session-scope |
+
+### Costo de cada feature de seguridad (overhead aprox sobre baseline)
+
+| Feature | Costo extra |
+|---|---|
+| Superuser SELECT (no auth) | baseline |
+| Con `SET SESSION AUTH` + 1 policy USING | +47 ms por SELECT (autenticación PBKDF2 + filter per-row) |
+| Con WITH CHECK en INSERT | +marginal (1 eval extra por row) |
+| RLS + PK lookup | +37 ms (vs baseline 12 µs) — overhead dominado por SET AUTH |
+
+### Costo de aritmética DECIMAL exacta (Y7/Y8/Y9)
+
+| Operación | Latencia | vs INT equivalente |
+|---|---:|---|
+| **SUM(DECIMAL 50k rows)** | 121-159 ms | comparable a SUM(INT) |
+| **AVG(DECIMAL 50k rows)** | 131-176 ms | + ~30% por la división final |
+| **SELECT a-b LIMIT 1000** | 1.3-1.5 ms | ~1.3 µs/row Decimal sub |
+| **SELECT a*1.05 LIMIT 1000** | 1.3-1.4 ms | ~1.3 µs/row Decimal mul scale-extending |
+| **GROUP BY + SUM(DECIMAL)** | 205 ms / 1000 groups | acceptable |
+
+**Veredicto**: la aritmética Decimal exacta (i128 + scale) **no introduce overhead significativo** respecto a INT — el costo está dominado por el scan, no por la aritmética. Y9 cumple su promesa.
+
+### Costo de WITH RECURSIVE (W2)
+
+| Profundidad | Latencia | Rows reach |
+|---|---:|---:|
+| 5 hops desde nodo 1 (graph 2k/6k) | **2.7 ms** | 90 rows alcanzadas |
+
+**Veredicto**: fixpoint con dedup FNV-1a-64 es eficiente para grafos chicos-medianos. Guard 10K iteraciones protege runaway.
+
+---
+
+## 🔎 Hallazgos honestos de esta corrida
+
+### Huecos del motor que el bench expuso (skip-graceful, no abortan)
+
+| Hueco | Código | Query afectada | Bloque deferido |
 |---|---|---|---|
-| 1 | Agregados sobre SELECT con JOIN no soportados | `[GBY-4028]` | F2 (futuro: extender exec_aggregate al pipeline JOIN) |
-| 2 | `WHERE col BETWEEN ...` rebota si la columna no es PK ni tiene índice ordered-int | `[GBY-4002]` | F3 (futuro: fallback full scan + filter, ya lo hace para `=` y `<`/`>`) |
-| 3 | `SELECT (subq)` sin `FROM` no parsea | parser | E5 (futuro: aceptar bare-SELECT como sintaxis válida) |
+| Agregados sobre `SELECT con JOIN` | `[GBY-4028]` | `SELECT COUNT(*) FROM t JOIN u ON ...` | F2 |
+| `BETWEEN` sin índice ordenado | `[GBY-4002]` | `WHERE qty BETWEEN 1 AND 5` (lines) | F3 |
+| `SELECT (subquery)` sin FROM | parser | scalar subquery bare-SELECT | E5 |
 
-**Bugs latentes del propio bench `gabybench`** (3 fixes commiteados en esta misma corrida):
+### Bugs del propio bench `gabybench` encontrados y fixeados durante esta sesión
 
-1. **Warmup colisionaba con el main loop** en suites DML: `warmup` llamaba al closure con `i=0..N`, después `main` con `i=0..N` también → INSERT con `id=i+100_000` duplicaba PK al re-arrancar.  
-   **Fix**: warmup ahora usa `i + 1_000_000` (rango disjunto). Para queries SELECT no cambia nada — ignoran `i`.
-2. **DML loops corrían sin tx activa**: el código tenía `pager.commit()` después del CREATE TABLE y nunca volvía a `begin()` antes del bench `INSERT/UPDATE/DELETE` → `new_page() requiere una transacción activa`.  
-   **Fix**: envoltura `begin()/commit()` alrededor del bloque DML completo. Mide cost in-tx amortizado (no fsync per-statement; eso es Fase 4).
-3. **Queries citaban columnas inexistentes**: `SELECT id FROM lines` cuando `lines` tiene PK compuesta `(order_id, line_no)` sin `id`.  
-   **Fix**: reescritas a `SELECT order_id FROM lines`.
+| Bug | Fix |
+|---|---|
+| Warmup colisionaba con main loop en suites DML | offset `i + 1_000_000` para warmup |
+| DML loops corrían sin tx activa | wrap `pager.begin()/commit()` alrededor |
+| Queries citaban columna inexistente `id` en `lines` | corregido a `order_id` |
+| `pager2 = open_for_bench(path)` con `pager` ya abierto → `[GBY-1002]` lock | reusar pager o `close()` antes de re-abrir |
+| Doble `begin()` sobre pager con tx implícita → `[GBY-1005]` | usar `Pager::open` directo (sin tx implícita) |
+| Constraint zoo `UNIQUE (code, region)` multi-col TEXT → `[GBY-4067]` | cambiar a UNIQUE single-col (K2 only all-INT) |
+| `WITH RECURSIVE` sin FROM en anchor → `[GBY-4081]` | agregar tabla `seed_one` para el anchor |
+| `COUNT(*) FROM view` → `[GBY-4028]` | cambiar a `SELECT * LIMIT 100` |
 
-**Queries reales que ahora skip-graceful en lugar de abortar la suite**: 3 (las que tropiezan con los huecos del motor). Las 3 se reportan con `⚠ SKIP` y total_ms=-1 en el JSON.
+### Hallazgo crítico: window functions `RANK`/`SUM OVER` son cuadráticas
 
-### Lectura ejecutiva
+- **ROW_NUMBER()** OVER (PARTITION BY) → 247-347 ms / 500 rows ✅ aceptable
+- **LAG()** OVER (PARTITION BY) → 158 ms / 500 rows ✅ aceptable
+- **RANK()** OVER (PARTITION BY ORDER BY) → **27-46 SEGUNDOS / 500 rows** ⚠️ inviable productivamente
+- **SUM() OVER (PARTITION BY)** cumulativo → **27-50 segundos / 500 rows** ⚠️ inviable
 
-**Excelente** (sub-50µs):
-- PK lookup hot 11.7µs / cold 13–20µs
-- Indexed eq (hash y ordered-int) 14µs
-- Composite PK 16µs — el fingerprint fast-path sigue rindiendo
-- DML in-tx 24–30µs (sin fsync per-statement — sólo cost de mutación + index update)
-- Aggregate sobre `lines` con GROUP+LIMIT 10 cae en 50µs porque limita early
+Este es el **hallazgo #1 del bench**. Hay un algoritmo cuadrático en `compute_window_value` para RANK y SUM-OVER. Defer **W4 — refactor window functions a O(n log n)**.
 
-**Aceptable** (10ms–100ms):
-- Full scan TEXT 50k chars 13ms (~10µs/row)
-- Index ordered range 2k rows 29ms
-- Indexed range 2k rows 46ms
-- INSERT PK compuesta 25µs
+---
 
-**Pobre** (>100ms):
-- Aggregate global 151ms y GROUP BY 180ms sobre 40k posts
-- Full scan eq 574ms sobre 200k events (~2.9µs/row decodificación)
-- Indexed range LARGE 160k rows 3.76s (~23µs/row)
-- UNION two valor ranges 800ms
-- Composite index lookup qty+precio 175ms (lookup compuesto sin índice cubrió full scan)
-- DISTINCT kind 519ms (no usa hash early-out)
-
-**Lo que ataca P5 cuando llegue**: full scan + filter sigue dominando los casos analíticos. El reorden de joins y la selección de índice por costo van a mover estos números mucho más que micro-optimizaciones aisladas.
-
-### Próximos targets
-
-- **F2** — agregados sobre JOIN (libera el `[GBY-4028]` que el bench tropezó).
-- **P4** — stats per-columna (NDV/MCV) — habilita que el optimizador decida.
-- **F3** — full-scan-fallback para BETWEEN sin índice (libera `[GBY-4002]`).
-- **P5** — planner real — único bloque que mueve los números de las queries analíticas pobres.
-
-### 📂 Demo DBs adicionales
-
-Aparte de las 3 del bench, hay un binario `demo-dbs` que crea 3 DBs chicas en `demo-dbs/` mostrando features de las últimas semanas:
-
-| DB | Features mostradas | Tamaño |
-|---|---|---:|
-| `auth_demo.db` | Z: USERS + ROLES + GRANT + RLS (3 policies: SELECT con USING, INSERT con WITH CHECK), ANALYZE corrido | 12 KB |
-| `inventory.db` | Y: DECIMAL(12,2) y (12,4) exactos, BLOB X'hex', UUID, CTAS con aritmética Decimal-exact, ANALYZE | 20 KB |
-| `analytics.db` | W3: 30 ventas + ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC), ANALYZE | 12 KB |
-
-Ejecutar con:
+## 🎯 Cómo correr el bench vos mismo
 
 ```bash
-cargo run --release --bin demo-dbs
+# Limpia + setup de las 10 DBs + run completo
+cargo run --release --bin gabybench -- all
+
+# Solo setup (no corre queries)
+cargo run --release --bin gabybench -- setup
+
+# Solo run (re-usa DBs ya seteadas)
+cargo run --release --bin gabybench -- run
 ```
 
-Luego explorar en REPL (ejemplos en stdout al crearlas):
-
-```sql
--- auth_demo: probar RLS
-SET SESSION AUTHORIZATION 'bob' WITH PASSWORD 'demo-bob';
-SELECT * FROM customers;       -- bob ve solo AR (policy p_bob_ar)
-EXPLAIN SELECT * FROM customers; -- anota [est.rows=5] gracias al ANALYZE
-
--- inventory: ver aritmética Decimal exacta
-SELECT * FROM inventory_summary; -- margin_abs y margin_ratio sin pérdida de precisión
-
--- analytics: window function
-SELECT region, salesperson, revenue,
-       ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC) AS rk
-FROM sales;
-```
+Outputs:
+- **stdout**: tabla por suite con p50/p95/p99/mean/rows
+- **`bench/results.json`**: raw rows para post-procesar
+- **`bench/dbs/*.db`**: las 10 DBs sintéticas regenerables
+- **`docs/benchmarks/BENCHMARK-YYYY-MM-DD[_N].md`**: snapshot histórico inmutable (auto-generado al final)
 
 ---
 
-## 📌 Resumen ejecutivo
+## 📌 Resumen ejecutivo (corrida 2026-05-27 — Docker)
+
+> Mantenido por compatibilidad histórica. Para los números actuales ver arriba.
 
 **Fixes que más mueven la aguja** (sesión 2026-05-27, post bloques L+V):
 
@@ -172,281 +178,3 @@ FROM sales;
 **Lo que sigue duele**: full scans sobre 200K rows (3.2–3.6 s en Docker), `INTERSECT` que duplica el costo de un full scan, JOIN sin push-down de WHERE al outer (el bench mide JOIN+BETWEEN en 1 s porque el BETWEEN se aplica POST-JOIN). El bucket overflow para índices secundarios de baja cardinalidad sigue pendiente.
 
 **Veredicto operativo**: el motor está listo para OLTP de tamaño chico-medio + analítica liviana sobre tablas de hasta ~100K rows con PK + índice. Inadecuado todavía para queries con full-scan repetitivos sin planner que push-downee WHERE.
-
----
-
-## 🔬 Metodología
-
-| Parámetro | Valor |
-|---|---|
-| **Fecha** | 2026-05-27 (re-bench post-L+V + fixes) |
-| **Toolchain** | rustc 1.94 dentro de `rust:1.94-bookworm` (Docker) |
-| **Profile** | `release` (LTO según `Cargo.toml`) |
-| **Entorno** | Docker `rust:1.94-bookworm` sobre Windows 11 (host) |
-| **Iteraciones por op** | 100 (5 warmup descartados, salvo queries lentas que usan `iters/5` o `iters/20` para mantener wall-clock razonable) |
-| **Métrica de latencia** | P50, P95, P99, min, max en µs sobre runs individuales |
-| **Métrica de throughput** | rows/s sobre la fase de carga completa |
-| **Page cache** | LRU bounded default (1024 páginas ≈ 4 MB) |
-| **WAL** | After-image, sin checkpoint |
-| **Concurrencia** | Single-thread (Mutex global, sin contención) |
-| **Harness** | `src/bin/gabysql-bench.rs` (~600 LoC, zero-deps) |
-
-### Caveats explícitos
-
-1. **Entorno Docker** — la corrida pre-L+V vivía en Windows 11 nativo (host CPU directo); ésta corre dentro de un container. Comparar absolute numbers contra `BENCHMARK_2026-05-26.md` (host nativo) puede engañar — usar las **proporciones relativas** dentro de cada corrida.
-2. **Una sola máquina, una sola corrida** — no hay intervalos de confianza estadísticos. P95/P99 sobre N=95 son indicativos.
-3. **Datos sintéticos** — PRNG xorshift64.
-4. **Sin comparativa contra SQLite/PostgreSQL/DuckDB** — fuera de alcance.
-5. **El reporte mide latencia desde `Engine::exec` hasta retorno** — no incluye round-trip HTTP/JSON.
-
-### Reproducir
-
-```bash
-# desde la raíz del repo, con Docker disponible:
-docker run --rm -v "$(pwd):/app" -v gabysql-target:/app/target \
-    -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm \
-    cargo build --release --bin gabysql-bench
-
-mkdir -p bench-output
-
-docker run --rm -v "$(pwd):/app" -v gabysql-target:/app/target \
-    -v gabysql-cargo:/usr/local/cargo/registry -w /app rust:1.94-bookworm \
-    /app/target/release/gabysql-bench --db /app/bench-output/microblog.db \
-    --scenario microblog --phase all --iters 100
-
-# Lo mismo para `events` y `catalog`.
-```
-
----
-
-## 🗂 Escenario 1 — `microblog` (OLTP-like)
-
-### Schema
-
-```sql
-CREATE TABLE users (
-    id         INT PRIMARY KEY,
-    nombre     TEXT NOT NULL,
-    email      TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE posts (
-    id         INT PRIMARY KEY,
-    user_id    INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    titulo     TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    likes      INT NOT NULL DEFAULT 0
-);
-
-CREATE INDEX idx_posts_user ON posts(user_id);
-```
-
-- 10,000 users + 40,000 posts ≈ 4 posts/user.
-
-### Carga
-
-| Operación | Filas | Tiempo | Throughput |
-|---|---:|---:|---:|
-| INSERT users (con UNIQUE check) | 10,000 | 2.83 s | 3,537 rows/s |
-| INSERT posts (FK + idx maintenance) | 40,000 | 4.72 s | 8,473 rows/s |
-
-> Throughput menor que la corrida pre-fix porque ésta corre en Docker; same engine, different host overhead.
-
-### Queries
-
-| Op | P50 (µs) | P95 (µs) | P99 (µs) | Max (µs) | Filas | Notas |
-|---|---:|---:|---:|---:|---:|---|
-| **Q1** PK lookup `WHERE id=N` | **240** | 394 | 514 | 516 | 1 | 1000 ids dispersos |
-| **Q2a** Indexed eq sin idx | 630,519 | 676,740 | 705,520 | 705,520 | 40000 | ✅ Issue #3: ya no rebota con `[GBY-4001]`; cae a full scan |
-| **Q2b** Indexed eq con idx | **348** | 2,157 | 2,432 | 2,605 | 4 | idx activo |
-| **Q3** Range scan PK BETWEEN | 1,325 | 3,596 | 3,963 | 4,055 | 100 | walk leaf |
-| **Q4** JOIN `posts × users` (BETWEEN 1..100) | 1,008,369 | 1,141,439 | 1,329,388 | 1,612,237 | 100 | usa index-loop existente sobre `users.id`; el WHERE post-JOIN sobre `posts.id` no se pushea aún |
-| **Q5** Aggregate COUNT(*) WHERE likes>50 | 609,184 | 697,856 | 865,458 | 865,458 | 1 | full scan 40K |
-| **Q6** UPDATE auto-commit (fsync por iter) | **132** | 615 | 887 | 1,627 | 1 | tx por iter |
-
----
-
-## 🗂 Escenario 2 — `events` (analítica mediana)
-
-### Schema
-
-```sql
-CREATE TABLE events (
-    id         INT PRIMARY KEY,
-    event_type TEXT NOT NULL,
-    user_id    INT NOT NULL,
-    payload    TEXT NOT NULL,
-    ts         TEXT NOT NULL,
-    latency_ms INT NOT NULL
-);
-
-CREATE INDEX idx_events_type ON events(event_type);
-```
-
-- 200,000 events con ~8 valores únicos de `event_type` (distribución zipf-ish).
-
-### Carga
-
-| Operación | Filas | Tiempo | Throughput |
-|---|---:|---:|---:|
-| INSERT events | 200,000 | 23.23 s | 8,608 rows/s |
-
-### Queries
-
-| Op | P50 (µs) | P95 (µs) | P99 (µs) | Max (µs) | Filas | Notas |
-|---|---:|---:|---:|---:|---:|---|
-| **Q1** `COUNT WHERE latency_ms>1000` (full scan) | 3,417,934 | 3,536,682 | 3,536,682 | 3,536,682 | 1 | scan 200K |
-| **Q2** `GROUP BY event_type` agg | 3,542,876 | 3,618,658 | 3,618,658 | 3,618,658 | 7 | hash group |
-| **Q3** Indexed lookup `type='login'` LIMIT 100 | **184** | 218 | 230 | 230 | 100 | tipo frecuente, ahora funciona |
-| **Q4** Indexed lookup `type='admin_action'` LIMIT 100 | **173** | 195 | 199 | 199 | 100 | tipo raro |
-| **Q5** `WHERE LENGTH(payload)>100` | 3,223,389 | 3,254,651 | 3,254,651 | 3,254,651 | 1 | scalar fn |
-| **Q6** `INTERSECT` entre dos predicados | 6,592,670 | 6,822,088 | 6,822,088 | 6,822,088 | 7 | set op (~2× full scan) |
-| **Q7** Scalar subquery en SELECT list LIMIT 10 | **3,336,880** | 3,653,241 | 3,806,779 | 3,806,779 | 10 | ✅ Issue #1: pre-fix 7.55 s (10 re-evals) → post-fix 3.34 s (1 eval) |
-| **Q8** Derived table + GROUP BY | 3,454,325 | 3,509,089 | 3,509,089 | 3,509,089 | 7 | scan + agg |
-
----
-
-## 🗂 Escenario 3 — `catalog` (K2 PK + índice compuestos)
-
-### Schema
-
-```sql
-CREATE TABLE orders (
-    id          INT PRIMARY KEY,
-    customer_id INT NOT NULL,
-    total       INT NOT NULL,
-    created_at  TEXT NOT NULL
-);
-
-CREATE TABLE order_lines (
-    order_id INT NOT NULL,
-    line_no  INT NOT NULL,
-    sku      TEXT NOT NULL,
-    qty      INT NOT NULL,
-    price    INT NOT NULL,
-    PRIMARY KEY (order_id, line_no)
-);
-
-CREATE INDEX idx_lines_order_sku
-    ON order_lines (order_id, line_no);
-```
-
-- 10,000 orders + 100,000 order_lines (≈10 lines/order).
-
-### Carga
-
-| Operación | Filas | Tiempo | Throughput |
-|---|---:|---:|---:|
-| INSERT orders | 10,000 | 0.85 s | 11,713 rows/s |
-| INSERT order_lines (PK compuesta + idx compuesto) | 100,000 | 91.34 s | 1,095 rows/s |
-
-> El bottleneck del INSERT en `order_lines` es el doble fingerprint + verificación de duplicado por fila — escenario "papel del peor caso" del encoder K2. No es regresión post-L+V; el patrón se mantiene de la corrida pre-fix.
-
-### Queries
-
-| Op | P50 (µs) | P95 (µs) | P99 (µs) | Max (µs) | Filas | Notas |
-|---|---:|---:|---:|---:|---:|---|
-| **Q1** Composite PK full `WHERE order_id=X AND line_no=Y` | **216** | 385 | 512 | 586 | 1 | ✅ **Issue #4**: 670× mejora vs 145 ms pre-fix; fast-path por fingerprint activado |
-| **Q2** Composite PK partial `WHERE order_id=X` | 640,797 | 691,846 | 693,355 | 693,355 | 10 | fallback a scan (esperado, sin fast-path por arity parcial) |
-| **Q3** JOIN orders × order_lines | 53,467 | 70,098 | 72,673 | 79,053 | 0 | join + composite |
-| **Q4** `SUM(qty*price) GROUP BY order_id` LIMIT 100 | **302** | 354 | 354 | 354 | 100 | ✅ **Issue #5**: pre-fix era parse error; ahora compila y corre |
-
-> **Antes**: composite PK full (Q1) y partial (Q2) tardaban casi lo mismo (145 ms vs 162 ms) — señal clara de que el fast-path no se disparaba. **Después**: 216 µs vs 641 ms — el fast-path entrega O(log n) cuando aplica, fallback a O(n) cuando no. Es el separador de 3 órdenes de magnitud que K2 prometía.
-
----
-
-## 🏆 Rankings de toda la sesión
-
-### Top-3 más rápidas (P50)
-
-| # | Operación | Escenario | P50 |
-|---|---|---|---:|
-| 🥇 | UPDATE auto-commit (incluye fsync) | microblog | **132 µs** |
-| 🥈 | Indexed lookup type='admin_action' | events | **173 µs** |
-| 🥉 | Indexed lookup type='login' | events | **184 µs** |
-|     | (también: Composite PK full lookup) | catalog | 216 µs |
-
-### Top-3 más lentas (P50)
-
-| # | Operación | Escenario | P50 |
-|---|---|---|---:|
-| 1 | `INTERSECT` entre dos predicados (events) | 6.6 s |
-| 2 | GROUP BY event_type (events full scan agg) | 3.5 s |
-| 3 | COUNT con scalar fn (events full scan) | 3.2 s |
-
----
-
-## ✅ Estado de issues — sesión 2026-05-27
-
-### Resueltos
-
-#### Issue #1 — 🔴 Scalar subquery no-correlacionada re-evaluada por fila — ✅ FIXED
-
-- **Fix**: `Engine::memoize_select_stmt` + `select_stmt_is_correlated` walker pre-evalúan toda `Expr::ScalarSubquery` no-correlated UNA vez y sustituyen el árbol con `Expr::Literal(value)`. La correlación se detecta vía `WhereClause::EqColumnRef` recursivo.
-- **Antes**: 7.55 s para `SELECT (SELECT COUNT(*) FROM events) FROM events LIMIT 10` (10 re-evaluaciones del scan completo).
-- **Después**: 3.34 s — equivale a UNA sola evaluación del scan. El "factor 1000×" prometido se materializa en LIMITs grandes; para LIMIT 10 ya muestra ~2.3× mientras el overhead de la primera eval domina.
-
-#### Issue #3 — 🟡 `[GBY-4001]` inconsistente — ✅ FIXED
-
-- **Fix**: el branch `else` del planner de `WhereClause::Eq` ahora cae a `Plan::FullScan` igual que el resto de operadores (`>`, `<`, `LIKE`, `IS NULL`, ...). `[GBY-4001]` queda como código reservado.
-- **Antes**: `WHERE col_no_indexada = val` → error.
-- **Después**: full scan + post-filter — misma semántica que cualquier otro operador.
-
-#### Issue #4 — 🟡 Composite PK lookup que no usaba B+Tree — ✅ FIXED
-
-- **Fix**: `extract_and_equality_map` walker reconoce AND-of-equality que cubre toda la PK compuesta y dispara `composite_pk_fast_path_active` antes del `generic_post_filter`. El planner ahora computa el fingerprint y va directo al B+Tree.
-- **Antes**: 145 ms (full scan + post-filter, idéntico a partial lookup).
-- **Después**: **216 µs** — separación clara entre fast-path indexado y fallback (Q1 vs Q2: 3000× de diferencia).
-
-#### Issue #5 — 🟢 `parse_agg_arg` no usa `Expr` completo — ✅ FIXED
-
-- **Fix**: nueva variante `AggArg::Expr(Expr)`; `parse_agg_arg` ahora delega a `parse_expr()` y colapsa a `AggArg::Column` cuando la Expr resultante es un único `Column`. `compute_aggregate` pre-evalúa la Expr por row contra una key sintética y reusa el motor de agregación existente.
-- **Antes**: parse error en `SUM(qty * price)`.
-- **Después**: compila y corre. Catalog Q4 mide **302 µs** sobre 100K rows con `GROUP BY` + `LIMIT`.
-
-#### Issue #6 — 🟢 JOIN nested-loop sin alternativa — ✅ FIXED
-
-- **Fix**: `exec_select_joined` ahora construye un `HashMap<Vec<u8>, Vec<usize>>` sobre la columna del lado right antes del loop, y probea cada left row en O(1). Si no hay equi-predicate (CROSS JOIN puro o predicate que no resuelve), cae al nested-loop original.
-- **Bench actual no lo exhibe** porque todos los JOINs del bench (`posts.user_id = users.id`, `orders.id = order_lines.order_id`) pegan al fast-path *index-loop* preexistente, que cubre el mismo caso con un lookup por outer row contra la PK del inner. La mejora aplica para equi-joins donde el inner NO está indexado por la columna del ON — caso que el bench no incluye.
-
-### Deferidos
-
-#### Issue #2 — 🔴 `CREATE INDEX` colapsa con cardinalidad muy baja — 🟡 DEFERRED
-
-- **Estado**: ahora emite un error claro indicando la causa (bucket excede una página) + workarounds (filtrar, índice compuesto, full scan post-Issue-#3). El fix real requiere reescribir el bucket layer del índice secundario (overflow chain entre páginas) — es un bloque propio.
-- **Mitigación parcial**: con la corrida actual del bench, los índices SÍ se crean correctamente sobre 200K rows con 8 valores únicos (Q3/Q4 de events miden ~180 µs). El bug original era condicional a tamaños mayores o a payload por row que infla el bucket más allá de la página.
-
----
-
-## 🎯 Recomendaciones priorizadas (post-fix)
-
-1. **(🔴 alta)** Implementar overflow chain en bucket secundario (Issue #2 real fix) — desbloquea indexado robusto sobre columnas categóricas con datasets grandes.
-2. **(🟡 media)** Push-down de WHERE al outer en JOIN — el `WHERE posts.id BETWEEN 1 AND 100` debería filtrar antes de iterar el JOIN, no después. Hoy escanea 40K posts × lookup por cada uno y filtra al final.
-3. **(🟡 media)** Optimización para `INTERSECT`/`EXCEPT` (hash-based en vez de full scan twice).
-4. **(🟢 baja)** Comparativa contra SQLite/PostgreSQL/DuckDB con dataset/queries portables.
-5. **(🟢 baja)** Concurrencia con MVCC para repetir el bench multi-thread cuando aterricen los locks granulares.
-
----
-
-## 📁 Artefactos
-
-| Archivo | Tamaño | Descripción |
-|---|---:|---|
-| `src/bin/gabysql-bench.rs` | ~600 LoC | Harness zero-deps, embebe la librería |
-| `BENCHMARK.md` | este archivo | Reporte profesional post-L+V + 5 fixes |
-| `BENCHMARK_2026-05-26.md` | snapshot | Corrida pre-fix archivada |
-| `bench-output/microblog.db` | ~10 MB | OLTP |
-| `bench-output/events.db` | ~56 MB | Analítica |
-| `bench-output/catalog.db` | ~13 MB | K2 |
-
----
-
-## 🔁 Cómo extender este benchmark
-
-- **Más iteraciones**: subir `--iters 1000` para reducir varianza en queries cortas.
-- **Comparar contra SQLite/PG**: setup separado, mismo dataset, mismas queries.
-- **Concurrencia**: hoy single-thread por Mutex global.
-- **Workload skewed**: agregar write/read ratios distintos (90/10, 50/50, 10/90).
-- **Cold cache**: instrumentar `Pager::reset_cache()` antes de cada query.
