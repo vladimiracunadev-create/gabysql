@@ -9,19 +9,21 @@
 
 ---
 
-## 🎯 Top 5 huecos por impacto práctico
+## 🎯 Top 5 huecos por impacto práctico (refrescado 2026-05-29)
 
-Si vas a ordenar bloques por ROI funcional, este es el orden:
+> **Histórico de huecos cerrados** (movido al pie del archivo): E1, E2, E3, F, T, J, J2, G, H, I, K1, K2, L, V, W, X, Y, Z — todos los "P0 clásicos" del 2026-05-25..27 ya están entregados. La superficie SQL relacional clásica está cubierta. Los huecos remanentes son **de rendimiento, herramientas y completitud avanzada**, no de uso básico.
 
-| # | Hueco | Impacto | Bloque sugerido |
+Si vas a ordenar bloques por ROI funcional **hoy**, este es el orden:
+
+| # | Hueco | Impacto real | Bloque sugerido |
 |---|---|---|---|
-| 1 | ~~**`AND` / `OR` / `NOT` en `WHERE`**~~ ✅ | Cerrado en E1 (2026-05-25) | E1 ✅ |
-| 2 | ~~**`<`, `>`, `<=`, `>=`, `<>`, `LIKE`, `IS NULL`**~~ ✅ | Cerrado en E2 (2026-05-25) | E2 ✅ |
-| 3 | ~~**`COUNT`, `SUM`, `AVG`, `MIN`, `MAX` + `GROUP BY`**~~ ✅ | Cerrado en F (2026-05-25; sin JOINs aún) | F ✅ |
-| 4 | ~~**`UPDATE` / `DELETE` por columna indexada o subquery**~~ ✅ | Cerrado en E3 (2026-05-25) | E3 ✅ |
-| 5 | ~~**Transacciones explícitas (`BEGIN`/`COMMIT`/`ROLLBACK`)**~~ ✅ | Cerrado en T (2026-05-25; `SAVEPOINT` y cross-request quedan pendientes) | T ✅ |
+| 1 | **Planner-as-optimizer cost-based** | Queries analíticas (full scan, agregados sobre 200k rows) cuestan 0.5–4 s en el bench 2026-05-29. Sin reorden de joins ni elección de índice por costo, gabysql es "ejecutor con plan fijo". | **P5** (depende de P4) |
+| 2 | **Stats por-columna** (NDV vía HyperLogLog, MCV top-K, histogramas) | P3 ya da `est.rows` global; sin per-column no se puede estimar selectividad de un predicado. Sin esto, P5 no tiene insumos. | **P4** |
+| 3 | **`SAVEPOINT` + `ROLLBACK TO SAVEPOINT`** | Hoy `ROLLBACK` descarta TODO el batch. Imposible deshacer una violation de constraint sin perder el resto. | **T1** |
+| 4 | **Bind params (`?`, `$1`) + `PREPARE`/`EXECUTE` + plan cache** | Sin esto, hay que concatenar SQL → riesgo de inyección si el caller no escapa. Plan cache habilita reuso del plan parseado. | **N1+N2** |
+| 5 | **Agregados sobre `SELECT` con `JOIN`** (`[GBY-4028]`) | El bench 2026-05-29 lo tropezó: queries comunes tipo `SELECT u.name, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.name` rebotan. Hoy hay que rescribirlas como subquery. | **F2** |
 
-Estos 5 bloques cierran >80% de las quejas previsibles de un usuario portando una app SQL clásica.
+Estos 5 bloques son los que más mueven la aguja a partir de hoy. Los 3 primeros (P4+P5+T1) son los que el usuario sentido como "esta DB rinde" o "esta DB no rinde".
 
 ---
 
