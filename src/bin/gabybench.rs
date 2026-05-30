@@ -1233,19 +1233,22 @@ fn suite_analytics(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT region, salesperson_id, revenue, ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC) FROM sales LIMIT 500",
     )?);
 
+    // CUIDADO: RANK y SUM OVER son cuadráticos hoy (defer W4). Cada iter
+    // toma 30-50s sobre 500 rows. Bajamos a 2 iters (p50 = pico, mean OK)
+    // para que la suite NO tarde 4+ min en estas 2 queries.
     out.push(bench_sql(
         "analytics",
-        "RANK() OVER (PARTITION BY region ORDER BY revenue DESC)",
+        "RANK() OVER (PARTITION BY region ORDER BY revenue DESC) [N=2, slow O(n²)]",
         &mut pager,
-        5,
+        2,
         "SELECT region, revenue, RANK() OVER (PARTITION BY region ORDER BY revenue DESC) FROM sales LIMIT 500",
     )?);
 
     out.push(bench_sql(
         "analytics",
-        "SUM OVER (PARTITION BY region) cumulative",
+        "SUM OVER (PARTITION BY region) cumulative [N=2, slow O(n²)]",
         &mut pager,
-        5,
+        2,
         "SELECT region, revenue, SUM(revenue) OVER (PARTITION BY region) FROM sales LIMIT 500",
     )?);
 
@@ -1430,14 +1433,18 @@ fn suite_procflow(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
     close_after_bench(pager);
 
     let mut pager = Pager::open(path)?;
+    // OJO: trigger inserta en audit_log con id = NEW.id. Si UPDATE rota
+    // las mismas 100 filas, el trigger intenta meter PKs duplicadas en
+    // audit_log → [GBY-3001]. Usamos IDs únicos (1..200) — cada UPDATE
+    // toca una row distinta → cada trigger fire = audit_log PK único.
     pager.begin()?;
     out.push(bench(
         "procflow",
-        "UPDATE dispara trigger AFTER (in-tx)",
+        "UPDATE dispara trigger AFTER (in-tx, ids únicos)",
         &mut pager,
         200,
         |engine, i| {
-            let id = (i % 100) + 1;
+            let id = (i + 1) as i64; // 1..200, todos únicos
             exec_sql(
                 engine,
                 &format!(
@@ -1770,9 +1777,28 @@ fn archive_run(rows: &[BenchRow], date_iso: &str) -> std::io::Result<PathBuf> {
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
+    let started = Instant::now();
+    println!("== gabybench iniciando (pid={}) ==", std::process::id());
+    println!("   target esperado: ~10-15 min (10 DBs, ~85 queries)");
+    println!("   ⚠ window functions RANK/SUM OVER hoy son O(n²) — defer W4");
+    println!();
+    let res = run();
+    let elapsed = started.elapsed();
+    match res {
+        Ok(_) => {
+            println!(
+                "\n== gabybench OK — total {:.1} min ==",
+                elapsed.as_secs_f64() / 60.0
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "\n== gabybench FAIL — total {:.1} min, error: {} ==",
+                elapsed.as_secs_f64() / 60.0,
+                e
+            );
+            std::process::exit(1);
+        }
     }
 }
 
