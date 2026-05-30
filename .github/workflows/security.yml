@@ -123,16 +123,47 @@ jobs:
             --exclude-lines '^\s*//|^\s*#' \
             > /tmp/scan_output.json
           python - <<'PY'
-          import json, sys
+          import json, sys, os
+
           data = json.load(open('/tmp/scan_output.json'))
           results = data.get('results', {})
-          if results:
-              print('::error::Posibles secretos detectados en filesystem:')
-              for fpath, items in results.items():
+
+          # Comparar contra .secrets.baseline: los hits ya conocidos no
+          # son fallo. detect-secrets `scan --baseline` actualiza el
+          # archivo in-place pero no filtra el output del scan suelto;
+          # acá hacemos el filtro nosotros via (filepath, hashed_secret).
+          # Esto permite mantener una lista auditada de false-positives
+          # (passwords de demo, hex de literales BLOB, etc.) sin tener
+          # que tocar workflows cada vez.
+          baseline_set = set()
+          if os.path.exists('.secrets.baseline'):
+              baseline = json.load(open('.secrets.baseline'))
+              for fpath, hits in baseline.get('results', {}).items():
+                  # detect-secrets emite paths con backslashes en Win;
+                  # normalizamos a forward slashes para comparar OS-agnostic.
+                  fpath_norm = fpath.replace('\\', '/')
+                  for h in hits:
+                      baseline_set.add((fpath_norm, h.get('hashed_secret')))
+
+          new_results = {}
+          for fpath, hits in results.items():
+              fpath_norm = fpath.replace('\\', '/')
+              fresh = [h for h in hits
+                       if (fpath_norm, h.get('hashed_secret')) not in baseline_set]
+              if fresh:
+                  new_results[fpath] = fresh
+
+          if new_results:
+              print('::error::Posibles secretos NUEVOS detectados (no estan en .secrets.baseline):')
+              for fpath, items in new_results.items():
                   for it in items:
                       print(f"  {fpath}:{it.get('line_number')}  type={it.get('type')}")
+              print('')
+              print('Si son false positives, agregalos a la baseline localmente:')
+              print('  detect-secrets scan --baseline .secrets.baseline')
+              print('  detect-secrets audit .secrets.baseline   # marcar uno por uno')
               sys.exit(1)
-          print('OK: sin secretos expuestos en filesystem')
+          print(f'OK: 0 secretos NUEVOS (baseline conoce {len(baseline_set)} hits previos)')
           PY
       - name: Escaneo de los ultimos 50 commits
         run: |
