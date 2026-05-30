@@ -68,7 +68,7 @@ CREATE TABLE orders (
 );
 ```
 
-Constraints disponibles (gabysql `VERSION 13+`):
+Constraints disponibles (gabysql `VERSION 13+`, sin cambios estructurales en bumps posteriores 14→31 — esos extendieron triggers/procedures/functions/types/security/EXPLAIN, no constraints):
 - `PRIMARY KEY` — escalar `INT` inline, o compuesta `PRIMARY KEY (a, b, ...)` table-level (K2, all-INT NOT NULL, equality-only via fingerprint FNV-1a-64). Implícitamente `NOT NULL`. `CONSTRAINT <name> PRIMARY KEY (...)` con nombre explícito desde residual #2.
 - `NOT NULL` — rechaza `NULL` literal y omisión sin DEFAULT.
 - `UNIQUE` — inline o table-level `UNIQUE (a, b, ...)` (L1, multi-col reusa el encoder K2). `CONSTRAINT <name> UNIQUE (...)` con nombre explícito desde residual #2.
@@ -253,7 +253,7 @@ Devuelve un JSON con `started_unix`, `uptime_s`, `requests_total`, `requests_by_
 
 ## 5. 📐 `gabymodeler v2` — modelador web (PowerDesigner-style)
 
-`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 13`.
+`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 31` (al 2026-05-29). El modelador refleja la superficie DDL/constraints — los bumps post-13 extendieron features ortogonales (triggers, procedures, types, security, EXPLAIN) que el modelador no toca, así que la UI sigue coherente sin cambios.
 
 ### Levantarlo
 ```bash

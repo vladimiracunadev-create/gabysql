@@ -74,13 +74,13 @@ A diciembre de 2026 el motor tiene una **base estable suficiente como mesa de tr
 | Storage `.db` + WAL + CRC32 por página | 🟢 | ADR-0003. Recovery + crash tests. |
 | B+Tree real (PK + índices secundarios) | 🟢 | ADR-0004, ADR-0005, ADR-0017. |
 | SQL surface mínima pero coherente | 🟢 | CREATE/INSERT/SELECT/UPDATE/DELETE/ORDER BY/BETWEEN/LIMIT/OFFSET + índices + FKs |
-| Constraints declarativas (NOT NULL, UNIQUE, DEFAULT, FK) | 🟢 | VERSION 6+ |
+| Constraints declarativas (NOT NULL, UNIQUE, DEFAULT, FK con todas las acciones, CHECK column/table-level, named) | 🟢 | VERSION 6+ inicio, completado en L1/L2/L3+residuales hasta VERSION 12 |
 | File lock cross-process | 🟢 | ADR-0013 |
 | Backup/restore/verify con CRC end-to-end | 🟢 | ADR-0015 |
 | Observabilidad básica (`/metrics`, `-log-json`) | 🟢 | ADR-0014 |
-| Error handling con códigos `[GBY-NNNN]` | 🟢 | ERROR_CODES.md |
+| Error handling con códigos `[GBY-NNNN]` | 🟢 | ERROR_CODES.md (códigos 1000-4143) |
 | Gateway MCP + vector search + audit log | 🟢 | ADR-0010/0011/0012 |
-| 45/45 integration tests, CI multi-OS | 🟢 | |
+| 723/723 integration tests verdes + 1 ignored (Argon2id RFC vector pendiente), CI multi-OS Ubuntu/macOS/Windows | 🟢 | actualizado al 2026-05-29 |
 
 Este conjunto es lo bastante sólido para ser **plataforma de exploración** sin estar quebrándose todo el tiempo. Las invariantes (formato versionado, single-writer, CRC, file lock) son honestas y consistentes.
 

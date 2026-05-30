@@ -61,7 +61,7 @@ graph LR
 Responsable de:
 - crear (sin sobrescribir) y abrir archivos `.db`; expone `create_force` para reset explícito
 - adquirir un **lock exclusivo cross-process** sobre el `.db` con `File::try_lock()` en cada `create/open`: dos procesos `gabysql` apuntando al mismo archivo → el segundo falla rápido con `database is locked by another process` (ver [ADR-0013](adr/0013-process-level-file-lock.md))
-- mantener el header del formato `VERSION=13` (rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md))
+- mantener el header del formato `VERSION=31` (corte semántico Z1f/Argon2id partial fix; bumps 14→31 extendieron triggers/procedures/functions/types extendidos/security; rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md) y [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md))
 - gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
 - finalizar el checksum antes de cada flush y verificarlo al leer
 - escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`
@@ -175,9 +175,9 @@ Las mejoras naturales siguientes son:
 - ~~`JOIN` (INNER, CROSS, comma-syntax, aliases, multi-tabla, self-join, LEFT/RIGHT/FULL [OUTER], USING, NATURAL, index-loop optimization)~~ ✅ entregado
 - `Transaction` (Unit of Work) con cache de `TableMeta` — pendiente, ROI marginal hoy
 - WAL persistente estilo SQLite-WAL — diseño documentado, sin código (ver [ADR-0018](adr/0018-wal-mode-opt-in.md)); condiciones de salida: bottleneck medido en gabybench, workload write-heavy real, o necesidad de MVCC
-- índices compuestos
-- range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME`
-- planner cost-based real (hoy: deterministic dispatch + plan enum cerrado + index-loop join automático para INNER/LEFT con PK/índice)
-- window functions, CTE recursivas, vistas materializadas (`GROUP BY`/`HAVING`/agregados single-table cerrados en bloque F el 2026-05-25; agregados sobre `SELECT` con JOIN aún devuelven `[GBY-4028]`)
-- subqueries correlacionadas con múltiples predicados (`AND`/`OR` en `WHERE` interno) y derived tables (`FROM (SELECT ...) t`)
-- política formal de migración entre versiones del formato en disco
+- índices compuestos all-INT ✅ (K2, 2026-05-26)
+- range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` (pendiente — solo INT con OrderedInt)
+- planner cost-based real (hoy: deterministic dispatch + plan enum cerrado + index-loop join automático para INNER/LEFT con PK/índice + P3 stats session-scoped en EXPLAIN; **P5 pendiente** — reorden de joins por costo, choice de índice por costo)
+- window functions ✅ (W3, 2026-05-29), CTE no-rec ✅ (W1), CTE recursivas ✅ (W2, fixpoint con guard 10K), vistas ✅ (V, 2026-05-27) — **materialized views con REFRESH pendientes**. (Hoy: agregados single-table OK; agregados sobre `SELECT` con `JOIN` aún devuelven `[GBY-4028]` — defer F2)
+- subqueries correlacionadas con múltiples predicados (`AND`/`OR` en `WHERE` interno) ✅ (H, 2026-05-26) y derived tables (`FROM (SELECT ...) t`) ✅ (H, 2026-05-26)
+- política formal de migración entre versiones del formato en disco (sigue pendiente — cada bump rechaza versiones anteriores con `[GBY-1003]`; backup + dump + recreate manual)
