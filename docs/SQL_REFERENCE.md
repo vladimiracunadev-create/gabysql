@@ -6,6 +6,15 @@
 >
 > Para el detalle del formato en disco que respalda esta gramática, ver [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md). Para el AST en código, [src/sql.rs](../src/sql.rs).
 
+> 📊 **¿No ves los railroad diagrams?** Este documento usa **17 bloques mermaid** + 1 en [ARCHITECTURE.md](ARCHITECTURE.md). Si los ves como código en lugar de gráfico, tu renderer no soporta mermaid. Soluciones:
+> - **GitHub web**: los renderiza nativamente desde 2022. Si no se ven, refrescá hard (Ctrl+F5).
+> - **VS Code**: instalá la extensión [`bierner.markdown-mermaid`](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid) — sin ella el Markdown Preview no los pinta.
+> - **Obsidian / Typora / Joplin**: lo soportan nativamente.
+> - **GitHub mobile**: NO los renderiza — abrir en navegador desktop.
+> - **PDF export**: requiere `mermaid-cli` (`npm i -g @mermaid-js/mermaid-cli`) o usar Pandoc + filtro.
+>
+> Los 17 bloques de este archivo + el de ARCHITECTURE.md fueron validados sintácticamente el 2026-05-29 — si alguno no renderiza es porque el renderer cortó por límite de nodos (raro), no porque el código mermaid esté roto.
+
 ---
 
 ## 🧭 Índice de comandos

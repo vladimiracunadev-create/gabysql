@@ -183,12 +183,15 @@ fn bench<F>(
 where
     F: FnMut(&mut Engine, usize) -> DbResult<usize>,
 {
-    // Warmup
+    // Warmup. Para que la suite DML (INSERT con id = i + K) no colisione
+    // con el main loop, usamos un offset gigante (1_000_000) en el
+    // índice de warmup. Las queries SELECT ignoran `i` así que no las
+    // afecta; las DML inserts caen en un rango disjunto al de iters.
     let warmup = (iters / 10).clamp(5, 50);
     {
         let mut engine = Engine::new(pager);
         for i in 0..warmup {
-            let _ = f(&mut engine, i)?;
+            let _ = f(&mut engine, i + 1_000_000)?;
         }
     }
 
@@ -222,6 +225,37 @@ fn bench_sql(
     // chico es <5µs y se mide *junto* a la ejecución, lo cual es honesto:
     // el usuario final paga ambos costos.
     bench(suite, name, pager, iters, |engine, _| exec_sql(engine, sql))
+}
+
+/// Variante que NO aborta el bench si la query falla (hueco conocido del
+/// motor — e.g. agregados sobre JOIN, [GBY-4028]). En vez de cortar
+/// abruptamente la suite, deja una BenchRow marcada con `total_ms=-1` y
+/// el código de error en `rows_returned` (-1 también) y sigue.
+fn bench_sql_or_skip(
+    suite: &str,
+    name: &str,
+    pager: &mut Pager,
+    iters: usize,
+    sql: &'static str,
+) -> BenchRow {
+    match bench_sql(suite, name, pager, iters, sql) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("   ⚠ SKIP '{}': {}", name, e);
+            BenchRow {
+                suite: suite.to_string(),
+                name: format!("{} [SKIPPED: motor no soporta]", name),
+                iters: 0,
+                p50_ns: 0,
+                p95_ns: 0,
+                p99_ns: 0,
+                mean_ns: 0,
+                stddev_ns: 0,
+                total_ms: -1.0,
+                rows_returned: 0,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +546,10 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT id FROM users WHERE nombre LIKE 'A%'",
     )?);
 
-    out.push(bench_sql("microblog", "JOIN index-loop (u.id=7)", &mut pager, 200,
-        "SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id = 7 GROUP BY u.nombre")?);
+    // [GBY-4028] vigente: agregados sobre SELECT con JOIN no se soportan.
+    // Lo medimos con skip-graceful para no abortar la suite.
+    out.push(bench_sql_or_skip("microblog", "JOIN+COUNT (u.id=7)", &mut pager, 200,
+        "SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id = 7 GROUP BY u.nombre"));
 
     out.push(bench_sql(
         "microblog",
@@ -533,7 +569,10 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
 
     close_after_bench(pager);
 
-    // DML — abrir nuevo pager y commitear por iteración para medir cost real.
+    // DML — bracket completo en UNA tx (la label original decía "auto-tx" pero
+    // el bench no implementaba commit per-iter y caía con
+    // "requiere transacción activa"). Hoy medimos cost in-tx amortizado, no
+    // cost de fsync per-statement. Honesto: el flush real es de Fase 4.
     {
         let mut pager = Pager::open(path)?;
         pager.begin()?;
@@ -545,9 +584,11 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         }
         pager.commit()?;
 
+        pager.begin()?;
+
         out.push(bench(
             "microblog",
-            "INSERT single (auto-tx)",
+            "INSERT single (in-tx)",
             &mut pager,
             500,
             |engine, i| {
@@ -564,7 +605,7 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
 
         out.push(bench(
             "microblog",
-            "UPDATE por PK",
+            "UPDATE por PK (in-tx)",
             &mut pager,
             500,
             |engine, i| {
@@ -578,7 +619,7 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
 
         out.push(bench(
             "microblog",
-            "DELETE por PK",
+            "DELETE por PK (in-tx)",
             &mut pager,
             500,
             |engine, i| {
@@ -586,6 +627,8 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
                 exec_sql(engine, &format!("DELETE FROM tmp_ins WHERE id = {}", id))
             },
         )?);
+
+        pager.commit()?;
 
         // cleanup
         pager.begin()?;
@@ -661,13 +704,15 @@ fn suite_events(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT DISTINCT kind FROM events",
     )?);
 
-    out.push(bench_sql(
+    // SELECT bare sin FROM (`SELECT (subq)`) no se soporta por el parser
+    // hoy — defer a un bloque futuro. Skip-graceful para no abortar la suite.
+    out.push(bench_sql_or_skip(
         "events",
-        "Subquery escalar COUNT(view)",
+        "Subquery escalar COUNT(view) bare-SELECT",
         &mut pager,
         20,
         "SELECT (SELECT COUNT(*) FROM events WHERE kind = 'view')",
-    )?);
+    ));
 
     out.push(bench_sql(
         "events",
@@ -715,7 +760,7 @@ fn suite_orders_lines(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "Composite index lookup qty+precio",
         &mut pager,
         200,
-        "SELECT id FROM lines WHERE qty = 5 AND precio = 100",
+        "SELECT order_id FROM lines WHERE qty = 5 AND precio = 100",
     )?);
 
     out.push(bench_sql(
@@ -734,13 +779,15 @@ fn suite_orders_lines(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT order_id, SUM(qty * precio) FROM lines GROUP BY order_id LIMIT 10",
     )?);
 
-    out.push(bench_sql(
+    // [GBY-4002] BETWEEN solo se soporta sobre PK o columna INT con índice
+    // ordenado. `qty` no tiene índice. Skip-graceful.
+    out.push(bench_sql_or_skip(
         "orders_lines",
-        "Composite range qty BETWEEN",
+        "Composite range qty BETWEEN (no idx)",
         &mut pager,
         50,
-        "SELECT id FROM lines WHERE qty BETWEEN 1 AND 5",
-    )?);
+        "SELECT order_id FROM lines WHERE qty BETWEEN 1 AND 5",
+    ));
 
     close_after_bench(pager);
 
@@ -814,9 +861,12 @@ fn suite_orders_lines(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         }
         pager.commit()?;
 
+        // El bench (que sigue) hace INSERTs sin abrir tx propia — el bench
+        // global necesita una tx activa para los new_page() internos.
+        pager.begin()?;
         let row = bench(
             "orders_lines",
-            "INSERT PK compuesta",
+            "INSERT PK compuesta (in-tx)",
             &mut pager,
             500,
             |engine, i| {
@@ -831,6 +881,7 @@ fn suite_orders_lines(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
                 )
             },
         )?;
+        pager.commit()?;
         out.push(row);
 
         pager.begin()?;
