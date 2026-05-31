@@ -724,15 +724,14 @@ fn suite_events(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT DISTINCT kind FROM events",
     )?);
 
-    // SELECT bare sin FROM (`SELECT (subq)`) no se soporta por el parser
-    // hoy — defer a un bloque futuro. Skip-graceful para no abortar la suite.
-    out.push(bench_sql_or_skip(
+    // E5 (ADR-0066 Gap 3 cerrado): bare SELECT con scalar subquery.
+    out.push(bench_sql(
         "events",
-        "Subquery escalar COUNT(view) bare-SELECT",
+        "Subquery escalar COUNT(view) bare-SELECT (E5)",
         &mut pager,
         20,
         "SELECT (SELECT COUNT(*) FROM events WHERE kind = 'view')",
-    ));
+    )?);
 
     out.push(bench_sql(
         "events",

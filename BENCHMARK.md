@@ -66,7 +66,7 @@
 | Aggregate COUNT(*) full | 30 | 537.87 ms | 554.33 ms | 560.09 ms | 538.85 ms | 1 |
 | GROUP BY kind (low-card 7) | 20 | 636.19 ms | 679.24 ms | 701.52 ms | 645.33 ms | 7 |
 | DISTINCT kind | 20 | 477.46 ms | 485.49 ms | 502.14 ms | 477.23 ms | 7 |
-| Scalar subquery bare-SELECT | — | **SKIP parser ("se esperaba FROM")** | | | | |
+| Scalar subquery bare-SELECT (E5) | 20 | _pendiente próximo bench_ | | | | |
 | UNION two ranges | 30 | 710.18 ms | 737.07 ms | 761.84 ms | 713.87 ms | 2118 |
 | SELECT con UPPER/expr LIMIT 100 | 200 | **187.30 µs** | 222.10 µs | 238.70 µs | 192.84 µs | 100 |
 
@@ -211,9 +211,9 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 |---|---|---|---|---:|
 | 1 | ~~Agregados sobre `SELECT con JOIN`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 2 | ~~`BETWEEN` sin índice ordenado~~ | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
-| 3 | `SELECT (subquery)` sin FROM | parser | E5 | P2 |
+| 3 | ~~`SELECT (subquery)` sin FROM~~ | ~~parser~~ | ~~E5~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 4 | `UNIQUE` multi-col exige all-INT | `[GBY-4067]` | K3 | P2 |
-| 5 | `WITH RECURSIVE` requiere FROM en anchor | `[GBY-4081]` | (depende de E5) | P2 |
+| 5 | ~~`WITH RECURSIVE` requiere FROM en anchor~~ | ~~`[GBY-4081]`~~ | ~~(depende de E5)~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 6 | Trigger PK auto-gen (sin SERIAL / DEFAULT con función) | bench design | N5 | P2 |
 | 7 | ~~`COUNT(*) FROM <view>`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 8 | ~~**`RANK()` y `SUM OVER (PARTITION BY)` eran O(n²)**~~ | ~~sin código~~ | ~~**W4 crítico**~~ ✓ | ~~**P1**~~ cerrado 2026-05-30 |

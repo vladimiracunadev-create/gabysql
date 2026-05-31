@@ -8486,6 +8486,62 @@ impl<'a> Engine<'a> {
         Ok(MaterializedDerived { meta, rows })
     }
 
+    /// E5 (ADR-0066 Gap 3+5, 2026-05-30): bare SELECT sin FROM.
+    /// Evalúa cada `SelectItem` contra una fila vacía y devuelve UNA
+    /// fila. Acepta literales, expresiones puras, scalar subqueries
+    /// (e.g. `SELECT (SELECT COUNT(*) FROM t)`), y la combinación
+    /// columna-virtual + alias (`SELECT 1 AS n, 0 AS depth`).
+    /// `*`, `Aggregate` y `Window` se rechazan — no hay row scope
+    /// sobre el que tengan sentido.
+    fn exec_bare_select(&mut self, stmt: SelectStmt) -> DbResult<ResultSet> {
+        let output_columns: Vec<String> = stmt.columns.iter().map(|i| i.output_name()).collect();
+        let empty_row: HashMap<String, Value> = HashMap::new();
+        let mut row_out: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+        for item in &stmt.columns {
+            let v = match item {
+                SelectItem::Star => {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        "SELECT * sin FROM no es válido — no hay scope de columnas",
+                    ));
+                }
+                SelectItem::Column(c) => {
+                    return Err(coded(
+                        codes::COLUMN_NOT_FOUND,
+                        format!("SELECT sin FROM: '{}' no resuelve a ninguna columna", c),
+                    ));
+                }
+                SelectItem::Expression { expr, .. } => {
+                    self.eval_expr_full(expr, &empty_row, None)?
+                }
+                SelectItem::Aggregate { .. } => {
+                    return Err(coded(
+                        codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
+                        "SELECT sin FROM: agregados no se permiten sin row scope",
+                    ));
+                }
+                SelectItem::Window { .. } => {
+                    return Err(coded(
+                        codes::WINDOW_NOT_ALLOWED_HERE,
+                        "SELECT sin FROM: window functions no se permiten sin row scope",
+                    ));
+                }
+            };
+            row_out.push(v);
+        }
+        // LIMIT 0 / OFFSET ≥ 1 → 0 filas. LIMIT n>=1 con offset 0 → 1 fila.
+        let rows: Vec<Vec<Value>> = if stmt.offset >= 1 || matches!(stmt.limit, Some(0)) {
+            Vec::new()
+        } else {
+            vec![row_out]
+        };
+        Ok(ResultSet {
+            columns: output_columns,
+            rows,
+            message: None,
+        })
+    }
+
     fn exec_select(&mut self, mut stmt: SelectStmt) -> DbResult<ResultSet> {
         // Bloque Z2 (2026-05-29): chequeo de PRIV_SELECT sobre la tabla
         // base y todas las joins nombradas. Derived tables / VALUES no
@@ -8509,6 +8565,16 @@ impl<'a> Engine<'a> {
                         Self::merge_where_with_rls(stmt.where_clause.take(), Some(rls));
                 }
             }
+        }
+        // E5 (ADR-0066 Gap 3+5): bare SELECT sin FROM. El parser deja
+        // `table=""` como sentinel cuando no había FROM. Evaluamos la
+        // lista contra una fila vacía y devolvemos 1 fila.
+        if stmt.table.is_empty()
+            && stmt.derived_source.is_none()
+            && stmt.values_source.is_none()
+            && stmt.joins.is_empty()
+        {
+            return self.exec_bare_select(stmt);
         }
         // Bloque V (2026-05-27): si el FROM apunta a una vista, la
         // re-expandimos como derived source ANTES de cualquier otro
@@ -23425,6 +23491,36 @@ impl Parser {
         // el executor valida la coherencia ANSI más abajo.
         let distinct = self.match_keyword("DISTINCT");
         let columns = self.parse_select_list()?;
+        // E5 (ADR-0066 Gap 3+5, 2026-05-30): bare SELECT sin FROM.
+        // PostgreSQL/MySQL admiten `SELECT 1`, `SELECT (SELECT ...)` y
+        // `WITH RECURSIVE r AS (SELECT 1 ...) ...` con un anchor sin FROM.
+        // Cuando no hay FROM tras la lista de columnas, devolvemos un
+        // `SelectStmt` con `table=""` y solo permitimos `ORDER BY` /
+        // `LIMIT` / `OFFSET` trailing — el executor (`exec_bare_select`)
+        // detecta el sentinel y evalúa la lista contra una fila vacía.
+        if !(self.peek().kind == TokenKind::Ident && self.peek().text.eq_ignore_ascii_case("FROM"))
+        {
+            let (order_by, limit, offset) = if allow_trailing_order_limit {
+                self.parse_top_order_limit()?
+            } else {
+                (None, None, 0)
+            };
+            return Ok(SelectStmt {
+                table: String::new(),
+                derived_source: None,
+                values_source: None,
+                table_alias: None,
+                joins: Vec::new(),
+                columns,
+                where_clause: None,
+                distinct,
+                group_by: Vec::new(),
+                having: None,
+                order_by,
+                limit,
+                offset,
+            });
+        }
         self.expect_keyword("FROM")?;
         // Base table + alias opcional (`AS` aceptado pero opcional).
         // Bloque H: el FROM puede arrancar con una derived table

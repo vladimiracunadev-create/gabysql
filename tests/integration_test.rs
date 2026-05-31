@@ -4286,6 +4286,74 @@ fn f2_aggregate_over_join_sum_expr_left_join() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn e5_bare_select_literal() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e5_literal");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let res = run_sql(&db, "SELECT 1;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e5_bare_select_multi_with_aliases() -> Result<(), Box<dyn Error>> {
+    // E5 (ADR-0066 Gap 5): forma típica del anchor de WITH RECURSIVE.
+    let db = temp_db_path("e5_aliases");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let res = run_sql(&db, "SELECT 1 AS n, 0 AS depth;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].columns, vec!["n".to_string(), "depth".to_string()]);
+    assert_eq!(res[0].rows[0][0], Value::Integer(1));
+    assert_eq!(res[0].rows[0][1], Value::Integer(0));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e5_bare_select_scalar_subquery() -> Result<(), Box<dyn Error>> {
+    // E5 (ADR-0066 Gap 3): SELECT (SELECT COUNT(*) FROM ... WHERE ...).
+    let db = temp_db_path("e5_scalar_subq");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE events (id INT PRIMARY KEY, kind TEXT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO events (id,kind) VALUES (1,'view'),(2,'view'),(3,'click');",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT (SELECT COUNT(*) FROM events WHERE kind = 'view');",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e5_bare_select_with_limit_offset() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("e5_limit");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    assert_eq!(run_sql(&db, "SELECT 1 LIMIT 0;")?[0].rows.len(), 0);
+    assert_eq!(run_sql(&db, "SELECT 1 OFFSET 1;")?[0].rows.len(), 0);
+    assert_eq!(run_sql(&db, "SELECT 1 LIMIT 5;")?[0].rows.len(), 1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn w4_rank_sum_over_2k_rows_is_linear() -> Result<(), Box<dyn Error>> {
     // W4 (ADR-0066 Gap 8 cerrado): RANK + SUM OVER en O(n) (antes O(n²)).
     // Sobre 2000 filas el path viejo tardaba ~minutos; el nuevo termina

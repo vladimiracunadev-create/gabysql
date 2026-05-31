@@ -58,19 +58,17 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 3 — `SELECT (subquery)` sin `FROM`
+## Gap 3 — `SELECT (subquery)` sin `FROM` ✓ CERRADO (E5, 2026-05-30)
 
-**Código de error**: parser, `se esperaba keyword FROM`
-**Query del bench**: `events` → `SELECT (SELECT COUNT(*) FROM events WHERE kind = 'view')`
-**Mensaje**: parser de `SELECT` exige `FROM` siempre.
+**Causa raíz** (pre-fix): el parser de SELECT siempre buscaba FROM tras la lista de columnas (`expect_keyword("FROM")` en `parse_select_stmt_inner`).
 
-**Causa raíz**: gabysql parser de SELECT siempre busca FROM tras la lista de columnas. PostgreSQL/MySQL aceptan `SELECT 1` o `SELECT (subquery)` sin FROM como queries de retorno-único.
+**Fix aplicado**:
+- Parser (`src/sql.rs:~23427`): tras `parse_select_list`, si el siguiente token no es `FROM`, sale por el camino "bare-SELECT" — construye un `SelectStmt` con `table: ""` (sentinel) y solo permite `ORDER BY` / `LIMIT` / `OFFSET` trailing.
+- Engine (`exec_bare_select` en `src/sql.rs:~8491`): detecta el sentinel `table.is_empty()`, evalúa cada `SelectItem` contra una fila vacía con `eval_expr_full`, devuelve UNA fila. `*`, `Aggregate` y `Window` rechazados (sin row scope no tienen sentido).
 
-**Workaround en bench**: SKIP graceful.
+**Tests**: `e5_bare_select_literal`, `e5_bare_select_multi_with_aliases`, `e5_bare_select_scalar_subquery`, `e5_bare_select_with_limit_offset`.
 
-**Fix definitivo**: **bloque E5** — extender el parser para aceptar bare-SELECT (sin FROM) y el engine para devolver una sola fila virtual. Cambio: ~10 líneas parser + ~5 líneas engine.
-
-**Prioridad**: P2 (rara en apps clásicas, común en ORMs y herramientas de admin).
+**Prioridad**: ~~P2~~ — entregado.
 
 ---
 
@@ -90,19 +88,15 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 5 — `WITH RECURSIVE` exige `FROM` en el anchor
+## Gap 5 — `WITH RECURSIVE` exige `FROM` en el anchor ✓ CERRADO (sub-caso de E5, 2026-05-30)
 
-**Código de error**: `[GBY-4081]`
-**Query del bench (original)**: `WITH RECURSIVE reach AS (SELECT 1 AS n, 0 AS depth UNION ALL SELECT e.dst, r.depth+1 FROM reach r JOIN edges e ON ...) SELECT * FROM reach`
-**Mensaje**: el parser no acepta `SELECT 1 AS n, 0 AS depth` como anchor (le pide FROM).
+**Causa raíz** (pre-fix): misma que Gap 3 — el parser no aceptaba bare-SELECT.
 
-**Causa raíz**: misma que Gap 3 (parser no acepta bare-SELECT). En WITH RECURSIVE el anchor suele ser un SELECT chico de valores literales; en gabysql hay que materializar una tabla seed.
+**Fix aplicado**: el cambio en `parse_select_stmt_inner` (E5) cubre también el anchor de `WITH RECURSIVE` porque WITH usa el mismo parser de SELECT. Sin código adicional.
 
-**Workaround en bench**: setup_graph crea tabla `seed_one (n INT PK, depth INT)` con un row `(1, 0)` y el anchor hace `SELECT n, depth FROM seed_one`.
+**Workaround del bench (todavía vigente, no obligatorio)**: `setup_graph` sigue creando `seed_one (n INT PK, depth INT)` con un row `(1, 0)` — la query del bench podría reescribirse a `WITH RECURSIVE r AS (SELECT 1 AS n, 0 AS depth UNION ALL ...)`. Defer la reescritura del bench a una iteración futura.
 
-**Fix definitivo**: depende de **E5** (bare-SELECT). Una vez E5 esté, este gap desaparece sin código adicional.
-
-**Prioridad**: P2 (workaround viable; common en literatura SQL pero no bloqueante).
+**Prioridad**: ~~P2~~ — entregado vía E5.
 
 ---
 
@@ -193,9 +187,9 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 |---|---|---|---:|
 | 1 | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 2 | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
-| 3 | parser | **E5** | P2 |
+| 3 | ~~parser~~ | ~~**E5**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 4 | `[GBY-4067]` | **K3** | P2 |
-| 5 | `[GBY-4081]` | dependencia de E5 | P2 |
+| 5 | ~~`[GBY-4081]`~~ | ~~dependencia de E5~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 6 | `[GBY-3001]` (bench) | **N5** (DEFAULT con función) | P2 |
 | 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |
 | 8 | ~~sin código~~ | ~~**W4**~~ ✓ | ~~**P1 crítico**~~ cerrado 2026-05-30 |
