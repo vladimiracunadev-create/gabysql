@@ -6,7 +6,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-31-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-723%2F723-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-724%2F724-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 > **2026-05-29 — Día grande: cierre de Fase 2 (seguridad) + arranque y avance fuerte de Fase 3 (planeación).** Lo entregado hoy en orden cronológico:
@@ -171,7 +171,7 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **N3** — `COPY FROM` / `COPY TO` streaming.
 > - **N4** — nested transactions (depende de T1).
 > - **F2** — agregados sobre `SELECT` con JOIN (hoy `[GBY-4028]`; lo bloqueó el benchmark 2026-05-29).
-> - **F3** — full-scan-fallback para `BETWEEN` sin índice (hoy `[GBY-4002]`).
+> - ~~**F3** — full-scan-fallback para `BETWEEN` sin índice~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 2).
 > - **Y10** — ARRAY type + JSONB.
 > - **X5** — cursores explícitos.
 

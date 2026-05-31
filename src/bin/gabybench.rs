@@ -800,15 +800,16 @@ fn suite_orders_lines(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT order_id, SUM(qty * precio) FROM lines GROUP BY order_id LIMIT 10",
     )?);
 
-    // [GBY-4002] BETWEEN solo se soporta sobre PK o columna INT con índice
-    // ordenado. `qty` no tiene índice. Skip-graceful.
-    out.push(bench_sql_or_skip(
+    // F3 (ADR-0066 Gap 2 cerrado): BETWEEN sin índice ordenado ahora cae
+    // a FullScan + post-filter. La query mide el costo real del scan
+    // lineal sobre 100k filas.
+    out.push(bench_sql(
         "orders_lines",
-        "Composite range qty BETWEEN (no idx)",
+        "BETWEEN qty 1..5 (no idx, full scan)",
         &mut pager,
         50,
         "SELECT order_id FROM lines WHERE qty BETWEEN 1 AND 5",
-    ));
+    )?);
 
     close_after_bench(pager);
 

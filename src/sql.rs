@@ -8655,7 +8655,19 @@ impl<'a> Engine<'a> {
                                 !is_simple_pk && !is_indexed
                             }
                             WhereClause::Between { column, .. } => {
-                                meta.has_composite_pk() && meta.is_pk_column(column)
+                                // F3 (ADR-0066 Gap 2): BETWEEN sobre columna
+                                // sin índice ordenado cae a FullScan en el
+                                // planner; sin post-filter, devolvería TODA
+                                // la tabla. Forzamos post-filter salvo cuando
+                                // hay fast-path (PK simple o índice ordenado).
+                                let n = normalize_ident(column);
+                                let is_simple_pk = !meta.has_composite_pk()
+                                    && n == normalize_ident(&meta.primary_key);
+                                let is_ordered_indexed = meta
+                                    .index_for_column(&n)
+                                    .map(|idx| matches!(idx.kind, IndexKind::OrderedInt))
+                                    .unwrap_or(false);
+                                !is_simple_pk && !is_ordered_indexed
                             }
                             _ => false,
                         }
@@ -8781,34 +8793,32 @@ impl<'a> Engine<'a> {
                     {
                         Plan::Range { from, to }
                     } else if let Some(idx) = meta.index_for_column(&normalized).cloned() {
-                        // BETWEEN over an indexed column only works when the
-                        // index is INT-ordered (ADR-0017). Hash indexes are
-                        // equality-only by construction.
+                        // BETWEEN sobre índice OrderedInt usa el range scan.
+                        // Hash idx no llega acá: `generic_post_filter` se
+                        // activó por la regla F3 y bypassea el planner a
+                        // FullScan + post-filter (Hash equality-only).
                         match idx.kind {
                             IndexKind::OrderedInt => {
                                 let pks = lookup_pks_via_index_range(self.pager, &idx, from, to)?;
                                 Plan::ByPks(pks)
                             }
-                            IndexKind::Hash => {
-                                return Err(coded(
-                                    codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
-                                    format!(
-                                    "WHERE BETWEEN sobre '{}': el índice secundario es hash-based \
-                                     (equality only). Solo columnas INT-indexadas admiten BETWEEN.",
-                                    column
-                                ),
-                                ));
-                            }
+                            IndexKind::Hash => Plan::FullScan,
                         }
+                    } else if meta.has_composite_pk() && meta.is_pk_column(&normalized) {
+                        // PK compuesta: lookup parcial cae a FullScan, igual
+                        // que la rama de `=` (líneas 8760-8763).
+                        Plan::FullScan
                     } else {
-                        return Err(coded(
-                            codes::BETWEEN_REQUIRES_PK_OR_INT_INDEX,
-                            format!(
-                                "WHERE BETWEEN solo soporta PK ({}) o columnas INT con índice; \
-                             '{}' no califica",
-                                meta.primary_key, column
-                            ),
-                        ));
+                        // F3 (ADR-0066 Gap 2): antes rebotábamos con
+                        // [GBY-4002] cuando la columna no tenía índice
+                        // ordenado. Ahora caemos a FullScan + post-filter,
+                        // alineando BETWEEN con `=`, `>`, `<`, `LIKE`,
+                        // `IS NULL` (ver lógica de `=` en líneas 8765-8774).
+                        // `[GBY-4002]` queda reservado para el caso del
+                        // índice hash secundario, donde sí es semánticamente
+                        // imposible.
+                        let _ = column;
+                        Plan::FullScan
                     }
                 }
                 Some(WhereClause::In {

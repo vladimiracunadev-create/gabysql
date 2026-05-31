@@ -1745,8 +1745,14 @@ fn where_between_on_int_indexed_column_uses_ordered_index() -> Result<(), Box<dy
 }
 
 #[test]
-fn where_between_on_text_indexed_column_is_rejected() -> Result<(), Box<dyn Error>> {
-    let db = temp_db_path("idx-text-between-reject");
+fn where_between_on_text_indexed_column_full_scans() -> Result<(), Box<dyn Error>> {
+    // F3 (ADR-0066 Gap 2): post-fix de BETWEEN sin índice ordenado. La
+    // restricción previa rebotaba con [GBY-4002] cuando el índice era
+    // hash. Hoy esa columna cae a FullScan + post-filter como cualquier
+    // otra columna no-ordered, igual que `=`/`>`/`<`/`LIKE`. La type
+    // mismatch entre BETWEEN INT y columna TEXT se resuelve sola en el
+    // evaluador (0 filas, no error).
+    let db = temp_db_path("idx-text-between-fullscan");
     let wal = wal_path(&db);
     cleanup(&[&db, &wal]);
 
@@ -1759,25 +1765,53 @@ fn where_between_on_text_indexed_column_is_rejected() -> Result<(), Box<dyn Erro
     run_sql(&db, "CREATE INDEX idx_u_name ON u (name);")?;
     run_sql(&db, "INSERT INTO u (id,name) VALUES (1,'Ana');")?;
 
-    // The parser only accepts integer literals in BETWEEN today, so
-    // text literals fail there first. The defense-in-depth path that
-    // matters is the engine gate: even when ints sneak through against
-    // a TEXT-indexed column, the engine refuses because the index is
-    // hash-based (equality only).
+    // El parser sigue exigiendo enteros en BETWEEN — no es alcance de F3.
     let parser_err = run_sql(&db, "SELECT id FROM u WHERE name BETWEEN 'A' AND 'Z';");
     assert!(parser_err.is_err(), "TEXT literals in BETWEEN should fail");
 
-    let engine_err = run_sql(&db, "SELECT id FROM u WHERE name BETWEEN 1 AND 10;");
-    assert!(
-        engine_err.is_err(),
-        "BETWEEN on hash-indexed column should be rejected by the engine"
-    );
-    let msg = engine_err.err().unwrap().to_string();
-    assert!(
-        msg.contains("hash") || msg.contains("equality") || msg.contains("INT"),
-        "error should explain why TEXT BETWEEN is rejected, got: {}",
-        msg
-    );
+    // BETWEEN INT contra columna TEXT con índice hash: ya no es error,
+    // el FullScan + post-filter devuelve 0 filas (type mismatch silente,
+    // consistente con la 3VL del resto de operadores).
+    let res = run_sql(&db, "SELECT id FROM u WHERE name BETWEEN 1 AND 10;")?;
+    assert_eq!(res[0].rows.len(), 0);
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// F3 (ADR-0066 Gap 2): BETWEEN sobre columna sin índice debe caer a
+// FullScan + post-filter, alineado con `=`, `>`, `<`, `LIKE`.
+// Antes rebotaba con [GBY-4002].
+#[test]
+fn where_between_on_non_indexed_column_full_scans() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("between-no-idx-fullscan");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, qty INT NOT NULL);",
+    )?;
+    for (i, q) in [(1, 3), (2, 7), (3, 1), (4, 5), (5, 9), (6, 4)].iter() {
+        run_sql(
+            &db,
+            &format!("INSERT INTO items (id, qty) VALUES ({}, {});", i, q),
+        )?;
+    }
+
+    let res = run_sql(&db, "SELECT id FROM items WHERE qty BETWEEN 3 AND 5;")?;
+    let mut ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .filter_map(|r| match r[0] {
+            Value::Integer(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 4, 6]);
 
     cleanup(&[&db, &wal]);
     Ok(())

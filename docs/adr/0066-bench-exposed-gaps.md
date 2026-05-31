@@ -38,19 +38,22 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 2 — `BETWEEN` sin índice ordenado
+## Gap 2 — `BETWEEN` sin índice ordenado ✓ CERRADO (F3, 2026-05-30)
 
-**Código de error**: `[GBY-4002]`
+**Código de error original**: `[GBY-4002]` (lifteado — ahora reservado).
 **Query del bench**: `orders_lines` → `SELECT order_id FROM lines WHERE qty BETWEEN 1 AND 5`
-**Mensaje**: `WHERE BETWEEN solo soporta PK (order_id) o columnas INT con índice; 'qty' no califica`
 
-**Causa raíz**: `exec_select_with_where` rebota `BETWEEN` cuando la columna no es PK ni tiene `IndexKind::OrderedInt`. La semántica original asumía que BETWEEN siempre quiere range scan; no contempla el fallback a full-scan + filter post-scan que sí existe para `=`/`<`/`>`.
+**Causa raíz** (pre-fix): `exec_select_with_where` rebotaba `BETWEEN` cuando la columna no era PK ni tenía `IndexKind::OrderedInt`. La semántica original asumía range scan exclusivo; no contemplaba el fallback a full-scan + filter post-scan que sí existía para `=`/`<`/`>`.
 
-**Workaround en bench**: SKIP graceful.
+**Fix aplicado (commit del bloque F3)**:
+1. Planner (`src/sql.rs:8777`): rama `else` (col sin índice) deja de devolver `Err(BETWEEN_REQUIRES_PK_OR_INT_INDEX)` y cae a `Plan::FullScan` — mismo path que `=`. Hash-idx también cae a FullScan (antes erroreaba; hoy generic_post_filter lo cubre).
+2. Force-rule en `generic_post_filter` (`src/sql.rs:8657`): BETWEEN exige post-filter salvo cuando hay fast-path (simple-PK Range plan o índice OrderedInt). El evaluador `eval_where_expr_single` ya soportaba BETWEEN; no se tocó.
+3. Bench: la query `BETWEEN qty 1..5` mide en vez de hacer SKIP.
+4. Tests: `where_between_on_non_indexed_column_full_scans` (nuevo) y `where_between_on_text_indexed_column_full_scans` (renombrado de `_is_rejected`, asserts actualizados a la nueva semántica).
 
-**Fix definitivo**: **bloque F3** — agregar fallback full-scan + post-filter para `BETWEEN` cuando no hay índice ordenado. Es ~5 líneas en `classify_scan` / `exec_select_with_where`. Trivial. Solo no se hizo porque no hubo presión hasta este bench.
+**Resultado**: BETWEEN ahora se comporta como `=`, `>`, `<`, `LIKE` — fast-path indexado cuando aplica, FullScan + post-filter en cualquier otro caso. Sin pérdida de performance en el path indexado; type mismatch (INT BETWEEN sobre TEXT col) devuelve 0 filas en vez de error, consistente con la 3VL del resto del WHERE.
 
-**Prioridad**: P1.
+**Prioridad**: ~~P1~~ — entregado.
 
 ---
 
@@ -192,7 +195,7 @@ Cambio sustantivo (~150 líneas + tests). Bloque deferred.
 | Gap | Código | Bloque | Prioridad |
 |---|---|---|---:|
 | 1 | `[GBY-4028]` | **F2** | P1 |
-| 2 | `[GBY-4002]` | **F3** | P1 |
+| 2 | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 3 | parser | **E5** | P2 |
 | 4 | `[GBY-4067]` | **K3** | P2 |
 | 5 | `[GBY-4081]` | dependencia de E5 | P2 |

@@ -79,7 +79,7 @@
 | Composite index lookup qty+precio | 200 | 161.24 ms | 182.09 ms | 201.39 ms | 164.27 ms | 100 000 |
 | JOIN orders×lines on order_id=7 | 100 | 163.80 ms | 236.06 ms | 302.95 ms | 171.33 ms | 0 |
 | Aggregate SUM(qty*precio) GROUP LIMIT 10 | 5 | **51.30 µs** | 52.30 µs | 52.30 µs | 51.18 µs | 10 |
-| Composite range qty BETWEEN | — | **SKIP `[GBY-4002]`** | | | | |
+| BETWEEN qty 1..5 (no idx, full scan) — F3 | 50 | _pendiente próximo bench_ | | | | |
 | CTAS lines_summary (one-shot) | 1 | 726 ms | — | — | — | 0 |
 | DROP COLUMN fecha (orders 20k) | 1 | 149.66 ms | — | — | — | 0 |
 | INSERT PK compuesta (in-tx) | 500 | **26.10 µs** | 65.70 µs | 100.60 µs | 34.40 µs | — |
@@ -210,7 +210,7 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 | # | Gap | Código | Bloque defer | Prioridad |
 |---|---|---|---|---:|
 | 1 | Agregados sobre `SELECT con JOIN` | `[GBY-4028]` | F2 | **P1** |
-| 2 | `BETWEEN` sin índice ordenado | `[GBY-4002]` | F3 | **P1** |
+| 2 | ~~`BETWEEN` sin índice ordenado~~ | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 3 | `SELECT (subquery)` sin FROM | parser | E5 | P2 |
 | 4 | `UNIQUE` multi-col exige all-INT | `[GBY-4067]` | K3 | P2 |
 | 5 | `WITH RECURSIVE` requiere FROM en anchor | `[GBY-4081]` | (depende de E5) | P2 |
