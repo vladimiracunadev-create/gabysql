@@ -1607,10 +1607,14 @@ fn setup_constraint_zoo(path: &Path) -> DbResult<()> {
     exec_batch(
         &mut pager,
         &[
+            // K3 (ADR-0066 Gap 4 cerrado): UNIQUE multi-col TEXT funciona.
+            // Antes el bench usaba UNIQUE single-col porque la combinación
+            // (code, region) rebotaba con [GBY-4067].
             "CREATE TABLE parent_cz (
                 id INT PRIMARY KEY,
-                code TEXT NOT NULL UNIQUE,
-                region TEXT NOT NULL
+                code TEXT NOT NULL,
+                region TEXT NOT NULL,
+                CONSTRAINT u_code_region UNIQUE (code, region)
              )",
             "CREATE TABLE child_cz (
                 id INT PRIMARY KEY,

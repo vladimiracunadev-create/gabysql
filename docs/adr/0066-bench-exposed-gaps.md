@@ -72,19 +72,24 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 4 — `UNIQUE` multi-columna con tipos no-INT
+## Gap 4 — `UNIQUE` multi-columna con tipos no-INT ✓ CERRADO (K3, 2026-05-30)
 
-**Código de error**: `[GBY-4067]`
-**Query del bench (original, ahora fixeada)**: `constraint_zoo` → `CONSTRAINT u_parent_code UNIQUE (code, region)` con `code TEXT, region TEXT`
-**Mensaje**: `CONSTRAINT '...' UNIQUE (code, region): todas las columnas deben ser INT NOT NULL (columna 'code' rompe la regla)`
+**Causa raíz** (pre-fix): los validadores de UNIQUE multi-col y CREATE INDEX composite en `src/sql.rs` exigían `column_type == Int`. Al inspeccionar el encoder, `encode_column_value` ya manejaba TEXT (y todos los tipos que `stores_as_text` cubre), y la per-column FNV en `encode_composite_key` ya separaba columnas con un sentinel — la limitación era cosmética en la validación upfront, no estructural.
 
-**Causa raíz**: K2 (composite PK/index, ADR-0019) usa fingerprint FNV-1a-64 sobre 8 bytes por columna i64. Solo todo-INT NOT NULL. UNIQUE multi-col TEXT requeriría un fingerprint sobre bytes UTF-8 variables.
+**Fix aplicado**:
+- Nuevo helper `validate_composite_member(column, ctx, require_not_null)` en `src/sql.rs:~11901`: rechaza JSON / BLOB / DECIMAL (sin equality fingerprint o sin encoder), acepta INT, FLOAT, BOOL, TEXT, DATE, DATETIME, TIME, UUID. `require_not_null = true` para UNIQUE en CREATE TABLE (preservando comportamiento pre-K3), `false` para CREATE INDEX (preservando el lazy NOT NULL check que el runtime hace en `encode_composite_key`).
+- Reemplaza los 3 sitios pre-K3 (UNIQUE table-level, named UNIQUE, CREATE INDEX composite).
+- PK compuesta queda intacta — su validador vive en `src/catalog.rs` y exige all-INT NOT NULL. Defer a un bloque futuro si aparece presión.
 
-**Workaround en bench**: cambié a `UNIQUE` single-col TEXT (que sí funciona). Documentado en el código del bench como TODO.
+**Bench**: `parent_cz` ahora declara `CONSTRAINT u_code_region UNIQUE (code, region)` con ambas TEXT — antes era single-col TEXT por workaround.
 
-**Fix definitivo**: **bloque K3** — extender fingerprint composite a soportar TEXT (hash FNV sobre UTF-8 bytes con length-prefix). Cambio: ~30 líneas en `Catalog::compute_fingerprint` + tests.
+**Tests**:
+- `k3_unique_composite_text_text_works`: UNIQUE (TEXT, TEXT) NOT NULL acepta INSERTs distintos y rebota duplicados con `[GBY-3003]`.
+- `k3_unique_composite_text_nullable_rejected`: nullable sigue siendo error.
+- `k3_create_index_composite_text_int_works`: CREATE INDEX mixto TEXT+INT funciona.
+- `k3_create_index_composite_blob_rejected`: BLOB sigue rechazado.
 
-**Prioridad**: P2.
+**Prioridad**: ~~P2~~ — entregado.
 
 ---
 
@@ -188,7 +193,7 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 | 1 | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 2 | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 3 | ~~parser~~ | ~~**E5**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
-| 4 | `[GBY-4067]` | **K3** | P2 |
+| 4 | ~~`[GBY-4067]`~~ | ~~**K3**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 5 | ~~`[GBY-4081]`~~ | ~~dependencia de E5~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 6 | `[GBY-3001]` (bench) | **N5** (DEFAULT con función) | P2 |
 | 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |

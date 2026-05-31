@@ -2624,23 +2624,16 @@ impl<'a> Engine<'a> {
                 }
             }
             let is_composite = cols.len() > 1;
-            // Para compuestos, K2 exige all-INT NOT NULL.
             if is_composite {
                 for col_name in cols {
                     let column = meta
                         .column(col_name)
                         .expect("ya validado arriba que existe");
-                    if column.column_type != ColumnType::Int || !column.not_null {
-                        return Err(coded(
-                            codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
-                            format!(
-                                "UNIQUE ({}): todas las columnas de un UNIQUE compuesto deben \
-                                 ser INT NOT NULL en este release (columna '{}' rompe la regla)",
-                                cols.join(", "),
-                                col_name
-                            ),
-                        ));
-                    }
+                    validate_composite_member(
+                        column,
+                        &format!("UNIQUE ({})", cols.join(", ")),
+                        true,
+                    )?;
                 }
             }
             let idx_root = self.pager.new_page()?;
@@ -2711,18 +2704,11 @@ impl<'a> Engine<'a> {
             if is_composite {
                 for col_name in cols {
                     let column = meta.column(col_name).expect("validado arriba");
-                    if column.column_type != ColumnType::Int || !column.not_null {
-                        return Err(coded(
-                            codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
-                            format!(
-                                "CONSTRAINT '{}' UNIQUE ({}): todas las columnas deben ser \
-                                 INT NOT NULL (columna '{}' rompe la regla)",
-                                idx_name,
-                                cols.join(", "),
-                                col_name
-                            ),
-                        ));
-                    }
+                    validate_composite_member(
+                        column,
+                        &format!("CONSTRAINT '{}' UNIQUE ({})", idx_name, cols.join(", ")),
+                        true,
+                    )?;
                 }
             }
             let idx_root = self.pager.new_page()?;
@@ -11098,18 +11084,7 @@ impl<'a> Engine<'a> {
                         ),
                     )
                 })?;
-                if col.column_type != ColumnType::Int {
-                    return Err(coded(
-                        codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
-                        format!(
-                            "CREATE INDEX '{}': columna '{}' es {} — los índices compuestos \
-                             en VERSION 8 exigen INT en todas las columnas (ver ADR-0019)",
-                            stmt.name,
-                            col_name,
-                            col.column_type.as_sql()
-                        ),
-                    ));
-                }
+                validate_composite_member(col, &format!("CREATE INDEX '{}'", stmt.name), false)?;
             }
         } else {
             // 2. Validate single-column index + type.
@@ -11921,6 +11896,55 @@ impl<'a> Engine<'a> {
 }
 
 /// Bloque F: true si la query requiere el stage de agregación
+/// K3 (ADR-0066 Gap 4, 2026-05-30): valida que una columna pueda
+/// participar en una clave compuesta (PK compuesta, UNIQUE multi-col,
+/// CREATE INDEX multi-col). El fingerprint FNV-1a-64 ya tolera
+/// cualquier tipo serializable, pero hay tipos que el encoder no sabe
+/// representar (BLOB, Decimal) y JSON no tiene equality canónica.
+/// `not_null` es estructural: `encode_composite_key` rechaza NULL en
+/// cualquier posición (no hay forma de fingerprintear el "no valor").
+fn validate_composite_member(column: &Column, ctx: &str, require_not_null: bool) -> DbResult<()> {
+    // `require_not_null` solo lo exige el path de UNIQUE en CREATE TABLE
+    // (pre-K3 ya lo exigía). En CREATE INDEX el chequeo estructural queda
+    // diferido al runtime (`encode_composite_key` rechaza NULL en cualquier
+    // posición), mismo comportamiento que pre-K3.
+    if require_not_null && !column.not_null {
+        return Err(coded(
+            codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
+            format!(
+                "{}: columna '{}' admite NULL — toda columna de una clave compuesta \
+                 debe declararse NOT NULL (el fingerprint no representa NULL)",
+                ctx, column.name
+            ),
+        ));
+    }
+    let ok = matches!(
+        column.column_type,
+        ColumnType::Int
+            | ColumnType::Float
+            | ColumnType::Bool
+            | ColumnType::Text
+            | ColumnType::Date
+            | ColumnType::DateTime
+            | ColumnType::Time
+            | ColumnType::Uuid
+    );
+    if !ok {
+        return Err(coded(
+            codes::COMPOSITE_INDEX_REQUIRES_ALL_INT,
+            format!(
+                "{}: columna '{}' es {} — los tipos JSON, BLOB y DECIMAL no se admiten en \
+                 claves compuestas (sin equality fingerprint o sin encoder). \
+                 Tipos aceptados: INT, FLOAT, BOOL, TEXT, DATE, DATETIME, TIME, UUID.",
+                ctx,
+                column.name,
+                column.column_type.as_sql()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// (cualquier agregado en SELECT, `GROUP BY` no vacío, o `HAVING`).
 fn stmt_needs_aggregation(stmt: &SelectStmt) -> bool {
     stmt.having.is_some()

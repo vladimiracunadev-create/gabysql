@@ -212,7 +212,7 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 | 1 | ~~Agregados sobre `SELECT con JOIN`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 2 | ~~`BETWEEN` sin índice ordenado~~ | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 3 | ~~`SELECT (subquery)` sin FROM~~ | ~~parser~~ | ~~E5~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
-| 4 | `UNIQUE` multi-col exige all-INT | `[GBY-4067]` | K3 | P2 |
+| 4 | ~~`UNIQUE` multi-col exige all-INT~~ | ~~`[GBY-4067]`~~ | ~~K3~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 5 | ~~`WITH RECURSIVE` requiere FROM en anchor~~ | ~~`[GBY-4081]`~~ | ~~(depende de E5)~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 6 | Trigger PK auto-gen (sin SERIAL / DEFAULT con función) | bench design | N5 | P2 |
 | 7 | ~~`COUNT(*) FROM <view>`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
@@ -231,7 +231,7 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 | Queries citaban columna inexistente `id` en `lines` | corregido a `order_id` |
 | Doble-open de pager (procflow/constraint_zoo) → `[GBY-1002]` | reusar pager o `close()` antes de re-abrir |
 | Doble `begin()` sobre tx implícita → `[GBY-1005]` | `Pager::open` directo sin tx implícita |
-| UNIQUE multi-col TEXT en constraint_zoo → `[GBY-4067]` | cambiar a UNIQUE single-col |
+| ~~UNIQUE multi-col TEXT en constraint_zoo → `[GBY-4067]`~~ | ~~cambiar a UNIQUE single-col~~ — cerrado por K3 (2026-05-30); el bench restauró `UNIQUE (code, region)` multi-col |
 | WITH RECURSIVE sin seed table → `[GBY-4081]` | agregar `seed_one` |
 | Trigger usaba `NEW.id` como PK + UPDATE rotaba IDs → `[GBY-3001]` | UPDATE con IDs únicos 1..N |
 

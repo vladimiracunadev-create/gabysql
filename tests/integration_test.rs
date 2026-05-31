@@ -4286,6 +4286,109 @@ fn f2_aggregate_over_join_sum_expr_left_join() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn k3_unique_composite_text_text_works() -> Result<(), Box<dyn Error>> {
+    // K3 (ADR-0066 Gap 4): UNIQUE (text, text) NOT NULL ahora se admite.
+    // Antes rebotaba con [GBY-4067] "todas las columnas deben ser INT".
+    let db = temp_db_path("k3_unique_text_text");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE parts (id INT PRIMARY KEY, code TEXT NOT NULL, region TEXT NOT NULL, \
+         CONSTRAINT u_code_region UNIQUE (code, region));",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO parts (id, code, region) VALUES (1, 'A1', 'NORTH'), (2, 'A1', 'SOUTH'), (3, 'B2', 'NORTH');",
+    )?;
+    // Duplicado exacto → debe rebotar con conflicto UNIQUE (GBY-3003).
+    let err = run_sql(
+        &db,
+        "INSERT INTO parts (id, code, region) VALUES (4, 'A1', 'NORTH');",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-3003]"),
+        "esperaba 3003 (UNIQUE conflict), got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k3_unique_composite_text_nullable_rejected() -> Result<(), Box<dyn Error>> {
+    // K3: la columna nullable sigue siendo error (el fingerprint no
+    // representa NULL). El código sigue siendo 4067 — mismo origen,
+    // mensaje actualizado.
+    let db = temp_db_path("k3_unique_text_nullable");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a TEXT NOT NULL, b TEXT, CONSTRAINT u UNIQUE (a, b));",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4067]"),
+        "esperaba 4067, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k3_create_index_composite_text_int_works() -> Result<(), Box<dyn Error>> {
+    // K3: `CREATE INDEX` compuesto sobre mezcla INT+TEXT NOT NULL.
+    let db = temp_db_path("k3_idx_text_int");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, sku TEXT NOT NULL, qty INT NOT NULL);",
+    )?;
+    run_sql(&db, "CREATE INDEX idx_sku_qty ON items (sku, qty);")?;
+    run_sql(
+        &db,
+        "INSERT INTO items (id, sku, qty) VALUES (1, 'SKU-A', 3), (2, 'SKU-A', 5), (3, 'SKU-B', 3);",
+    )?;
+    // Sanity: el índice existe y la tabla se llena sin problema.
+    let res = run_sql(&db, "SELECT COUNT(*) FROM items;")?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k3_create_index_composite_blob_rejected() -> Result<(), Box<dyn Error>> {
+    // K3: BLOB sigue rechazado (encoder no lo soporta para fingerprint).
+    let db = temp_db_path("k3_idx_blob_reject");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, b BLOB NOT NULL);",
+    )?;
+    let err = run_sql(&db, "CREATE INDEX idx ON t (a, b);").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4067]"),
+        "esperaba 4067, got {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn e5_bare_select_literal() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("e5_literal");
     let wal = wal_path(&db);
@@ -7661,9 +7764,16 @@ fn k2_index_composite_basic() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn k2_index_composite_not_int_error() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = k2_setup("k2_idx_notint")?;
-    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT);")?;
+fn k2_index_composite_unsupported_type_error() -> Result<(), Box<dyn Error>> {
+    // K3 (ADR-0066 Gap 4, 2026-05-30): TEXT compuesto ahora SE acepta.
+    // Lo que sigue rebotando con [GBY-4067] son los tipos sin equality
+    // fingerprint (JSON) o sin encoder en `encode_column_value`
+    // (BLOB, DECIMAL).
+    let (db, wal) = k2_setup("k2_idx_unsupported")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, b BLOB NOT NULL);",
+    )?;
     let err = run_sql(&db, "CREATE INDEX idx ON t (a, b);").unwrap_err();
     assert!(
         err.to_string().contains("[GBY-4067]"),
