@@ -178,6 +178,6 @@ Las mejoras naturales siguientes son:
 - índices compuestos all-INT ✅ (K2, 2026-05-26)
 - range scan por índice secundario sobre `TEXT`/`FLOAT`/`DATE`/`DATETIME` (pendiente — solo INT con OrderedInt)
 - planner cost-based real (hoy: deterministic dispatch + plan enum cerrado + index-loop join automático para INNER/LEFT con PK/índice + P3 stats session-scoped en EXPLAIN; **P5 pendiente** — reorden de joins por costo, choice de índice por costo)
-- window functions ✅ (W3, 2026-05-29), CTE no-rec ✅ (W1), CTE recursivas ✅ (W2, fixpoint con guard 10K), vistas ✅ (V, 2026-05-27) — **materialized views con REFRESH pendientes**. (Hoy: agregados single-table OK; agregados sobre `SELECT` con `JOIN` aún devuelven `[GBY-4028]` — defer F2)
+- window functions ✅ (W3, 2026-05-29; W4 O(n) per partition, 2026-05-30), CTE no-rec ✅ (W1), CTE recursivas ✅ (W2, fixpoint con guard 10K; anchor bare-SELECT vía E5 — 2026-05-30), vistas ✅ (V, 2026-05-27; agregados sobre vista OK desde F2 — 2026-05-30) — **materialized views con REFRESH pendientes**. Agregados single-table desde F + sobre `SELECT con JOIN` desde F2 (ADR-0066 Gap 1+7); único residual `COUNT(DISTINCT col)` sobre JOIN.
 - subqueries correlacionadas con múltiples predicados (`AND`/`OR` en `WHERE` interno) ✅ (H, 2026-05-26) y derived tables (`FROM (SELECT ...) t`) ✅ (H, 2026-05-26)
 - política formal de migración entre versiones del formato en disco (sigue pendiente — cada bump rechaza versiones anteriores con `[GBY-1003]`; backup + dump + recreate manual)

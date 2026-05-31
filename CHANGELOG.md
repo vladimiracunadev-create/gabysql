@@ -6,9 +6,9 @@
 
 ---
 
-## 2026-05-30 — Bloques F3 + F2 + W4 + E5 + K3 + K4 + N5: 7 gaps del ADR-0066 cerrados
+## 2026-05-30 — Bloques F3 + F2 + W4 + E5 + K3 + K4 + N5: 9 gaps del ADR-0066 cerrados (7 bloques)
 
-> **Siete pushes a `main`** en una sesión. Cierre del catálogo completo de gaps que el benchmark de 2026-05-29 había expuesto sobre el motor SQL (ADR-0066 Gap 1–9, todos los P1 + cuatro P2). Sin bump de `VERSION` on-disk. Detalle por bloque y por test en [`docs/adr/0066-bench-exposed-gaps.md`](docs/adr/0066-bench-exposed-gaps.md).
+> **Siete pushes a `main`** en una sesión cierran **9 de los 10 gaps** del catálogo del ADR-0066 (todos los P1 + cinco P2). Hay menos bloques que gaps porque **F2** cubre Gap 1 + Gap 7 (`COUNT(*)` sobre vista comparte la ruta de agregados sobre JOIN) y **E5** cubre Gap 3 + Gap 5 (el anchor de `WITH RECURSIVE` reusa el mismo parser de bare-SELECT). Único pendiente: Gap 10 (P5b, depende de P5 — planner real, no entregado). Sin bump de `VERSION` on-disk. Detalle por bloque y por test en [`docs/adr/0066-bench-exposed-gaps.md`](docs/adr/0066-bench-exposed-gaps.md).
 
 ### 🆕 Comportamiento habilitado
 

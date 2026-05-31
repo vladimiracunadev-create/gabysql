@@ -953,7 +953,8 @@ SELECT COUNT(DISTINCT user_id) FROM sessions;
 -- - Toda columna no-agregada en el SELECT debe figurar en GROUP BY ([GBY-4027]).
 -- - Las funciones agregadas solo se permiten en SELECT y HAVING, no en WHERE ([GBY-4025]).
 -- - Sin GROUP BY pero con agregados → UNA fila global (incluso sobre input vacío: COUNT=0, resto=NULL).
--- - Aún no se soportan agregados sobre SELECT con JOIN ([GBY-4028]): reescribir como subquery agregada.
+-- - Agregados sobre SELECT con JOIN funcionan desde F2 (2026-05-30, ADR-0066 Gap 1+7).
+--   Único residual: COUNT(DISTINCT col) sobre JOIN sigue rebotando con [GBY-4028].
 
 -- AND / OR / NOT + paréntesis (bloque E1)
 SELECT id FROM users WHERE active = TRUE AND score BETWEEN 80 AND 100;

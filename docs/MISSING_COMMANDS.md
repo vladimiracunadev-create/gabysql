@@ -23,7 +23,7 @@ Si vas a ordenar bloques por ROI funcional **hoy**, este es el orden:
 | 2 | **Stats por-columna** (NDV vía HyperLogLog, MCV top-K, histogramas) | P3 ya da `est.rows` global; sin per-column no se puede estimar selectividad de un predicado. Sin esto, P5 no tiene insumos. | **P4** |
 | 3 | **`SAVEPOINT` + `ROLLBACK TO SAVEPOINT`** | Hoy `ROLLBACK` descarta TODO el batch. Imposible deshacer una violation de constraint sin perder el resto. | **T1** |
 | 4 | **Bind params (`?`, `$1`) + `PREPARE`/`EXECUTE` + plan cache** | Sin esto, hay que concatenar SQL → riesgo de inyección si el caller no escapa. Plan cache habilita reuso del plan parseado. | **N1+N2** |
-| 5 | **Agregados sobre `SELECT` con `JOIN`** (`[GBY-4028]`) | El bench 2026-05-29 lo tropezó: queries comunes tipo `SELECT u.name, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.name` rebotan. Hoy hay que rescribirlas como subquery. | **F2** |
+| ~~5~~ | ~~**Agregados sobre `SELECT` con `JOIN`** (`[GBY-4028]`)~~ | ✅ **cerrado 2026-05-30 (F2 + Gap 7)**. La query del bench mide sin SKIP. Único residual: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando, defer al bloque que generalice DISTINCT. | ~~F2~~ ✓ |
 
 Estos 5 bloques son los que más mueven la aguja a partir de hoy. Los 3 primeros (P4+P5+T1) son los que el usuario sentido como "esta DB rinde" o "esta DB no rinde".
 
@@ -108,7 +108,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | `SUM/AVG/MIN/MAX/COUNT(expr)` con `Expr` arbitrario — e.g. `SUM(qty * price)`, `AVG(LENGTH(name))` | ✅ (Issue #5, 2026-05-27; via `AggArg::Expr`) | — |
 | `DISTINCT` — `SELECT DISTINCT col` | ✅ (F) | — |
 | `COUNT(DISTINCT col)` | ✅ (F) | — |
-| **Agregados sobre `SELECT` con `JOIN`** | ❌ ([GBY-4028]) | P1 |
+| **Agregados sobre `SELECT` con `JOIN`** | ✅ F2 (2026-05-30, ADR-0066 Gap 1+7). Residual: `COUNT(DISTINCT col)` sobre JOIN sigue `[GBY-4028]`. | — |
 | `GROUP_CONCAT` / `STRING_AGG` | ❌ | P2 |
 | `JSON_AGG` / `ARRAY_AGG` | ❌ | P3 |
 

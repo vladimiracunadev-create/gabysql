@@ -117,16 +117,12 @@
 |---|---:|---:|---:|---:|---:|---:|
 | PK lookup hot (id=15000) | 1000 | **12.00 µs** | 17.10 µs | 30.20 µs | 12.90 µs | 1 |
 | **ROW_NUMBER() OVER (PARTITION BY region)** | 5 | 270.26 ms | 279.77 ms | 279.77 ms | 267.50 ms | 500 |
-| **🚨 RANK() OVER (PARTITION BY)** | 5 | **44.5 s** | 45.6 s | 45.6 s | 44.5 s | 500 |
-| **🚨 SUM OVER (PARTITION BY) cumulativo** | 5 | **59.4 s** | 62.5 s | 62.5 s | 60.0 s | 500 |
+| ~~**🚨 RANK() OVER (PARTITION BY)**~~ — pre-W4 | 5 | **44.5 s** | 45.6 s | 45.6 s | 44.5 s | 500 |
+| ~~**🚨 SUM OVER (PARTITION BY) cumulativo**~~ — pre-W4 | 5 | **59.4 s** | 62.5 s | 62.5 s | 60.0 s | 500 |
 | LAG(revenue, 1) OVER (PARTITION BY) | 5 | 229.52 ms | 246.14 ms | 246.14 ms | 232.57 ms | 500 |
 | GROUP BY region SUM(revenue) (baseline) | 20 | **113.70 ms** | 128.31 ms | 129.68 ms | 114.83 ms | 5 |
 
-🚨 **HALLAZGO CRÍTICO** — `RANK()` y `SUM() OVER (PARTITION BY)` son **O(n²) hoy**. 500 rows toman 44-60 segundos. Esto es **inviable productivamente**. ROW_NUMBER, LAG y LEAD están OK porque su algoritmo es lineal.
-
-**Defer W4 — refactor `compute_window_value` a O(n log n)**.
-
-Mientras tanto, el bench bajó `iters` para esas 2 queries (de 5 → 2 en la siguiente corrida) para no hacer durar 10 min el bench cada vez.
+✅ **HALLAZGO CRÍTICO CERRADO** — `RANK()` y `SUM() OVER (PARTITION BY)` eran O(n²) (44-60s para 500 filas). **W4 (2026-05-30)** reescribió el path per-partition a una sola pasada lineal (`fill_window_partition_into`): RANK/DENSE_RANK por adjacent-compare, SUM/AVG con prefix sum, COUNT/MIN/MAX prefix. Test funcional `w4_rank_sum_over_2k_rows_is_linear` corre 2000 filas en <0.5s (debug). El bench restauró `iters=5` para esas 2 queries. Ver [ADR-0066 Gap 8](docs/adr/0066-bench-exposed-gaps.md).
 
 ### Suite 7 — `graph` (W2 + V, 8k rows)
 
@@ -189,23 +185,23 @@ Mientras tanto, el bench bajó `iters` para esas 2 queries (de 5 → 2 en la sig
 
 | Operación | Latencia | Bloque que lo arregla |
 |---|---:|---|
-| **🚨 RANK() OVER (PARTITION BY) 500 rows** | **44 s** | W4 (refactor O(n log n)) |
-| **🚨 SUM OVER (PARTITION BY) 500 rows** | **60 s** | W4 |
+| ~~**🚨 RANK() OVER (PARTITION BY) 500 rows**~~ | ~~**44 s**~~ | ~~W4 (refactor O(n log n))~~ ✅ cerrado 2026-05-30, hoy O(n) |
+| ~~**🚨 SUM OVER (PARTITION BY) 500 rows**~~ | ~~**60 s**~~ | ~~W4~~ ✅ cerrado 2026-05-30, hoy O(n) |
 | **Indexed range LARGE 160k rows** | 3.48 s | leaf cursor batch decode |
-| **Full scan eq 200k rows** | 762 ms | F3 + planner P5 |
+| **Full scan eq 200k rows** | 762 ms | F3 desbloqueó BETWEEN; full scan ms-level sigue pendiente de P5 |
 | **UNION two ranges (events)** | 710 ms | F4 (streaming) |
 | **Aggregate full (events COUNT)** | 538 ms | P4 stats + P5 planner |
 | **GROUP BY low-card (events)** | 636 ms | P4 + P5 |
 | **DISTINCT** | 477 ms | hash early-out |
 | **RLS + SELECT** | 40-52 ms | auth cache sesión |
 | **JOIN orders×lines** | 164 ms | P5 (planner real) |
-| **PK compuesta partial** | 137 ms | hoy full scan (no usa idx parcial) |
+| ~~**PK compuesta partial**~~ | ~~137 ms~~ | ~~hoy full scan~~ ✅ K4 cerrado 2026-05-30: auto-index OrderedInt sobre pk1 → O(log n) |
 
 ### 🔎 Huecos del motor expuestos por el bench
 
 **Catálogo completo, auditado y priorizado**: [ADR-0066 — Gaps del motor expuestos por el benchmark](docs/adr/0066-bench-exposed-gaps.md).
 
-Resumen (10 gaps identificados, cada uno con código de error + query del bench que lo dispara + workaround + bloque/prioridad de fix):
+Resumen (**9/10 gaps cerrados en 7 bloques el 2026-05-30**; pendiente Gap 10 / P5b dentro del bloque P5 — planner real):
 
 | # | Gap | Código | Bloque defer | Prioridad |
 |---|---|---|---|---:|
@@ -232,7 +228,7 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 | Doble-open de pager (procflow/constraint_zoo) → `[GBY-1002]` | reusar pager o `close()` antes de re-abrir |
 | Doble `begin()` sobre tx implícita → `[GBY-1005]` | `Pager::open` directo sin tx implícita |
 | ~~UNIQUE multi-col TEXT en constraint_zoo → `[GBY-4067]`~~ | ~~cambiar a UNIQUE single-col~~ — cerrado por K3 (2026-05-30); el bench restauró `UNIQUE (code, region)` multi-col |
-| WITH RECURSIVE sin seed table → `[GBY-4081]` | agregar `seed_one` |
+| ~~WITH RECURSIVE sin seed table → `[GBY-4081]`~~ | ~~agregar `seed_one`~~ — el motor acepta anchor bare-SELECT desde E5 (2026-05-30); la seed table sigue siendo válida pero opcional |
 | Trigger usaba `NEW.id` como PK + UPDATE rotaba IDs → `[GBY-3001]` | UPDATE con IDs únicos 1..N |
 
 ---
@@ -256,7 +252,7 @@ Outputs:
 - **`bench/dbs/*.db`**: las 10 DBs sintéticas regenerables
 - **`docs/benchmarks/BENCHMARK-YYYY-MM-DD[_N].md`**: snapshot histórico inmutable (auto-generado al final)
 
-**Tiempo total esperado**: ~10-12 min en hardware moderno (con RANK/SUM OVER en 2 iters cada uno para no quemar 5+ min en esos solos).
+**Tiempo total esperado**: ~5-7 min en hardware moderno tras W4 (2026-05-30) — RANK/SUM OVER pasaron de 44-60s a sub-segundo, y volvieron a 5 iters como el resto.
 
 ---
 

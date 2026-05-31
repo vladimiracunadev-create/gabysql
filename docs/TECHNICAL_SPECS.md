@@ -260,9 +260,9 @@ Enforcement en runtime:
 - `INTEGRITY CHECK` (sweep operacional de páginas + índices + FKs)
 
 ### No soportado todavía
-- Agregados sobre `SELECT` con `JOIN` (devuelve `[GBY-4028]`). `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)` single-table sí están soportados desde el bloque F
+- `COUNT(DISTINCT col)` sobre SELECT con JOIN sigue `[GBY-4028]`. El resto de los agregados sobre JOIN funcionan desde F2 (2026-05-30, ADR-0066 Gap 1+7); single-table desde F.
 - `GROUP_CONCAT` / `STRING_AGG` / `JSON_AGG` / `ARRAY_AGG`
-- Window functions, CTE (`WITH ... AS`), `WITH RECURSIVE` (bloque W)
+- ~~Window functions, CTE (`WITH ... AS`), `WITH RECURSIVE` (bloque W)~~ ✅ entregados: W1 (CTE no-rec) + W2 (recursivas) + W3 (window fns) + W4 (O(n) per partition, 2026-05-30) + E5 (anchor bare-SELECT)
 - `ILIKE`, `REGEXP`, `GLOB`, `IS TRUE`/`IS FALSE`
 - `WHERE` por columnas no PK ni indexadas usa FullScan (no es bloqueante — solo perf)
 - Optimización indexada para operadores no-`=`/no-`BETWEEN` (`<`, `>`, `LIKE`, `IN literal`) — hoy cae a FullScan aunque la columna tenga índice

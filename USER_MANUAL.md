@@ -253,7 +253,7 @@ Devuelve un JSON con `started_unix`, `uptime_s`, `requests_total`, `requests_by_
 
 ## 5. 📐 `gabymodeler v2` — modelador web (PowerDesigner-style)
 
-`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 31` (al 2026-05-29). El modelador refleja la superficie DDL/constraints — los bumps post-13 extendieron features ortogonales (triggers, procedures, types, security, EXPLAIN) que el modelador no toca, así que la UI sigue coherente sin cambios.
+`gabymodeler v2` es un single-page HTML+JS vanilla (sin npm, sin frameworks, sin backend acoplado) con layout PowerDesigner-style — Object Browser + Canvas + Result List + Status bar — espejo del motor `gabysql VERSION 31` (al 2026-05-30; los 9 gaps del ADR-0066 cerrados ese día son planner/parser/engine, no tocan la superficie DDL que ve el modelador). El modelador refleja la superficie DDL/constraints — los bumps post-13 extendieron features ortogonales (triggers, procedures, types, security, EXPLAIN) que el modelador no toca, así que la UI sigue coherente sin cambios.
 
 ### Levantarlo
 ```bash

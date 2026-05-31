@@ -8,7 +8,7 @@
 
 ---
 
-## 📊 Snapshot 2026-05-29 — qué está cerrado por Fase
+## 📊 Snapshot 2026-05-30 — qué está cerrado por Fase
 
 | Fase | Subsistema | Estado | Detalle |
 |---|---|:---:|---|
@@ -18,6 +18,7 @@
 | **Fase 2** | Identidad SQL-level (Z1+Z1b+Z1c+Z1d+Z1e+Z1f) | 🟡 | USERS+ROLES, PBKDF2 default, scrypt scheme=2, Blake2b RFC 7693, Argon2id estructural (no matchea vector RFC 9106 §A.3, mar­cado en ADR-0061) |
 | **Fase 2** | Authz (Z2 + Z3+Z3b+Z3c+Z3d+Z3e+Z3f) | 🟢 | GRANT/REVOKE bitmask + SET SESSION AUTH + RLS USING/WITH CHECK + RETURNING filter + DEFAULTs antes de check |
 | **Fase 3** | Plan textual (P1+P2+P3) | 🟢 | EXPLAIN dry-run + EXPLAIN ANALYZE con Instant + ANALYZE TABLE con stats session-scoped |
+| **Cross-fase** | ADR-0066 (F3+F2+W4+E5+K3+K4+N5) | 🟢 | 9/10 gaps del bench cerrados 2026-05-30 (7 bloques): BETWEEN sin idx, agregados sobre JOIN/view, window funcs O(n), bare-SELECT, UNIQUE multi-col TEXT, auto-index prefix PK, DEFAULT con función. Gap 10 (P5b) depende de P5. |
 | **Fase 3** | Cost estimates per-column | 🔴 | P4 (NDV/MCV/histogramas) |
 | **Fase 3** | Stats persistidas en catálogo | 🔴 | P3b |
 | **Fase 3** | Planner-as-optimizer | 🔴 | P5 (reorden de joins, choice de índice por costo) |
@@ -73,13 +74,13 @@ Ver [docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md): schema semánt
 ## 🚦 Estado actual
 
 - Core reescrito en Rust
-- Pager con header, páginas fijas y formato en disco **versión `8`** (K2, 2026-05-26: PK e índices admiten múltiples columnas all-INT)
+- Pager con header, páginas fijas y formato en disco **versión `31`** (Z1f, 2026-05-29). Los 7 bloques del 2026-05-30 (F3/F2/W4/E5/K3/K4/N5) son planner-only — sin bump on-disk.
 - Cada página persistida lleva trailer CRC32-IEEE (4 bytes); corrupción se detecta al leer y al replay del WAL
 - WAL after-image con replay por `COMMIT` y verificación CRC del payload de cada página
 - **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits
 - Catálogo de tablas persistente con hashing FNV-1a-64 (estable entre versiones de Rust)
 - **Índices secundarios** sobre una columna escalar (no JSON), con backfill automático y mantenimiento en `INSERT`/`UPDATE`/`DELETE`
-- SQL estable: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `NOT NULL` / `DEFAULT` / `UNIQUE` / `REFERENCES ... [ON DELETE RESTRICT|CASCADE]` inline; `PRIMARY KEY (a, b, ...)` table-level all-INT desde K2), `CREATE TABLE [IF NOT EXISTS] [(aliases)] AS SELECT ...` (CTAS, K1), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN]`, `ALTER TABLE DROP COLUMN [IF EXISTS]` (K1), `ALTER TABLE RENAME COLUMN` (K1), `ALTER TABLE RENAME TO` / `RENAME TABLE` (K1), `INSERT` (single/multi-row, `INSERT ... SELECT`, `ON CONFLICT`/UPSERT, `REPLACE INTO`, `RETURNING`), `SELECT`/`UPDATE`/`DELETE` con `WHERE` completo (`=`/`<`/`>`/`<=`/`>=`/`<>`/`!=`/`BETWEEN`/`[NOT] LIKE`/`IS [NOT] NULL`/`[NOT] IN (lista | SELECT)`/`= (SELECT)`/`[NOT] EXISTS` con correlated multi-pred, conectados con `AND`/`OR`/`NOT` y paréntesis), expresiones escalares (27 funciones + `CAST` + `CASE` + aritméticos + concat `||` + postfix `Expr`) en SELECT/WHERE/HAVING/UPDATE SET/DELETE WHERE (G1+G2+G3), derived tables `FROM (SELECT ...) AS t` y scalar subquery en SELECT list (H), set ops `UNION`/`UNION ALL`/`INTERSECT [ALL]`/`EXCEPT [ALL]`/`MINUS` + `VALUES` (I), JOINs (INNER/LEFT/RIGHT/FULL/CROSS, USING, NATURAL, index-loop), agregados single-table (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)`, F), TCL (`BEGIN`/`COMMIT`/`ROLLBACK` batch-local, T), `CREATE [UNIQUE] INDEX` single o compuesto all-INT (K2), `DROP INDEX`, `TRUNCATE`, `LIMIT`/`OFFSET`, `ORDER BY`. (Ver [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) para la gramática completa y [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md) para lo que falta.)
+- SQL estable: `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`, `CREATE TABLE` (con `NOT NULL` / `DEFAULT` / `UNIQUE` / `REFERENCES ... [ON DELETE RESTRICT|CASCADE]` inline; `PRIMARY KEY (a, b, ...)` table-level PK all-INT desde K2; UNIQUE/INDEX multi-col aceptan TEXT/UUID/etc desde K3), `CREATE TABLE [IF NOT EXISTS] [(aliases)] AS SELECT ...` (CTAS, K1), `DROP TABLE [IF EXISTS]`, `ALTER TABLE ADD [COLUMN]`, `ALTER TABLE DROP COLUMN [IF EXISTS]` (K1), `ALTER TABLE RENAME COLUMN` (K1), `ALTER TABLE RENAME TO` / `RENAME TABLE` (K1), `INSERT` (single/multi-row, `INSERT ... SELECT`, `ON CONFLICT`/UPSERT, `REPLACE INTO`, `RETURNING`), `SELECT`/`UPDATE`/`DELETE` con `WHERE` completo (`=`/`<`/`>`/`<=`/`>=`/`<>`/`!=`/`BETWEEN`/`[NOT] LIKE`/`IS [NOT] NULL`/`[NOT] IN (lista | SELECT)`/`= (SELECT)`/`[NOT] EXISTS` con correlated multi-pred, conectados con `AND`/`OR`/`NOT` y paréntesis), expresiones escalares (27 funciones + `CAST` + `CASE` + aritméticos + concat `||` + postfix `Expr`) en SELECT/WHERE/HAVING/UPDATE SET/DELETE WHERE (G1+G2+G3), derived tables `FROM (SELECT ...) AS t` y scalar subquery en SELECT list (H), set ops `UNION`/`UNION ALL`/`INTERSECT [ALL]`/`EXCEPT [ALL]`/`MINUS` + `VALUES` (I), JOINs (INNER/LEFT/RIGHT/FULL/CROSS, USING, NATURAL, index-loop), agregados single-table (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT`/`COUNT(DISTINCT)`, F), TCL (`BEGIN`/`COMMIT`/`ROLLBACK` batch-local, T), `CREATE [UNIQUE] INDEX` single o compuesto (K2+K3 acepta INT/FLOAT/BOOL/TEXT/DATE/DATETIME/TIME/UUID), `DROP INDEX`, `TRUNCATE`, `LIMIT`/`OFFSET`, `ORDER BY`. (Ver [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) para la gramática completa y [docs/MISSING_COMMANDS.md](docs/MISSING_COMMANDS.md) para lo que falta.)
 - Modelador web `gabymodeler` (vanilla HTML/JS) + admin web `phpgabyadmin`, ambos en `web/`
 - Server HTTP/JSON para single DB y multi DB con tope de conexiones simultáneas (default 64, configurable con `-max-connections`)
 - `Pager::create` rehúsa sobrescribir un archivo existente; `gabysql init --force` para reset intencional

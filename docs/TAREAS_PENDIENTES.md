@@ -50,7 +50,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 **Estado al 2026-05-26**: cerrada. JOINs ANSI completos (INNER/LEFT/RIGHT/FULL/CROSS/USING/NATURAL + index-loop optimization) entregados antes de la sesión 2026-05-25; `WHERE` completo (E1+E2+E3), agregados single-table (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` + `GROUP BY`/`HAVING`/`DISTINCT` — bloque F), DML masivo (J), UPSERT/RETURNING (J2), funciones escalares + aritméticos en cualquier cláusula (G1+G2+G3), subqueries restantes (H), set ops + VALUES (I), DDL extendido (K1+K2 con PK compuesta + índices compuestos all-INT) en sesiones 2026-05-25 y 2026-05-26. La superficie SQL operacional clásica está completa.
 
-**Pendiente residual**: agregados sobre `SELECT` con JOIN (hoy `[GBY-4028]`), CTE/window functions (bloque W), `UPDATE ... FROM`, `EXCLUDED.col` en UPSERT. Ninguno bloquea el proyecto comparativo.
+**Pendiente residual** (al 2026-05-30): `UPDATE ... FROM`, `EXCLUDED.col` en UPSERT. Lo que estaba pendiente y cerró 2026-05-30: agregados sobre `SELECT con JOIN` (F2, ADR-0066 Gap 1+7 — `COUNT(DISTINCT col)` sobre JOIN sigue residual), CTE recursivas con anchor bare-SELECT (E5/W2). Window functions (W3+W4) y CTE no-rec (W1) ya estaban cerrados antes. Ninguno bloquea el proyecto comparativo.
 
 ---
 
