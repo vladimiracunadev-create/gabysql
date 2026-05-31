@@ -216,7 +216,7 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 | 5 | `WITH RECURSIVE` requiere FROM en anchor | `[GBY-4081]` | (depende de E5) | P2 |
 | 6 | Trigger PK auto-gen (sin SERIAL / DEFAULT con función) | bench design | N5 | P2 |
 | 7 | ~~`COUNT(*) FROM <view>`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
-| 8 | **`RANK()` y `SUM OVER (PARTITION BY)` son O(n²)** | sin código | **W4 crítico** | **P1** |
+| 8 | ~~**`RANK()` y `SUM OVER (PARTITION BY)` eran O(n²)**~~ | ~~sin código~~ | ~~**W4 crítico**~~ ✓ | ~~**P1**~~ cerrado 2026-05-30 |
 | 9 | PK compuesta partial scan no usa idx | sin código | K4 | P2 |
 | 10 | Composite index no detecta `WHERE A AND B` | sin código | P5b | P1 (con P5) |
 

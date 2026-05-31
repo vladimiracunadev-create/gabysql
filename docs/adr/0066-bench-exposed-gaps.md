@@ -137,28 +137,25 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 8 — `RANK()` y `SUM() OVER (PARTITION BY)` cuadráticos
+## Gap 8 — `RANK()` y `SUM() OVER (PARTITION BY)` cuadráticos ✓ CERRADO (W4, 2026-05-30)
 
-**Código de error**: ninguno — la query funciona, pero **toma 44-60 segundos para 500 filas**.
-**Query del bench**: `analytics` → `SELECT region, revenue, RANK() OVER (PARTITION BY region ORDER BY revenue DESC) FROM sales LIMIT 500` y la análoga con `SUM OVER`.
+**Causa raíz** (pre-fix): `compute_window_value` iteraba, por cada fila del partition, recorriendo TODO el partition (0..pos) para calcular rank/sum acumulado — O(n²) por partition.
 
-**Causa raíz**: `compute_window_value` en W3 itera, por cada fila del partition, recorriendo TODO el partition para calcular el rank/sum acumulado. Es O(n²) por partition.
+**Fix aplicado**: nueva función `fill_window_partition_into` (`src/sql.rs:~20115`) que rellena el resultado de toda una partition en O(n):
+- RANK / DENSE_RANK: walk lineal con `order_by_equal` adjacente (1 sola comparación por fila vs N).
+- SUM / AVG OVER con ORDER BY: prefix sum + count running. Sin ORDER BY: una pasada y todas las filas reciben el mismo agregado.
+- COUNT(expr) OVER: pre-eval por fila + prefix count de no-nulls.
+- MIN / MAX OVER: running prefix con comparación incremental. Sin ORDER BY: una pasada.
+- RowNumber / Ntile / Lag / Lead / FirstValue / LastValue: ya eran O(1) per row, delegados al evaluador per-row clásico.
 
-**Lo que SÍ funciona OK (lineal)**:
-- `ROW_NUMBER() OVER` → 270 ms / 500 rows
-- `LAG()` / `LEAD()` → 229 ms / 500 rows
-- `FIRST_VALUE` / `LAST_VALUE` (no medido pero misma estructura)
+**Tests**:
+- `w4_rank_sum_over_2k_rows_is_linear`: 2000 filas con RANK+SUM OVER terminan en <0.5s (antes serían minutos).
+- `w4_rank_dense_rank_matches_expected_values`: verificación de corrección con ties.
+- `w4_sum_over_running_prefix`: SUM OVER con prefix progresivo (10, 30, 60, …).
 
-**Workaround en bench**: bajé `iters` de 5 → 2 para RANK y SUM OVER (las 2 cuadráticas) para que la suite no tarde 4+ min en esas dos solas. La queries siguen midiendo correctamente p50.
+**Bench**: iters de RANK/SUM OVER vuelve de 2 → 5 (antes bajado por O(n²)).
 
-**Fix definitivo**: **bloque W4** — refactor `compute_window_value` a O(n log n):
-- Sort por partition key + order key una sola vez.
-- RANK/DENSE_RANK: walk lineal con comparación a la fila anterior.
-- SUM OVER cumulativo: prefix sum O(n) por partition.
-
-Cambio sustantivo (~150 líneas + tests). Bloque deferred.
-
-**Prioridad**: P1 (es un hallazgo crítico — hace inviable usar window functions en producción).
+**Prioridad**: ~~**P1 crítico**~~ — entregado.
 
 ---
 
@@ -201,7 +198,7 @@ Cambio sustantivo (~150 líneas + tests). Bloque deferred.
 | 5 | `[GBY-4081]` | dependencia de E5 | P2 |
 | 6 | `[GBY-3001]` (bench) | **N5** (DEFAULT con función) | P2 |
 | 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |
-| 8 | sin código | **W4** | **P1 crítico** |
+| 8 | ~~sin código~~ | ~~**W4**~~ ✓ | ~~**P1 crítico**~~ cerrado 2026-05-30 |
 | 9 | sin código | **K4** | P2 |
 | 10 | sin código | **P5b** | P1 (cuando llegue P5) |
 

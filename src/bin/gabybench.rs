@@ -1231,22 +1231,21 @@ fn suite_analytics(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT region, salesperson_id, revenue, ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC) FROM sales LIMIT 500",
     )?);
 
-    // CUIDADO: RANK y SUM OVER son cuadráticos hoy (defer W4). Cada iter
-    // toma 30-50s sobre 500 rows. Bajamos a 2 iters (p50 = pico, mean OK)
-    // para que la suite NO tarde 4+ min en estas 2 queries.
+    // W4 (ADR-0066 Gap 8 cerrado): RANK y SUM OVER ahora son O(n) por
+    // partition. Volvemos a 5 iters; antes corrían a 2 con caveat O(n²).
     out.push(bench_sql(
         "analytics",
-        "RANK() OVER (PARTITION BY region ORDER BY revenue DESC) [N=2, slow O(n²)]",
+        "RANK() OVER (PARTITION BY region ORDER BY revenue DESC) (W4)",
         &mut pager,
-        2,
+        5,
         "SELECT region, revenue, RANK() OVER (PARTITION BY region ORDER BY revenue DESC) FROM sales LIMIT 500",
     )?);
 
     out.push(bench_sql(
         "analytics",
-        "SUM OVER (PARTITION BY region) cumulative [N=2, slow O(n²)]",
+        "SUM OVER (PARTITION BY region) cumulative (W4)",
         &mut pager,
-        2,
+        5,
         "SELECT region, revenue, SUM(revenue) OVER (PARTITION BY region) FROM sales LIMIT 500",
     )?);
 
@@ -1786,7 +1785,7 @@ fn main() {
     let started = Instant::now();
     println!("== gabybench iniciando (pid={}) ==", std::process::id());
     println!("   target esperado: ~10-15 min (10 DBs, ~85 queries)");
-    println!("   ⚠ window functions RANK/SUM OVER hoy son O(n²) — defer W4");
+    println!("   ✓ window functions RANK/SUM OVER son O(n) por partition (W4 cerrado 2026-05-30)");
     println!();
     let res = run();
     let elapsed = started.elapsed();

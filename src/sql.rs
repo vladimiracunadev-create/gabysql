@@ -20105,12 +20105,295 @@ fn compute_window_column(
                 std::cmp::Ordering::Equal
             });
         }
-        for pos in 0..indices.len() {
-            let v = compute_window_value(func, args, &indices, pos, rows, &over.order_by)?;
-            result[indices[pos]] = v;
-        }
+        // W4 (ADR-0066 Gap 8, 2026-05-30): fast path por partition que
+        // evita el O(n²) anterior. Antes `compute_window_value` se llamaba
+        // 1 vez por fila y cada llamada recorría 0..pos. Ahora hacemos
+        // UN solo walk por partition (O(n)) construyendo prefijos o
+        // comparaciones adjacentes. RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX
+        // con ORDER BY (running) y sin ORDER BY (full partition) caen acá.
+        // Lag/Lead/FirstValue/LastValue/RowNumber/Ntile siguen siendo
+        // O(1) por fila — los routeamos al evaluador per-row.
+        fill_window_partition_into(func, args, &indices, rows, &over.order_by, &mut result)?;
     }
     Ok(result)
+}
+
+/// W4: rellena `result[indices[pos]]` para cada `pos` en `0..indices.len()`
+/// en O(n) sobre la partition ya ordenada. Si la función es O(1) per row
+/// (RowNumber/Ntile/Lag/Lead/FirstValue/LastValue), delegamos al evaluador
+/// per-row existente — no hay overhead que ahorrar ahí.
+fn fill_window_partition_into(
+    func: WindowFunc,
+    args: &[Expr],
+    sorted_indices: &[usize],
+    rows: &[HashMap<String, Value>],
+    order_by: &[(Expr, OrderDir)],
+    result: &mut [Value],
+) -> DbResult<()> {
+    use WindowFunc::*;
+    let len = sorted_indices.len();
+    match func {
+        Rank => {
+            let mut rank: i64 = 1;
+            for i in 0..len {
+                if i > 0 {
+                    let prev = sorted_indices[i - 1];
+                    let cur = sorted_indices[i];
+                    if !order_by_equal(rows, prev, cur, order_by) {
+                        rank = (i + 1) as i64;
+                    }
+                }
+                result[sorted_indices[i]] = Value::Integer(rank);
+            }
+            Ok(())
+        }
+        DenseRank => {
+            let mut rank: i64 = 1;
+            for i in 0..len {
+                if i > 0 {
+                    let prev = sorted_indices[i - 1];
+                    let cur = sorted_indices[i];
+                    if !order_by_equal(rows, prev, cur, order_by) {
+                        rank += 1;
+                    }
+                }
+                result[sorted_indices[i]] = Value::Integer(rank);
+            }
+            Ok(())
+        }
+        CountStar => {
+            // Sin ORDER BY: todas reciben el total. Con ORDER BY: running
+            // count (pos+1). En ambos casos es O(1) per row pero lo
+            // dejamos acá para no romper el dispatch.
+            if order_by.is_empty() {
+                let total = len as i64;
+                for &idx in sorted_indices {
+                    result[idx] = Value::Integer(total);
+                }
+            } else {
+                for (i, &idx) in sorted_indices.iter().enumerate() {
+                    result[idx] = Value::Integer((i + 1) as i64);
+                }
+            }
+            Ok(())
+        }
+        Count => {
+            // Pre-evaluamos args[0] por fila — una vez. Después prefix
+            // count de no-nulls (O(n)) si hay ORDER BY; sino, total.
+            let mut precomputed: Vec<Value> = Vec::with_capacity(len);
+            for &idx in sorted_indices {
+                precomputed.push(eval_expr(&args[0], &rows[idx])?);
+            }
+            if order_by.is_empty() {
+                let total: i64 = precomputed
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Null))
+                    .count() as i64;
+                for &idx in sorted_indices {
+                    result[idx] = Value::Integer(total);
+                }
+            } else {
+                let mut running: i64 = 0;
+                for (i, &idx) in sorted_indices.iter().enumerate() {
+                    if !matches!(precomputed[i], Value::Null) {
+                        running += 1;
+                    }
+                    result[idx] = Value::Integer(running);
+                }
+            }
+            Ok(())
+        }
+        Sum | Avg => {
+            // Pre-eval; rechazamos no-numéricos como hacía window_sum.
+            let mut precomputed: Vec<Value> = Vec::with_capacity(len);
+            for &idx in sorted_indices {
+                precomputed.push(eval_expr(&args[0], &rows[idx])?);
+            }
+            // Detección upfront del tipo: si aparece algún Float, todo
+            // se promueve a f64. Mismo criterio que `window_sum` original.
+            let any_float = precomputed.iter().any(|v| matches!(v, Value::Float(_)));
+            // Validación de tipos: solo Int/Float/Null aceptados.
+            for v in &precomputed {
+                match v {
+                    Value::Null | Value::Integer(_) | Value::Float(_) => {}
+                    _ => {
+                        return Err(coded(
+                            codes::WINDOW_ARG_MISMATCH,
+                            format!("{}() OVER: argumento numérico requerido", func.keyword()),
+                        ));
+                    }
+                }
+            }
+            if order_by.is_empty() {
+                // Una sola pasada → todos reciben el mismo agregado.
+                let (total, nz) = sum_count_nonnull(&precomputed, any_float);
+                let final_val: Value = match func {
+                    Sum => {
+                        if nz == 0 {
+                            Value::Null
+                        } else {
+                            total
+                        }
+                    }
+                    Avg => {
+                        if nz == 0 {
+                            Value::Null
+                        } else {
+                            match total {
+                                Value::Integer(i) => Value::Float(i as f64 / nz as f64),
+                                Value::Float(f) => Value::Float(f / nz as f64),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                for &idx in sorted_indices {
+                    result[idx] = final_val.clone();
+                }
+            } else {
+                // Prefix running sum + count.
+                let mut sum_i: i64 = 0;
+                let mut sum_f: f64 = 0.0;
+                let mut nz: i64 = 0;
+                for (i, &idx) in sorted_indices.iter().enumerate() {
+                    match &precomputed[i] {
+                        Value::Null => {}
+                        Value::Integer(n) => {
+                            if any_float {
+                                sum_f += *n as f64;
+                            } else {
+                                sum_i += *n;
+                            }
+                            nz += 1;
+                        }
+                        Value::Float(f) => {
+                            sum_f += *f;
+                            nz += 1;
+                        }
+                        _ => unreachable!("typecheck arriba"),
+                    }
+                    let val: Value = if nz == 0 {
+                        Value::Null
+                    } else {
+                        match func {
+                            Sum => {
+                                if any_float {
+                                    Value::Float(sum_f)
+                                } else {
+                                    Value::Integer(sum_i)
+                                }
+                            }
+                            Avg => {
+                                let s = if any_float { sum_f } else { sum_i as f64 };
+                                Value::Float(s / nz as f64)
+                            }
+                            _ => unreachable!(),
+                        }
+                    };
+                    result[idx] = val;
+                }
+            }
+            Ok(())
+        }
+        Min | Max => {
+            let mut precomputed: Vec<Value> = Vec::with_capacity(len);
+            for &idx in sorted_indices {
+                precomputed.push(eval_expr(&args[0], &rows[idx])?);
+            }
+            if order_by.is_empty() {
+                // Una pasada por toda la partition.
+                let non_null: Vec<&Value> = precomputed
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Null))
+                    .collect();
+                let final_val = if non_null.is_empty() {
+                    Value::Null
+                } else {
+                    let mut best = non_null[0];
+                    for v in &non_null[1..] {
+                        let ord = compare_values(Some(v), Some(best));
+                        let pick = match func {
+                            Min => ord == std::cmp::Ordering::Less,
+                            Max => ord == std::cmp::Ordering::Greater,
+                            _ => unreachable!(),
+                        };
+                        if pick {
+                            best = v;
+                        }
+                    }
+                    best.clone()
+                };
+                for &idx in sorted_indices {
+                    result[idx] = final_val.clone();
+                }
+            } else {
+                // Running min/max prefix.
+                let mut best: Option<Value> = None;
+                for (i, &idx) in sorted_indices.iter().enumerate() {
+                    let cur = &precomputed[i];
+                    if !matches!(cur, Value::Null) {
+                        match &best {
+                            None => best = Some(cur.clone()),
+                            Some(b) => {
+                                let ord = compare_values(Some(cur), Some(b));
+                                let pick = match func {
+                                    Min => ord == std::cmp::Ordering::Less,
+                                    Max => ord == std::cmp::Ordering::Greater,
+                                    _ => unreachable!(),
+                                };
+                                if pick {
+                                    best = Some(cur.clone());
+                                }
+                            }
+                        }
+                    }
+                    result[idx] = best.clone().unwrap_or(Value::Null);
+                }
+            }
+            Ok(())
+        }
+        // Funciones O(1) per row — reusamos el evaluador clásico.
+        RowNumber | Ntile | Lag | Lead | FirstValue | LastValue => {
+            for pos in 0..len {
+                let v = compute_window_value(func, args, sorted_indices, pos, rows, order_by)?;
+                result[sorted_indices[pos]] = v;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// W4: helper para Sum/Avg en el path sin ORDER BY. Devuelve (suma, cantidad
+/// de no-nulls). `any_float` decide si la suma se mantiene en i64 o promueve.
+fn sum_count_nonnull(values: &[Value], any_float: bool) -> (Value, i64) {
+    let mut sum_i: i64 = 0;
+    let mut sum_f: f64 = 0.0;
+    let mut nz: i64 = 0;
+    for v in values {
+        match v {
+            Value::Null => {}
+            Value::Integer(n) => {
+                if any_float {
+                    sum_f += *n as f64;
+                } else {
+                    sum_i += *n;
+                }
+                nz += 1;
+            }
+            Value::Float(f) => {
+                sum_f += *f;
+                nz += 1;
+            }
+            _ => unreachable!("typecheck arriba"),
+        }
+    }
+    let total = if any_float {
+        Value::Float(sum_f)
+    } else {
+        Value::Integer(sum_i)
+    };
+    (total, nz)
 }
 
 /// Computa el valor de una window function para una sola fila dentro

@@ -4286,6 +4286,134 @@ fn f2_aggregate_over_join_sum_expr_left_join() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn w4_rank_sum_over_2k_rows_is_linear() -> Result<(), Box<dyn Error>> {
+    // W4 (ADR-0066 Gap 8 cerrado): RANK + SUM OVER en O(n) (antes O(n²)).
+    // Sobre 2000 filas el path viejo tardaba ~minutos; el nuevo termina
+    // en <2s incluso en debug. Si este test tarda >30s, hay regresión
+    // de complejidad.
+    use std::time::Instant;
+    let db = temp_db_path("w4_window_perf");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE sales (id INT PRIMARY KEY, region INT, revenue INT);",
+    )?;
+    let mut buf = String::from("INSERT INTO sales (id, region, revenue) VALUES ");
+    for i in 0..2000 {
+        if i > 0 {
+            buf.push(',');
+        }
+        buf.push_str(&format!("({},{},{})", i + 1, i % 5, (i * 17) % 1000));
+    }
+    buf.push(';');
+    run_sql(&db, &buf)?;
+
+    let start = Instant::now();
+    let res = run_sql(
+        &db,
+        "SELECT id, RANK() OVER (PARTITION BY region ORDER BY revenue DESC) AS r, \
+                SUM(revenue) OVER (PARTITION BY region ORDER BY revenue DESC) AS running \
+         FROM sales ORDER BY id LIMIT 10;",
+    )?;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 30,
+        "RANK/SUM OVER sobre 2000 filas tardó {:?} — regresión cuadrática",
+        elapsed
+    );
+    assert_eq!(res[0].rows.len(), 10);
+    for row in &res[0].rows {
+        match row[1] {
+            Value::Integer(n) if n >= 1 => {}
+            ref other => panic!("RANK fila no entera positiva: {:?}", other),
+        }
+    }
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w4_rank_dense_rank_matches_expected_values() -> Result<(), Box<dyn Error>> {
+    // W4: sanity de corrección del refactor para RANK / DENSE_RANK.
+    // region 1: scores 10,20,20,30 → RANK 1,2,2,4; DENSE 1,2,2,3
+    // region 2: scores 5,5,7       → RANK 1,1,3;   DENSE 1,1,2
+    let db = temp_db_path("w4_rank_correctness");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, region INT, score INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id, region, score) VALUES \
+            (1,1,10),(2,1,20),(3,1,20),(4,1,30), \
+            (5,2,5),(6,2,5),(7,2,7);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, \
+                RANK() OVER (PARTITION BY region ORDER BY score) AS r, \
+                DENSE_RANK() OVER (PARTITION BY region ORDER BY score) AS d \
+         FROM t ORDER BY id;",
+    )?;
+    let expected: Vec<(i64, i64, i64)> = vec![
+        (1, 1, 1),
+        (2, 2, 2),
+        (3, 2, 2),
+        (4, 4, 3),
+        (5, 1, 1),
+        (6, 1, 1),
+        (7, 3, 2),
+    ];
+    assert_eq!(res[0].rows.len(), expected.len());
+    for (row, (eid, er, ed)) in res[0].rows.iter().zip(expected.iter()) {
+        match (&row[0], &row[1], &row[2]) {
+            (Value::Integer(id), Value::Integer(r), Value::Integer(d)) => {
+                assert_eq!((*id, *r, *d), (*eid, *er, *ed), "fila desviada");
+            }
+            other => panic!("tipos inesperados: {:?}", other),
+        }
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn w4_sum_over_running_prefix() -> Result<(), Box<dyn Error>> {
+    // W4: SUM OVER (PARTITION ... ORDER BY ...) usa prefix sum.
+    let db = temp_db_path("w4_sum_prefix");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO t (id,g,v) VALUES (1,1,10),(2,1,20),(3,1,30),(4,2,100),(5,2,200);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY id) AS rs FROM t ORDER BY id;",
+    )?;
+    let expected = [10, 30, 60, 100, 300];
+    for (row, &exp) in res[0].rows.iter().zip(expected.iter()) {
+        match &row[1] {
+            Value::Integer(n) => assert_eq!(*n, exp, "fila {:?}", row),
+            other => panic!("tipo inesperado: {:?}", other),
+        }
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn f2_count_star_over_view() -> Result<(), Box<dyn Error>> {
     // F2 (ADR-0066 Gap 7): COUNT(*) FROM <view>. La vista se expande
     // a derived source, que comparte el path joined del bloque H —

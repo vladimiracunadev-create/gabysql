@@ -80,7 +80,7 @@ A diciembre de 2026 el motor tiene una **base estable suficiente como mesa de tr
 | Observabilidad básica (`/metrics`, `-log-json`) | 🟢 | ADR-0014 |
 | Error handling con códigos `[GBY-NNNN]` | 🟢 | ERROR_CODES.md (códigos 1000-4143) |
 | Gateway MCP + vector search + audit log | 🟢 | ADR-0010/0011/0012 |
-| 727/727 integration tests verdes + 1 ignored (Argon2id RFC vector pendiente), CI multi-OS Ubuntu/macOS/Windows | 🟢 | actualizado al 2026-05-30 |
+| 730/730 integration tests verdes + 1 ignored (Argon2id RFC vector pendiente), CI multi-OS Ubuntu/macOS/Windows | 🟢 | actualizado al 2026-05-30 |
 
 Este conjunto es lo bastante sólido para ser **plataforma de exploración** sin estar quebrándose todo el tiempo. Las invariantes (formato versionado, single-writer, CRC, file lock) son honestas y consistentes.
 
