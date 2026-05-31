@@ -9447,6 +9447,14 @@ impl<'a> Engine<'a> {
             current = self.filter_joined_rows_expr(current, &where_clause, &scope)?;
         }
 
+        // --- 4b. F2 (ADR-0066 Gap 1+7): agregados sobre filas joineadas.
+        // El stream que produjo el JOIN está en `current` (qualified keys).
+        // El bucketing/HAVING/ORDER BY/LIMIT corren en una ruta paralela
+        // a `exec_aggregate_pipeline` que ya no asume single-table.
+        if stmt_needs_aggregation(&stmt) {
+            return self.exec_aggregate_joined(&stmt, &scope, current);
+        }
+
         // --- 5. Resolver columnas proyectadas (output_columns = lo que escribió el user) ---
         let (output_columns, projected_keys) = resolve_joined_projection(&scope, &stmt.columns)?;
 
@@ -11553,6 +11561,286 @@ impl<'a> Engine<'a> {
             None => total,
         };
         let windowed: Vec<Vec<Value>> = projected
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .collect();
+
+        Ok(ResultSet {
+            columns: output_columns,
+            rows: windowed,
+            message: None,
+        })
+    }
+
+    /// F2 (ADR-0066 Gap 1+7): pipeline de agregación sobre filas joineadas.
+    ///
+    /// Recibe el stream de filas que produjo `exec_select_joined` (después
+    /// de aplicar el WHERE), donde cada fila es una `HashMap` con claves
+    /// cualificadas (`alias.col`). Buckets, agregados, HAVING, ORDER BY,
+    /// DISTINCT y LIMIT/OFFSET corren contra ese stream — el aggregator
+    /// single-table queda intacto.
+    ///
+    /// Estrategia: pre-rewriteamos cada `Expr::Column` (en args de
+    /// agregados, en HAVING y en SELECT items no-agregados) a la forma
+    /// cualificada vía `rewrite_expr_columns_for_join`. Eso permite
+    /// reusar `eval_expr` sin que el JoinScope tenga que viajar al
+    /// motor de agregados.
+    fn exec_aggregate_joined(
+        &mut self,
+        stmt: &SelectStmt,
+        scope: &JoinScope,
+        rows: Vec<HashMap<String, Value>>,
+    ) -> DbResult<ResultSet> {
+        // 1. Resolver columnas del GROUP BY a su clave cualificada.
+        let group_keys: Vec<String> = stmt
+            .group_by
+            .iter()
+            .map(|c| resolve_joined_column_key(scope, c))
+            .collect::<DbResult<_>>()?;
+
+        // 2. Validar SELECT items contra GROUP BY (ANSI): toda columna
+        //    no-agregada que aparezca en la proyección debe estar en GROUP BY.
+        let group_set: HashSet<String> = group_keys.iter().cloned().collect();
+        for item in &stmt.columns {
+            match item {
+                SelectItem::Star => {
+                    return Err(coded(
+                        codes::SELECT_COLUMN_NOT_IN_GROUP_BY,
+                        "SELECT *: no se permite combinar `*` con agregados o GROUP BY \
+                         sobre JOIN; enumerar las columnas a proyectar",
+                    ));
+                }
+                SelectItem::Column(c) => {
+                    let key = resolve_joined_column_key(scope, c)?;
+                    if !group_set.contains(&key) {
+                        return Err(coded(
+                            codes::SELECT_COLUMN_NOT_IN_GROUP_BY,
+                            format!(
+                                "columna '{}' debe figurar en GROUP BY o estar dentro de un agregado",
+                                c
+                            ),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 3. Bucketear filas por la tupla de claves del GROUP BY.
+        let mut bucket_order: Vec<Vec<Value>> = Vec::new();
+        type GroupBucket = (Vec<Value>, Vec<HashMap<String, Value>>);
+        let mut buckets: HashMap<Vec<u8>, GroupBucket> = HashMap::new();
+        for row in rows {
+            let key_tuple: Vec<Value> = group_keys
+                .iter()
+                .map(|k| row.get(k).cloned().unwrap_or(Value::Null))
+                .collect();
+            let key_bytes = encode_group_key(&key_tuple);
+            buckets
+                .entry(key_bytes.clone())
+                .and_modify(|(_, rs)| rs.push(row.clone()))
+                .or_insert_with(|| {
+                    bucket_order.push(key_tuple.clone());
+                    (key_tuple, vec![row])
+                });
+        }
+        // Sin GROUP BY pero con agregados: 1 bucket sintético para devolver
+        // la fila de neutros (COUNT=0, SUM=NULL, etc.) cuando 0 filas pasan.
+        if group_keys.is_empty() && buckets.is_empty() {
+            buckets.insert(Vec::new(), (Vec::new(), Vec::new()));
+            bucket_order.push(Vec::new());
+        }
+
+        // 4. Pre-rewrite de cada AggArg::Expr a forma cualificada, y de
+        //    AggArg::Column(c) a AggArg::Expr(Expr::Column("alias.c")) —
+        //    `compute_aggregate` evalúa el Expr fila a fila con `eval_expr`
+        //    que sí entiende claves cualificadas (`eval_expr` rama
+        //    `Expr::Column` line ~16030 hace fast-path por nombre completo).
+        let prepared_args: Vec<Option<AggArg>> = stmt
+            .columns
+            .iter()
+            .map(|item| match item {
+                SelectItem::Aggregate { arg, .. } => match arg {
+                    AggArg::Star => Ok::<_, DbError>(Some(AggArg::Star)),
+                    AggArg::Column(c) => {
+                        let key = resolve_joined_column_key(scope, c)?;
+                        Ok(Some(AggArg::Expr(Expr::Column(key))))
+                    }
+                    AggArg::DistinctColumn(_) => {
+                        // F2: COUNT(DISTINCT col) sobre JOIN no se soporta
+                        // en este release. `compute_aggregate` resuelve la
+                        // columna con `normalize_ident`, que tira el
+                        // qualifier y rompe el lookup. Defer al bloque que
+                        // generalice el dispatch DISTINCT.
+                        Err(coded(
+                            codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
+                            "COUNT(DISTINCT col) sobre SELECT con JOIN aún no se soporta; \
+                             usar subquery agregada sobre la tabla base",
+                        ))
+                    }
+                    AggArg::Expr(e) => {
+                        let rewritten = rewrite_expr_columns_for_join(e.clone(), scope)?;
+                        Ok(Some(AggArg::Expr(rewritten)))
+                    }
+                },
+                _ => Ok(None),
+            })
+            .collect::<DbResult<_>>()?;
+
+        // 5. Por cada bucket, computar la fila de salida con el orden
+        //    exacto del SELECT list.
+        let output_columns: Vec<String> = stmt.columns.iter().map(|i| i.output_name()).collect();
+        let mut output_rows: Vec<Vec<Value>> = Vec::with_capacity(bucket_order.len());
+        // Buffer paralelo para HAVING — mismo shape que rows pero indexed
+        // por output_name + canonical (ver eval HAVING abajo).
+        let mut having_maps: Vec<HashMap<String, Value>> = Vec::with_capacity(bucket_order.len());
+
+        for key_bytes in bucket_order.iter().map(|t| encode_group_key(t.as_slice())) {
+            let (key_tuple, bucket_rows) = buckets
+                .remove(&key_bytes)
+                .expect("bucket presente en bucket_order");
+
+            // Mapa group_key → value para resolver SelectItem::Column.
+            let group_value_by_key: HashMap<&String, &Value> =
+                group_keys.iter().zip(key_tuple.iter()).collect();
+
+            let mut having_row: HashMap<String, Value> = HashMap::new();
+            // Inyectamos las cols del GROUP BY también bajo el qualified
+            // key — `HAVING u.id > 0` debe poder resolver.
+            for (k, v) in &group_value_by_key {
+                having_row.insert((*k).clone(), (*v).clone());
+            }
+
+            let mut out_values: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+            for (idx, item) in stmt.columns.iter().enumerate() {
+                let value = match item {
+                    SelectItem::Aggregate { func, arg, alias } => {
+                        let prepared = prepared_args[idx]
+                            .as_ref()
+                            .expect("aggregate prepared above");
+                        let v = compute_aggregate(*func, prepared, &bucket_rows)?;
+                        // HAVING puede referirse al alias o al canonical
+                        // (mismo comportamiento que el path single-table,
+                        // ver `exec_aggregate_pipeline` line ~11473).
+                        having_row.insert(item.output_name(), v.clone());
+                        if alias.is_some() {
+                            let canonical = SelectItem::Aggregate {
+                                func: *func,
+                                arg: arg.clone(),
+                                alias: None,
+                            }
+                            .output_name();
+                            having_row.insert(canonical, v.clone());
+                        }
+                        v
+                    }
+                    SelectItem::Column(c) => {
+                        let key = resolve_joined_column_key(scope, c)?;
+                        group_value_by_key
+                            .get(&key)
+                            .cloned()
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    }
+                    SelectItem::Expression { expr, .. } => {
+                        let rewritten = rewrite_expr_columns_for_join(expr.clone(), scope)?;
+                        // Para una Expr puramente sobre cols del GROUP BY,
+                        // usamos la primera fila del bucket (el valor es
+                        // constante por bucket). Si el bucket está vacío
+                        // (caso 0 filas + sin GROUP BY), no debería haber
+                        // SelectItem::Expression — caería como column not
+                        // found, que es lo esperado.
+                        let probe_row = bucket_rows.first().cloned().unwrap_or_else(HashMap::new);
+                        let v = eval_expr(&rewritten, &probe_row)?;
+                        having_row.insert(item.output_name(), v.clone());
+                        v
+                    }
+                    SelectItem::Star => unreachable!("validated out arriba"),
+                    SelectItem::Window { .. } => {
+                        return Err(DbError::new(
+                            "interno: window function en path de agregados con JOIN \
+                             (debió haber tomado exec_window_select)"
+                                .to_string(),
+                        ));
+                    }
+                };
+                out_values.push(value);
+            }
+            having_maps.push(having_row);
+            output_rows.push(out_values);
+        }
+
+        // 6. HAVING: filtra buckets. Usa el evaluador 3VL que vive en el
+        //    path single-table porque las claves del having_row están
+        //    indexadas por output_name (los aggregates) o por qualified
+        //    key (las cols del GROUP BY). `eval_where_expr_single` espera
+        //    `&TableMeta` pero solo lo usa para `ensure_column_visible`.
+        //    Como las filas joineadas no tienen `TableMeta` único, hacemos
+        //    el HAVING vía `filter_joined_rows_expr` que sí trabaja sobre
+        //    qualified rows — pero antes hay que pasar el HAVING a través
+        //    de un mapeo: la WhereExpr referencia agregates como columnas
+        //    (e.g. `HAVING total > 5` tras `SUM(..) AS total`). Las
+        //    insertamos en `having_row` arriba bajo `output_name`, y
+        //    `resolve_joined_column_key` no resuelve esas claves. Para no
+        //    duplicar el evaluador, hacemos el filtro inline con
+        //    `eval_where_expr_single` y un `TableMeta` ficticio.
+        if let Some(expr) = &stmt.having {
+            // `eval_where_expr_single` exige `&TableMeta` para
+            // `ensure_column_visible`; usamos el de la base table.
+            // El check pasa si la clave existe en el row map (line 15783),
+            // lo cual cubre tanto agregates (insertados bajo output_name
+            // y canonical) como cols del GROUP BY (qualified key).
+            let base_meta = scope.tables[0].meta.clone();
+            let mut kept_rows = Vec::with_capacity(output_rows.len());
+            let mut kept_having = Vec::with_capacity(having_maps.len());
+            for (row, having) in output_rows.into_iter().zip(having_maps.into_iter()) {
+                let verdict = self.eval_where_expr_single(expr, &base_meta, &having)?;
+                if matches!(verdict, Some(true)) {
+                    kept_rows.push(row);
+                    kept_having.push(having);
+                }
+            }
+            output_rows = kept_rows;
+            having_maps = kept_having;
+        }
+        let _ = having_maps;
+
+        // 7. DISTINCT post-proyección.
+        if stmt.distinct {
+            output_rows = dedup_preserving_order(output_rows);
+        }
+
+        // 8. ORDER BY contra el esquema de salida.
+        if let Some(ord) = &stmt.order_by {
+            let target = ord.column.clone();
+            let target_norm = normalize_ident(&target);
+            let idx = output_columns
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(&target) || normalize_ident(n) == target_norm);
+            let idx = idx.ok_or_else(|| {
+                coded(
+                    codes::COLUMN_NOT_FOUND,
+                    format!(
+                        "ORDER BY: '{}' no figura en el SELECT list de una query agregada con JOIN",
+                        target
+                    ),
+                )
+            })?;
+            output_rows.sort_by(|a, b| compare_values(Some(&a[idx]), Some(&b[idx])));
+            if matches!(ord.direction, OrderDir::Desc) {
+                output_rows.reverse();
+            }
+        }
+
+        // 9. OFFSET/LIMIT.
+        let total = output_rows.len();
+        let start = stmt.offset.min(total);
+        let end = match stmt.limit {
+            Some(l) => (start + l).min(total),
+            None => total,
+        };
+        let windowed: Vec<Vec<Value>> = output_rows
             .into_iter()
             .skip(start)
             .take(end - start)
@@ -14883,10 +15171,14 @@ fn resolve_joined_projection(
                 ));
             }
             SelectItem::Aggregate { .. } => {
-                return Err(coded(
-                    codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
-                    "agregados (COUNT/SUM/AVG/MIN/MAX) sobre SELECT con JOIN aún no se soportan; \
-                     reescribir como subquery agregada sobre la tabla base",
+                // F2 (ADR-0066 Gap 1+7): agregados sobre JOIN se manejan en
+                // `exec_aggregate_joined`. Si el flujo llega acá con un
+                // aggregate en la proyección significa que el dispatch no
+                // detectó la query como aggregate — bug interno.
+                return Err(DbError::new(
+                    "interno: resolve_joined_projection no debe recibir aggregates; \
+                     stmt_needs_aggregation debió haber desviado a exec_aggregate_joined"
+                        .to_string(),
                 ));
             }
             SelectItem::Expression { expr, .. } => {

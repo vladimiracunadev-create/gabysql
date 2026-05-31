@@ -48,7 +48,7 @@
 | Index secundario eq (user_id=100) | 500 | 16.00 µs | 45.10 µs | 67.20 µs | 20.55 µs | 0 |
 | Index ordered range (likes 50..100) | 200 | 36.94 ms | 45.54 ms | 48.14 ms | 38.06 ms | 2073 |
 | Full scan TEXT (nombre LIKE 'A%') | 100 | 17.89 ms | 26.69 ms | 39.68 ms | 19.62 ms | 1250 |
-| JOIN+COUNT (u.id=7) | — | **SKIP `[GBY-4028]`** | | | | |
+| JOIN+COUNT (u.id=7) — F2 | 200 | _pendiente próximo bench_ | | | | |
 | Aggregate global posts (COUNT+AVG) | 50 | 192.09 ms | 209.46 ms | 356.30 ms | 196.48 ms | 1 |
 | GROUP BY user_id | 20 | 235.31 ms | 251.97 ms | 255.84 ms | 237.81 ms | 4998 |
 | INSERT single (in-tx) | 500 | **23.80 µs** | 59.70 µs | 73.10 µs | 31.32 µs | — |
@@ -209,13 +209,13 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 
 | # | Gap | Código | Bloque defer | Prioridad |
 |---|---|---|---|---:|
-| 1 | Agregados sobre `SELECT con JOIN` | `[GBY-4028]` | F2 | **P1** |
+| 1 | ~~Agregados sobre `SELECT con JOIN`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 2 | ~~`BETWEEN` sin índice ordenado~~ | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 3 | `SELECT (subquery)` sin FROM | parser | E5 | P2 |
 | 4 | `UNIQUE` multi-col exige all-INT | `[GBY-4067]` | K3 | P2 |
 | 5 | `WITH RECURSIVE` requiere FROM en anchor | `[GBY-4081]` | (depende de E5) | P2 |
 | 6 | Trigger PK auto-gen (sin SERIAL / DEFAULT con función) | bench design | N5 | P2 |
-| 7 | `COUNT(*) FROM <view>` | `[GBY-4028]` | (sub-caso de F2) | P1 |
+| 7 | ~~`COUNT(*) FROM <view>`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 8 | **`RANK()` y `SUM OVER (PARTITION BY)` son O(n²)** | sin código | **W4 crítico** | **P1** |
 | 9 | PK compuesta partial scan no usa idx | sin código | K4 | P2 |
 | 10 | Composite index no detecta `WHERE A AND B` | sin código | P5b | P1 (con P5) |

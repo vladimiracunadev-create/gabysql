@@ -567,10 +567,9 @@ fn suite_microblog(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT id FROM users WHERE nombre LIKE 'A%'",
     )?);
 
-    // [GBY-4028] vigente: agregados sobre SELECT con JOIN no se soportan.
-    // Lo medimos con skip-graceful para no abortar la suite.
-    out.push(bench_sql_or_skip("microblog", "JOIN+COUNT (u.id=7)", &mut pager, 200,
-        "SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id = 7 GROUP BY u.nombre"));
+    // F2 (ADR-0066 Gap 1 cerrado): agregados sobre SELECT con JOIN.
+    out.push(bench_sql("microblog", "JOIN+COUNT (u.id=7) (F2)", &mut pager, 200,
+        "SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id = 7 GROUP BY u.nombre")?);
 
     out.push(bench_sql(
         "microblog",
@@ -1339,15 +1338,21 @@ fn suite_graph(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "WITH RECURSIVE reach AS (SELECT n, depth FROM seed_one UNION ALL SELECT e.dst, r.depth + 1 FROM reach r JOIN edges e ON e.src = r.n WHERE r.depth < 5) SELECT DISTINCT n FROM reach",
     )?);
 
-    // COUNT(*) sobre vista expande a SELECT con sub-tabla → cae bajo
-    // [GBY-4028]. Cambio a SELECT de filas reales para que mida la
-    // expansión de la vista sin tropezar con la limitación de agregados.
+    // F2 (ADR-0066 Gap 7 cerrado): COUNT(*) sobre vista ahora bucketea
+    // las filas del derived source vía exec_aggregate_joined.
     out.push(bench_sql(
         "graph",
         "SELECT FROM view heavy_edges LIMIT 100 (V expansión)",
         &mut pager,
         50,
         "SELECT id, src, dst, weight FROM heavy_edges LIMIT 100",
+    )?);
+    out.push(bench_sql(
+        "graph",
+        "COUNT(*) FROM heavy_edges (view + F2)",
+        &mut pager,
+        20,
+        "SELECT COUNT(*) FROM heavy_edges",
     )?);
 
     out.push(bench_sql(

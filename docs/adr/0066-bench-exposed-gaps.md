@@ -19,22 +19,23 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 1 — Agregados sobre SELECT con JOIN
+## Gap 1 — Agregados sobre SELECT con JOIN ✓ CERRADO (F2, 2026-05-30)
 
-**Código de error**: `[GBY-4028]`
+**Código de error original**: `[GBY-4028]` (lifteado para el path JOIN — ahora se emite solo desde `COUNT(DISTINCT col)` sobre JOIN, deferred).
 **Query del bench**: `microblog` → `SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id = 7 GROUP BY u.nombre`
-**Mensaje**: `agregados (COUNT/SUM/AVG/MIN/MAX) sobre SELECT con JOIN aún no se soportan; reescribir como subquery agregada sobre la tabla base`
 
-**Causa raíz**: `exec_aggregate` solo opera sobre el pipeline single-table. El pipeline JOIN (nested-loop o index-loop) entrega filas joineadas, pero la fase de agregación no está conectada a ese stream — solo a `exec_select_single`.
+**Causa raíz** (pre-fix): `exec_aggregate_pipeline` solo operaba sobre el pipeline single-table. El pipeline JOIN (nested-loop / hash-join / index-loop) entregaba filas joineadas, pero la fase de agregación no estaba conectada a ese stream — solo a `exec_select` single-table.
 
-**Workaround en bench**: `bench_sql_or_skip` → la query queda registrada como SKIP, suite continúa.
+**Fix aplicado**:
+1. Nuevo `exec_aggregate_joined` (`src/sql.rs:~11580`): bucketea las filas que produce el JOIN por claves cualificadas (`alias.col`), reusa `compute_aggregate` con `AggArg::Expr` rewriting (pre-resolución de columnas vía `rewrite_expr_columns_for_join`), HAVING (3VL con `eval_where_expr_single` sobre el `having_row` que tiene aggregates indexados por output_name + canonical), DISTINCT, ORDER BY, LIMIT/OFFSET. ~250 líneas.
+2. Dispatch: `exec_select_joined` (`src/sql.rs:~9450`) chequea `stmt_needs_aggregation` después del WHERE y delega.
+3. `resolve_joined_projection` ya no rechaza `SelectItem::Aggregate` — el dispatch lo desvía antes.
 
-**Fix definitivo**: **bloque F2** — extender `exec_aggregate` para consumir el row stream que devuelve `exec_join`. Diseño:
-1. Reordenar el pipeline: JOIN → filter → aggregator (hoy: scan → filter → aggregator).
-2. El aggregator no necesita cambios; solo el dispatcher de exec_select que detecta agg+JOIN.
-3. Tests: F2-1 (COUNT con INNER), F2-2 (SUM(qty*price) con LEFT JOIN), F2-3 (GROUP BY columna de la tabla derecha).
+**Limitación conocida**: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando con `[GBY-4028]` — el path DISTINCT en `compute_aggregate` usa `normalize_ident(col)` que tira el qualifier. Defer al bloque que generalice DISTINCT.
 
-**Prioridad**: P1 (común en cualquier aplicación SQL real).
+**Tests**: `f2_aggregate_over_join_count_inner`, `f2_aggregate_over_join_sum_expr_left_join`, `f2_aggregate_over_join_group_by_right_table`, `f2_count_star_over_view` (todos en `tests/integration_test.rs`).
+
+**Prioridad**: ~~P1~~ — entregado.
 
 ---
 
@@ -121,19 +122,18 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 7 — `COUNT(*) FROM <view>`
+## Gap 7 — `COUNT(*) FROM <view>` ✓ CERRADO (sub-caso de F2, 2026-05-30)
 
-**Código de error**: `[GBY-4028]` (mismo que Gap 1)
-**Query del bench (original)**: `SELECT COUNT(*) FROM heavy_edges` donde `heavy_edges` es VIEW.
-**Mensaje**: el motor expande la vista a su source SQL inline, que es un SELECT con WHERE; al envolver con COUNT(*) cae al case de "agg sobre SELECT no-base".
+**Código de error original**: `[GBY-4028]` (mismo que Gap 1).
+**Query del bench**: `SELECT COUNT(*) FROM heavy_edges` donde `heavy_edges` es VIEW.
 
-**Causa raíz**: la expansión de vista (V) genera un derived-table-like wrapper; los agregados sobre ese wrapper caen al mismo case que JOIN+agg.
+**Causa raíz** (pre-fix): la expansión de vista (V) genera un derived source; los agregados sobre derived caían en el mismo path que JOIN+agg.
 
-**Workaround en bench**: cambié `COUNT(*) FROM heavy_edges` por `SELECT id, src, dst, weight FROM heavy_edges LIMIT 100` — sin agregar, sí funciona.
+**Fix aplicado**: la expansión de vista convierte el FROM a `derived_source`. Eso dispatch a `exec_select_joined` (línea 8544) — ahora ese path tiene aggregator gracias a F2. **Sin código adicional**.
 
-**Fix definitivo**: arreglar como sub-caso de **F2** (Gap 1). Cuando F2 esté, esto se arregla solo porque el wrapper view se convertirá en un node más del pipeline.
+**Test**: `f2_count_star_over_view`.
 
-**Prioridad**: P1 (junto con F2).
+**Prioridad**: ~~P1~~ — entregado junto con Gap 1.
 
 ---
 
@@ -194,13 +194,13 @@ Cambio sustantivo (~150 líneas + tests). Bloque deferred.
 
 | Gap | Código | Bloque | Prioridad |
 |---|---|---|---:|
-| 1 | `[GBY-4028]` | **F2** | P1 |
+| 1 | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 2 | ~~`[GBY-4002]`~~ | ~~F3~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 3 | parser | **E5** | P2 |
 | 4 | `[GBY-4067]` | **K3** | P2 |
 | 5 | `[GBY-4081]` | dependencia de E5 | P2 |
 | 6 | `[GBY-3001]` (bench) | **N5** (DEFAULT con función) | P2 |
-| 7 | `[GBY-4028]` (vista) | F2 (resuelve al cerrar Gap 1) | P1 |
+| 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |
 | 8 | sin código | **W4** | **P1 crítico** |
 | 9 | sin código | **K4** | P2 |
 | 10 | sin código | **P5b** | P1 (cuando llegue P5) |

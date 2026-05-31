@@ -4229,8 +4229,10 @@ fn f_aggregate_in_where_is_rejected() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn f_aggregate_over_join_rejected() -> Result<(), Box<dyn Error>> {
-    let db = temp_db_path("f_agg_join");
+fn f2_aggregate_over_join_count_inner() -> Result<(), Box<dyn Error>> {
+    // F2 (ADR-0066 Gap 1): COUNT(*) sobre INNER JOIN. Antes [GBY-4028];
+    // hoy `exec_aggregate_joined` bucketea las filas joineadas.
+    let db = temp_db_path("f2_agg_join_count");
     let wal = wal_path(&db);
     cleanup(&[&db, &wal]);
     let mut pager = Pager::create(&db)?;
@@ -4242,11 +4244,101 @@ fn f_aggregate_over_join_rejected() -> Result<(), Box<dyn Error>> {
     )?;
     run_sql(
         &db,
-        "INSERT INTO a (id,x) VALUES (1,10); INSERT INTO b (id,a_id) VALUES (10,1);",
+        "INSERT INTO a (id,x) VALUES (1,10), (2,20);
+         INSERT INTO b (id,a_id) VALUES (10,1), (11,1), (12,2);",
     )?;
-    let err = run_sql(&db, "SELECT COUNT(*) FROM a JOIN b ON a.id = b.a_id;").unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("[GBY-4028]"), "esperaba GBY-4028: {}", msg);
+    let res = run_sql(&db, "SELECT COUNT(*) FROM a JOIN b ON a.id = b.a_id;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f2_aggregate_over_join_sum_expr_left_join() -> Result<(), Box<dyn Error>> {
+    // F2 (ADR-0066 Gap 1): SUM(qty * price) sobre LEFT JOIN.
+    let db = temp_db_path("f2_agg_join_sum");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE orders (id INT PRIMARY KEY, cust INT);
+         CREATE TABLE lines (id INT PRIMARY KEY, order_id INT, qty INT, price INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO orders (id,cust) VALUES (1,100), (2,100), (3,200);
+         INSERT INTO lines (id,order_id,qty,price) VALUES \
+            (10,1,2,50), (11,1,3,10), (12,2,1,100);",
+    )?;
+    // order 3 sin lines → LEFT JOIN inyecta NULL en qty/price; SUM ignora.
+    let res = run_sql(
+        &db,
+        "SELECT SUM(l.qty * l.price) FROM orders o LEFT JOIN lines l ON o.id = l.order_id;",
+    )?;
+    assert_eq!(res[0].rows.len(), 1);
+    // 2*50 + 3*10 + 1*100 = 100 + 30 + 100 = 230
+    assert_eq!(res[0].rows[0][0], Value::Integer(230));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f2_count_star_over_view() -> Result<(), Box<dyn Error>> {
+    // F2 (ADR-0066 Gap 7): COUNT(*) FROM <view>. La vista se expande
+    // a derived source, que comparte el path joined del bloque H —
+    // exec_aggregate_joined ahora maneja ese caso igual que el JOIN.
+    let db = temp_db_path("f2_count_view");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE edges (id INT PRIMARY KEY, weight INT);")?;
+    run_sql(
+        &db,
+        "INSERT INTO edges (id,weight) VALUES (1,10),(2,60),(3,75),(4,90),(5,30);",
+    )?;
+    run_sql(
+        &db,
+        "CREATE VIEW heavy_edges AS SELECT id, weight FROM edges WHERE weight > 50;",
+    )?;
+    let res = run_sql(&db, "SELECT COUNT(*) FROM heavy_edges;")?;
+    assert_eq!(res[0].rows.len(), 1);
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn f2_aggregate_over_join_group_by_right_table() -> Result<(), Box<dyn Error>> {
+    // F2 (ADR-0066 Gap 1): GROUP BY sobre columna de la tabla derecha.
+    let db = temp_db_path("f2_agg_join_group");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE users (id INT PRIMARY KEY, nombre TEXT);
+         CREATE TABLE posts (id INT PRIMARY KEY, user_id INT);",
+    )?;
+    run_sql(
+        &db,
+        "INSERT INTO users (id,nombre) VALUES (1,'Ana'), (2,'Bob');
+         INSERT INTO posts (id,user_id) VALUES (10,1), (11,1), (12,1), (13,2);",
+    )?;
+    let res = run_sql(
+        &db,
+        "SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id \
+         GROUP BY u.nombre ORDER BY u.nombre;",
+    )?;
+    assert_eq!(res[0].rows.len(), 2);
+    assert_eq!(res[0].rows[0][0], Value::String("Ana".into()));
+    assert_eq!(res[0].rows[0][1], Value::Integer(3));
+    assert_eq!(res[0].rows[1][0], Value::String("Bob".into()));
+    assert_eq!(res[0].rows[1][1], Value::Integer(1));
     cleanup(&[&db, &wal]);
     Ok(())
 }
