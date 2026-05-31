@@ -2736,6 +2736,33 @@ impl<'a> Engine<'a> {
             });
         }
 
+        // K4 (ADR-0066 Gap 9, 2026-05-30): auto-index single-col sobre
+        // la primera columna de la PK compuesta. Permite que el planner
+        // resuelva `WHERE pk1 = X` por OrderedInt en O(log n + k) en
+        // vez de FullScan — equivalente al "left-most column match" de
+        // MySQL InnoDB sobre composite PK.
+        // Skip si el usuario ya declaró un índice single-col sobre pk1
+        // (inline UNIQUE, table-level UNIQUE single-col, o un ALTER
+        // posterior). El nombre reservado `_pk_prefix_<table>` marca
+        // el origen para `INTEGRITY CHECK` y futuros migrations.
+        if meta.has_composite_pk() && meta.index_for_column(&meta.primary_key).is_none() {
+            let first_pk = meta.primary_key.clone();
+            // PK compuesta exige all-INT NOT NULL (validado por K2 en
+            // catalog.rs), así que first_pk es siempre INT → OrderedInt.
+            let idx_root = self.pager.new_page()?;
+            let mut leaf = vec![0; self.pager.page_size()];
+            init_leaf_page(&mut leaf);
+            self.pager.write_page(idx_root, &leaf, true)?;
+            meta.indexes.push(IndexMeta {
+                name: format!("_pk_prefix_{}", meta.name.to_ascii_lowercase()),
+                column: first_pk,
+                root_page: idx_root,
+                unique: false,
+                kind: IndexKind::OrderedInt,
+                extra_columns: Vec::new(),
+            });
+        }
+
         // Residual #2 (2026-05-27): FKs table-level con nombre. La FK
         // se adjunta a la columna correspondiente del child, igual que
         // si hubiera venido inline — la diferencia es que `name` tiene

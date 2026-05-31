@@ -217,7 +217,7 @@ Resumen (10 gaps identificados, cada uno con código de error + query del bench 
 | 6 | Trigger PK auto-gen (sin SERIAL / DEFAULT con función) | bench design | N5 | P2 |
 | 7 | ~~`COUNT(*) FROM <view>`~~ | ~~`[GBY-4028]`~~ | ~~F2~~ ✓ | ~~P1~~ cerrado 2026-05-30 |
 | 8 | ~~**`RANK()` y `SUM OVER (PARTITION BY)` eran O(n²)**~~ | ~~sin código~~ | ~~**W4 crítico**~~ ✓ | ~~**P1**~~ cerrado 2026-05-30 |
-| 9 | PK compuesta partial scan no usa idx | sin código | K4 | P2 |
+| 9 | ~~PK compuesta partial scan no usa idx~~ | ~~sin código~~ | ~~K4~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 10 | Composite index no detecta `WHERE A AND B` | sin código | P5b | P1 (con P5) |
 
 **Política**: el bench tiene `bench_sql_or_skip` para los gaps documentados — la suite **no aborta** por una limitación conocida. Si aparece un gap NUEVO, agregarlo a ADR-0066 antes de aplicar el workaround.

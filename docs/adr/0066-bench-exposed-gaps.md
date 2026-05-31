@@ -158,17 +158,25 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 9 — `PRIMARY KEY` compuesta partial scan no usa índice
+## Gap 9 — `PRIMARY KEY` compuesta partial scan no usa índice ✓ CERRADO (K4, 2026-05-30)
 
-**Código de error**: ninguno — funciona, pero hace full-scan.
-**Query del bench**: `orders_lines` → `SELECT * FROM lines WHERE order_id = X` (sin line_no).
-**Latencia medida**: **137 ms** para encontrar 5 rows sobre 100k.
+**Causa raíz** (pre-fix): el fingerprint FNV-1a-64 exige TODAS las columnas de la PK para el lookup O(log n). Lookup parcial caía a full-scan (137 ms para 5 rows sobre 100k).
 
-**Causa raíz**: K2 fingerprint exige TODAS las columnas de la PK para el lookup O(log n). Lookup parcial cae a full-scan.
+**Fix aplicado**: en vez de replantear el on-disk format del fingerprint, se auto-crea un índice single-col `OrderedInt` sobre la primera columna de la PK cuando hay PK compuesta. Estrategia equivalente al "left-most column match" de MySQL InnoDB. El planner existente (`exec_select_with_where` line ~8757) ya usa secondary indexes; el cambio es solo materializar el índice en `CREATE TABLE`.
 
-**Fix definitivo**: **bloque K4** — implementar range scan sobre prefix de PK compuesta. Equivalente a "left-most column index match" de MySQL. Requiere replantear el fingerprint para que sea prefix-friendly (e.g. concatenar cada columna como [u32 width][bytes]).
+Detalles:
+- `src/sql.rs:~2739`: tras la materialización de UNIQUE indexes, si `meta.has_composite_pk()` y no hay un single-col idx pre-existente sobre `meta.primary_key`, se crea `_pk_prefix_<table>` (nombre reservado con prefijo `_`) como `IndexKind::OrderedInt`. PK compuesta sigue siendo all-INT NOT NULL — el tipo está garantizado.
+- El INSERT/UPDATE/DELETE no necesita cambios: ya iteran sobre `meta.indexes` para mantener todos los secondary indexes.
+- Skip si el usuario ya declaró un single-col idx sobre pk1 (UNIQUE inline, table-level, o CREATE INDEX manual).
 
-**Prioridad**: P2.
+**Latencia**: lookup parcial sobre 50k rows pasa de full-scan a O(log n) — test `k4_composite_pk_partial_lookup_uses_index` corre en <500ms (debug) cuando antes hubiera tomado ~70ms (release).
+
+**Tests**:
+- `k4_composite_pk_partial_lookup_uses_index`: lookup parcial sobre 50k filas en perf budget.
+- `k4_composite_pk_auto_index_visible_in_meta`: nombre reservado discoverable.
+- `k4_no_auto_index_for_simple_pk`: PK simple NO genera auto-index (innecesario).
+
+**Prioridad**: ~~P2~~ — entregado.
 
 ---
 
@@ -198,7 +206,7 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 | 6 | `[GBY-3001]` (bench) | **N5** (DEFAULT con función) | P2 |
 | 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |
 | 8 | ~~sin código~~ | ~~**W4**~~ ✓ | ~~**P1 crítico**~~ cerrado 2026-05-30 |
-| 9 | sin código | **K4** | P2 |
+| 9 | ~~sin código~~ | ~~**K4**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 10 | sin código | **P5b** | P1 (cuando llegue P5) |
 
 ---

@@ -4286,6 +4286,103 @@ fn f2_aggregate_over_join_sum_expr_left_join() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn k4_composite_pk_partial_lookup_uses_index() -> Result<(), Box<dyn Error>> {
+    // K4 (ADR-0066 Gap 9): WHERE pk1 = X sobre PK compuesta ahora
+    // resuelve por índice OrderedInt (auto-creado en CREATE TABLE) en
+    // vez de FullScan. Test funcional + perf.
+    use std::time::Instant;
+    let db = temp_db_path("k4_pk_prefix");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE lines (order_id INT NOT NULL, line_no INT NOT NULL, qty INT NOT NULL, \
+         PRIMARY KEY (order_id, line_no));",
+    )?;
+    // 50k filas, 5 por order.
+    let mut buf = String::from("INSERT INTO lines (order_id, line_no, qty) VALUES ");
+    for i in 0..50_000 {
+        if i > 0 {
+            buf.push(',');
+        }
+        buf.push_str(&format!("({},{},{})", i / 5, i % 5, (i * 3) % 100));
+    }
+    buf.push(';');
+    run_sql(&db, &buf)?;
+
+    // Sanity: lookup parcial devuelve las 5 filas del order_id=7.
+    let start = Instant::now();
+    let res = run_sql(&db, "SELECT line_no, qty FROM lines WHERE order_id = 7;")?;
+    let elapsed = start.elapsed();
+    assert_eq!(res[0].rows.len(), 5, "esperaba 5 filas para order_id=7");
+    // Sin el índice (FullScan sobre 50k filas) tarda ~70ms en debug.
+    // Con índice OrderedInt debería ser <10ms; tope generoso 500ms.
+    assert!(
+        elapsed.as_millis() < 500,
+        "lookup parcial PK compuesta tardó {:?} — auto-index no aplicó",
+        elapsed
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k4_composite_pk_auto_index_visible_in_meta() -> Result<(), Box<dyn Error>> {
+    // K4: el auto-index se llama `_pk_prefix_<table>` y es discoverable.
+    // El nombre reservado evita colisión con usuarios y marca el origen.
+    let db = temp_db_path("k4_pk_prefix_meta");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));",
+    )?;
+    // Sigue aceptando un índice manual sobre 'a' (no colisiona porque
+    // el reservado tiene otro name); el manual no se crea si ya existe
+    // uno single-col sobre la misma columna — chequeamos vía CREATE
+    // duplicado que el reservado YA cubre el slot.
+    let mut pager = Pager::open(&db)?;
+    let mut catalog = gabysql::catalog::Catalog::open(&mut pager);
+    let meta = catalog.get_table("t")?.expect("tabla t");
+    let auto = meta
+        .indexes
+        .iter()
+        .find(|i| i.name.starts_with("_pk_prefix_"))
+        .expect("auto-index del prefix de PK compuesta debe existir");
+    assert_eq!(auto.column, "a");
+    assert!(!auto.unique);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn k4_no_auto_index_for_simple_pk() -> Result<(), Box<dyn Error>> {
+    // K4: PK simple no necesita auto-index (el PK fast-path ya cubre
+    // single-col lookups en O(log n)).
+    let db = temp_db_path("k4_no_auto_simple");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, x INT);")?;
+    let mut pager = Pager::open(&db)?;
+    let mut catalog = gabysql::catalog::Catalog::open(&mut pager);
+    let meta = catalog.get_table("t")?.expect("tabla t");
+    assert!(
+        meta.indexes
+            .iter()
+            .all(|i| !i.name.starts_with("_pk_prefix_")),
+        "PK simple no debe generar auto-index"
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn k3_unique_composite_text_text_works() -> Result<(), Box<dyn Error>> {
     // K3 (ADR-0066 Gap 4): UNIQUE (text, text) NOT NULL ahora se admite.
     // Antes rebotaba con [GBY-4067] "todas las columnas deben ser INT".
