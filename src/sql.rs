@@ -11862,7 +11862,7 @@ impl<'a> Engine<'a> {
             let base_meta = scope.tables[0].meta.clone();
             let mut kept_rows = Vec::with_capacity(output_rows.len());
             let mut kept_having = Vec::with_capacity(having_maps.len());
-            for (row, having) in output_rows.into_iter().zip(having_maps.into_iter()) {
+            for (row, having) in output_rows.into_iter().zip(having_maps) {
                 let verdict = self.eval_where_expr_single(expr, &base_meta, &having)?;
                 if matches!(verdict, Some(true)) {
                     kept_rows.push(row);
