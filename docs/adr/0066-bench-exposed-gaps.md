@@ -105,19 +105,25 @@ Este ADR documenta cada gap UNA SOLA VEZ con:
 
 ---
 
-## Gap 6 — Trigger `BEFORE`/`AFTER` con `NEW.id` como PK del audit table
+## Gap 6 — Trigger `BEFORE`/`AFTER` con `NEW.id` como PK del audit table ✓ CERRADO parcialmente (N5, 2026-05-30)
 
-**Código de error**: `[GBY-3001]` PRIMARY KEY duplicada
-**Query del bench (original)**: trigger `AFTER UPDATE ON accounts FOR EACH ROW BEGIN INSERT INTO audit_log (id, ...) VALUES (NEW.id, ...) END` + UPDATE iterando sobre `id = (i % 100) + 1`
-**Mensaje**: `PRIMARY KEY duplicada: la clave 1 ya existe en la tabla`
+**Causa raíz**: era principalmente un bug del bench (audit PK colisionando con id source). El gap del motor era la falta de DEFAULT evaluado por función — UUID / now() no se podían usar en `DEFAULT` aunque ambos existían como funciones escalares.
 
-**Causa raíz**: **no es un gap del motor — es un bug del bench**. Pero lo dejo documentado porque es la trampa más fácil de caer cuando se diseñan triggers reales: si el audit log usa una columna source como PK, queda obligado a unicidad. La solución real-world es usar una secuencia / autoincrement / UUID.
+**Fix aplicado (N5)**:
+- Parser (`parse_default_expr` en `src/sql.rs:~25329`): tras `DEFAULT`, si el siguiente token es `ident(`, lo trata como llamada a función pura. Whitelist actual: `gen_random_uuid` / `uuid_v4` / `uuid_generate_v4` / `random_uuid`, `uuid_v7` / `uuid_generate_v7` / `gen_uuid_v7`, `current_timestamp` / `now`. Codifica como `Value::String("__GBY_DEFAULT_FN__<canonical>__")` — sin bump de `VERSION` on-disk: piggyback sobre el variant String del `DefaultLiteral` existente.
+- Eval (`evaluate_default_string` en `src/sql.rs:~13735`): `default_to_value` ahora detecta el prefijo reservado y dispatch a `gen_uuid_v4()` / `gen_uuid_v7()` / `now_datetime_utc()`. Strings que no matchean el prefijo siguen como literales TEXT.
 
-**Workaround en bench**: UPDATE con IDs únicos `(i + 1) as i64` rango 1..200 → cada trigger fire genera un audit_log con PK único.
+**Limitación residual**: `SERIAL` / `AUTOINCREMENT` (contador persistido) NO se entrega en N5 — requiere bump de `VERSION` para persistir el counter por columna. La solución actual cubre el caso de audit log via UUID, que es el caso del ADR original.
 
-**Fix futuro**: **bloque N5** — agregar `SERIAL` / `AUTOINCREMENT` o `gen_random_uuid()` como DEFAULT viable en columnas PK. Hoy hay `gen_random_uuid()` (Y5) pero el motor no lo evalúa como DEFAULT — solo como expresión SQL escalar.
+**Tests**:
+- `n5_default_gen_random_uuid`: tres INSERTs generan tres UUIDs distintos de 36 chars.
+- `n5_default_current_timestamp`: produce un string con shape `YYYY-MM-DD...`.
+- `n5_default_function_unknown_rejected`: función fuera del whitelist → error.
+- `n5_default_literal_string_still_works`: regresión — literales TEXT siguen intactos.
 
-**Prioridad**: P2.
+**Convención reservada**: el prefijo `__GBY_DEFAULT_FN__` queda reservado en el namespace de strings de gabysql; un usuario que persista un literal con ese prefijo se topará con la re-evaluación.
+
+**Prioridad**: ~~P2~~ — entregado (vía N5).
 
 ---
 
@@ -203,7 +209,7 @@ Detalles:
 | 3 | ~~parser~~ | ~~**E5**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 4 | ~~`[GBY-4067]`~~ | ~~**K3**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 5 | ~~`[GBY-4081]`~~ | ~~dependencia de E5~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
-| 6 | `[GBY-3001]` (bench) | **N5** (DEFAULT con función) | P2 |
+| 6 | ~~`[GBY-3001]` (bench)~~ | ~~**N5** (DEFAULT con función)~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
 | 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |
 | 8 | ~~sin código~~ | ~~**W4**~~ ✓ | ~~**P1 crítico**~~ cerrado 2026-05-30 |
 | 9 | ~~sin código~~ | ~~**K4**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |

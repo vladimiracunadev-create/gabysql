@@ -4286,6 +4286,107 @@ fn f2_aggregate_over_join_sum_expr_left_join() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn n5_default_gen_random_uuid() -> Result<(), Box<dyn Error>> {
+    // N5 (ADR-0066 Gap 6): DEFAULT gen_random_uuid() produce un UUID
+    // distinto por fila (36 chars canónicos).
+    let db = temp_db_path("n5_uuid_default");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE audit (id INT PRIMARY KEY, token TEXT NOT NULL DEFAULT gen_random_uuid());",
+    )?;
+    run_sql(&db, "INSERT INTO audit (id) VALUES (1), (2), (3);")?;
+    let res = run_sql(&db, "SELECT id, token FROM audit ORDER BY id;")?;
+    assert_eq!(res[0].rows.len(), 3);
+    let mut tokens: Vec<String> = Vec::new();
+    for row in &res[0].rows {
+        match &row[1] {
+            Value::String(s) => {
+                assert_eq!(s.len(), 36, "UUID v4 canónico debe tener 36 chars: {}", s);
+                assert_eq!(s.chars().filter(|c| *c == '-').count(), 4);
+                tokens.push(s.clone());
+            }
+            other => panic!("token no es string: {:?}", other),
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    assert_eq!(tokens.len(), 3, "UUIDs duplicados — DEFAULT no se reevaluó");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn n5_default_current_timestamp() -> Result<(), Box<dyn Error>> {
+    // N5: DEFAULT current_timestamp produce un timestamp con prefijo YYYY-MM-DD.
+    let db = temp_db_path("n5_now_default");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT current_timestamp());",
+    )?;
+    run_sql(&db, "INSERT INTO events (id) VALUES (1);")?;
+    let res = run_sql(&db, "SELECT created_at FROM events;")?;
+    match &res[0].rows[0][0] {
+        Value::String(s) => {
+            assert!(
+                s.len() >= 10 && s.chars().nth(4) == Some('-'),
+                "timestamp inesperado: {}",
+                s
+            );
+        }
+        other => panic!("created_at no es string: {:?}", other),
+    }
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn n5_default_function_unknown_rejected() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("n5_unknown_fn");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    let err = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, x TEXT DEFAULT not_a_known_fn());",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("no admitida"),
+        "esperaba error de whitelist: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn n5_default_literal_string_still_works() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("n5_literal");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active');",
+    )?;
+    run_sql(&db, "INSERT INTO t (id) VALUES (1);")?;
+    let res = run_sql(&db, "SELECT status FROM t;")?;
+    assert_eq!(res[0].rows[0][0], Value::String("active".into()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
 fn k4_composite_pk_partial_lookup_uses_index() -> Result<(), Box<dyn Error>> {
     // K4 (ADR-0066 Gap 9): WHERE pk1 = X sobre PK compuesta ahora
     // resuelve por índice OrderedInt (auto-creado en CREATE TABLE) en

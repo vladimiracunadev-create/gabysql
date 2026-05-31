@@ -13712,8 +13712,30 @@ fn default_to_value(default: &DefaultLiteral) -> Value {
         DefaultLiteral::Integer(n) => Value::Integer(*n),
         DefaultLiteral::Float(n) => Value::Float(*n),
         DefaultLiteral::Bool(b) => Value::Bool(*b),
-        DefaultLiteral::String(s) => Value::String(s.clone()),
+        DefaultLiteral::String(s) => evaluate_default_string(s),
     }
+}
+
+/// N5 (ADR-0066 Gap 6, 2026-05-30): si el string es una marca de
+/// función reservada (`__GBY_DEFAULT_FN__<name>__`), evaluamos la
+/// función ahora. Si no, es un literal TEXT normal. El prefijo
+/// reservado contiene caracteres que un literal de usuario
+/// difícilmente colisionaría — la convención `__GBY_*__` queda
+/// documentada como reservada.
+fn evaluate_default_string(s: &str) -> Value {
+    const PREFIX: &str = "__GBY_DEFAULT_FN__";
+    const SUFFIX: &str = "__";
+    if let Some(rest) = s.strip_prefix(PREFIX) {
+        if let Some(canonical) = rest.strip_suffix(SUFFIX) {
+            return match canonical {
+                "gen_random_uuid" => Value::String(gen_uuid_v4()),
+                "uuid_v7" => Value::String(gen_uuid_v7()),
+                "current_timestamp" => Value::String(now_datetime_utc()),
+                _ => Value::String(s.to_string()),
+            };
+        }
+    }
+    Value::String(s.to_string())
 }
 
 /// For every column the user did not list in INSERT, apply its DEFAULT (if
@@ -22562,7 +22584,12 @@ impl Parser {
                         name
                     )));
                 }
-                default = Some(self.expect_value()?);
+                // N5 (ADR-0066 Gap 6, 2026-05-30): además de literales,
+                // DEFAULT acepta llamadas a funciones puras del whitelist
+                // (gen_random_uuid, uuid_v7, current_timestamp, now). Se
+                // codifican como `Value::String` con prefijo reservado;
+                // `default_to_value` las re-evalúa en cada INSERT.
+                default = Some(self.parse_default_expr()?);
             } else if self.match_keyword("REFERENCES") {
                 if references.is_some() {
                     return Err(DbError::new(format!(
@@ -25324,6 +25351,45 @@ impl Parser {
             out.push(self.expect_value()?);
         }
         Ok(out)
+    }
+
+    /// N5 (ADR-0066 Gap 6, 2026-05-30): parsea el operando de DEFAULT.
+    /// Acepta literal escalar (vía `expect_value`) o llamada a función
+    /// pura sin argumentos del whitelist `gen_random_uuid` / `uuid_v4` /
+    /// `uuid_v7` / `current_timestamp` / `now`. El resultado se persiste
+    /// como `Value::String` con prefijo `__GBY_DEFAULT_FN__<canonical>__`
+    /// — `default_to_value` lo re-evalúa en cada INSERT.
+    fn parse_default_expr(&mut self) -> DbResult<Value> {
+        // Peek: si el siguiente token es un identificador y el de después
+        // es '(' entonces es una llamada a función.
+        let is_func_call = self.peek().kind == TokenKind::Ident
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .map(|t| t.kind == TokenKind::Symbol && t.text == "(")
+                .unwrap_or(false);
+        if !is_func_call {
+            return self.expect_value();
+        }
+        let raw_name = self.peek().text.clone();
+        let upper = raw_name.to_ascii_uppercase();
+        let canonical = match upper.as_str() {
+            "GEN_RANDOM_UUID" | "UUID_V4" | "UUID_GENERATE_V4" | "RANDOM_UUID" => "gen_random_uuid",
+            "UUID_V7" | "UUID_GENERATE_V7" | "GEN_UUID_V7" => "uuid_v7",
+            "CURRENT_TIMESTAMP" | "NOW" => "current_timestamp",
+            _ => {
+                return Err(DbError::new(format!(
+                    "DEFAULT '{}()': función no admitida como DEFAULT. \
+                     Whitelist: gen_random_uuid, uuid_v7, current_timestamp, now.",
+                    raw_name
+                )));
+            }
+        };
+        // Consumir ident y `()`.
+        self.pos += 1;
+        self.expect_symbol("(")?;
+        self.expect_symbol(")")?;
+        Ok(Value::String(format!("__GBY_DEFAULT_FN__{}__", canonical)))
     }
 
     fn expect_value(&mut self) -> DbResult<Value> {

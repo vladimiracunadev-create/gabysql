@@ -24,7 +24,7 @@
 | **Fase 4** | Operación de producto, release, backups | 🟡 | gabysql backup/restore/verify funciona, falta release process formal |
 | **Fase 5** | AI-native (MCP gateway) | 🟡 | binario `gabysql-mcp` existe, falta endurecer |
 
-**Tests integración: 741 verdes + 1 ignored** (Argon2id RFC test marcado por la limitación arriba).
+**Tests integración: 745 verdes + 1 ignored** (Argon2id RFC test marcado por la limitación arriba).
 
 ---
 
