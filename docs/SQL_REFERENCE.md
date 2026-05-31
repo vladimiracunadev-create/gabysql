@@ -266,7 +266,7 @@ column_constraint ::= [ "CONSTRAINT" identifier ]
                     ( "PRIMARY" "KEY"
                     | "NOT" "NULL"
                     | "UNIQUE"
-                    | "DEFAULT" literal
+                    | "DEFAULT" default_value
                     | "CHECK" "(" expr ")"
                     | "REFERENCES" identifier "(" identifier ")" fk_action* )
 table_constraint  ::= [ "CONSTRAINT" identifier ]
@@ -279,6 +279,10 @@ fk_action      ::= ("ON" "DELETE" | "ON" "UPDATE")
                    ("RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT" | "NO" "ACTION")
 type           ::= "INT" | "TEXT" | "BOOL" | "FLOAT" | "DATE" | "DATETIME" | "JSON"
 literal        ::= integer | float | string | "TRUE" | "FALSE" | "NULL"
+default_value  ::= literal | default_fn
+default_fn     ::= ("gen_random_uuid" | "uuid_v4" | "uuid_generate_v4" | "random_uuid"
+                  | "uuid_v7" | "uuid_generate_v7" | "gen_uuid_v7"
+                  | "current_timestamp" | "now") "(" ")"
 identifier     ::= [A-Za-z_][A-Za-z0-9_]*
 ```
 
@@ -288,6 +292,7 @@ Notas:
 - `DEFAULT NULL` es válido pero incompatible con `NOT NULL` en la misma columna.
 - `DEFAULT` no se admite sobre la PK.
 - El literal de `DEFAULT` debe coincidir con el tipo de la columna; `name TEXT DEFAULT 1` se rechaza en `CREATE TABLE`.
+- **`DEFAULT <fn>()`** (N5, 2026-05-30): además de literales, `DEFAULT` acepta una llamada sin argumentos a una función pura del whitelist: `gen_random_uuid` (alias: `uuid_v4`, `uuid_generate_v4`, `random_uuid`), `uuid_v7` (alias: `uuid_generate_v7`, `gen_uuid_v7`), `current_timestamp` (alias: `now`). La función se re-evalúa por fila en cada INSERT. Funciones fuera del whitelist se rechazan en `CREATE TABLE`. Ver [ADR-0066 Gap 6](adr/0066-bench-exposed-gaps.md).
 - **`CHECK (expr)`** (L2/VERSION 10) admite cualquier expresión Expr (booleana 3VL ANSI). Se evalúa en INSERT/UPDATE/UPSERT/cascade. Subqueries dentro de `CHECK` se rechazan con `[GBY-4069]`. Persistencia como texto canónico vía `format_expr` + reparse en cada open. `[GBY-3008] CHECK_VIOLATED` cuando falla.
 - **`REFERENCES <tabla>(<col>)`**: el target column debe ser la PK del parent (no se admiten FKs contra `UNIQUE` no-PK). El tipo de la FK debe coincidir con el de la PK referenciada. Self-references válidas. Acciones referenciales completas en `ON DELETE` y `ON UPDATE` (L1/V9 + residual #4): `RESTRICT` (default), `CASCADE`, `SET NULL`, `SET DEFAULT`, `NO ACTION`. **FK multi-col** (residual #3/V12) via constraint table-level `FOREIGN KEY (a, b) REFERENCES p (x, y)` — target debe ser la PK compuesta del parent, lookup O(log n) por fingerprint K2.
 - **`CONSTRAINT <name>`** (residual #2/V11): nombre opcional para PK/UNIQUE/FK/CHECK; útil con `ALTER TABLE DROP CONSTRAINT <name>` después.

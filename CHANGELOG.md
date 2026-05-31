@@ -6,6 +6,101 @@
 
 ---
 
+## 2026-05-30 — Bloques F3 + F2 + W4 + E5 + K3 + K4 + N5: 7 gaps del ADR-0066 cerrados
+
+> **Siete pushes a `main`** en una sesión. Cierre del catálogo completo de gaps que el benchmark de 2026-05-29 había expuesto sobre el motor SQL (ADR-0066 Gap 1–9, todos los P1 + cuatro P2). Sin bump de `VERSION` on-disk. Detalle por bloque y por test en [`docs/adr/0066-bench-exposed-gaps.md`](docs/adr/0066-bench-exposed-gaps.md).
+
+### 🆕 Comportamiento habilitado
+
+```sql
+-- F3 (Gap 2): BETWEEN sin índice ordenado ahora FullScan + post-filter
+SELECT order_id FROM lines WHERE qty BETWEEN 1 AND 5;
+-- antes [GBY-4002]; hoy mismo path que `=`/`>`/`<`/`LIKE`.
+
+-- F2 (Gap 1+7): agregados sobre SELECT con JOIN + COUNT(*) sobre vista
+SELECT u.nombre, COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id
+WHERE u.id = 7 GROUP BY u.nombre;
+SELECT COUNT(*) FROM heavy_edges;  -- heavy_edges es VIEW
+-- antes [GBY-4028]; hoy `exec_aggregate_joined` bucketea filas joineadas.
+
+-- W4 (Gap 8): RANK / SUM OVER (PARTITION BY) en O(n) por partition
+SELECT region, revenue,
+       RANK() OVER (PARTITION BY region ORDER BY revenue DESC),
+       SUM(revenue) OVER (PARTITION BY region ORDER BY revenue DESC)
+FROM sales;
+-- antes O(n²): 44-60s para 500 rows. Hoy 2000 rows en <0.5s (debug).
+
+-- E5 (Gap 3+5): SELECT sin FROM (bare-SELECT)
+SELECT 1;
+SELECT 1 AS n, 0 AS depth;  -- anchor típico de WITH RECURSIVE
+SELECT (SELECT COUNT(*) FROM events WHERE kind = 'view');
+
+-- K3 (Gap 4): UNIQUE / CREATE INDEX multi-col acepta TEXT, DATE,
+--             DATETIME, TIME, UUID, FLOAT, BOOL además de INT
+CREATE TABLE parts (id INT PRIMARY KEY, code TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    CONSTRAINT u_code_region UNIQUE (code, region));
+
+-- K4 (Gap 9): partial PK lookup sobre composite PK auto-indexado
+CREATE TABLE lines (order_id INT NOT NULL, line_no INT NOT NULL,
+                    PRIMARY KEY (order_id, line_no));
+-- auto-crea `_pk_prefix_lines` OrderedInt sobre order_id
+SELECT * FROM lines WHERE order_id = 7;  -- O(log n) en vez de FullScan
+
+-- N5 (Gap 6): DEFAULT con función pura
+CREATE TABLE audit (id INT PRIMARY KEY,
+                    token TEXT NOT NULL DEFAULT gen_random_uuid(),
+                    created_at TEXT NOT NULL DEFAULT current_timestamp());
+-- antes solo literales; hoy whitelist:
+--   gen_random_uuid / uuid_v4 / random_uuid / uuid_generate_v4
+--   uuid_v7 / uuid_generate_v7 / gen_uuid_v7
+--   current_timestamp / now
+```
+
+### 🔑 Decisiones clave
+
+- **Sin bump on-disk**: ningún bloque cambia el formato de página, encoder de fila o catálogo. K3 y K4 piggyback sobre `IndexMeta` y `DefaultLiteral::String` existentes. N5 codifica la función como string con prefijo reservado `__GBY_DEFAULT_FN__<canonical>__`. F3/F2/W4/E5 son planner-only.
+- **F3**: el `else` final del planner BETWEEN ya no rebota — cae a FullScan, alineado con `=`. `generic_post_filter` se fuerza cuando no hay fast-path (PK simple o índice OrderedInt).
+- **F2**: nuevo `exec_aggregate_joined` (~250 líneas) bucketea filas joineadas con keys cualificadas, reusa `compute_aggregate` con `AggArg::Expr` pre-rewriteado. HAVING vía `eval_where_expr_single` sobre buckets indexados por output_name + canonical. **Limitación residual**: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando.
+- **W4**: nueva `fill_window_partition_into` (~250 líneas) hace una sola pasada por partition. RANK/DENSE_RANK por adjacent-compare; SUM/AVG/COUNT/MIN/MAX por prefix arrays (running con ORDER BY, single-pass sin).
+- **E5**: parser sale temprano con `table=""` sentinel cuando no hay FROM; engine `exec_bare_select` evalúa cada `SelectItem` contra fila vacía con `eval_expr_full`. `*` / Aggregate / Window rechazados sin row scope.
+- **K3**: nuevo helper `validate_composite_member(col, ctx, require_not_null)`. Whitelist explícita (INT/FLOAT/BOOL/TEXT/DATE/DATETIME/TIME/UUID); rechaza JSON/BLOB/DECIMAL. `require_not_null=true` solo para UNIQUE en CREATE TABLE (preserva pre-K3); CREATE INDEX deja el NULL check al runtime.
+- **K4**: auto-index `_pk_prefix_<table>` OrderedInt sobre la primera col de PK compuesta — equivalente al left-most column match de MySQL InnoDB. El planner ya usaba secondary indexes; solo se materializa en `CREATE TABLE`. Skip si el user ya declaró un single-col idx sobre pk1.
+- **N5**: prefijo reservado en namespace de literales TEXT. El parser `parse_default_expr` whitelistea las funciones puras; `evaluate_default_string` dispatch a `gen_uuid_v4` / `gen_uuid_v7` / `now_datetime_utc` por canonical name. Función fuera del whitelist → error. **Limitación residual**: SERIAL/AUTOINCREMENT (counter persistido) NO se entrega — requeriría bump VERSION.
+
+### 🧪 Tests agregados (+21)
+
+- F3: `where_between_on_non_indexed_column_full_scans`, `where_between_on_text_indexed_column_full_scans` (renombrado de `_is_rejected`).
+- F2: `f2_aggregate_over_join_count_inner`, `f2_aggregate_over_join_sum_expr_left_join`, `f2_aggregate_over_join_group_by_right_table`, `f2_count_star_over_view`.
+- W4: `w4_rank_sum_over_2k_rows_is_linear`, `w4_rank_dense_rank_matches_expected_values`, `w4_sum_over_running_prefix`.
+- E5: `e5_bare_select_literal`, `e5_bare_select_multi_with_aliases`, `e5_bare_select_scalar_subquery`, `e5_bare_select_with_limit_offset`.
+- K3: `k3_unique_composite_text_text_works`, `k3_unique_composite_text_nullable_rejected`, `k3_create_index_composite_text_int_works`, `k3_create_index_composite_blob_rejected`, `k2_index_composite_unsupported_type_error` (actualizado).
+- K4: `k4_composite_pk_partial_lookup_uses_index`, `k4_composite_pk_auto_index_visible_in_meta`, `k4_no_auto_index_for_simple_pk`.
+- N5: `n5_default_gen_random_uuid`, `n5_default_current_timestamp`, `n5_default_function_unknown_rejected`, `n5_default_literal_string_still_works`.
+
+**Total**: 745 verdes + 1 ignored (Argon2id RFC).
+
+### 🧹 Códigos `[GBY-*]` afectados
+
+- `[GBY-4002]` BETWEEN sin índice → **inactivo** desde F3.
+- `[GBY-4028]` Aggregate over JOIN → **restringido** a `COUNT(DISTINCT col)` sobre JOIN únicamente.
+- `[GBY-4067]` Composite index requires all-INT → **redefinido** por K3 (acepta más tipos; rechaza JSON/BLOB/DECIMAL).
+
+### 🚫 Gaps del ADR-0066 que quedan abiertos
+
+- **Gap 10** (`P5b`): composite index AND detection en el planner. Depende del bloque **P5** (planner real, no entregado).
+
+### 📊 Bench: revertimientos de workaround
+
+- `microblog.JOIN+COUNT (u.id=7)` deja de ser SKIP — mide (F2).
+- `events.Subquery escalar bare-SELECT` deja de ser SKIP — mide (E5).
+- `orders_lines.Composite range qty BETWEEN` deja de ser SKIP — mide como `BETWEEN qty 1..5 (no idx, full scan)` (F3).
+- `graph.COUNT(*) FROM heavy_edges` agregado como nueva query (F2 Gap 7).
+- `analytics.RANK / SUM OVER` vuelven de 2 → 5 iters (W4).
+- `constraint_zoo.parent_cz` declara `UNIQUE (code, region)` multi-col en vez de single-col TEXT por workaround pre-K3.
+
+---
+
 ## 2026-05-29 — Bloque P3: `ANALYZE <table>` + EXPLAIN consume stats
 
 > **Un push a `main`** sin bump on-disk. Tercer sub-bloque de Fase 3. Detalle en [`docs/adr/0065-p3-analyze-stats.md`](docs/adr/0065-p3-analyze-stats.md).

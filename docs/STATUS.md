@@ -172,6 +172,11 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **N4** — nested transactions (depende de T1).
 > - ~~**F2** — agregados sobre `SELECT` con JOIN~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 1+7). Limitación residual: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando.
 > - ~~**F3** — full-scan-fallback para `BETWEEN` sin índice~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 2).
+> - ~~**W4** — window functions O(n²) → O(n) por partition~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 8 crítico).
+> - ~~**E5** — bare-SELECT sin FROM~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 3+5).
+> - ~~**K3** — UNIQUE/CREATE INDEX multi-col acepta TEXT/UUID/etc~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 4).
+> - ~~**K4** — auto-index sobre primera col de PK compuesta~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 9).
+> - ~~**N5** — DEFAULT con función pura (UUID, current_timestamp)~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 6). Limitación residual: SERIAL/AUTOINCREMENT persistido requiere bump VERSION.
 > - **Y10** — ARRAY type + JSONB.
 > - **X5** — cursores explícitos.
 
