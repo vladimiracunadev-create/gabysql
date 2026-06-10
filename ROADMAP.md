@@ -8,24 +8,23 @@
 
 ---
 
-## 📊 Snapshot 2026-05-30 — qué está cerrado por Fase
+## 📊 Snapshot 2026-06-09 — qué está cerrado por Fase
 
 | Fase | Subsistema | Estado | Detalle |
 |---|---|:---:|---|
-| **Fase 1** | Core (Pager, B+Tree, WAL, catálogo, índices) | 🟢 | VERSION on-disk 31, CRC32 trailer, replay, autovacuum no-impl |
+| **Fase 1** | Core (Pager, B+Tree, WAL, catálogo, índices) | 🟢 | VERSION on-disk 32, CRC32 trailer, replay, autovacuum no-impl |
 | **Fase 1** | SQL declarativo y procedural | 🟢 | DDL+DML+JOINs+CTEs+window functions+triggers+procedures+functions+IF/CASE/WHILE/FOR/RAISE/EXCEPTION |
 | **Fase 1** | Tipos extendidos (Y1→Y9) | 🟢 | INT widths, DECIMAL exacto i128, BLOB, TIME, UUID, UNSIGNED, aliases ANSI |
 | **Fase 2** | Identidad SQL-level (Z1+Z1b+Z1c+Z1d+Z1e+Z1f) | 🟡 | USERS+ROLES, PBKDF2 default, scrypt scheme=2, Blake2b RFC 7693, Argon2id estructural (no matchea vector RFC 9106 §A.3, mar­cado en ADR-0061) |
 | **Fase 2** | Authz (Z2 + Z3+Z3b+Z3c+Z3d+Z3e+Z3f) | 🟢 | GRANT/REVOKE bitmask + SET SESSION AUTH + RLS USING/WITH CHECK + RETURNING filter + DEFAULTs antes de check |
-| **Fase 3** | Plan textual (P1+P2+P3) | 🟢 | EXPLAIN dry-run + EXPLAIN ANALYZE con Instant + ANALYZE TABLE con stats session-scoped |
+| **Fase 3** | Plan textual (P1+P2+P3+P3b) | 🟢 | EXPLAIN dry-run + EXPLAIN ANALYZE con Instant + ANALYZE TABLE **con stats persistidas en catálogo** (P3b, 2026-06-09; sobreviven a reopen) |
 | **Cross-fase** | ADR-0066 (F3+F2+W4+E5+K3+K4+N5) | 🟢 | 9/10 gaps del bench cerrados 2026-05-30 (7 bloques): BETWEEN sin idx, agregados sobre JOIN/view, window funcs O(n), bare-SELECT, UNIQUE multi-col TEXT, auto-index prefix PK, DEFAULT con función. Gap 10 (P5b) depende de P5. |
-| **Fase 3** | Cost estimates per-column | 🔴 | P4 (NDV/MCV/histogramas) |
-| **Fase 3** | Stats persistidas en catálogo | 🔴 | P3b |
+| **Fase 3** | Cost estimates per-column | 🔴 | P4 (NDV/MCV/histogramas) — slot `ObjectKind::TableStats` ya existe (P3b), P4 extiende `StatsMeta` |
 | **Fase 3** | Planner-as-optimizer | 🔴 | P5 (reorden de joins, choice de índice por costo) |
 | **Fase 4** | Operación de producto, release, backups | 🟡 | gabysql backup/restore/verify funciona, falta release process formal |
 | **Fase 5** | AI-native (MCP gateway) | 🟡 | binario `gabysql-mcp` existe, falta endurecer |
 
-**Tests integración: 745 verdes + 1 ignored** (Argon2id RFC test marcado por la limitación arriba).
+**Tests integración: 749 verdes + 1 ignored** (Argon2id RFC test marcado por la limitación arriba; +4 P3b suite).
 
 ---
 
@@ -35,9 +34,9 @@
 
 ### Cierre inmediato de Fase 3 — performance / planeación
 
-1. **P3b — Persistir stats en el catálogo.** Nuevo `ObjectKind::TableStats` + bump VERSION 31→32. Lifecycle ligado a la tabla (DROP TABLE borra; CREATE no crea). Migración: catálogo legacy no trae stats, se generan on-demand al primer ANALYZE.
-2. **P4 — Stats por-columna.** NDV vía HyperLogLog (8KB por columna), top-K MCV (K=10), histogramas equi-depth (50 buckets). Habilita estimación de selectividad real: `WHERE col = 'X'` puede estimar rows en lugar de mostrar solo `est.rows=total`.
-3. **P5 — Planner-as-optimizer.** Reordena INNER JOINs por costo (selectividad acumulada × cardinalidad), elige índice cuando hay varios candidatos sobre la misma tabla, decide hash-join vs nested-loop por tamaño relativo. Sin esto, gabysql sigue siendo "ejecutor con plan fijo".
+1. ~~**P3b — Persistir stats en el catálogo.**~~ ✅ **cerrado 2026-06-09** ([ADR-0067](docs/adr/0067-p3b-persistent-stats.md)). Nuevo `ObjectKind::TableStats` + bump VERSION 31→32. Lifecycle ligado a la tabla (DROP TABLE borra). Hidratación automática en `Engine::new`. +4 tests `p3b_*`.
+2. **P4 — Stats por-columna.** NDV vía HyperLogLog (8KB por columna), top-K MCV (K=10), histogramas equi-depth (50 buckets). Habilita estimación de selectividad real: `WHERE col = 'X'` puede estimar rows en lugar de mostrar solo `est.rows=total`. El slot `ObjectKind::TableStats` ya existe (P3b); P4 extiende `StatsMeta` con un `Vec<ColumnStats>`.
+3. **P5 — Planner-as-optimizer.** Reordena INNER JOINs por costo (selectividad acumulada × cardinalidad), elige índice cuando hay varios candidatos sobre la misma tabla, decide hash-join vs nested-loop por tamaño relativo. Sin esto, gabysql sigue siendo "ejecutor con plan fijo". Sub-tarea **P5b** cierra el Gap 10 del bench ([ADR-0066](docs/adr/0066-bench-exposed-gaps.md)).
 4. **P6 — `gabybench` con benchmarks reproducibles** + tracking de regresiones en CI.
 
 ### Fase 4 — operación de producto

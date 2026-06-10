@@ -170,7 +170,16 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        nuevo flag `COLUMN_FLAG_HAS_DECIMAL_META = 0x20`. Value
 //        gana variante `Decimal { value: i128, scale: u8 }`. V21
 //        rechazados con `[GBY-1003]`.
-pub const VERSION: u32 = 31;
+//  32 -> Bloque P3b (2026-06-09): stats por tabla persistidas en
+//        catálogo vía nuevo `ObjectKind::TableStats` (code = 9).
+//        Record: `StatsMeta { name, row_count, analyzed_at_nanos }`
+//        bajo clave `__stats__:<tabla>`. `ANALYZE` upsert el record,
+//        `DROP TABLE` lo borra, `Engine::open` hidrata el HashMap
+//        en memoria desde el catálogo. V31 rechazados con
+//        `[GBY-1003]` aunque la única diferencia sea el nuevo kind:
+//        política conservadora del motor — sin auto-upgrade entre
+//        versiones de formato.
+pub const VERSION: u32 = 32;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

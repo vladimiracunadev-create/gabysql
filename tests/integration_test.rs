@@ -17132,7 +17132,15 @@ fn p3_analyze_returns_row_count() -> Result<(), Box<dyn Error>> {
     assert_eq!(last.rows[0][0], Value::String("t".to_string()));
     assert_eq!(last.rows[0][1], Value::Integer(3));
     let msg = last.message.clone().unwrap_or_default();
-    assert!(msg.contains("session-scoped") || msg.contains("Cache session-scoped"));
+    // P3b (VERSION 32): el mensaje cambió de "session-scoped" a
+    // "Persistidas en catálogo". Aceptamos cualquiera por compat futura.
+    assert!(
+        msg.contains("Persistidas en catálogo")
+            || msg.contains("session-scoped")
+            || msg.contains("Cache session-scoped"),
+        "mensaje inesperado: {}",
+        msg
+    );
     cleanup(&[&db, &wal]);
     Ok(())
 }
@@ -17221,20 +17229,26 @@ fn p3_explain_con_where_pk_lookup_muestra_est_rows() -> Result<(), Box<dyn Error
 }
 
 #[test]
-fn p3_stats_son_session_scoped_se_pierden_en_reapertura() -> Result<(), Box<dyn Error>> {
-    let (db, wal) = p3_setup("session")?;
+fn p3_stats_persisten_a_traves_de_reapertura_p3b() -> Result<(), Box<dyn Error>> {
+    // Bloque P3b (VERSION 32, 2026-06-09): este test originalmente
+    // validaba que las stats eran session-scoped (P3 puro). Con P3b
+    // el contrato cambia — ahora persisten en catálogo, así que la
+    // segunda apertura debe verlas. Mantengo el test invertido para
+    // documentar el cambio de contrato y prevenir regresión.
+    let (db, wal) = p3_setup("p3b-cross-session")?;
     run_sql(
         &db,
         "CREATE TABLE t (id INT PRIMARY KEY);
          INSERT INTO t (id) VALUES (1),(2);
          ANALYZE TABLE t;",
     )?;
-    // Re-apertura: nueva sesión, stats vacías.
+    // Re-apertura: nueva sesión. Pre-P3b: stats vacías. Post-P3b:
+    // hidratadas del catálogo.
     let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
     let detail = extract_scan_detail(res.last().unwrap());
     assert!(
-        !detail.contains("est.rows="),
-        "post-reapertura no debería haber stats (P3 session-scoped), vi: {}",
+        detail.contains("[est.rows=2]"),
+        "P3b: stats deben sobrevivir reapertura, esperaba [est.rows=2] vi: {}",
         detail
     );
     cleanup(&[&db, &wal]);
@@ -17258,6 +17272,117 @@ fn p3_drop_table_invalida_stats() -> Result<(), Box<dyn Error>> {
     assert!(
         !detail.contains("est.rows=3"),
         "DROP debe invalidar stats viejas, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque P3b (2026-06-09): persistencia de stats en catálogo
+// vía ObjectKind::TableStats (VERSION 32). Las stats sobreviven
+// a un re-open del Engine; DROP TABLE las limpia del catálogo.
+// ============================================================
+
+#[test]
+fn p3b_stats_sobreviven_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p3b-reopen")?;
+    // 1ra sesión: crear, insertar, ANALYZE → debería persistir.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70);
+         ANALYZE TABLE t;",
+    )?;
+    // 2da sesión: SIN ejecutar ANALYZE de nuevo, EXPLAIN debe
+    // mostrar las stats hidratadas desde el catálogo.
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("[est.rows=7]"),
+        "P3b: stats deberían sobrevivir reopen, esperaba [est.rows=7] vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3b_drop_table_borra_stats_del_catalogo() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p3b-drop")?;
+    // ANALYZE persiste, DROP TABLE debe borrar el record.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9);
+         ANALYZE TABLE t;
+         DROP TABLE t;",
+    )?;
+    // Re-creamos la tabla en una sesión nueva. Si DROP no hubiera
+    // borrado las stats persistidas, la 2da sesión hidrataría
+    // stats viejas (9 rows) que no corresponden a la tabla nueva.
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         EXPLAIN SELECT * FROM t;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.rows=9"),
+        "P3b: DROP debe limpiar stats persistidas, vi residuo: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3b_analyze_sobrescribe_stats_persistidas() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p3b-overwrite")?;
+    // 1er ANALYZE persiste row_count=3.
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1),(2),(3);
+         ANALYZE TABLE t;",
+    )?;
+    // 2da sesión: insertamos 4 más y re-corremos ANALYZE.
+    // Debe sobrescribir, no duplicar el record.
+    run_sql(
+        &db,
+        "INSERT INTO t (id) VALUES (4),(5),(6),(7);
+         ANALYZE TABLE t;",
+    )?;
+    // 3ra sesión: hidratar y verificar que el valor es el nuevo (7).
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("[est.rows=7]"),
+        "P3b: ANALYZE debe sobrescribir, esperaba [est.rows=7] vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p3b_db_sin_analyze_arranca_sin_stats() -> Result<(), Box<dyn Error>> {
+    // Caso regression: una DB recién creada (o que nunca corrió
+    // ANALYZE) debe abrir limpio — sin records TableStats el
+    // hydrate devuelve HashMap vacío y EXPLAIN no muestra est.rows.
+    let (db, wal) = p3_setup("p3b-empty")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1),(2);",
+    )?;
+    // Re-open sin ANALYZE.
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.rows="),
+        "P3b: DB sin ANALYZE no debe mostrar est.rows, vi: {}",
         detail
     );
     cleanup(&[&db, &wal]);

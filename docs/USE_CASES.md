@@ -514,7 +514,7 @@ curl -s "http://localhost:8080/schema?db=prod.db&table=orders" \
 TMP=$(mktemp -d)
 cd "$TMP"
 
-# Crear DB nueva (formato actual VERSION 31)
+# Crear DB nueva (formato actual VERSION 32)
 ./target/release/gabysql init smoke.db
 ./target/release/gabysql info smoke.db
 # pageSize=4096  pageCount=1  catalogRoot=0

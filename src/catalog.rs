@@ -1262,6 +1262,7 @@ impl ViewMeta {
 ///
 /// Bloque X1 (VERSION 14, 2026-05-28): agregado `Trigger`.
 /// Bloque X3 (VERSION 15, 2026-05-28): agregado `Procedure`.
+/// Bloque P3b (VERSION 32, 2026-06-09): agregado `TableStats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Table,
@@ -1281,6 +1282,11 @@ pub enum ObjectKind {
     /// Bloque Z3 (VERSION 25): policy de Row-Level Security — predicado
     /// USING(expr) por (name, table, action). Ver `PolicyMeta`.
     Policy,
+    /// Bloque P3b (VERSION 32): stats por tabla persistidas (`row_count`
+    /// y `analyzed_at_nanos` calculadas por `ANALYZE <table>`). Lifecycle:
+    /// se sobrescriben con cada `ANALYZE` y se borran con `DROP TABLE`.
+    /// Ver `StatsMeta`; clave del catálogo: `__stats__:<tabla>`.
+    TableStats,
 }
 
 impl ObjectKind {
@@ -1295,6 +1301,7 @@ impl ObjectKind {
             Self::Role => 6,
             Self::Grant => 7,
             Self::Policy => 8,
+            Self::TableStats => 9,
         }
     }
 
@@ -1309,8 +1316,9 @@ impl ObjectKind {
             6 => Ok(Self::Role),
             7 => Ok(Self::Grant),
             8 => Ok(Self::Policy),
+            9 => Ok(Self::TableStats),
             other => Err(DbError::new(format!(
-                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role, 7=Grant, 8=Policy)",
+                "kind de objeto desconocido en catálogo: {} (esperaba 0=Table, 1=View, 2=Trigger, 3=Procedure, 4=Function, 5=User, 6=Role, 7=Grant, 8=Policy, 9=TableStats)",
                 other
             ))),
         }
@@ -1848,7 +1856,61 @@ impl PolicyMeta {
     }
 }
 
-/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user, role, grant o policy.
+/// Bloque P3b (VERSION 32): stats por tabla persistidas en catálogo.
+///
+/// Refleja el `TableStats` en memoria del Engine (ver `sql.rs`) pero
+/// agregando `name` porque el catálogo necesita asociar el record con
+/// la tabla. La clave del record es `__stats__:<tabla>` para no
+/// colisionar con el record de la tabla (que usa `hash_name(tabla)`).
+///
+/// `row_count` es exacto al momento de `ANALYZE`. Queda **stale** si
+/// la tabla cambia después — invalidación manual reejecutando ANALYZE.
+/// `analyzed_at_nanos` es el wall-clock en nanos del momento del
+/// `ANALYZE`, útil para que EXPLAIN muestre cuán viejas son las stats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsMeta {
+    pub name: String,
+    pub row_count: u64,
+    pub analyzed_at_nanos: u128,
+}
+
+impl StatsMeta {
+    /// Clave del catálogo para el record de stats de una tabla. El
+    /// prefijo `__stats__:` evita colisión con el record de la tabla
+    /// (que usa `hash_name(tabla)`).
+    pub fn catalog_key_name(table: &str) -> String {
+        format!("__stats__:{}", table.to_ascii_lowercase())
+    }
+
+    pub fn serialize(&self) -> DbResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(32 + self.name.len());
+        push_string(&mut out, &self.name)?;
+        out.extend_from_slice(&self.row_count.to_le_bytes());
+        out.extend_from_slice(&self.analyzed_at_nanos.to_le_bytes());
+        Ok(out)
+    }
+
+    pub fn deserialize(data: &[u8]) -> DbResult<Self> {
+        let mut offset = 0usize;
+        let name = take_string(data, &mut offset)?;
+        if offset + 8 + 16 > data.len() {
+            return Err(DbError::new(format!(
+                "StatsMeta corrupto: faltan {} bytes para row_count(u64)+analyzed_at_nanos(u128)",
+                (offset + 8 + 16).saturating_sub(data.len())
+            )));
+        }
+        let row_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let analyzed_at_nanos = u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
+        Ok(Self {
+            name,
+            row_count,
+            analyzed_at_nanos,
+        })
+    }
+}
+
+/// Wrapper de lectura para un record del catálogo — tabla, vista, trigger, procedure, function, user, role, grant, policy o table stats.
 #[derive(Debug, Clone)]
 pub enum CatalogObject {
     Table(TableMeta),
@@ -1860,6 +1922,7 @@ pub enum CatalogObject {
     Role(RoleMeta),
     Grant(GrantMeta),
     Policy(PolicyMeta),
+    TableStats(StatsMeta),
 }
 
 impl CatalogObject {
@@ -1879,12 +1942,13 @@ impl CatalogObject {
             // comparación robusta vive en `is_grant_key_match`.
             Self::Grant(g) => &g.grantee,
             Self::Policy(p) => &p.name,
+            Self::TableStats(s) => &s.name,
         }
     }
 
-    /// Bloque Z2/Z3: helper para la verificación de colisión de hash en
-    /// `Catalog::get_object`. Variants con clave compuesta (Grant, Policy)
-    /// usan su key compuesta; el resto usa `name()` directo.
+    /// Bloque Z2/Z3/P3b: helper para la verificación de colisión de hash en
+    /// `Catalog::get_object`. Variants con clave compuesta (Grant, Policy,
+    /// TableStats) usan su key compuesta; el resto usa `name()` directo.
     pub(crate) fn matches_lookup_name(&self, lookup: &str) -> bool {
         match self {
             Self::Grant(g) => {
@@ -1893,6 +1957,10 @@ impl CatalogObject {
             }
             Self::Policy(p) => {
                 let key = PolicyMeta::catalog_key_name(&p.name, &p.table);
+                key.eq_ignore_ascii_case(lookup)
+            }
+            Self::TableStats(s) => {
+                let key = StatsMeta::catalog_key_name(&s.name);
                 key.eq_ignore_ascii_case(lookup)
             }
             other => other.name().eq_ignore_ascii_case(lookup),
@@ -1920,6 +1988,7 @@ fn decode_catalog_object(data: &[u8]) -> DbResult<CatalogObject> {
         ObjectKind::Role => CatalogObject::Role(RoleMeta::deserialize(rest)?),
         ObjectKind::Grant => CatalogObject::Grant(GrantMeta::deserialize(rest)?),
         ObjectKind::Policy => CatalogObject::Policy(PolicyMeta::deserialize(rest)?),
+        ObjectKind::TableStats => CatalogObject::TableStats(StatsMeta::deserialize(rest)?),
     })
 }
 
@@ -2260,6 +2329,41 @@ impl<'a> Catalog<'a> {
     pub fn remove_policy(&mut self, name: &str, table: &str) -> DbResult<bool> {
         let key_name = PolicyMeta::catalog_key_name(name, table);
         self.remove_object(&key_name)
+    }
+
+    /// Bloque P3b (VERSION 32): persiste stats por tabla en el catálogo
+    /// bajo la clave compuesta `__stats__:<tabla>`. Si ya había stats
+    /// para esa tabla, se sobrescriben (cada `ANALYZE` reemplaza).
+    pub fn put_table_stats(&mut self, meta: &StatsMeta) -> DbResult<()> {
+        let root = self.ensure_root()?;
+        let key_name = StatsMeta::catalog_key_name(&meta.name);
+        let key = hash_name(&key_name);
+        let mut payload = Vec::with_capacity(1 + 32 + meta.name.len());
+        payload.push(ObjectKind::TableStats.code());
+        payload.extend_from_slice(&meta.serialize()?);
+        let mut tree = Tree::new(self.pager);
+        tree.upsert(root, key, payload)?;
+        Ok(())
+    }
+
+    /// Bloque P3b: borra el record de stats de una tabla. Devuelve true
+    /// si existía. Lo llama `DROP TABLE` para no dejar huérfanos.
+    pub fn remove_table_stats(&mut self, table: &str) -> DbResult<bool> {
+        let key_name = StatsMeta::catalog_key_name(table);
+        self.remove_object(&key_name)
+    }
+
+    /// Bloque P3b: lista todos los records de stats del catálogo. Lo usa
+    /// `Engine::open` para hidratar el HashMap de stats al abrir la DB.
+    pub fn list_table_stats(&mut self) -> DbResult<Vec<StatsMeta>> {
+        Ok(self
+            .list_objects()?
+            .into_iter()
+            .filter_map(|o| match o {
+                CatalogObject::TableStats(s) => Some(s),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Bloque Z3: lista todas las policies del catálogo.

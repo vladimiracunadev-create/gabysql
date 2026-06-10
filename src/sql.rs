@@ -2,10 +2,10 @@ use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
     ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, GrantMeta, IndexKind, IndexMeta,
-    OnDelete, OnUpdate, PolicyMeta, ProcedureMeta, RoleMeta, TableMeta, TriggerMeta, UserMeta,
-    ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT,
-    POLICY_ACTION_UPDATE, PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT,
-    PRIV_TRUNCATE, PRIV_UPDATE,
+    OnDelete, OnUpdate, PolicyMeta, ProcedureMeta, RoleMeta, StatsMeta, TableMeta, TriggerMeta,
+    UserMeta, ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_INSERT,
+    POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE, PRIV_ALL, PRIV_DELETE, PRIV_INSERT,
+    PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -2267,8 +2267,10 @@ pub struct Engine<'a> {
     /// Bloque P3 (2026-05-29): cache session-scoped de stats por tabla.
     /// Poblado por `ANALYZE <table>` (exec_analyze_table) y consumido
     /// por `exec_explain` para anotar `est.rows=N` en el SCAN step.
-    /// **No persiste**: se pierde al cerrar el Engine. Persistencia
-    /// en catálogo es P3b. Drop/truncate de una tabla invalida su entry.
+    /// Bloque P3b (VERSION 32, 2026-06-09): **ahora persiste**. ANALYZE
+    /// upsert un record `ObjectKind::TableStats` en el catálogo; al abrir
+    /// la DB `Engine::open` hidrata este HashMap desde el catálogo. DROP
+    /// TABLE limpia tanto este HashMap como el record persistido.
     table_stats: HashMap<String, TableStats>,
 }
 
@@ -2331,6 +2333,30 @@ struct OuterRow {
 
 impl<'a> Engine<'a> {
     pub fn new(pager: &'a mut Pager) -> Self {
+        // Bloque P3b (VERSION 32): hidratar stats persistidas desde el
+        // catálogo. Si la DB es nueva o no hay records TableStats, el
+        // HashMap arranca vacío (comportamiento idéntico al pre-P3b).
+        // Best-effort: si la lectura falla (DB corrupta, etc.), arrancamos
+        // con stats vacías — el error real saltará cuando se intente
+        // ejecutar un statement.
+        let table_stats: HashMap<String, TableStats> = {
+            let mut catalog = Catalog::open(pager);
+            match catalog.list_table_stats() {
+                Ok(list) => list
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            s.name,
+                            TableStats {
+                                row_count: s.row_count,
+                                analyzed_at_nanos: s.analyzed_at_nanos,
+                            },
+                        )
+                    })
+                    .collect(),
+                Err(_) => HashMap::new(),
+            }
+        };
         Self {
             pager,
             outer_stack: Vec::new(),
@@ -2340,7 +2366,7 @@ impl<'a> Engine<'a> {
             var_scope: HashMap::new(),
             pending_return_value: None,
             current_user: None,
-            table_stats: HashMap::new(),
+            table_stats,
         }
     }
 
@@ -3013,6 +3039,11 @@ impl<'a> Engine<'a> {
         if !removed && !stmt.if_exists {
             return Err(DbError::new(format!("tabla no existe: {}", stmt.name)));
         }
+        // Bloque P3b (VERSION 32): borrar también el record de stats
+        // persistido para no dejar huérfanos en el catálogo. Si la tabla
+        // nunca corrió ANALYZE, `remove_table_stats` devuelve false y no
+        // hace nada — no es un error.
+        catalog.remove_table_stats(&stmt.name)?;
         // Bloque P3: stats cacheadas pierden referente al borrarse la tabla.
         self.table_stats.remove(&stmt.name);
         Ok(ResultSet {
@@ -3942,13 +3973,17 @@ impl<'a> Engine<'a> {
             Some(CatalogObject::User(_))
             | Some(CatalogObject::Role(_))
             | Some(CatalogObject::Grant(_))
-            | Some(CatalogObject::Policy(_)) => {
+            | Some(CatalogObject::Policy(_))
+            | Some(CatalogObject::TableStats(_)) => {
                 // Bloque Z1/Z2/Z3: namespace flat — user/role/grant/policy
                 // tampoco se pueden re-usar como nombre de vista.
+                // Bloque P3b: TableStats usa key prefijada `__stats__:...`
+                // así que el match acá es defensivo (un user pidiendo
+                // `CREATE VIEW __stats__:foo` rebotaría).
                 return Err(coded(
                     codes::VIEW_NAME_COLLIDES_WITH_OBJECT,
                     format!(
-                        "CREATE VIEW '{}': ya existe un USER/ROLE/GRANT/POLICY con ese nombre.",
+                        "CREATE VIEW '{}': ya existe un USER/ROLE/GRANT/POLICY/STATS con ese nombre.",
                         stmt.name
                     ),
                 ));
@@ -4038,6 +4073,11 @@ impl<'a> Engine<'a> {
                 "DROP VIEW '{}': el nombre apunta a una POLICY. Usá DROP POLICY.",
                 stmt.name
             ))),
+            Some(CatalogObject::TableStats(_)) => Err(DbError::new(format!(
+                "DROP VIEW '{}': el nombre apunta a un record interno TABLE_STATS (P3b). \
+                 Los stats se borran automáticamente con DROP TABLE.",
+                stmt.name
+            ))),
             None => {
                 if stmt.if_exists {
                     Ok(ResultSet {
@@ -4087,6 +4127,7 @@ impl<'a> Engine<'a> {
                 | Some(CatalogObject::Role(_))
                 | Some(CatalogObject::Grant(_))
                 | Some(CatalogObject::Policy(_))
+                | Some(CatalogObject::TableStats(_))
                 | None => {
                     return Err(coded(
                         codes::TABLE_NOT_FOUND,
@@ -4112,6 +4153,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Role(_) => "ROLE",
                     CatalogObject::Grant(_) => "GRANT",
                     CatalogObject::Policy(_) => "POLICY",
+                    CatalogObject::TableStats(_) => "TABLE_STATS",
                 };
                 return Err(coded(
                     codes::TRIGGER_NAME_COLLIDES,
@@ -4225,6 +4267,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Role(_) => "ROLE",
                     CatalogObject::Grant(_) => "GRANT",
                     CatalogObject::Policy(_) => "POLICY",
+                    CatalogObject::TableStats(_) => "TABLE_STATS",
                 };
                 return Err(coded(
                     codes::PROCEDURE_NAME_COLLIDES,
@@ -4388,6 +4431,7 @@ impl<'a> Engine<'a> {
                     CatalogObject::Role(_) => "ROLE",
                     CatalogObject::Grant(_) => "GRANT",
                     CatalogObject::Policy(_) => "POLICY",
+                    CatalogObject::TableStats(_) => "TABLE_STATS",
                 };
                 return Err(coded(
                     codes::FUNCTION_NAME_COLLIDES,
@@ -5061,6 +5105,18 @@ impl<'a> Engine<'a> {
                 analyzed_at_nanos,
             },
         );
+        // Bloque P3b (VERSION 32): persistir al catálogo. Si falla acá
+        // (p.ej. WAL llena), el HashMap en memoria queda actualizado
+        // pero el record persistido es el viejo — comportamiento
+        // aceptable: la próxima ANALYZE sobrescribe.
+        {
+            let mut catalog = Catalog::open(self.pager);
+            catalog.put_table_stats(&StatsMeta {
+                name: table.clone(),
+                row_count,
+                analyzed_at_nanos,
+            })?;
+        }
         Ok(ResultSet {
             columns: vec!["table".to_string(), "row_count".to_string()],
             rows: vec![vec![
@@ -5069,7 +5125,7 @@ impl<'a> Engine<'a> {
             ]],
             message: Some(format!(
                 "ANALYZE: stats actualizadas para `{}` ({} rows). \
-                 Cache session-scoped — se pierde al cerrar el Engine. \
+                 Persistidas en catálogo — sobreviven a reopen del Engine. \
                  EXPLAIN las mostrará como `est.rows`.",
                 table, row_count
             )),
@@ -18308,6 +18364,7 @@ fn catalog_object_kind_name(obj: &CatalogObject) -> &'static str {
         CatalogObject::Role(_) => "ROLE",
         CatalogObject::Grant(_) => "GRANT",
         CatalogObject::Policy(_) => "POLICY",
+        CatalogObject::TableStats(_) => "TABLE_STATS",
     }
 }
 

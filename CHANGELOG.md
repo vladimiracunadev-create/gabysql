@@ -6,6 +6,52 @@
 
 ---
 
+## 2026-06-09 — Bloque P3b: stats persistidas en catálogo (VERSION 31→32)
+
+> **Un push a `main`.** Cierra la última limitación honesta de P3: las stats producidas por `ANALYZE <table>` ahora persisten en el catálogo y sobreviven a re-aperturas del Engine. Pre-requisito limpio para P4 (stats por-columna) y P5 (planner-as-optimizer). Ver [`docs/adr/0067-p3b-persistent-stats.md`](docs/adr/0067-p3b-persistent-stats.md).
+
+### 🆕 Comportamiento
+
+```sql
+-- Sesión 1
+ANALYZE TABLE pedidos;
+-- mensaje: "Persistidas en catálogo — sobreviven a reopen del Engine."
+
+-- Cerrar Engine, re-abrir DB
+EXPLAIN SELECT * FROM pedidos;
+-- antes (P3): SCAN sin `est.rows=N` — stats perdidas.
+-- ahora (P3b): SCAN [est.rows=N] — hidratadas desde catálogo.
+
+DROP TABLE pedidos;
+-- borra también el record TableStats; no quedan huérfanos.
+```
+
+### 🔑 Decisiones clave
+
+- **Nuevo `ObjectKind::TableStats` (code = 9)** sobre el discriminator byte de catálogo. Mismo patrón que las 9 variantes previas.
+- **`StatsMeta { name: String, row_count: u64, analyzed_at_nanos: u128 }`** persistido bajo clave `__stats__:<tabla>` (prefijo para no colisionar con `hash_name(tabla)` de la tabla).
+- **Bump VERSION 31 → 32**: política conservadora del motor (sin auto-upgrade entre versiones). V31 se rechaza con `[GBY-1003]` y mensaje "dump + re-create".
+- **Hidratación automática** en `Engine::new` vía `Catalog::list_table_stats()`. DB sin records arranca con HashMap vacío (comportamiento idéntico al pre-P3b).
+- **`DROP TABLE`** invoca `remove_table_stats` además de `remove_table`. `TRUNCATE` no entregado (TRUNCATE como statement aún no existe).
+- **`analyzed_at_nanos` capturado pero no consumido**: queda para EXPLAIN-con-staleness en P4/P5.
+
+### 🧪 Tests (+4 P3b, total 749)
+
+- `p3b_stats_sobreviven_reopen`: ANALYZE en sesión 1, EXPLAIN en sesión 2 muestra `est.rows`.
+- `p3b_drop_table_borra_stats_del_catalogo`: re-CREATE en sesión nueva NO ve stats viejas.
+- `p3b_analyze_sobrescribe_stats_persistidas`: dos ANALYZE consecutivos; el segundo gana.
+- `p3b_db_sin_analyze_arranca_sin_stats`: regression — DB sin ANALYZE abre limpia.
+
+Test viejo `p3_stats_son_session_scoped_se_pierden_en_reapertura` **invertido** a `p3_stats_persisten_a_traves_de_reapertura_p3b` — documenta el cambio de contrato P3 → P3b.
+
+**Total**: 749 verdes + 1 ignored.
+
+### 🧹 Compat
+
+- DBs creadas con VERSION 31 son rechazadas al abrir. Path manual: dump SQL desde binario viejo + re-load contra binario nuevo. Sin migrador automático en este release (queda para R3, ver ROADMAP).
+
+---
+
 ## 2026-05-30 — Bloques F3 + F2 + W4 + E5 + K3 + K4 + N5: 9 gaps del ADR-0066 cerrados (7 bloques)
 
 > **Siete pushes a `main`** en una sesión cierran **9 de los 10 gaps** del catálogo del ADR-0066 (todos los P1 + cinco P2). Hay menos bloques que gaps porque **F2** cubre Gap 1 + Gap 7 (`COUNT(*)` sobre vista comparte la ruta de agregados sobre JOIN) y **E5** cubre Gap 3 + Gap 5 (el anchor de `WITH RECURSIVE` reusa el mismo parser de bare-SELECT). Único pendiente: Gap 10 (P5b, depende de P5 — planner real, no entregado). Sin bump de `VERSION` on-disk. Detalle por bloque y por test en [`docs/adr/0066-bench-exposed-gaps.md`](docs/adr/0066-bench-exposed-gaps.md).

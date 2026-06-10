@@ -1,12 +1,12 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-05-29 contra `main` post-bloques W1+W2+W3 (CTEs no-rec / `WITH RECURSIVE` / window functions), X1→X4f+X6 (triggers AFTER/BEFORE, stored procedures, user functions, control de flujo procedural completo + `FOR row IN SELECT`), Y1→Y9 (tipos extendidos + Decimal exacto + UUID + UNSIGNED + BLOB + aritmética Decimal exacta), Z1→Z3f (USER/ROLE + PBKDF2/scrypt/Blake2b/Argon2id + GRANT/REVOKE + RLS USING/WITH CHECK + DEFAULTs antes de check), **P1+P2+P3 (Fase 3)**: `EXPLAIN <stmt>` + `EXPLAIN ANALYZE <stmt>` + `ANALYZE <table>` con stats session-scoped. **VERSION on-disk = 31** (último bump fue **Z1f → Argon2id partial fix**, ver ADR-0061; ningún bloque del 2026-05-29 posterior a Z1f cambió el formato — Z3f y P1+P2+P3 son zero-bump).
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-09 contra `main` post-bloques W1+W2+W3 (CTEs no-rec / `WITH RECURSIVE` / window functions), X1→X4f+X6 (triggers AFTER/BEFORE, stored procedures, user functions, control de flujo procedural completo + `FOR row IN SELECT`), Y1→Y9 (tipos extendidos + Decimal exacto + UUID + UNSIGNED + BLOB + aritmética Decimal exacta), Z1→Z3f (USER/ROLE + PBKDF2/scrypt/Blake2b/Argon2id + GRANT/REVOKE + RLS USING/WITH CHECK + DEFAULTs antes de check), **P1+P2+P3+P3b (Fase 3)**: `EXPLAIN <stmt>` + `EXPLAIN ANALYZE <stmt>` + `ANALYZE <table>` **con stats persistidas en catálogo** (P3b, 2026-06-09). **VERSION on-disk = 32** (último bump fue **P3b → `ObjectKind::TableStats`**, ver ADR-0067; P3b es el único cambio de formato desde Z1f).
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-31-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-745%2F745-brightgreen)](../tests/integration_test.rs)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-32-2d7a66)](TECHNICAL_SPECS.md)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-749%2F749-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 > **2026-05-29 — Día grande: cierre de Fase 2 (seguridad) + arranque y avance fuerte de Fase 3 (planeación).** Lo entregado hoy en orden cronológico:
@@ -36,7 +36,7 @@ Leyenda: 🟢 producción-ready en su scope · 🟡 funcional con limitaciones �
 | Pager (header + caché in-memory) | 🟢 | `PageCache` con cap fija + LRU clean-only (default 1024 páginas ≈ 4 MB; tunable con `set_cache_capacity`). Prefetch pendiente. | [src/storage.rs](../src/storage.rs) |
 | WAL after-image + replay | 🟢 | CRC32 verificado por record. Sin checkpoints. | [src/storage.rs](../src/storage.rs) |
 | CRC32 por página | 🟢 | IEEE polynomial, table-based; verifica en lectura y replay. | [src/storage.rs](../src/storage.rs) |
-| Formato en disco versionado | 🟢 | `VERSION = 31` (Z1f/2026-05-29: Argon2id partial fix, corte semántico). Bumps acumulados desde V: 14 (X3 procedures), 15 (X3 payload), 16 (X3b functions), 17 (Y TIME/UUID), 18 (Y2 max_length), 19 (Y3 int_width), 20 (Y4 BLOB), 21 (Y5 UNSIGNED), 22 (Y6 DECIMAL exacto), 23 (Z1 User/Role), 24 (Z2 Grant), 25 (Z3 Policy USING), 26 (Z1b PBKDF2 KDF metadata), 27 (Z3b PolicyMeta with_check_sql), 28 (Z1c scrypt scheme=2), 29 (Z1d Blake2b H'), 30 (Z1e Argon2id scheme=3), 31 (Z1f corte). Rechazo explícito de versiones anteriores. P1/P2/P3 son zero-bump. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
+| Formato en disco versionado | 🟢 | `VERSION = 32` (P3b/2026-06-09: stats persistidas vía `ObjectKind::TableStats`). Bumps acumulados desde V: 14 (X3 procedures), 15 (X3 payload), 16 (X3b functions), 17 (Y TIME/UUID), 18 (Y2 max_length), 19 (Y3 int_width), 20 (Y4 BLOB), 21 (Y5 UNSIGNED), 22 (Y6 DECIMAL exacto), 23 (Z1 User/Role), 24 (Z2 Grant), 25 (Z3 Policy USING), 26 (Z1b PBKDF2 KDF metadata), 27 (Z3b PolicyMeta with_check_sql), 28 (Z1c scrypt scheme=2), 29 (Z1d Blake2b H'), 30 (Z1e Argon2id scheme=3), 31 (Z1f corte), 32 (P3b TableStats). Rechazo explícito de versiones anteriores. P1/P2/P3 son zero-bump; P3b sí bumpa por nuevo `ObjectKind`. | [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
 | `Pager::create` no destructivo | 🟢 | Refuses overwrite; `create_force` explícito. | [src/storage.rs](../src/storage.rs) |
 | B+Tree (LEAF + INTERNAL) | 🟡 | Splits OK; falta merge / rebalance al borrar. | [src/bptree.rs](../src/bptree.rs) |
 | Catálogo persistente | 🟢 | FNV-1a-64, estable entre versiones de Rust. | [src/catalog.rs](../src/catalog.rs) |
@@ -153,13 +153,13 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **2026-05-29** sesión 1 (W/X/Y, VERSION 13→22): W1, W2, W3, X1, X2, X3, X3b, X4, X4b, X4c, X4d, X4e, X4f, X6, Y1, Y2, Y3, Y4, Y5, Y6, Y7, Y8, Y9.
 > - **2026-05-29** sesión 2 (Z security, VERSION 22→31): Z1, Z2, Z3, Z1b, Z3b, Z3c, Z1c, Z3d, Z1d, Z3e, Z1e, Z1f (Argon2id partial fix — corte semántico VERSION 30→31), Z3f.
 > - **2026-05-29** sesión 3 (P planeación, sin bump on-disk): P1 (EXPLAIN), P2 (EXPLAIN ANALYZE), P3 (ANALYZE TABLE + stats en EXPLAIN).
+> - **2026-06-09** sesión P3b (VERSION 31→32): stats persistidas en catálogo vía `ObjectKind::TableStats`. Sobreviven a reopen; DROP TABLE las borra. Ver [ADR-0067](adr/0067-p3b-persistent-stats.md).
 >
 > **Pendientes priorizados** (orden recomendado, ver [ROADMAP.md](../ROADMAP.md#-próximas-proyecciones-orden-sugerido) sección "🔭 Próximas proyecciones" para el detalle):
 >
 > **Cierre inmediato de Fase 3**:
-> - **P3b** — persistir stats en catálogo (`ObjectKind::TableStats`, bump VERSION 31→32).
-> - **P4** — stats por-columna (NDV vía HyperLogLog, MCV top-K, histogramas equi-depth).
-> - **P5** — planner-as-optimizer real (reorden de joins, choice de índice por costo).
+> - **P4** — stats por-columna (NDV vía HyperLogLog, MCV top-K, histogramas equi-depth). El slot `ObjectKind::TableStats` ya existe; P4 extiende `StatsMeta`.
+> - **P5** — planner-as-optimizer real (reorden de joins, choice de índice por costo). Sub-tarea P5b cierra el último gap del bench ([ADR-0066 Gap 10](adr/0066-bench-exposed-gaps.md)).
 > - **P6** — gabybench con benchmarks reproducibles + tracking de regresiones en CI.
 >
 > **Hilos cruzados** (no atan a una fase):
