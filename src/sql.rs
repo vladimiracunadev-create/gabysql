@@ -10168,45 +10168,102 @@ impl<'a> Engine<'a> {
             };
 
             if let Some((right_index_key, left_probe_key)) = hash_join_plan {
-                // Build: hash sobre los valores del right_index_key.
+                // Bloque P5d (2026-06-11, ADR-0072): build-side selection.
+                // Hash join cost ≈ |build| (insertar) + |probe| × lookup.
+                // Construir el hash sobre el lado MÁS CHICO baja memoria y
+                // collisions. La preservación de left_matched/right_matched
+                // sigue exacta — solo cambia QUIÉN se itera primero.
+                //
+                // Threshold 2×: solo invertimos cuando hay ventaja clara,
+                // para no introducir cambios sutiles de orden de filas en
+                // queries sin ORDER BY (SQL no garantiza orden, pero las
+                // tests sí asumen estabilidad).
+                let swap_build_side = current.len() > right_rows.len() * 2;
+                // Build: hash sobre los valores del lado más chico.
                 // NULL nunca matchea (SQL standard: NULL = NULL → NULL),
-                // así que filas NULL del right se omiten del hash y
-                // sólo aparecen vía LEFT/RIGHT/FULL fill-null.
-                let mut hash: HashMap<Vec<u8>, Vec<usize>> =
-                    HashMap::with_capacity(right_rows.len());
-                for (ri, r) in right_rows.iter().enumerate() {
-                    let v = r.get(&right_index_key).cloned().unwrap_or(Value::Null);
-                    if matches!(v, Value::Null) {
-                        continue;
-                    }
-                    let bytes = encode_group_key(&[v]);
-                    hash.entry(bytes).or_default().push(ri);
-                }
-                // Probe.
-                for (li, left_row) in current.iter().enumerate() {
-                    let lv = left_row
-                        .get(&left_probe_key)
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    if matches!(lv, Value::Null) {
-                        continue;
-                    }
-                    let bytes = encode_group_key(&[lv]);
-                    let Some(ris) = hash.get(&bytes) else {
-                        continue;
-                    };
-                    for &ri in ris {
-                        left_matched[li] = true;
-                        right_matched[ri] = true;
-                        let right_row = &right_rows[ri];
-                        let mut merged = HashMap::with_capacity(left_row.len() + right_row.len());
-                        for (k, v) in left_row {
-                            merged.insert(k.clone(), v.clone());
+                // así que filas NULL se omiten del hash y sólo aparecen
+                // vía LEFT/RIGHT/FULL fill-null.
+                if swap_build_side {
+                    // Build sobre `current` (lado izquierdo), probe con
+                    // `right_rows`. Útil cuando current se acumuló muy
+                    // grande tras joins previos pero la próxima tabla es
+                    // chica.
+                    let mut hash: HashMap<Vec<u8>, Vec<usize>> =
+                        HashMap::with_capacity(current.len());
+                    for (li, l) in current.iter().enumerate() {
+                        let v = l.get(&left_probe_key).cloned().unwrap_or(Value::Null);
+                        if matches!(v, Value::Null) {
+                            continue;
                         }
-                        for (k, v) in right_row {
-                            merged.insert(k.clone(), v.clone());
+                        let bytes = encode_group_key(&[v]);
+                        hash.entry(bytes).or_default().push(li);
+                    }
+                    for (ri, right_row) in right_rows.iter().enumerate() {
+                        let rv = right_row
+                            .get(&right_index_key)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        if matches!(rv, Value::Null) {
+                            continue;
                         }
-                        next.push(merged);
+                        let bytes = encode_group_key(&[rv]);
+                        let Some(lis) = hash.get(&bytes) else {
+                            continue;
+                        };
+                        for &li in lis {
+                            left_matched[li] = true;
+                            right_matched[ri] = true;
+                            let left_row = &current[li];
+                            let mut merged =
+                                HashMap::with_capacity(left_row.len() + right_row.len());
+                            for (k, v) in left_row {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                            for (k, v) in right_row {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                            next.push(merged);
+                        }
+                    }
+                } else {
+                    // Build clásico sobre right_rows.
+                    let mut hash: HashMap<Vec<u8>, Vec<usize>> =
+                        HashMap::with_capacity(right_rows.len());
+                    for (ri, r) in right_rows.iter().enumerate() {
+                        let v = r.get(&right_index_key).cloned().unwrap_or(Value::Null);
+                        if matches!(v, Value::Null) {
+                            continue;
+                        }
+                        let bytes = encode_group_key(&[v]);
+                        hash.entry(bytes).or_default().push(ri);
+                    }
+                    // Probe.
+                    for (li, left_row) in current.iter().enumerate() {
+                        let lv = left_row
+                            .get(&left_probe_key)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        if matches!(lv, Value::Null) {
+                            continue;
+                        }
+                        let bytes = encode_group_key(&[lv]);
+                        let Some(ris) = hash.get(&bytes) else {
+                            continue;
+                        };
+                        for &ri in ris {
+                            left_matched[li] = true;
+                            right_matched[ri] = true;
+                            let right_row = &right_rows[ri];
+                            let mut merged =
+                                HashMap::with_capacity(left_row.len() + right_row.len());
+                            for (k, v) in left_row {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                            for (k, v) in right_row {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                            next.push(merged);
+                        }
                     }
                 }
             } else {

@@ -17944,6 +17944,134 @@ fn p5c_composite_pk_lookup_no_es_overridden() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque P5d (2026-06-11): hash join build-side selection. Cuando
+// `current` (acumulado de joins previos) es >2× más grande que la
+// próxima `right_rows`, swap el build side al lado más chico.
+// Smoke tests de correctness + ordering preservado para casos
+// que no disparan el swap.
+// ============================================================
+
+#[test]
+fn p5d_inner_join_correctness_small_left_grande_right() -> Result<(), Box<dyn Error>> {
+    // current.len() (left) chico, right_rows grande. NO debe swap
+    // (condición es current > right × 2). El resultado debe ser
+    // correcto en cualquier caso.
+    let (db, wal) = p3_setup("p5d-small-large")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE small (id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE big (id INT PRIMARY KEY, ref_id INT, payload TEXT);
+         INSERT INTO small (id, label) VALUES (1,'a'),(2,'b');
+         INSERT INTO big (id, ref_id, payload) VALUES
+            (1,1,'p1'),(2,1,'p2'),(3,2,'p3'),(4,2,'p4'),(5,1,'p5'),(6,2,'p6');
+         SELECT s.label, b.payload FROM small s
+            INNER JOIN big b ON b.ref_id = s.id
+            ORDER BY b.id;",
+    )?;
+    let rows: Vec<(String, String)> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| {
+            let a = match &r[0] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            let b = match &r[1] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            (a, b)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), "p1".to_string()),
+            ("a".to_string(), "p2".to_string()),
+            ("b".to_string(), "p3".to_string()),
+            ("b".to_string(), "p4".to_string()),
+            ("a".to_string(), "p5".to_string()),
+            ("b".to_string(), "p6".to_string()),
+        ]
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5d_inner_join_correctness_left_grande_swap_dispara() -> Result<(), Box<dyn Error>> {
+    // current.len() (left) grande (10 filas), right_rows chico (2).
+    // condición: current > right × 2 → 10 > 4 → swap activo.
+    // Resultado debe ser correcto pese al swap.
+    let (db, wal) = p3_setup("p5d-large-small")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE big (id INT PRIMARY KEY, ref_id INT, payload TEXT);
+         CREATE TABLE tiny (id INT PRIMARY KEY, label TEXT);
+         INSERT INTO big (id, ref_id, payload) VALUES
+            (1,1,'p1'),(2,1,'p2'),(3,2,'p3'),(4,2,'p4'),(5,1,'p5'),
+            (6,2,'p6'),(7,1,'p7'),(8,2,'p8'),(9,1,'p9'),(10,2,'p10');
+         INSERT INTO tiny (id, label) VALUES (1,'A'),(2,'B');
+         SELECT b.payload, t.label FROM big b
+            INNER JOIN tiny t ON t.id = b.ref_id
+            ORDER BY b.id;",
+    )?;
+    let rows_pairs: Vec<(String, String)> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| {
+            let a = match &r[0] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            let b = match &r[1] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            (a, b)
+        })
+        .collect();
+    assert_eq!(rows_pairs.len(), 10);
+    assert_eq!(rows_pairs[0], ("p1".to_string(), "A".to_string()));
+    assert_eq!(rows_pairs[9], ("p10".to_string(), "B".to_string()));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5d_left_join_swap_preserva_null_fill() -> Result<(), Box<dyn Error>> {
+    // LEFT JOIN: filas del left sin match deben aparecer con NULL del
+    // right. El swap NO debe romper esa semántica.
+    let (db, wal) = p3_setup("p5d-left-join")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE big (id INT PRIMARY KEY, ref_id INT);
+         CREATE TABLE tiny (id INT PRIMARY KEY, label TEXT);
+         INSERT INTO big (id, ref_id) VALUES
+            (1,1),(2,1),(3,2),(4,99),(5,1),(6,99),(7,1),(8,2),(9,99),(10,2);
+         INSERT INTO tiny (id, label) VALUES (1,'A'),(2,'B');
+         SELECT b.id, t.label FROM big b
+            LEFT JOIN tiny t ON t.id = b.ref_id
+            ORDER BY b.id;",
+    )?;
+    let last = res.last().unwrap();
+    assert_eq!(last.rows.len(), 10);
+    // ref_id=99 → sin match → label=NULL.
+    let row4 = &last.rows[3];
+    assert!(
+        matches!(row4[1], Value::Null),
+        "LEFT JOIN: ref_id=99 sin match debe dar NULL, vi: {:?}",
+        row4[1]
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5b (2026-06-11): composite secondary index lookup.
 // `WHERE c1 = X AND c2 = Y AND ...` con CREATE INDEX (c1, c2, ...)
 // → fast-path por fingerprint en vez de full-scan. Cierra Gap 10
