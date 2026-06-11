@@ -2343,6 +2343,32 @@ fn stats_are_stale(analyzed_at_nanos: u128) -> bool {
     stats_age_secs(analyzed_at_nanos) >= STATS_STALE_THRESHOLD_SECS
 }
 
+/// Bloque R6 (2026-06-11): post-lookup check para composite index.
+/// El composite_index_lookup_pks devuelve el bucket exacto; si su
+/// tamaño cubre más del INDEX_BREAKEVEN del total de filas, FullScan
+/// secuencial es más barato que N random reads. Esto refina P5c:
+/// P5c usa estimate_selectivity (asunción de independencia AND), R6
+/// usa el conteo REAL del bucket.
+///
+/// Conservador: sin stats, NO bailamos (preserva comportamiento
+/// pre-R6). Con stats stale, tampoco (mismo criterio que R1).
+fn composite_bucket_too_large_for_index_path(
+    stats: Option<&TableStats>,
+    bucket_size: usize,
+) -> bool {
+    let Some(stats) = stats else {
+        return false;
+    };
+    if stats_are_stale(stats.analyzed_at_nanos) {
+        return false;
+    }
+    if stats.row_count == 0 {
+        return false;
+    }
+    let ratio = bucket_size as f64 / stats.row_count as f64;
+    ratio >= INDEX_BREAKEVEN_SELECTIVITY
+}
+
 /// Bloque R1: renderiza la edad como string legible (`3d 5h`, `12h`,
 /// `45m`, `fresh`). Usado en EXPLAIN para que el usuario sepa cuán
 /// viejas son las stats sin tener que hacer la cuenta él.
@@ -9747,6 +9773,17 @@ impl<'a> Engine<'a> {
         // Cierra Gap 10 de ADR-0066 (composite index lookup full-scan
         // sobre `WHERE qty = 5 AND precio = 100`).
         let composite_index_plan: Option<Plan> = if exists_postfilter.is_none() {
+            // Bloque R6 (2026-06-11, ADR-0077): mismo check que P5c
+            // pero sobre la cardinalidad REAL del bucket (no la
+            // estimación). Si el composite devuelve >= 20% de la tabla,
+            // FullScan + post-filter es más barato. Resuelve el caso de
+            // independencia mal asumida en `WHERE a=X AND b=Y` cuando
+            // las cols están correlacionadas.
+            let stats_for_table = self
+                .table_stats
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&meta.name))
+                .map(|(_, v)| v.clone());
             stmt.where_clause
                 .as_ref()
                 .and_then(extract_and_equality_map)
@@ -9754,9 +9791,14 @@ impl<'a> Engine<'a> {
                     find_matching_composite_index(&meta, &map).map(|(idx, fp)| (idx.root_page, fp))
                 })
                 .and_then(|(idx_root, fp)| {
-                    composite_index_lookup_pks(self.pager, idx_root, fp)
-                        .ok()
-                        .map(Plan::ByPks)
+                    let pks = composite_index_lookup_pks(self.pager, idx_root, fp).ok()?;
+                    if composite_bucket_too_large_for_index_path(
+                        stats_for_table.as_ref(),
+                        pks.len(),
+                    ) {
+                        return None;
+                    }
+                    Some(Plan::ByPks(pks))
                 })
         } else {
             None
@@ -12129,30 +12171,44 @@ impl<'a> Engine<'a> {
         // FullScan. El post-filter (eval_where_expr_single) descarta
         // colisiones FNV-1a-64 y aplica predicados extra — misma red de
         // seguridad que P5b usa en SELECT.
+        // Bloque R6 (2026-06-11, ADR-0077): post-lookup check.
+        // Si el bucket cubre >=20% de las filas, FullScan + 3VL es más
+        // barato. Mismo refinamiento que en SELECT.
         if let Some(map) = extract_and_equality_map(where_clause) {
             if let Some((idx, fp)) = find_matching_composite_index(meta, &map) {
                 let idx_root = idx.root_page;
+                let stats_for_table = self
+                    .table_stats
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&meta.name))
+                    .map(|(_, v)| v.clone());
                 let candidate_pks = composite_index_lookup_pks(self.pager, idx_root, fp)?;
-                // Materializar decoded rows ANTES de soltar el catalog
-                // borrow — eval_where_expr_single necesita &mut self.
-                let candidate_rows: Vec<(i64, HashMap<String, Value>)> = {
-                    let mut catalog = Catalog::open(self.pager);
-                    let mut rows = Vec::with_capacity(candidate_pks.len());
-                    for pk in candidate_pks {
-                        if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
-                            rows.push((pk, decode_row(meta, &bytes)?));
+                if !composite_bucket_too_large_for_index_path(
+                    stats_for_table.as_ref(),
+                    candidate_pks.len(),
+                ) {
+                    // Materializar decoded rows ANTES de soltar el catalog
+                    // borrow — eval_where_expr_single necesita &mut self.
+                    let candidate_rows: Vec<(i64, HashMap<String, Value>)> = {
+                        let mut catalog = Catalog::open(self.pager);
+                        let mut rows = Vec::with_capacity(candidate_pks.len());
+                        for pk in candidate_pks {
+                            if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
+                                rows.push((pk, decode_row(meta, &bytes)?));
+                            }
+                        }
+                        rows
+                    };
+                    let mut pks = Vec::with_capacity(candidate_rows.len());
+                    for (pk, decoded) in candidate_rows {
+                        let verdict = self.eval_where_expr_single(where_clause, meta, &decoded)?;
+                        if matches!(verdict, Some(true)) {
+                            pks.push(pk);
                         }
                     }
-                    rows
-                };
-                let mut pks = Vec::with_capacity(candidate_rows.len());
-                for (pk, decoded) in candidate_rows {
-                    let verdict = self.eval_where_expr_single(where_clause, meta, &decoded)?;
-                    if matches!(verdict, Some(true)) {
-                        pks.push(pk);
-                    }
+                    return Ok((pks, false));
                 }
-                return Ok((pks, false));
+                // R6: bucket demasiado grande — caer al FullScan fallback abajo.
             }
         }
 

@@ -18204,6 +18204,157 @@ fn r4_hll_decimal_300_distinct() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque R6 (2026-06-11): post-lookup check del composite index.
+// P5c usa estimate_selectivity (asunción de independencia AND);
+// R6 usa la cardinalidad REAL del bucket. Cuando el composite
+// devuelve ≥20% de las filas, FullScan + post-filter es más
+// barato — el R6 check bail-ea aunque P5c no haya bow-out.
+// ============================================================
+
+#[test]
+fn r6_composite_bucket_grande_cae_a_fullscan_select() -> Result<(), Box<dyn Error>> {
+    // 10 filas, (qty=5, precio=10) cubre 8 → bucket ratio = 0.8 ≥ 0.2.
+    // R6 bail; resultado debe ser bit-a-bit idéntico al index path.
+    let (db, wal) = p3_setup("r6-select")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT, sku TEXT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio, sku) VALUES
+            (1,5,10,'A'),(2,5,10,'B'),(3,5,10,'C'),(4,5,10,'D'),
+            (5,5,10,'E'),(6,5,10,'F'),(7,5,10,'G'),(8,5,10,'H'),
+            (9,5,99,'X'),(10,6,10,'Y');
+         ANALYZE TABLE lines;
+         SELECT id FROM lines WHERE qty = 5 AND precio = 10 ORDER BY id;",
+    )?;
+    let ids: Vec<i64> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r6_composite_bucket_chico_sigue_usando_indice() -> Result<(), Box<dyn Error>> {
+    // 100 filas, (qty=5, precio=10) cubre 1 → ratio = 0.01 < 0.2.
+    // Index path sigue activo.
+    let (db, wal) = p3_setup("r6-keep")?;
+    let mut sql = String::from(
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT);\n\
+         CREATE INDEX idx_qp ON lines (qty, precio);\n\
+         INSERT INTO lines (id, qty, precio) VALUES ",
+    );
+    for i in 0..100 {
+        if i > 0 {
+            sql.push(',');
+        }
+        if i == 0 {
+            sql.push_str(&format!("({},5,10)", i + 1));
+        } else {
+            // qty, precio distintos para garantizar 1 bucket = 1 fila.
+            sql.push_str(&format!("({},{},{})", i + 1, 100 + i, 200 + i));
+        }
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE lines;")?;
+    let res = run_sql(
+        &db,
+        "EXPLAIN SELECT * FROM lines WHERE qty = 5 AND precio = 10;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    // Composite con 1 fila / 100 = 0.01 → sel baja → no P5c, índice sigue.
+    assert!(
+        detail.contains("composite index lookup"),
+        "bucket chico debe usar composite, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r6_composite_bucket_grande_correctness_update() -> Result<(), Box<dyn Error>> {
+    // Mismo escenario que SELECT pero con UPDATE — R6 en
+    // resolve_target_pks debe dar exactamente el mismo resultado.
+    let (db, wal) = p3_setup("r6-update")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT, payload TEXT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio, payload) VALUES
+            (1,5,10,'A'),(2,5,10,'B'),(3,5,10,'C'),(4,5,10,'D'),
+            (5,5,10,'E'),(6,5,10,'F'),(7,5,10,'G'),(8,5,10,'H'),
+            (9,5,99,'X'),(10,6,10,'Y');
+         ANALYZE TABLE lines;
+         UPDATE lines SET payload = 'mod' WHERE qty = 5 AND precio = 10;
+         SELECT id, payload FROM lines ORDER BY id;",
+    )?;
+    let rows: Vec<(i64, String)> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| {
+            let id = match r[0] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            let pl = match &r[1] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            (id, pl)
+        })
+        .collect();
+    // Filas 1..=8 actualizadas; 9 ('X') y 10 ('Y') intactas.
+    let modded: Vec<i64> = rows
+        .iter()
+        .filter(|(_, pl)| pl == "mod")
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(modded, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    let untouched: Vec<(i64, String)> =
+        rows.iter().filter(|(_, pl)| pl != "mod").cloned().collect();
+    assert_eq!(untouched, vec![(9, "X".to_string()), (10, "Y".to_string())]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r6_sin_stats_no_bail() -> Result<(), Box<dyn Error>> {
+    // Sin ANALYZE: R6 no se activa, composite index path normal.
+    // Conservador.
+    let (db, wal) = p3_setup("r6-no-stats")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio) VALUES
+            (1,5,10),(2,5,10),(3,5,10),(4,5,10),
+            (5,5,10),(6,5,10),(7,5,10),(8,5,10),(9,6,99);
+         EXPLAIN SELECT * FROM lines WHERE qty = 5 AND precio = 10;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    // Sin stats, ni P5c ni R6 activos → composite path.
+    assert!(
+        detail.contains("composite index lookup"),
+        "sin stats: composite path debe activarse, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque R8 (2026-06-11): UPDATE/DELETE con composite-eq usan los
 // mismos fast-paths que SELECT (P5b + composite PK). Asimetría
 // heredada de P5b cerrada — resolve_target_pks gana 2 ramas.
