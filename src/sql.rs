@@ -2389,14 +2389,24 @@ fn stats_value_bytes(v: &Value) -> Vec<u8> {
     out
 }
 
-/// FNV-1a 64-bit. Mismo offset/prime que el resto del motor (ADR-0002).
+/// FNV-1a 64-bit (ADR-0002) + splitmix64 finalizer. El finalizer evita
+/// que la baja discrepancia de FNV sobre enteros secuenciales rompa la
+/// estimación HLL (cada bucket vería un valor → linear counting
+/// sobre-estima). El finalizer es estándar en HLL real (HLL++ usa Murmur,
+/// equivalente en calidad de mixing).
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    h
+    splitmix64_finalize(h)
+}
+
+fn splitmix64_finalize(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
 /// Bloque P4: convierte un `Value` runtime a `StatsValue` para

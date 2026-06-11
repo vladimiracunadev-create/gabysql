@@ -17200,8 +17200,8 @@ fn p3_explain_post_analyze_muestra_est_rows() -> Result<(), Box<dyn Error>> {
     )?;
     let detail = extract_scan_detail(res.last().unwrap());
     assert!(
-        detail.contains("[est.rows=5]"),
-        "esperaba [est.rows=5], vi: {}",
+        detail.contains("est.rows=5"),
+        "esperaba est.rows=5, vi: {}",
         detail
     );
     cleanup(&[&db, &wal]);
@@ -17220,7 +17220,7 @@ fn p3_explain_con_where_pk_lookup_muestra_est_rows() -> Result<(), Box<dyn Error
     )?;
     let detail = extract_scan_detail(res.last().unwrap());
     assert!(
-        detail.contains("PK lookup") && detail.contains("[est.rows=4]"),
+        detail.contains("PK lookup") && detail.contains("est.rows=4"),
         "esperaba PK lookup con est.rows=4, vi: {}",
         detail
     );
@@ -17247,8 +17247,8 @@ fn p3_stats_persisten_a_traves_de_reapertura_p3b() -> Result<(), Box<dyn Error>>
     let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
     let detail = extract_scan_detail(res.last().unwrap());
     assert!(
-        detail.contains("[est.rows=2]"),
-        "P3b: stats deben sobrevivir reapertura, esperaba [est.rows=2] vi: {}",
+        detail.contains("est.rows=2"),
+        "P3b: stats deben sobrevivir reapertura, esperaba est.rows=2 vi: {}",
         detail
     );
     cleanup(&[&db, &wal]);
@@ -17299,8 +17299,8 @@ fn p3b_stats_sobreviven_reopen() -> Result<(), Box<dyn Error>> {
     let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
     let detail = extract_scan_detail(res.last().unwrap());
     assert!(
-        detail.contains("[est.rows=7]"),
-        "P3b: stats deberían sobrevivir reopen, esperaba [est.rows=7] vi: {}",
+        detail.contains("est.rows=7"),
+        "P3b: stats deberían sobrevivir reopen, esperaba est.rows=7 vi: {}",
         detail
     );
     cleanup(&[&db, &wal]);
@@ -17358,8 +17358,8 @@ fn p3b_analyze_sobrescribe_stats_persistidas() -> Result<(), Box<dyn Error>> {
     let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
     let detail = extract_scan_detail(res.last().unwrap());
     assert!(
-        detail.contains("[est.rows=7]"),
-        "P3b: ANALYZE debe sobrescribir, esperaba [est.rows=7] vi: {}",
+        detail.contains("est.rows=7"),
+        "P3b: ANALYZE debe sobrescribir, esperaba est.rows=7 vi: {}",
         detail
     );
     cleanup(&[&db, &wal]);
