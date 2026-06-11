@@ -17944,6 +17944,116 @@ fn p5c_composite_pk_lookup_no_es_overridden() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque P5e (2026-06-11): EXPLAIN anota el algoritmo real de JOIN
+// (index-loop / hash join / nested-loop) en vez de mentir con
+// "nested-loop" fijo. Anota también stats si están disponibles.
+// ============================================================
+
+fn join_step_detail(rs: &gabysql::sql::ResultSet) -> String {
+    for r in &rs.rows {
+        let step = match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        };
+        if step.contains("join") {
+            if let Value::String(d) = &r[1] {
+                return d.clone();
+            }
+        }
+    }
+    String::new()
+}
+
+#[test]
+fn p5e_explain_join_pk_anota_index_loop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5e-pk")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, b_id INT);
+         CREATE TABLE b (id INT PRIMARY KEY, label TEXT);
+         INSERT INTO a (id, b_id) VALUES (1,1),(2,2);
+         INSERT INTO b (id, label) VALUES (1,'x'),(2,'y');
+         EXPLAIN SELECT * FROM a JOIN b ON a.b_id = b.id;",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("index-loop") && detail.contains("PK"),
+        "PK join debe anotar index-loop PK, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5e_explain_join_index_secundario() -> Result<(), Box<dyn Error>> {
+    // Join con predicate sobre columna indexada del right (no-PK).
+    let (db, wal) = p3_setup("p5e-idx")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, ref_b INT);
+         CREATE TABLE b (id INT PRIMARY KEY, code INT);
+         CREATE INDEX idx_b_code ON b (code);
+         INSERT INTO a (id, ref_b) VALUES (1, 10);
+         INSERT INTO b (id, code) VALUES (1, 10);
+         EXPLAIN SELECT * FROM a JOIN b ON a.ref_b = b.code;",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("index-loop") && detail.contains("idx_b_code"),
+        "join sobre col indexada debe anotar index-loop con nombre del idx, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5e_explain_cross_join_anota_nested_loop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5e-cross")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY);
+         CREATE TABLE b (id INT PRIMARY KEY);
+         INSERT INTO a (id) VALUES (1);
+         INSERT INTO b (id) VALUES (1);
+         EXPLAIN SELECT * FROM a CROSS JOIN b;",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("nested-loop") && detail.contains("O(N×M)"),
+        "CROSS JOIN debe ser nested-loop, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5e_explain_join_anota_stats_de_ambos_lados() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5e-stats")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE small (id INT PRIMARY KEY, b_id INT);
+         CREATE TABLE big (id INT PRIMARY KEY, label TEXT);
+         INSERT INTO small (id, b_id) VALUES (1,1),(2,1);
+         INSERT INTO big (id, label) VALUES
+            (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f'),(7,'g'),(8,'h');
+         ANALYZE TABLE small;
+         ANALYZE TABLE big;
+         EXPLAIN SELECT * FROM small JOIN big ON small.b_id = big.id;",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("small.rows=2") && detail.contains("big.rows=8"),
+        "EXPLAIN debe anotar stats de ambos lados, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5d (2026-06-11): hash join build-side selection. Cuando
 // `current` (acumulado de joins previos) es >2× más grande que la
 // próxima `right_rows`, swap el build side al lado más chico.

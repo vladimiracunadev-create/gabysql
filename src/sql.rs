@@ -6027,9 +6027,27 @@ impl<'a> Engine<'a> {
             } else {
                 ""
             };
+            // Bloque P5e (2026-06-11, ADR-0073): detección de algoritmo
+            // de JOIN para EXPLAIN. Refleja la decisión real del
+            // dispatcher en `exec_select_joined`: index-loop (PK/index
+            // sobre RHS, sólo INNER/LEFT) → hash join (equi predicate
+            // con keys resolubles) → nested-loop (CROSS / sin predicate).
+            // Heurística estática — no construye el scope ni ejecuta
+            // subqueries. Si el RHS es derived/VALUES, no hay índice,
+            // así que skip directo a hash/nested.
+            let algo = self.classify_join_algorithm(j, &stmt.table);
+            let stats_left = self.join_side_stats(&stmt.table);
+            let stats_right = if j.right.derived.is_none() && j.right.values.is_none() {
+                self.join_side_stats(&j.right.name)
+            } else {
+                String::new()
+            };
             steps.push((
                 format!("{}.join.{}", base_step + 1, i + 1),
-                format!("{} JOIN {}{} (nested-loop)", kind, target, predicate),
+                format!(
+                    "{} JOIN {}{} ({}){}{}",
+                    kind, target, predicate, algo, stats_left, stats_right
+                ),
             ));
         }
         // GROUP BY / HAVING.
@@ -6074,6 +6092,98 @@ impl<'a> Engine<'a> {
             ));
         }
         Ok(())
+    }
+
+    /// Bloque P5e (2026-06-11, ADR-0073): clasifica QUÉ algoritmo de
+    /// JOIN va a usar el dispatcher de `exec_select_joined`. Refleja
+    /// la lógica real: index-loop (INNER/LEFT con PK o índice en RHS),
+    /// hash join (equi predicate con keys resolubles), nested-loop
+    /// (CROSS, sin predicate, o RHS derived sin index posible).
+    /// Heurística estática — no construye el scope ni ejecuta nada.
+    fn classify_join_algorithm(&mut self, join: &JoinClause, _base_table: &str) -> String {
+        // CROSS o sin predicate efectivo → nested-loop.
+        if matches!(join.kind, JoinKind::Cross) {
+            return "nested-loop, ~O(N×M)".to_string();
+        }
+        let has_predicate = join.on.is_some() || join.using.is_some() || join.natural;
+        if !has_predicate {
+            return "nested-loop, ~O(N×M)".to_string();
+        }
+        // Derived/VALUES no soportan index-loop (sin storage indexado).
+        if join.right.derived.is_some() || join.right.values.is_some() {
+            return "hash join, ~O(N+M)".to_string();
+        }
+        // Index-loop solo aplica a INNER y LEFT.
+        let candidate_index_loop = matches!(join.kind, JoinKind::Inner | JoinKind::Left);
+        if !candidate_index_loop {
+            return "hash join, ~O(N+M)".to_string();
+        }
+        // Para ON explícito: si el lado RHS del predicate apunta a
+        // PK o columna indexada del right, → index-loop.
+        if let Some(pred) = &join.on {
+            let right_meta = {
+                let mut catalog = Catalog::open(self.pager);
+                match catalog.get_table(&join.right.name) {
+                    Ok(Some(m)) => m,
+                    _ => return "hash join, ~O(N+M)".to_string(),
+                }
+            };
+            // Cualquiera de los dos lados del predicate puede apuntar
+            // al right table (`l.col = r.col` o `r.col = l.col`).
+            let right_qual = join
+                .right
+                .alias
+                .clone()
+                .unwrap_or_else(|| join.right.name.clone())
+                .to_ascii_lowercase();
+            let left_ref = column_ref_to_raw(&pred.left);
+            let right_ref = column_ref_to_raw(&pred.right);
+            for candidate in [&left_ref, &right_ref] {
+                let (qual, col) = split_qualified_ident(candidate);
+                let q_matches = qual
+                    .as_deref()
+                    .map(|q| {
+                        q.eq_ignore_ascii_case(&right_qual)
+                            || q.eq_ignore_ascii_case(&join.right.name)
+                    })
+                    .unwrap_or(false);
+                if !q_matches {
+                    continue;
+                }
+                let col_n = normalize_ident(&col);
+                if right_meta.primary_key.eq_ignore_ascii_case(&col_n) {
+                    return format!(
+                        "index-loop on `{}`.`{}` (PK), ~O(N × log M)",
+                        right_qual, col
+                    );
+                }
+                if let Some(idx) = right_meta.index_for_column(&col_n) {
+                    return format!(
+                        "index-loop on `{}`.`{}` (index `{}`), ~O(N × log M)",
+                        right_qual, col, idx.name
+                    );
+                }
+            }
+        }
+        // USING/NATURAL: si el nombre coincide con PK o índice del right,
+        // también irían a index-loop. Pero no resolvemos los nombres acá
+        // sin scope completo — reportamos hash conservadoramente.
+        "hash join, ~O(N+M)".to_string()
+    }
+
+    /// Bloque P5e: anota ` [side=alias est.rows=N]` cuando hay stats
+    /// para la tabla side del JOIN. Devuelve string vacío si no hay
+    /// stats (mismo patrón que `stats_annotation`).
+    fn join_side_stats(&self, table: &str) -> String {
+        let stats = self
+            .table_stats
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(table))
+            .map(|(_, v)| v);
+        match stats {
+            Some(s) => format!(" [{}.rows={}]", table, s.row_count),
+            None => String::new(),
+        }
     }
 
     /// Bloque P1: clasifica el tipo de scan que el engine usaría para
