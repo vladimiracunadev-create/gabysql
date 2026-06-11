@@ -2301,6 +2301,18 @@ const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
 /// convención clásica (Selinger et al., 1979).
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.333;
 
+/// Bloque P5c (2026-06-11): punto de break-even entre lookup indexado
+/// (con N random reads) y FullScan secuencial. Derivado del cost model
+/// `FullScan = row_count × C_SEQ` vs `Index = log(N) × C_LOG +
+/// est.match × C_RANDOM` con `C_RANDOM ≈ 5 × C_SEQ` (típico SSD,
+/// peor en HDD): index gana sólo si `est.match / row_count < 0.2`.
+/// Si la selectividad estimada supera este umbral, P5c fuerza
+/// FullScan + post-filter incluso cuando hay índice disponible.
+///
+/// Conservador: sólo aplica cuando HAY stats P4. Sin stats, el
+/// comportamiento es idéntico al pre-P5c (siempre preferir índice).
+const INDEX_BREAKEVEN_SELECTIVITY: f64 = 0.2;
+
 /// Bloque P5a (2026-06-11): estima la fracción de filas que sobrevivirá
 /// el predicado, usando las stats P4 (`null_count`, NDV, MCV,
 /// histograma). Resultado en `[0.0, 1.0]`. Es **solo estimación** — el
@@ -6108,6 +6120,20 @@ impl<'a> Engine<'a> {
             ));
         };
         let stats = self.stats_annotation(table, where_clause);
+        // Bloque P5c (2026-06-11): si las stats indican alta selectividad,
+        // anunciamos el fallback a FullScan aunque el WHERE matchee algún
+        // índice. Misma decisión que toma exec_select_with_where.
+        let p5c_skip_index = where_clause
+            .and_then(|expr| {
+                let stats_ref = self
+                    .table_stats
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(table))
+                    .map(|(_, v)| v)?;
+                let sel = estimate_selectivity(stats_ref, expr);
+                Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
+            })
+            .unwrap_or(false);
         // Sin WHERE → full scan.
         let Some(where_expr) = where_clause else {
             return Ok(format!(
@@ -6122,6 +6148,13 @@ impl<'a> Engine<'a> {
             // compuesto, anunciamos el fast-path por fingerprint.
             if let Some(eq_map) = extract_and_equality_map(where_expr) {
                 if let Some((idx, _fp)) = find_matching_composite_index(&meta, &eq_map) {
+                    if p5c_skip_index {
+                        return Ok(format!(
+                            "SCAN `{}` (P5c: composite index `{}` disponible \
+                             pero stats prefieren FullScan + post-filter){}",
+                            table, idx.name, stats
+                        ));
+                    }
                     return Ok(format!(
                         "SCAN `{}` → composite index lookup `{}` ({}) \
                          (B+tree fingerprint, ~O(log n)){}",
@@ -6141,6 +6174,8 @@ impl<'a> Engine<'a> {
             WhereClause::Eq { column, .. } => {
                 let key = normalize_ident(column);
                 if key == normalize_ident(&meta.primary_key) {
+                    // PK lookup siempre gana — match único por construcción,
+                    // no aplica P5c.
                     Ok(format!(
                         "SCAN `{}` → PK lookup `{}` (B+tree get, ~O(log n)){}",
                         table, column, stats
@@ -6148,8 +6183,18 @@ impl<'a> Engine<'a> {
                 } else {
                     let idx_kind = self.find_index_kind(&meta, &key);
                     match idx_kind {
+                        Some(IndexKind::Hash) if p5c_skip_index => Ok(format!(
+                            "SCAN `{}` (P5c: hash-index `{}` disponible \
+                             pero stats prefieren FullScan + post-filter){}",
+                            table, column, stats
+                        )),
                         Some(IndexKind::Hash) => Ok(format!(
                             "SCAN `{}` → hash-index equality `{}` (bucket lookup, ~O(1)){}",
+                            table, column, stats
+                        )),
+                        Some(IndexKind::OrderedInt) if p5c_skip_index => Ok(format!(
+                            "SCAN `{}` (P5c: ordered-int index `{}` disponible \
+                             pero stats prefieren FullScan + post-filter){}",
                             table, column, stats
                         )),
                         Some(IndexKind::OrderedInt) => Ok(format!(
@@ -6168,6 +6213,11 @@ impl<'a> Engine<'a> {
                 let key = normalize_ident(column);
                 let idx_kind = self.find_index_kind(&meta, &key);
                 match idx_kind {
+                    Some(IndexKind::OrderedInt) if p5c_skip_index => Ok(format!(
+                        "SCAN `{}` (P5c: ordered-int index `{}` disponible \
+                         pero stats prefieren FullScan + post-filter){}",
+                        table, column, stats
+                    )),
                     Some(IndexKind::OrderedInt) => Ok(format!(
                         "SCAN `{}` → ordered-int index BETWEEN range `{}` (sequential walk){}",
                         table, column, stats
@@ -9357,8 +9407,31 @@ impl<'a> Engine<'a> {
                 .map(|map| map.len() == meta.pk_columns().len())
                 .unwrap_or(false);
 
+        // Bloque P5c (2026-06-11, ADR-0071): cost-based fallback. Si
+        // hay stats P4 y la selectividad estimada supera
+        // INDEX_BREAKEVEN_SELECTIVITY (~0.2), el lookup indexado con
+        // sus N random reads cuesta más que el FullScan secuencial.
+        // Forzamos FullScan + post-filter en ese caso. NO se aplica a
+        // composite_pk_fast_path_active (PK compuesta = match único
+        // por construcción) — esa rama siempre gana.
+        let p5c_skip_index: bool = !composite_pk_fast_path_active
+            && stmt
+                .where_clause
+                .as_ref()
+                .and_then(|expr| {
+                    let stats = self
+                        .table_stats
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&meta.name))
+                        .map(|(_, v)| v)?;
+                    let sel = estimate_selectivity(stats, expr);
+                    Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
+                })
+                .unwrap_or(false);
+
         let generic_post_filter: Option<WhereExpr> = match &stmt.where_clause {
             Some(_) if composite_pk_fast_path_active => None,
+            Some(expr) if p5c_skip_index => Some(expr.clone()),
             Some(expr) => {
                 let force = match expr.as_atom() {
                     None => true,
@@ -9512,6 +9585,12 @@ impl<'a> Engine<'a> {
 
         let plan = if let Some(p) = composite_pk_plan {
             p
+        } else if p5c_skip_index {
+            // Bloque P5c: stats indican alta selectividad → FullScan
+            // secuencial es más barato que el index lookup + N random
+            // reads. El generic_post_filter ya está activo (forzado
+            // arriba) — filtra row-a-row con 3VL.
+            Plan::FullScan
         } else if let Some(p) = composite_index_plan {
             p
         } else if exists_postfilter.is_some() || generic_post_filter.is_some() {

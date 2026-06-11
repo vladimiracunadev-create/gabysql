@@ -17790,6 +17790,160 @@ fn p5a_selectivity_between_usa_histograma() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque P5c (2026-06-11): cost-based fallback. Si stats muestran
+// alta selectividad (>= INDEX_BREAKEVEN_SELECTIVITY ~ 0.2), preferir
+// FullScan + post-filter sobre index lookup. Sin stats, comportamiento
+// inalterado (preferir índice).
+// ============================================================
+
+#[test]
+fn p5c_alta_selectividad_prefiere_fullscan_sobre_hash_idx() -> Result<(), Box<dyn Error>> {
+    // Tabla con índice hash en `category`. 10 filas, 6 son 'a' (60%).
+    // sel(category='a') ≈ 0.6 > 0.2 → P5c fuerza FullScan.
+    let (db, wal) = p3_setup("p5c-hash-skip")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT, val INT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category, val) VALUES
+            (1,'a',1),(2,'a',2),(3,'a',3),(4,'a',4),(5,'a',5),(6,'a',6),
+            (7,'b',7),(8,'b',8),(9,'b',9),(10,'c',10);
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("P5c") && detail.contains("FullScan"),
+        "esperaba P5c skip-index sobre alta sel, vi: {}",
+        detail
+    );
+    // El SELECT real debe devolver las 6 filas correctas (verificación
+    // de correctness — el FullScan + post-filter NO debe romper nada).
+    let rs = run_sql(&db, "SELECT id FROM t WHERE category = 'a' ORDER BY id;")?;
+    let ids: Vec<i64> = rs
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5c_baja_selectividad_sigue_usando_indice() -> Result<(), Box<dyn Error>> {
+    // 'd' aparece 1 de 10 (10%) → sel < 0.2 → mantener índice.
+    let (db, wal) = p3_setup("p5c-keep-idx")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),(10,'d');
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'd';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("P5c") && detail.contains("hash-index equality"),
+        "baja sel debe mantener índice, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5c_sin_stats_conserva_path_indexado() -> Result<(), Box<dyn Error>> {
+    // Sin ANALYZE: aunque la selectividad real sería alta, P5c NO
+    // se activa (decisión conservadora).
+    let (db, wal) = p3_setup("p5c-no-stats")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES (1,'a'),(2,'a'),(3,'a'),(4,'b');",
+    )?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("P5c") && detail.contains("hash-index equality"),
+        "sin stats: P5c NO debe activarse, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5c_correctness_fullscan_devuelve_mismo_resultado() -> Result<(), Box<dyn Error>> {
+    // Cuando P5c fuerza FullScan, el resultado debe coincidir bit-a-bit
+    // con el que daría el index lookup. Regression de correctness.
+    let (db, wal) = p3_setup("p5c-correct")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, payload TEXT);
+         CREATE INDEX idx_cat ON t (cat);
+         INSERT INTO t (id, cat, payload) VALUES
+            (1,'x','one'),(2,'x','two'),(3,'x','three'),(4,'x','four'),
+            (5,'x','five'),(6,'y','six'),(7,'x','seven'),(8,'x','eight'),
+            (9,'y','nine'),(10,'z','ten');
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(&db, "SELECT payload FROM t WHERE cat = 'x' ORDER BY id;")?;
+    let payloads: Vec<String> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(
+        payloads,
+        vec!["one", "two", "three", "four", "five", "seven", "eight"]
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5c_composite_pk_lookup_no_es_overridden() -> Result<(), Box<dyn Error>> {
+    // composite PK lookup es unique-by-construction (1 row exacto).
+    // P5c no debe pisarlo aunque las stats agregadas digan otra cosa.
+    let (db, wal) = p3_setup("p5c-pk-protected")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, payload TEXT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, payload) VALUES (1,1,'first'),(1,2,'second'),(2,1,'third');
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 1;",
+    )?;
+    let last = run_sql(&db, "SELECT payload FROM t WHERE a = 1 AND b = 1;")?;
+    let payloads: Vec<String> = last
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(payloads, vec!["first"]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5b (2026-06-11): composite secondary index lookup.
 // `WHERE c1 = X AND c2 = Y AND ...` con CREATE INDEX (c1, c2, ...)
 // → fast-path por fingerprint en vez de full-scan. Cierra Gap 10
