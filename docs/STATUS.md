@@ -1,12 +1,14 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-09 contra `main` post-bloques W1+W2+W3 (CTEs no-rec / `WITH RECURSIVE` / window functions), X1→X4f+X6 (triggers AFTER/BEFORE, stored procedures, user functions, control de flujo procedural completo + `FOR row IN SELECT`), Y1→Y9 (tipos extendidos + Decimal exacto + UUID + UNSIGNED + BLOB + aritmética Decimal exacta), Z1→Z3f (USER/ROLE + PBKDF2/scrypt/Blake2b/Argon2id + GRANT/REVOKE + RLS USING/WITH CHECK + DEFAULTs antes de check), **P1+P2+P3+P3b (Fase 3)**: `EXPLAIN <stmt>` + `EXPLAIN ANALYZE <stmt>` + `ANALYZE <table>` **con stats persistidas en catálogo** (P3b, 2026-06-09). **VERSION on-disk = 32** (último bump fue **P3b → `ObjectKind::TableStats`**, ver ADR-0067; P3b es el único cambio de formato desde Z1f).
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-11 contra `main` post-bloques W1+W2+W3, X1→X4f+X6, Y1→Y9, Z1→Z3f, y **Fase 3 cerrada (`P1+P2+P3+P3b+P4+P5a+P5b+P5c+P5d+P5e`)** + hardening post-sesión (`R1+R4+M2+R8+R6`): EXPLAIN/EXPLAIN ANALYZE + ANALYZE con stats persistidas en catálogo + stats por-columna (NDV/MCV/histograma) + planner cost-based con bypass por stats stale + composite secondary index lookup + hash-join build-side selection + JOIN algorithm annotation + UPDATE/DELETE composite-eq fast-paths + post-lookup bucket-size check. **VERSION on-disk = 33** (último bump P4 / 2026-06-10 — column stats; P3b → 32 fue el bump previo). Los 10 bloques P4 → R6 entregados en sesión 2026-06-10/11 son zero-bump excepto P4.
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
+>
+> 👉 **Para el balance crítico de la última sesión** (tensiones cerradas, abiertas, deuda residual): [ANALISIS_POST_P5.md](ANALISIS_POST_P5.md).
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
-[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-32-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-749%2F749-brightgreen)](../tests/integration_test.rs)
+[![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-33-2d7a66)](TECHNICAL_SPECS.md)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-798%2F798-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 > **2026-05-29 — Día grande: cierre de Fase 2 (seguridad) + arranque y avance fuerte de Fase 3 (planeación).** Lo entregado hoy en orden cronológico:
@@ -161,7 +163,7 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **2026-06-11** sesión P5d (zero-bump): hash join build-side selection. Cuando `current` (acumulado de joins previos) supera 2× `right_rows`, swap el build side al lado más chico. Cardinalidad real (no estimada). Threshold conservador para preservar orden de output en queries sin ORDER BY. Ver [ADR-0072](adr/0072-p5d-hash-join-build-side.md).
 > - **2026-06-11** sesión P5e (zero-bump): EXPLAIN anota el algoritmo real de JOIN (index-loop / hash / nested-loop) en vez de mentir con "nested-loop" fijo, más cardinality stats de ambos lados. Cierre formal de Fase 3 — EXPLAIN refleja ahora todo el planner. Ver [ADR-0073](adr/0073-p5e-join-algorithm-annotation.md).
 > - **2026-06-11** sesión R1 (zero-bump): detección de stats stale. EXPLAIN muestra `stats.age=Xd Yh` (+`STALE` si >7d). P5c bow out cuando stats stale → preserva path indexado. Cierra la tensión #1 del análisis post-P5. Ver [ADR-0074](adr/0074-r1-stats-stale-detection.md).
-> - **2026-06-11** sesión R4 (zero-bump, sin ADR): validación empírica de HLL+splitmix64 sobre TEXT (500 distinct), UUID (500), DATE (365) y DECIMAL (300). Suite total 789 passing — todos los tipos dentro de ±25% del NDV real.
+> - **2026-06-11** sesión R4 (zero-bump, sin ADR): validación empírica de HLL+splitmix64 sobre TEXT (500 distinct), UUID (500), DATE (365) y DECIMAL (300). +4 tests. Todos los tipos dentro de ±25% del NDV real.
 > - **2026-06-11** sesión M2 (zero-bump): nuevo modo `gabybench smoke` (microblog + orders_lines, ~1-2 min) y job CI `bench` que sube `bench/results.json` como artifact. Pre-requisito para R2/R3 (calibración de thresholds empíricos). Ver [ADR-0075](adr/0075-m2-gabybench-in-ci.md).
 > - **2026-06-11** sesión R8 (zero-bump): composite-eq fast-path para UPDATE/DELETE. Cierra la asimetría P5b (que solo cubría SELECT). Bonus: composite PK fast-path para UPDATE/DELETE también. Suite total 794. Ver [ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md).
 > - **2026-06-11** sesión R6 (zero-bump): post-lookup bucket size check. Si el composite devuelve ≥20% de las filas, bail a FullScan + post-filter — usa cardinalidad REAL del bucket, no la estimación con asunción de independencia. Refina P5c en el caso de AND con cols correlacionadas. Suite total 798. Ver [ADR-0077](adr/0077-r6-composite-bucket-size-check.md).

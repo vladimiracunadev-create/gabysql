@@ -1,9 +1,32 @@
-# Análisis del producto tras la sesión P3b → P5e (2026-06-09 al 2026-06-11)
+# Análisis del producto tras la sesión P3b → P5e + R1/R4/M2/R8/R6 (2026-06-09 al 2026-06-11)
 
 > **Propósito**: dejar registrado qué cambió, qué quedó frágil, qué características
 > chocan entre sí, qué hay que reparar y qué hay que mejorar. Es un diagnóstico
-> después de 8 pushes en 48h — el ritmo expuso tensiones que conviene nombrar
+> después de 12 pushes en 48h — el ritmo expuso tensiones que conviene nombrar
 > antes de seguir construyendo.
+>
+> ## Actualización 2026-06-11 (post-acciones del análisis)
+>
+> Tras escribir el análisis original (justo después de P5e), seguimos trabajando
+> sobre las tensiones identificadas. Las acciones aplicadas:
+>
+> - **Tensión 2.1 (stats stale + P5c)** → ✅ **cerrada por R1** ([ADR-0074](adr/0074-r1-stats-stale-detection.md)).
+>   EXPLAIN muestra `stats.age=Xd Yh` (+ `STALE`); P5c bow out automático >7d.
+> - **Tensión 2.2 (independencia AND)** → ✅ **mitigada por R6** ([ADR-0077](adr/0077-r6-composite-bucket-size-check.md)).
+>   No eliminada — sigue afectando single-col AND y AND más complejo —, pero en el caso composite
+>   el post-lookup ya no depende del producto estimado.
+> - **Tensión 2.7 (composite bucket grande)** → ✅ **cerrada por R6**.
+> - **Tensión 2.8 (HLL no validado en tipos no-INT)** → ✅ **cerrada por R4**
+>   (4 tests: TEXT/UUID/DATE/DECIMAL, todos ±25% del NDV real).
+> - **Tensión 2.3 / 2.4 (calibración INDEX_BREAKEVEN y threshold P5d)** → parcial:
+>   **M2** ([ADR-0075](adr/0075-m2-gabybench-in-ci.md)) puso `gabybench smoke` en CI con artifact JSON
+>   por commit. Falta R2/R3 dedicados que analicen N corridas y ajusten constantes.
+> - **Asimetría R8 (UPDATE/DELETE no usaban P5b)** → ✅ **cerrada por R8**
+>   ([ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md)).
+>
+> **Marcador rápido**: 5 de 9 tensiones del análisis original cerradas; 4 abiertas
+> (2 cosméticas: 2.5, 2.6 · 2 dependientes de bench data: 2.3, 2.4 · 1 deuda
+> documentada: 2.9). Suite tests 745 → **798**. Detalles abajo en cada tensión.
 
 ---
 
@@ -18,17 +41,23 @@
 | **P5c** (2026-06-11) | cost-based skip-index si `sel ≥ 0.2` | zero-bump | medio (primer plan-cambio por stats) |
 | **P5d** (2026-06-11) | hash-join build-side swap si `current > right × 2` | zero-bump | bajo (cardinality real) |
 | **P5e** (2026-06-11) | EXPLAIN anota algoritmo real de JOIN | zero-bump | nulo (annotation) |
+| **R1** (2026-06-11) | detección stats stale + bypass P5c | zero-bump | nulo (mitigación tensión 2.1) |
+| **R4** (2026-06-11) | tests HLL sobre TEXT/UUID/DATE/DECIMAL | zero-bump | nulo (tests, mitigación tensión 2.8) |
+| **M2** (2026-06-11) | `gabybench smoke` en CI + artifact JSON | zero-bump | nulo (CI) |
+| **R8** (2026-06-11) | composite-eq fast-path para UPDATE/DELETE | zero-bump | bajo (reusa helpers P5b) |
+| **R6** (2026-06-11) | post-lookup bucket-size check | zero-bump | bajo (mitigación tensiones 2.2/2.7) |
 
-**Tests**: 745 → 781 (+36). Pasaron en 4 runners de CI (ubuntu/macos/windows/docker).
+**Tests**: 745 → **798** (+53). Pasaron en 5 runners de CI (ubuntu/macos/windows/docker + nuevo job `bench`).
 
-**Líneas tocadas**: ~3 500 LOC en `src/sql.rs`, `src/catalog.rs`, `src/storage.rs`,
-`tests/integration_test.rs`, más 6 ADRs nuevos (0067–0073).
+**Líneas tocadas**: ~5 000 LOC en `src/sql.rs`, `src/catalog.rs`, `src/storage.rs`,
+`src/bin/gabybench.rs`, `tests/integration_test.rs`, `.github/workflows/ci.yml`,
+más **11 ADRs nuevos** (0067–0077).
 
 ---
 
 ## 2. Tensiones y choques entre características
 
-### 2.1 Stats stale silenciosas (heredado P3 → amplificado por P5c)
+### 2.1 Stats stale silenciosas (heredado P3 → amplificado por P5c) — ✅ CERRADA por R1
 
 **Problema**: `ANALYZE TABLE` corre una vez, las stats persisten. Pero si la
 tabla cambia mucho después, ni el motor ni EXPLAIN lo señalan. Pre-P5c era
@@ -42,7 +71,7 @@ de tabla, sin error visible. El usuario no sabe que sus stats son obsoletas.
 
 **Magnitud**: alto — es la principal externalidad de P5c.
 
-### 2.2 Independencia asumida en AND (heredado P5a → propagado a P5c)
+### 2.2 Independencia asumida en AND (heredado P5a → propagado a P5c) — 🟡 PARCIALMENTE MITIGADA por R6
 
 `estimate_selectivity(And(a, b)) = sel(a) × sel(b)`. Asume columnas
 independientes. En la realidad están correlacionadas (`marca='Toyota' AND
@@ -100,7 +129,7 @@ con la ejecución real.
 
 **Magnitud**: bajo. RIGHT/FULL son raros en queries típicas.
 
-### 2.7 Composite index NO-UNIQUE con bucket gigantesco
+### 2.7 Composite index NO-UNIQUE con bucket gigantesco — ✅ CERRADA por R6
 
 Si el composite index `(qty, precio)` se usa sobre valores muy repetidos
 (p.ej. todas las filas con `qty=5, precio=100`), el bucket guarda miles de
@@ -111,7 +140,7 @@ el caso que P5c quiere evitar. Pero P5c NO se aplica a composite indexes
 **Magnitud**: medio. No es un bug; es un caso edge que P5c no cubre por
 diseño.
 
-### 2.8 HLL bias en columnas con tipos no-INT
+### 2.8 HLL bias en columnas con tipos no-INT — ✅ CERRADA por R4
 
 El hot-fix de P4 (splitmix64 finalizer) se validó con INT secuenciales.
 Para DECIMAL, DATE, UUID, TEXT — no validado empíricamente. Si HLL está
@@ -134,18 +163,21 @@ en un JOIN sin ORDER BY, puede romperse al cruzar el 2× con datos nuevos.
 
 ## 3. Lista de reparaciones (lo que se rompió o quedó débil)
 
-| # | Item | Severidad | Esfuerzo |
-|---|------|-----------|----------|
-| R1 | **Detección de stats stale en EXPLAIN + warning si P5c usa stats > X días vieja** | alta | 1 push (~200 LOC) |
-| R2 | **Calibrar `INDEX_BREAKEVEN_SELECTIVITY` contra `gabybench` real** (correr el bench, medir, ajustar) | alta | 1 push (~50 LOC + análisis) |
-| R3 | **Calibrar threshold P5d (1.5× vs 2× vs 3×)** mismo método | media | 1 push (~50 LOC + análisis) |
-| R4 | **HLL test sobre DECIMAL/DATE/UUID/TEXT** — verificar empíricamente que la distribución no esté sesgada | media | 1 push (~250 LOC tests) |
-| R5 | **TRUNCATE TABLE limpia stats persistidas** (heredado P3b — falta el statement) | media | parte de un bloque mayor sobre TRUNCATE |
-| R6 | **Composite index lookup con bucket gigantesco** — P5c extendido a composite (chequear `est.match` antes del lookup) | media | 1 push (~150 LOC) |
-| R7 | **Mensaje EXPLAIN del P5c skip — sugerir re-`ANALYZE` si stats viejas** | baja | 1 push (~30 LOC) |
-| R8 | **UPDATE/DELETE con composite-eq aún hacen FullScan** — extender P5b a esos paths | media | 1 push (~200 LOC, reusa helpers) |
-| R9 | **`COUNT(DISTINCT col)` sobre JOIN** — heredado de ADR-0066 Gap 1, no cerrado | baja | 1 push (~150 LOC) |
-| R10 | **USING/NATURAL JOIN — EXPLAIN heurística conservadora** — completar con resolución de scope dry-run | baja | 1 push (~200 LOC) |
+| # | Item | Severidad | Estado |
+|---|------|-----------|--------|
+| R1 | **Detección de stats stale en EXPLAIN + warning si P5c usa stats > X días vieja** | alta | ✅ entregada ([ADR-0074](adr/0074-r1-stats-stale-detection.md)) |
+| R2 | **Calibrar `INDEX_BREAKEVEN_SELECTIVITY` contra `gabybench` real** | alta | 🟡 parcial — M2 ya da datos, falta corrida dedicada |
+| R3 | **Calibrar threshold P5d (1.5× vs 2× vs 3×)** | media | 🔴 abierto — depende de M2 |
+| R4 | **HLL test sobre DECIMAL/DATE/UUID/TEXT** | media | ✅ entregada (sin ADR; ver `r4_*` tests) |
+| R5 | **TRUNCATE TABLE limpia stats persistidas** | media | 🔴 abierto (bloqueado por implementar TRUNCATE como statement) |
+| R6 | **Composite index lookup con bucket gigantesco** — refinamiento de P5c | media | ✅ entregada ([ADR-0077](adr/0077-r6-composite-bucket-size-check.md)) |
+| R7 | **Mensaje EXPLAIN del P5c skip — sugerir re-`ANALYZE` si stats viejas** | baja | 🔴 abierto (cosmético) |
+| R8 | **UPDATE/DELETE con composite-eq aún hacen FullScan** | media | ✅ entregada ([ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md)) |
+| R9 | **`COUNT(DISTINCT col)` sobre JOIN** — ADR-0066 Gap 1 residual | baja | 🔴 abierto |
+| R10 | **USING/NATURAL JOIN — EXPLAIN heurística conservadora** | baja | 🔴 abierto |
+
+**6 de 10 cerradas.** Las 4 abiertas restantes están detalladas en
+[TAREAS_PENDIENTES.md §4](TAREAS_PENDIENTES.md) con esfuerzo estimado.
 
 ---
 
@@ -224,19 +256,36 @@ seguridad que faltó durante esta sesión.
 
 ---
 
-## 6. Recomendación de orden
+## 6. Recomendación de orden — actualizada 2026-06-11
 
-Si tuviera que priorizar el próximo bloque entre todos los anteriores:
+Original (antes de hacer nada): M2 → R1 → R2 → R4 → M4 → R5/R8/R9.
 
-1. **M2 — gabybench reproducible en CI** (declarado como P6 en STATUS). Sin
-   esto, R2/R3 son adivinaciones.
-2. **R1 — detección de stats stale** (analyzed_at_nanos ya persiste — falta
-   consumirlo en EXPLAIN + en la decisión de P5c).
-3. **R2 — calibrar `INDEX_BREAKEVEN`** una vez M2 esté.
-4. **R4 — tests de HLL sobre tipos no-INT** (independiente de M2; previene
-   futuros sustos como el hot-fix de P4).
-5. **M4 — `cargo fuzz` sobre el parser** (declarado en TAREAS_PENDIENTES,
-   sigue ahí; aporta confianza independiente del optimizer).
-6. **R5/R8/R9 — cierre de pendientes residuales** del bloque previo.
+**Lo que efectivamente se hizo**: R1 → R4 → M2 → R8 → R6 (orden distinto al
+propuesto: R1 antes de M2 porque era el bloque más chico y self-contained;
+M2 después porque ya teníamos suficiente confianza en el optimizer post-R1+R4;
+R8/R6 como cierre de residual; R2/R3 quedaron para otro día porque calibrar
+contra bench data requiere análisis manual de N corridas, no un push
+mecánico).
 
-Cualquier bloque P5f+ debería esperar al menos a (1) y (2).
+**Próximo orden recomendado** desde acá:
+
+1. **R2 — calibrar `INDEX_BREAKEVEN`** con bench data acumulada (M2 ya está).
+   Requiere recolectar 5-10 corridas de smoke en commits distintos y comparar
+   latencia FullScan vs Index path en queries con sel conocida.
+2. **R3 — calibrar threshold P5d** con el mismo método.
+3. **M4 — `cargo fuzz` sobre el parser** (declarado hace tiempo en
+   TAREAS_PENDIENTES como prioridad alta; sigue ahí).
+4. **M3 — property tests sobre planner** (`proptest` que verifique
+   resultados idénticos con/sin ANALYZE). Defensa contra futuros P5f+.
+5. **R5/R9/R10 — residuales** restantes.
+
+**Lo que NO conviene hacer antes**: cualquier bloque P5f+ (JOIN reorder
+global, multi-column stats M5, prefix matching M8). El optimizer actual con
+P5c+P5d+R6+R1 está en un equilibrio razonable; sumar más antes de calibrar
+R2/R3 multiplica el riesgo de regresiones silenciosas que no podemos detectar.
+
+Otra opción razonable: **parar acá**. La superficie del optimizer está
+internamente consistente, las tensiones de severidad alta están cerradas, la
+suite es 798/798 verde. Es un punto de descanso natural antes de decidir el
+siguiente eje (más optimizer, más DDL como TRUNCATE/M12 SAVEPOINT, o más
+ergonomía operativa como auto-ANALYZE M1).

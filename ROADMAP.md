@@ -18,9 +18,9 @@
 | **Fase 2** | Identidad SQL-level (Z1+Z1b+Z1c+Z1d+Z1e+Z1f) | 🟡 | USERS+ROLES, PBKDF2 default, scrypt scheme=2, Blake2b RFC 7693, Argon2id estructural (no matchea vector RFC 9106 §A.3, mar­cado en ADR-0061) |
 | **Fase 2** | Authz (Z2 + Z3+Z3b+Z3c+Z3d+Z3e+Z3f) | 🟢 | GRANT/REVOKE bitmask + SET SESSION AUTH + RLS USING/WITH CHECK + RETURNING filter + DEFAULTs antes de check |
 | **Fase 3** | Plan textual (P1+P2+P3+P3b) | 🟢 | EXPLAIN dry-run + EXPLAIN ANALYZE con Instant + ANALYZE TABLE **con stats persistidas en catálogo** (P3b, 2026-06-09; sobreviven a reopen) |
-| **Cross-fase** | ADR-0066 (F3+F2+W4+E5+K3+K4+N5) | 🟢 | 9/10 gaps del bench cerrados 2026-05-30 (7 bloques): BETWEEN sin idx, agregados sobre JOIN/view, window funcs O(n), bare-SELECT, UNIQUE multi-col TEXT, auto-index prefix PK, DEFAULT con función. Gap 10 (P5b) depende de P5. |
-| **Fase 3** | Cost estimates per-column | 🔴 | P4 (NDV/MCV/histogramas) — slot `ObjectKind::TableStats` ya existe (P3b), P4 extiende `StatsMeta` |
-| **Fase 3** | Planner-as-optimizer | 🔴 | P5 (reorden de joins, choice de índice por costo) |
+| **Cross-fase** | ADR-0066 (F3+F2+W4+E5+K3+K4+N5+P5b) | 🟢 | **10/10 gaps del bench cerrados**. 9 primeros en 7 bloques el 2026-05-30 (BETWEEN sin idx, agregados sobre JOIN/view, window funcs O(n), bare-SELECT, UNIQUE multi-col TEXT, auto-index prefix PK, DEFAULT con función). Gap 10 cerrado el 2026-06-11 por P5b (composite secondary index lookup). |
+| **Fase 3** | Cost estimates per-column (P4) | 🟢 | P4 cerrado 2026-06-10. NDV vía HyperLogLog 256-reg + splitmix64 + MCV top-K=10 + histograma equi-depth ~16 buckets persistidos. VERSION 32→33. Ver [ADR-0068](docs/adr/0068-p4-column-stats.md). |
+| **Fase 3** | Planner-as-optimizer (P5a-e) | 🟢 | Fase 3 cerrada 2026-06-11. P5a (selectivity), P5b (composite idx), P5c (cost-based skip), P5d (hash-join build-side), P5e (JOIN annotation). Reparaciones: R1 (stats stale), R4 (HLL tests), M2 (bench en CI), R8 (UPDATE/DELETE composite), R6 (bucket size check). |
 | **Fase 4** | Operación de producto, release, backups | 🟡 | gabysql backup/restore/verify funciona, falta release process formal |
 | **Fase 5** | AI-native (MCP gateway) | 🟡 | binario `gabysql-mcp` existe, falta endurecer |
 

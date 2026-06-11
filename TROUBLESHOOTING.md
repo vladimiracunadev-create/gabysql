@@ -37,10 +37,10 @@ cargo run --release --bin gabysql -- init demo.db
 
 ---
 
-## 🔢 `unsupported gabysql file format: version=N (expected 13)`
+## 🔢 `unsupported gabysql file format: version=N (expected 33)`
 
 ### Causa
-Intentas abrir un archivo con una versión de formato anterior. La versión actual es `13`. Las versiones `1` a `12` quedaron explícitamente fuera (cada bump persiste cosas nuevas: `2` cambió el hash, `3` agregó CRCs, `4` agregó índices secundarios, `5` agregó `NOT NULL`/`DEFAULT`/`UNIQUE`, `6` agregó `FOREIGN KEY`, `7` agregó `IndexKind` para índices INT-ordenados, `8` agregó PK e índices compuestos all-INT — K2, ADR-0019, `9` agregó FK actions extendidas + `ON UPDATE` — L1/ADR-0020, `10` agregó `CHECK` — L2/ADR-0021, `11` agregó nombres de constraint + `DROP CONSTRAINT` — residual #2/ADR-0022, `12` agregó FK multi-col — residual #3/ADR-0023, `13` agregó vistas lógicas + discriminator byte — bloque V/ADR-0025). Ver [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
+Intentas abrir un archivo con una versión de formato anterior. La versión actual es `33` (bump P4 / 2026-06-10 — column stats persistidas). Las versiones `1` a `32` quedaron explícitamente fuera — la política del motor es **no auto-upgrade** entre versiones (ver TECHNICAL_SPECS.md y los ADRs por bloque). La lista completa de bumps con su contexto vive en [COMPATIBILITY.md §5](COMPATIBILITY.md#5--formato-en-disco).
 
 ### Solución
 - Re-crear la base con el binario actual: `gabysql init <file.db>`.

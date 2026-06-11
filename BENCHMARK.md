@@ -201,7 +201,7 @@
 
 **Catálogo completo, auditado y priorizado**: [ADR-0066 — Gaps del motor expuestos por el benchmark](docs/adr/0066-bench-exposed-gaps.md).
 
-Resumen (**9/10 gaps cerrados en 7 bloques el 2026-05-30**; pendiente Gap 10 / P5b dentro del bloque P5 — planner real):
+Resumen (**10/10 gaps cerrados** — 9 primeros en 7 bloques el 2026-05-30, Gap 10 cerrado por P5b el 2026-06-11):
 
 | # | Gap | Código | Bloque defer | Prioridad |
 |---|---|---|---|---:|
