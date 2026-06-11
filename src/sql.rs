@@ -2528,7 +2528,7 @@ impl ColumnCollector {
         // MCV: top-K por count, tie-break por orden estable.
         let mut entries: Vec<(StatsValue, u64)> =
             self.counts.drain().map(|(_k, (v, c))| (v, c)).collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
         let mcv: Vec<(StatsValue, u64)> = entries.into_iter().take(Self::MCV_K).collect();
 
         // Histograma equi-depth: sort + slice en N buckets aproximadamente
