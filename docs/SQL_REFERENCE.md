@@ -129,7 +129,7 @@ flowchart LR
 
 ## CREATE DATABASE
 
-> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 32` (bump P3b por nuevo `ObjectKind::TableStats`, ver [ADR-0067](adr/0067-p3b-persistent-stats.md)). En modo single-DB (`-db`) responde `405`.
+> **Solo en modo server multi-DB (`-dir`) o CLI con un directorio.** Crea un archivo `.db` aplicando el formato `VERSION = 33` (bump P4 por column stats persistidas, ver [ADR-0068](adr/0068-p4-column-stats.md)). En modo single-DB (`-db`) responde `405`.
 
 ### 🛤️ Railroad
 

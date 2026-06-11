@@ -1858,6 +1858,11 @@ impl PolicyMeta {
 
 /// Bloque P3b (VERSION 32): stats por tabla persistidas en catálogo.
 ///
+/// Bloque P4 (VERSION 33, 2026-06-10): extendido con `format_version`
+/// y `Vec<ColumnStats>` por columna (NDV vía HyperLogLog, MCV top-K,
+/// histograma equi-depth). El `format_version` interno (no el `VERSION`
+/// global del archivo) permite extensiones aditivas sin bump global.
+///
 /// Refleja el `TableStats` en memoria del Engine (ver `sql.rs`) pero
 /// agregando `name` porque el catálogo necesita asociar el record con
 /// la tabla. La clave del record es `__stats__:<tabla>` para no
@@ -1867,12 +1872,21 @@ impl PolicyMeta {
 /// la tabla cambia después — invalidación manual reejecutando ANALYZE.
 /// `analyzed_at_nanos` es el wall-clock en nanos del momento del
 /// `ANALYZE`, útil para que EXPLAIN muestre cuán viejas son las stats.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatsMeta {
     pub name: String,
     pub row_count: u64,
     pub analyzed_at_nanos: u128,
+    /// Bloque P4: per-column stats. Vacío para tablas que nunca
+    /// corrieron ANALYZE bajo P4 (no debería existir bajo VERSION 33
+    /// porque el bump fuerza re-creación de DBs viejas).
+    pub columns: Vec<ColumnStats>,
 }
+
+/// Bloque P4 (VERSION 33): formato actual del payload `StatsMeta`.
+/// Solo `1` por ahora. Se incrementa cuando se agreguen campos sin
+/// bumpear el VERSION global del archivo.
+pub const STATS_META_FORMAT_V1: u8 = 1;
 
 impl StatsMeta {
     /// Clave del catálogo para el record de stats de una tabla. El
@@ -1883,10 +1897,23 @@ impl StatsMeta {
     }
 
     pub fn serialize(&self) -> DbResult<Vec<u8>> {
-        let mut out = Vec::with_capacity(32 + self.name.len());
+        let mut out = Vec::with_capacity(64 + self.name.len());
         push_string(&mut out, &self.name)?;
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&self.analyzed_at_nanos.to_le_bytes());
+        // Bloque P4: format_version + column count + per-column payload.
+        out.push(STATS_META_FORMAT_V1);
+        if self.columns.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "StatsMeta: demasiadas columnas ({}); máximo {}",
+                self.columns.len(),
+                u16::MAX
+            )));
+        }
+        out.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
+        for col in &self.columns {
+            col.encode_into(&mut out)?;
+        }
         Ok(out)
     }
 
@@ -1902,10 +1929,270 @@ impl StatsMeta {
         let row_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         offset += 8;
         let analyzed_at_nanos = u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
+        offset += 16;
+        // Bloque P4: format_version + column stats. Si el buffer se
+        // acabó acá, asumimos sin column stats (defensivo, no debería
+        // pasar bajo VERSION 33 — el bump rechaza DBs sin el byte).
+        let columns = if offset >= data.len() {
+            Vec::new()
+        } else {
+            let fmt = data[offset];
+            offset += 1;
+            if fmt != STATS_META_FORMAT_V1 {
+                return Err(DbError::new(format!(
+                    "StatsMeta: format_version {} desconocido (esperaba {})",
+                    fmt, STATS_META_FORMAT_V1
+                )));
+            }
+            if offset + 2 > data.len() {
+                return Err(DbError::new(
+                    "StatsMeta corrupto: faltan 2 bytes para column_count".to_string(),
+                ));
+            }
+            let n = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let mut cols = Vec::with_capacity(n);
+            for _ in 0..n {
+                cols.push(ColumnStats::decode(data, &mut offset)?);
+            }
+            cols
+        };
         Ok(Self {
             name,
             row_count,
             analyzed_at_nanos,
+            columns,
+        })
+    }
+}
+
+/// Bloque P4 (VERSION 33): valor para representar elementos de MCV y
+/// extremos de histograma. Subset de `sql::Value` excluyendo `Bytes`
+/// (BLOB no tiene semántica de orden útil) — para mantener `catalog`
+/// independiente del frontend SQL.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatsValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+    Decimal { value: i128, scale: u8 },
+}
+
+impl StatsValue {
+    fn kind_code(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Integer(_) => 1,
+            Self::Float(_) => 2,
+            Self::Bool(_) => 3,
+            Self::String(_) => 4,
+            Self::Decimal { .. } => 5,
+        }
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) -> DbResult<()> {
+        out.push(self.kind_code());
+        match self {
+            Self::Null => {}
+            Self::Integer(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Self::Float(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Self::Bool(b) => out.push(u8::from(*b)),
+            Self::String(s) => push_string(out, s)?,
+            Self::Decimal { value, scale } => {
+                out.extend_from_slice(&value.to_le_bytes());
+                out.push(*scale);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(data: &[u8], offset: &mut usize) -> DbResult<Self> {
+        if *offset >= data.len() {
+            return Err(DbError::new(
+                "StatsValue corrupto: buffer agotado en kind".to_string(),
+            ));
+        }
+        let kind = data[*offset];
+        *offset += 1;
+        Ok(match kind {
+            0 => Self::Null,
+            1 => {
+                if *offset + 8 > data.len() {
+                    return Err(DbError::new(
+                        "StatsValue INT corrupto: faltan 8 bytes".to_string(),
+                    ));
+                }
+                let n = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+                *offset += 8;
+                Self::Integer(n)
+            }
+            2 => {
+                if *offset + 8 > data.len() {
+                    return Err(DbError::new(
+                        "StatsValue FLOAT corrupto: faltan 8 bytes".to_string(),
+                    ));
+                }
+                let n = f64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+                *offset += 8;
+                Self::Float(n)
+            }
+            3 => {
+                if *offset >= data.len() {
+                    return Err(DbError::new(
+                        "StatsValue BOOL corrupto: falta 1 byte".to_string(),
+                    ));
+                }
+                let b = data[*offset] != 0;
+                *offset += 1;
+                Self::Bool(b)
+            }
+            4 => Self::String(take_string(data, offset)?),
+            5 => {
+                if *offset + 16 + 1 > data.len() {
+                    return Err(DbError::new(
+                        "StatsValue DECIMAL corrupto: faltan 17 bytes".to_string(),
+                    ));
+                }
+                let value = i128::from_le_bytes(data[*offset..*offset + 16].try_into().unwrap());
+                *offset += 16;
+                let scale = data[*offset];
+                *offset += 1;
+                Self::Decimal { value, scale }
+            }
+            other => {
+                return Err(DbError::new(format!(
+                    "StatsValue: kind={} desconocido (esperaba 0..=5)",
+                    other
+                )))
+            }
+        })
+    }
+}
+
+/// Bloque P4 (VERSION 33): bucket de histograma equi-depth.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramBucket {
+    pub lower: StatsValue,
+    pub upper: StatsValue,
+    pub count: u64,
+}
+
+impl HistogramBucket {
+    fn encode_into(&self, out: &mut Vec<u8>) -> DbResult<()> {
+        self.lower.encode_into(out)?;
+        self.upper.encode_into(out)?;
+        out.extend_from_slice(&self.count.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(data: &[u8], offset: &mut usize) -> DbResult<Self> {
+        let lower = StatsValue::decode(data, offset)?;
+        let upper = StatsValue::decode(data, offset)?;
+        if *offset + 8 > data.len() {
+            return Err(DbError::new(
+                "HistogramBucket corrupto: faltan 8 bytes (count)".to_string(),
+            ));
+        }
+        let count = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+        *offset += 8;
+        Ok(Self {
+            lower,
+            upper,
+            count,
+        })
+    }
+}
+
+/// Bloque P4 (VERSION 33): stats por-columna persistidas. NDV es un
+/// estimado vía HyperLogLog (256 registros, ~6.5% error típico hasta
+/// 100k distinct values). MCV es top-K=10 ordenado por frecuencia
+/// descendente. Histograma equi-depth ~16 buckets sobre el reservoir
+/// sample de hasta 10k filas (omite para tipos no ordenables).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStats {
+    pub name: String,
+    pub null_count: u64,
+    pub ndv: u64,
+    pub mcv: Vec<(StatsValue, u64)>,
+    pub histogram: Vec<HistogramBucket>,
+}
+
+impl ColumnStats {
+    fn encode_into(&self, out: &mut Vec<u8>) -> DbResult<()> {
+        push_string(out, &self.name)?;
+        out.extend_from_slice(&self.null_count.to_le_bytes());
+        out.extend_from_slice(&self.ndv.to_le_bytes());
+        if self.mcv.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "ColumnStats '{}': MCV demasiado largo ({})",
+                self.name,
+                self.mcv.len()
+            )));
+        }
+        out.extend_from_slice(&(self.mcv.len() as u16).to_le_bytes());
+        for (val, count) in &self.mcv {
+            val.encode_into(out)?;
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        if self.histogram.len() > u16::MAX as usize {
+            return Err(DbError::new(format!(
+                "ColumnStats '{}': histograma demasiado largo ({})",
+                self.name,
+                self.histogram.len()
+            )));
+        }
+        out.extend_from_slice(&(self.histogram.len() as u16).to_le_bytes());
+        for bucket in &self.histogram {
+            bucket.encode_into(out)?;
+        }
+        Ok(())
+    }
+
+    fn decode(data: &[u8], offset: &mut usize) -> DbResult<Self> {
+        let name = take_string(data, offset)?;
+        if *offset + 8 + 8 + 2 > data.len() {
+            return Err(DbError::new(format!(
+                "ColumnStats corrupto: faltan bytes para null_count+ndv+mcv_count en '{}'",
+                name
+            )));
+        }
+        let null_count = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+        *offset += 8;
+        let ndv = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+        *offset += 8;
+        let mcv_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize;
+        *offset += 2;
+        let mut mcv = Vec::with_capacity(mcv_len);
+        for _ in 0..mcv_len {
+            let val = StatsValue::decode(data, offset)?;
+            if *offset + 8 > data.len() {
+                return Err(DbError::new(
+                    "ColumnStats MCV corrupto: faltan 8 bytes para count".to_string(),
+                ));
+            }
+            let count = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+            *offset += 8;
+            mcv.push((val, count));
+        }
+        if *offset + 2 > data.len() {
+            return Err(DbError::new(
+                "ColumnStats corrupto: faltan 2 bytes para histogram_count".to_string(),
+            ));
+        }
+        let hist_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize;
+        *offset += 2;
+        let mut histogram = Vec::with_capacity(hist_len);
+        for _ in 0..hist_len {
+            histogram.push(HistogramBucket::decode(data, offset)?);
+        }
+        Ok(Self {
+            name,
+            null_count,
+            ndv,
+            mcv,
+            histogram,
         })
     }
 }

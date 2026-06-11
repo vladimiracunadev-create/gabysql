@@ -17366,6 +17366,228 @@ fn p3b_analyze_sobrescribe_stats_persistidas() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque P4 (2026-06-10, VERSION 33): stats por-columna persistidas.
+// `ANALYZE` colecta null_count, NDV (HLL), MCV top-K y histograma
+// equi-depth por cada columna. Las stats sobreviven a reopen como
+// las de P3b. EXPLAIN muestra `est.rows=N cols=M`.
+// ============================================================
+
+fn p4_open_stats(path: &Path, table: &str) -> Result<gabysql::catalog::StatsMeta, Box<dyn Error>> {
+    let mut pager = Pager::open(path)?;
+    let mut catalog = gabysql::catalog::Catalog::open(&mut pager);
+    let list = catalog.list_table_stats()?;
+    let key = table.to_ascii_lowercase();
+    let stats = list
+        .into_iter()
+        .find(|s| s.name.eq_ignore_ascii_case(&key))
+        .ok_or_else(|| format!("no se encontraron stats para `{}`", table))?;
+    Ok(stats)
+}
+
+#[test]
+fn p4_analyze_persiste_column_stats() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p4-persist")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT, label TEXT);
+         INSERT INTO t (id, n, label) VALUES (1,10,'a'),(2,20,'b'),(3,30,'a'),(4,40,'c'),(5,50,'a');
+         ANALYZE TABLE t;",
+    )?;
+    let stats = p4_open_stats(&db, "t")?;
+    assert_eq!(stats.row_count, 5);
+    assert_eq!(stats.columns.len(), 3, "deben haber 3 column stats");
+    let names: Vec<String> = stats.columns.iter().map(|c| c.name.clone()).collect();
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("id")));
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("n")));
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("label")));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p4_ndv_aproximado_dentro_del_margen() -> Result<(), Box<dyn Error>> {
+    // 1000 filas con 200 valores distintos en columna `bucket`.
+    // HLL con m=256 → error típico < ~10% en este rango.
+    let (db, wal) = p3_setup("p4-ndv")?;
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, bucket INT);\n\
+         INSERT INTO t (id, bucket) VALUES ",
+    );
+    for i in 0..1000 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({},{})", i + 1, (i % 200) + 1));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let stats = p4_open_stats(&db, "t")?;
+    let bucket = stats
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("bucket"))
+        .unwrap();
+    // 200 distinct esperado. Tolerancia ±25% (margen para HLL).
+    assert!(
+        bucket.ndv >= 150 && bucket.ndv <= 250,
+        "NDV esperada ~200 ±25%, vi: {}",
+        bucket.ndv
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p4_null_count_exacto() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p4-nulls")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, maybe INT);
+         INSERT INTO t (id, maybe) VALUES (1,10),(2,NULL),(3,30),(4,NULL),(5,NULL);
+         ANALYZE TABLE t;",
+    )?;
+    let stats = p4_open_stats(&db, "t")?;
+    let maybe = stats
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("maybe"))
+        .unwrap();
+    assert_eq!(maybe.null_count, 3, "esperaba 3 NULLs en maybe");
+    let id = stats
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("id"))
+        .unwrap();
+    assert_eq!(id.null_count, 0, "id es PK, no debe tener NULLs");
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p4_mcv_top_k_ordenado_por_frecuencia() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p4-mcv")?;
+    // 'a' x6, 'b' x3, 'c' x2, 'd' x1 → top-3 esperado: a, b, c
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, code TEXT);
+         INSERT INTO t (id, code) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),
+            (10,'c'),(11,'c'),
+            (12,'d');
+         ANALYZE TABLE t;",
+    )?;
+    let stats = p4_open_stats(&db, "t")?;
+    let code = stats
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("code"))
+        .unwrap();
+    assert!(code.mcv.len() >= 3, "MCV debería tener al menos 3 entries");
+    // Top-1 = 'a' con count 6.
+    let (top_val, top_count) = &code.mcv[0];
+    assert!(matches!(top_val, gabysql::catalog::StatsValue::String(s) if s == "a"));
+    assert_eq!(*top_count, 6);
+    // Orden estrictamente descendente en los primeros 3.
+    assert!(code.mcv[0].1 >= code.mcv[1].1);
+    assert!(code.mcv[1].1 >= code.mcv[2].1);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p4_histograma_buckets_aproximadamente_equi_depth() -> Result<(), Box<dyn Error>> {
+    // 100 filas con valores 1..=100 → 16 buckets de ~6 elementos.
+    let (db, wal) = p3_setup("p4-hist")?;
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT);\n\
+         INSERT INTO t (id, val) VALUES ",
+    );
+    for i in 0..100 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({},{})", i + 1, i + 1));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let stats = p4_open_stats(&db, "t")?;
+    let val = stats
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("val"))
+        .unwrap();
+    assert!(
+        !val.histogram.is_empty(),
+        "histograma no debería estar vacío para INT"
+    );
+    // Cada bucket cubre rango contiguo, count ≥ 1, count total = 100.
+    let total: u64 = val.histogram.iter().map(|b| b.count).sum();
+    assert_eq!(total, 100, "suma de buckets debe ser 100");
+    // Equi-depth: max/min ratio razonable (con 100/16 ≈ 6, tolerancia 2x).
+    let max_count = val.histogram.iter().map(|b| b.count).max().unwrap();
+    let min_count = val.histogram.iter().map(|b| b.count).min().unwrap();
+    assert!(
+        max_count <= min_count * 2,
+        "equi-depth: max={} min={} (ratio > 2x)",
+        max_count,
+        min_count
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p4_column_stats_sobreviven_reopen() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p4-reopen")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,100),(2,100),(3,200),(4,300);
+         ANALYZE TABLE t;",
+    )?;
+    // EXPLAIN en sesión nueva: debe mostrar `est.rows=4 cols=2`.
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("est.rows=4") && detail.contains("cols=2"),
+        "P4: EXPLAIN debe mostrar est.rows=4 cols=2, vi: {}",
+        detail
+    );
+    // Y las column stats persistidas son consultables vía catalog.
+    let stats = p4_open_stats(&db, "t")?;
+    assert_eq!(stats.columns.len(), 2);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p4_drop_table_borra_column_stats() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p4-drop")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,1),(2,2),(3,3);
+         ANALYZE TABLE t;
+         DROP TABLE t;",
+    )?;
+    // El record stats debe haberse borrado; list_table_stats no
+    // devuelve nada para `t`.
+    let mut pager = Pager::open(&db)?;
+    let mut catalog = gabysql::catalog::Catalog::open(&mut pager);
+    let list = catalog.list_table_stats()?;
+    assert!(
+        list.iter().all(|s| !s.name.eq_ignore_ascii_case("t")),
+        "DROP TABLE debe borrar stats persistidas, vi: {:?}",
+        list.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 #[test]
 fn p3b_db_sin_analyze_arranca_sin_stats() -> Result<(), Box<dyn Error>> {
     // Caso regression: una DB recién creada (o que nunca corrió

@@ -179,7 +179,16 @@ pub const MAGIC: &[u8; 8] = b"GABYSQL1";
 //        `[GBY-1003]` aunque la única diferencia sea el nuevo kind:
 //        política conservadora del motor — sin auto-upgrade entre
 //        versiones de formato.
-pub const VERSION: u32 = 32;
+//  33 -> Bloque P4 (2026-06-10): stats por-columna persistidas dentro
+//        del mismo record `StatsMeta` que P3b. Sufijo aditivo:
+//        `format_version (u8) || column_count (u16) || Vec<ColumnStats>`
+//        donde cada `ColumnStats` lleva `null_count`, `ndv` (estimado
+//        HyperLogLog 256-reg), `mcv` (top-K=10 por frecuencia) e
+//        `histogram` (equi-depth ~16 buckets sobre reservoir sample
+//        de hasta 10k filas). V32 rechazados con `[GBY-1003]` aunque
+//        el formato sea aditivo: política conservadora — un binario
+//        viejo viendo el `format_version` lo trataría como basura.
+pub const VERSION: u32 = 33;
 
 /// Trailer used inside every page on disk for the CRC32 checksum.
 pub const PAGE_CHECKSUM_BYTES: usize = 4;

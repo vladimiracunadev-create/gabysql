@@ -1,11 +1,11 @@
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,
-    ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, GrantMeta, IndexKind, IndexMeta,
-    OnDelete, OnUpdate, PolicyMeta, ProcedureMeta, RoleMeta, StatsMeta, TableMeta, TriggerMeta,
-    UserMeta, ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_INSERT,
-    POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE, PRIV_ALL, PRIV_DELETE, PRIV_INSERT,
-    PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
+    ColumnStats, ColumnType, DefaultLiteral, ForeignKeyMeta, FunctionMeta, GrantMeta,
+    HistogramBucket, IndexKind, IndexMeta, OnDelete, OnUpdate, PolicyMeta, ProcedureMeta, RoleMeta,
+    StatsMeta, StatsValue, TableMeta, TriggerMeta, UserMeta, ViewMeta, POLICY_ACTION_ALL,
+    POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
+    PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::index::{
@@ -2275,6 +2275,7 @@ pub struct Engine<'a> {
 }
 
 /// Bloque P3 (2026-05-29): stats básicas por tabla, cacheadas en memoria.
+/// Bloque P4 (VERSION 33, 2026-06-10): extendido con stats por-columna.
 /// `row_count` es exacto al momento de `ANALYZE`, pero queda **stale**
 /// si después la tabla cambia (no hay invalidation automática salvo en
 /// DROP/TRUNCATE explícito). El usuario debe re-ejecutar `ANALYZE <table>`.
@@ -2284,6 +2285,303 @@ pub struct TableStats {
     /// Nanos epoch en que se corrió `ANALYZE`. Útil para detectar
     /// stats viejas en la salida de EXPLAIN.
     pub analyzed_at_nanos: u128,
+    /// Bloque P4: stats por-columna (NDV / null_count / MCV /
+    /// histograma). Espejo del `Vec<ColumnStats>` persistido en el
+    /// catálogo. Vacío para tablas sin ANALYZE.
+    pub columns: Vec<ColumnStats>,
+}
+
+/// Bloque P4 (VERSION 33): HyperLogLog mínimo para estimar NDV por
+/// columna. m=256 registros (b=8 bits del hash para el índice),
+/// 1 byte por registro. Memoria: 256 B por columna. Error típico
+/// ~6.5% hasta 100k distinct; aceptable para guiar el planner.
+///
+/// Hash: FNV-1a 64-bit sobre el byte-encoding canónico del valor (ver
+/// `stats_value_bytes`). Mismo encoding entre runs → estimaciones
+/// determinísticas.
+struct HllNdv {
+    registers: [u8; 256],
+}
+
+impl HllNdv {
+    const M: usize = 256;
+    const B: u32 = 8;
+
+    fn new() -> Self {
+        Self {
+            registers: [0u8; 256],
+        }
+    }
+
+    fn add_hash(&mut self, hash: u64) {
+        let idx = (hash & ((Self::M as u64) - 1)) as usize;
+        let w = hash >> Self::B;
+        // leading_zeros sobre los (64 - B) bits restantes + 1 (rank de
+        // la primera posición con 1, en base 1).
+        let rank = if w == 0 {
+            (64 - Self::B) as u8 + 1
+        } else {
+            (w.leading_zeros() - Self::B) as u8 + 1
+        };
+        if rank > self.registers[idx] {
+            self.registers[idx] = rank;
+        }
+    }
+
+    /// Estimación cardinalidad con corrección small/large range estándar.
+    fn estimate(&self) -> u64 {
+        let m = Self::M as f64;
+        let alpha = 0.7213 / (1.0 + 1.079 / m); // m=256
+        let mut sum = 0.0f64;
+        let mut zeros = 0usize;
+        for &r in &self.registers {
+            sum += 2.0f64.powi(-(r as i32));
+            if r == 0 {
+                zeros += 1;
+            }
+        }
+        let raw = alpha * m * m / sum;
+        // Small range correction (linear counting).
+        let est = if raw <= 2.5 * m && zeros > 0 {
+            m * (m / zeros as f64).ln()
+        } else {
+            raw
+        };
+        est.round() as u64
+    }
+}
+
+/// Bloque P4: encoding determinístico de un `Value` a bytes para hashear
+/// en HLL y para igualdad en MCV. NULL no llega acá (se cuenta antes).
+/// BLOB se hashea por bytes; DECIMAL por (value, scale); FLOAT por bits
+/// (suficiente para igualdad bit-perfect, no para "equivalencia
+/// numérica" — aceptable para stats).
+fn stats_value_bytes(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    match v {
+        Value::Null => out.push(0),
+        Value::Integer(n) => {
+            out.push(1);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Float(f) => {
+            out.push(2);
+            out.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Value::Bool(b) => {
+            out.push(3);
+            out.push(u8::from(*b));
+        }
+        Value::String(s) => {
+            out.push(4);
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::Bytes(b) => {
+            out.push(5);
+            out.extend_from_slice(b);
+        }
+        Value::Decimal { value, scale } => {
+            out.push(6);
+            out.extend_from_slice(&value.to_le_bytes());
+            out.push(*scale);
+        }
+    }
+    out
+}
+
+/// FNV-1a 64-bit. Mismo offset/prime que el resto del motor (ADR-0002).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Bloque P4: convierte un `Value` runtime a `StatsValue` para
+/// serialización en MCV / histograma. `Bytes` no se persiste en stats
+/// (BLOB sin semántica de orden / equality útil para el planner).
+fn value_to_stats_value(v: &Value) -> Option<StatsValue> {
+    Some(match v {
+        Value::Null => StatsValue::Null,
+        Value::Integer(n) => StatsValue::Integer(*n),
+        Value::Float(f) => StatsValue::Float(*f),
+        Value::Bool(b) => StatsValue::Bool(*b),
+        Value::String(s) => StatsValue::String(s.clone()),
+        Value::Decimal { value, scale } => StatsValue::Decimal {
+            value: *value,
+            scale: *scale,
+        },
+        Value::Bytes(_) => return None,
+    })
+}
+
+/// Bloque P4: total order parcial para construir histograma. Devuelve
+/// `None` para tipos no comparables / mezclas heterogéneas. Mismo
+/// criterio que la 3VL pero sin propagar NULL — el caller filtra antes.
+fn cmp_stats_values(a: &StatsValue, b: &StatsValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (StatsValue::Integer(x), StatsValue::Integer(y)) => Some(x.cmp(y)),
+        (StatsValue::Float(x), StatsValue::Float(y)) => x.partial_cmp(y),
+        (StatsValue::Integer(x), StatsValue::Float(y)) => (*x as f64).partial_cmp(y),
+        (StatsValue::Float(x), StatsValue::Integer(y)) => x.partial_cmp(&(*y as f64)),
+        (StatsValue::Bool(x), StatsValue::Bool(y)) => Some(x.cmp(y)),
+        (StatsValue::String(x), StatsValue::String(y)) => Some(x.cmp(y)),
+        (
+            StatsValue::Decimal {
+                value: xv,
+                scale: xs,
+            },
+            StatsValue::Decimal {
+                value: yv,
+                scale: ys,
+            },
+        ) => {
+            // Comparación exacta: alinear escala común.
+            let max_scale = (*xs).max(*ys);
+            let xa = (*xv) * 10i128.pow((max_scale - *xs) as u32);
+            let ya = (*yv) * 10i128.pow((max_scale - *ys) as u32);
+            Some(xa.cmp(&ya))
+        }
+        _ => None,
+    }
+}
+
+/// Bloque P4: ¿el tipo soporta histograma equi-depth? Tipos no
+/// ordenables (JSON, BLOB) se omiten — el histograma queda vacío.
+fn column_type_orderable(ct: ColumnType) -> bool {
+    !matches!(ct, ColumnType::Json | ColumnType::Blob)
+}
+
+/// Bloque P4 (VERSION 33): acumulador per-column durante ANALYZE.
+struct ColumnCollector {
+    column_type: ColumnType,
+    null_count: u64,
+    hll: HllNdv,
+    /// Conteo por valor para el cálculo de MCV. Cap inferior para no
+    /// explotar memoria en columnas de alta cardinalidad; al llegar
+    /// al cap descartamos entries nuevas pero seguimos sumando a las
+    /// existentes (heurística simple — sesgo hacia valores tempranos
+    /// frecuentes, aceptable para top-K).
+    counts: HashMap<Vec<u8>, (StatsValue, u64)>,
+    /// Reservoir sample para histograma. Solo se mantiene si el tipo
+    /// es ordenable.
+    sample: Vec<StatsValue>,
+    seen_non_null: u64,
+}
+
+impl ColumnCollector {
+    const COUNTS_CAP: usize = 50_000;
+    const MCV_K: usize = 10;
+    const SAMPLE_CAP: usize = 10_000;
+    const HISTOGRAM_BUCKETS: usize = 16;
+
+    fn for_column(col: &Column) -> Self {
+        Self {
+            column_type: col.column_type,
+            null_count: 0,
+            hll: HllNdv::new(),
+            counts: HashMap::new(),
+            sample: Vec::new(),
+            seen_non_null: 0,
+        }
+    }
+
+    fn observe(&mut self, v: &Value) {
+        if matches!(v, Value::Null) {
+            self.null_count += 1;
+            return;
+        }
+        self.seen_non_null += 1;
+        let bytes = stats_value_bytes(v);
+        let hash = fnv1a64(&bytes);
+        self.hll.add_hash(hash);
+
+        if let Some(sv) = value_to_stats_value(v) {
+            match self.counts.get_mut(&bytes) {
+                Some(entry) => entry.1 += 1,
+                None => {
+                    if self.counts.len() < Self::COUNTS_CAP {
+                        self.counts.insert(bytes, (sv.clone(), 1));
+                    }
+                }
+            }
+            // Reservoir sample determinístico: primeras SAMPLE_CAP
+            // observaciones (no aleatorio — evitamos RNG no-determinístico
+            // que romperia tests). Bias hacia el comienzo del scan, pero
+            // el scan ya es esencialmente orden de inserción → no peor
+            // que un sample aleatorio para histograma equi-depth.
+            if column_type_orderable(self.column_type) && self.sample.len() < Self::SAMPLE_CAP {
+                self.sample.push(sv);
+            }
+        }
+    }
+
+    fn finalize(mut self, col_name: &str) -> ColumnStats {
+        let ndv = if self.seen_non_null == 0 {
+            0
+        } else {
+            self.hll.estimate()
+        };
+
+        // MCV: top-K por count, tie-break por orden estable.
+        let mut entries: Vec<(StatsValue, u64)> =
+            self.counts.drain().map(|(_k, (v, c))| (v, c)).collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        let mcv: Vec<(StatsValue, u64)> = entries.into_iter().take(Self::MCV_K).collect();
+
+        // Histograma equi-depth: sort + slice en N buckets aproximadamente
+        // iguales. Para tipos no ordenables o cuando no hay sample, vacío.
+        let histogram = if self.sample.len() < 2 || !column_type_orderable(self.column_type) {
+            Vec::new()
+        } else {
+            let mut sorted = std::mem::take(&mut self.sample);
+            sorted.sort_by(|a, b| cmp_stats_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+            build_equi_depth_histogram(&sorted, Self::HISTOGRAM_BUCKETS)
+        };
+
+        ColumnStats {
+            name: col_name.to_string(),
+            null_count: self.null_count,
+            ndv,
+            mcv,
+            histogram,
+        }
+    }
+}
+
+/// Bloque P4: parte un sample ordenado en `buckets` rangos
+/// aproximadamente del mismo conteo. Si `sorted.len() < buckets`, hace
+/// menos buckets (uno por elemento como tope).
+fn build_equi_depth_histogram(sorted: &[StatsValue], buckets: usize) -> Vec<HistogramBucket> {
+    let n = sorted.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let buckets = buckets.min(n);
+    let per_bucket = n / buckets;
+    let remainder = n % buckets;
+    let mut out = Vec::with_capacity(buckets);
+    let mut cursor = 0usize;
+    for i in 0..buckets {
+        // Los primeros `remainder` buckets se quedan con un elemento extra
+        // para repartir el sobrante sin perder filas.
+        let take = per_bucket + if i < remainder { 1 } else { 0 };
+        if take == 0 {
+            break;
+        }
+        let end = (cursor + take).min(n);
+        let lower = sorted[cursor].clone();
+        let upper = sorted[end - 1].clone();
+        out.push(HistogramBucket {
+            lower,
+            upper,
+            count: take as u64,
+        });
+        cursor = end;
+    }
+    out
 }
 
 /// Bloque V: límite de profundidad de expansión de vistas. 32 está muy
@@ -2350,6 +2648,7 @@ impl<'a> Engine<'a> {
                             TableStats {
                                 row_count: s.row_count,
                                 analyzed_at_nanos: s.analyzed_at_nanos,
+                                columns: s.columns,
                             },
                         )
                     })
@@ -5089,11 +5388,35 @@ impl<'a> Engine<'a> {
                 )
             })?
         };
-        // Full scan del B+tree: contamos rows reales.
-        let row_count = {
+        // Bloque P4 (VERSION 33): un solo scan, por cada columna
+        // acumulamos HLL (NDV), null_count, MCV (HashMap con cap),
+        // y reservoir sample para histograma equi-depth post-scan.
+        let rows = {
             let mut catalog = Catalog::open(self.pager);
-            catalog.scan_rows(meta.root_page, 0, None)?.len() as u64
+            catalog.scan_rows(meta.root_page, 0, None)?
         };
+        let row_count = rows.len() as u64;
+
+        let mut collectors: Vec<ColumnCollector> = meta
+            .columns
+            .iter()
+            .map(ColumnCollector::for_column)
+            .collect();
+        for kv in &rows {
+            let decoded = decode_row(&meta, &kv.value)?;
+            for (idx, col) in meta.columns.iter().enumerate() {
+                let key = normalize_ident(&col.name);
+                let val = decoded.get(&key).cloned().unwrap_or(Value::Null);
+                collectors[idx].observe(&val);
+            }
+        }
+        let column_stats: Vec<ColumnStats> = meta
+            .columns
+            .iter()
+            .zip(collectors)
+            .map(|(c, coll)| coll.finalize(&c.name))
+            .collect();
+
         let analyzed_at_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -5103,18 +5426,21 @@ impl<'a> Engine<'a> {
             TableStats {
                 row_count,
                 analyzed_at_nanos,
+                columns: column_stats.clone(),
             },
         );
         // Bloque P3b (VERSION 32): persistir al catálogo. Si falla acá
         // (p.ej. WAL llena), el HashMap en memoria queda actualizado
         // pero el record persistido es el viejo — comportamiento
         // aceptable: la próxima ANALYZE sobrescribe.
+        // Bloque P4 (VERSION 33): el record también lleva `columns`.
         {
             let mut catalog = Catalog::open(self.pager);
             catalog.put_table_stats(&StatsMeta {
                 name: table.clone(),
                 row_count,
                 analyzed_at_nanos,
+                columns: column_stats,
             })?;
         }
         Ok(ResultSet {
@@ -5124,10 +5450,12 @@ impl<'a> Engine<'a> {
                 Value::Integer(row_count as i64),
             ]],
             message: Some(format!(
-                "ANALYZE: stats actualizadas para `{}` ({} rows). \
+                "ANALYZE: stats actualizadas para `{}` ({} rows, {} columnas). \
                  Persistidas en catálogo — sobreviven a reopen del Engine. \
                  EXPLAIN las mostrará como `est.rows`.",
-                table, row_count
+                table,
+                row_count,
+                meta.columns.len()
             )),
         })
     }
@@ -5497,7 +5825,13 @@ impl<'a> Engine<'a> {
     /// debe re-ejecutar ANALYZE para refrescarla (documentado en ADR-0065).
     fn stats_annotation(&self, table: &str) -> String {
         match self.table_stats.get(table) {
-            Some(s) => format!(" [est.rows={}]", s.row_count),
+            Some(s) => {
+                if s.columns.is_empty() {
+                    format!(" [est.rows={}]", s.row_count)
+                } else {
+                    format!(" [est.rows={} cols={}]", s.row_count, s.columns.len())
+                }
+            }
             None => String::new(),
         }
     }
