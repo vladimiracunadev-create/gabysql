@@ -18054,6 +18054,158 @@ fn p5e_explain_join_anota_stats_de_ambos_lados() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque R1 (2026-06-11): detección de stats stale.
+// - EXPLAIN muestra stats.age=Xd Yh (y STALE si >7d).
+// - P5c bow out cuando las stats son stale → preserva path indexado.
+// Tests inyectan stats sintéticas con timestamps controlados.
+// ============================================================
+
+fn r1_overwrite_stats_timestamp(
+    db: &Path,
+    table: &str,
+    age_secs: u64,
+) -> Result<(), Box<dyn Error>> {
+    use gabysql::catalog::Catalog;
+    let mut pager = Pager::open(db)?;
+    pager.begin()?;
+    {
+        let mut catalog = Catalog::open(&mut pager);
+        let list = catalog.list_table_stats()?;
+        let mut current = list
+            .into_iter()
+            .find(|s| s.name.eq_ignore_ascii_case(table))
+            .ok_or_else(|| format!("no hay stats para '{}'", table))?;
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let offset_nanos = (age_secs as u128) * 1_000_000_000;
+        current.analyzed_at_nanos = now_nanos.saturating_sub(offset_nanos);
+        catalog.put_table_stats(&current)?;
+    }
+    pager.commit()?;
+    Ok(())
+}
+
+#[test]
+fn r1_explain_muestra_stats_age_para_stats_frescas() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r1-fresh")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,1),(2,2),(3,3);
+         ANALYZE TABLE t;",
+    )?;
+    // Stats acabadas de crear → age < 60s → "fresh" → no se muestra age.
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE n = 1;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    // Stats existen, est.rows debe aparecer, pero stats.age NO porque
+    // tienen < 60s de vida.
+    assert!(
+        detail.contains("est.rows=3"),
+        "esperaba est.rows=3, vi: {}",
+        detail
+    );
+    assert!(
+        !detail.contains("stats.age"),
+        "stats <60s no deben mostrar age, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r1_explain_muestra_stats_age_para_stats_viejas() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r1-old")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,1),(2,2),(3,3);
+         ANALYZE TABLE t;",
+    )?;
+    // Reescribir timestamp como si las stats tuvieran 3 días.
+    r1_overwrite_stats_timestamp(&db, "t", 3 * 86_400)?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE n = 1;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("stats.age=3d"),
+        "esperaba stats.age=3d X, vi: {}",
+        detail
+    );
+    assert!(
+        !detail.contains("STALE"),
+        "3d < threshold 7d → NO debe marcar STALE, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r1_explain_marca_stale_si_supera_threshold() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r1-stale")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,1),(2,2),(3,3);
+         ANALYZE TABLE t;",
+    )?;
+    // 10 días → STALE.
+    r1_overwrite_stats_timestamp(&db, "t", 10 * 86_400)?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE n = 1;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("stats.age=10d") && detail.contains("STALE"),
+        "esperaba stats.age=10d ... STALE, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r1_p5c_bow_out_si_stats_stale() -> Result<(), Box<dyn Error>> {
+    // Setup que dispararía P5c (alta sel) → con stats frescas EXPLAIN
+    // dice "P5c skip-index". Con stats stale, debe preservar el path
+    // indexado (bow out).
+    let (db, wal) = p3_setup("r1-bypass")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT, val INT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category, val) VALUES
+            (1,'a',1),(2,'a',2),(3,'a',3),(4,'a',4),(5,'a',5),(6,'a',6),
+            (7,'b',7),(8,'b',8),(9,'b',9),(10,'c',10);
+         ANALYZE TABLE t;",
+    )?;
+    // Con stats frescas, sel('a')=0.6 ≥ 0.2 → P5c activo.
+    let res_fresh = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail_fresh = extract_scan_detail(res_fresh.last().unwrap());
+    assert!(
+        detail_fresh.contains("P5c"),
+        "stats frescas + alta sel: P5c debe activarse, vi: {}",
+        detail_fresh
+    );
+    // Reescribir timestamp como 14 días → STALE → P5c bow out.
+    r1_overwrite_stats_timestamp(&db, "t", 14 * 86_400)?;
+    let res_stale = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail_stale = extract_scan_detail(res_stale.last().unwrap());
+    assert!(
+        !detail_stale.contains("P5c") && detail_stale.contains("hash-index"),
+        "stats stale: P5c debe bow out, EXPLAIN debe mostrar hash-index, vi: {}",
+        detail_stale
+    );
+    assert!(
+        detail_stale.contains("STALE"),
+        "stats stale → marcar STALE en EXPLAIN, vi: {}",
+        detail_stale
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5d (2026-06-11): hash join build-side selection. Cuando
 // `current` (acumulado de joins previos) es >2× más grande que la
 // próxima `right_rows`, swap el build side al lado más chico.

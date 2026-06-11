@@ -2313,6 +2313,55 @@ const DEFAULT_RANGE_SELECTIVITY: f64 = 0.333;
 /// comportamiento es idéntico al pre-P5c (siempre preferir índice).
 const INDEX_BREAKEVEN_SELECTIVITY: f64 = 0.2;
 
+/// Bloque R1 (2026-06-11, ADR-0074): edad en segundos a partir de la
+/// cual las stats persistidas se consideran "stale" y P5c deja de
+/// confiar en ellas. 7 días es razonable para workloads que cambian
+/// gradualmente; el usuario que actualiza la tabla a diario debería
+/// re-ANALYZE igual. El valor es deliberadamente generoso para no
+/// alarmar al usuario casual.
+const STATS_STALE_THRESHOLD_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Bloque R1: edad en segundos de las stats. Calculada con SystemTime
+/// actual; si el sistema da error (reloj atrasado), devuelve 0 (stats
+/// "frescas" — sesgo conservador, evita falsos positivos de stale).
+fn stats_age_secs(analyzed_at_nanos: u128) -> u64 {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    if now_nanos <= analyzed_at_nanos {
+        return 0;
+    }
+    let delta_nanos = now_nanos - analyzed_at_nanos;
+    (delta_nanos / 1_000_000_000) as u64
+}
+
+/// Bloque R1: ¿las stats son lo suficientemente viejas como para que
+/// P5c deje de confiar en ellas? `true` significa que el path indexado
+/// debe preferirse (preservar comportamiento conservador pre-P5c).
+fn stats_are_stale(analyzed_at_nanos: u128) -> bool {
+    stats_age_secs(analyzed_at_nanos) >= STATS_STALE_THRESHOLD_SECS
+}
+
+/// Bloque R1: renderiza la edad como string legible (`3d 5h`, `12h`,
+/// `45m`, `fresh`). Usado en EXPLAIN para que el usuario sepa cuán
+/// viejas son las stats sin tener que hacer la cuenta él.
+fn format_stats_age(age_secs: u64) -> String {
+    if age_secs < 60 {
+        return "fresh".to_string();
+    }
+    let days = age_secs / 86_400;
+    let hours = (age_secs % 86_400) / 3_600;
+    let mins = (age_secs % 3_600) / 60;
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else {
+        format!("{}m", mins)
+    }
+}
+
 /// Bloque P5a (2026-06-11): estima la fracción de filas que sobrevivirá
 /// el predicado, usando las stats P4 (`null_count`, NDV, MCV,
 /// histograma). Resultado en `[0.0, 1.0]`. Es **solo estimación** — el
@@ -6215,6 +6264,16 @@ impl<'a> Engine<'a> {
             let est_match = ((s.row_count as f64) * sel).round() as u64;
             parts.push_str(&format!(" est.match={}", est_match));
         }
+        // Bloque R1 (2026-06-11, ADR-0074): edad de las stats. Útil
+        // para detectar staleness — si dice `stats.age=15d 3h` el
+        // usuario sabe que conviene re-ANALYZE.
+        let age = stats_age_secs(s.analyzed_at_nanos);
+        if age >= 60 {
+            parts.push_str(&format!(" stats.age={}", format_stats_age(age)));
+            if stats_are_stale(s.analyzed_at_nanos) {
+                parts.push_str(" STALE");
+            }
+        }
         format!(" [{}]", parts)
     }
 
@@ -6240,6 +6299,9 @@ impl<'a> Engine<'a> {
                     .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case(table))
                     .map(|(_, v)| v)?;
+                if stats_are_stale(stats_ref.analyzed_at_nanos) {
+                    return Some(false);
+                }
                 let sel = estimate_selectivity(stats_ref, expr);
                 Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
             })
@@ -9524,6 +9586,10 @@ impl<'a> Engine<'a> {
         // Forzamos FullScan + post-filter en ese caso. NO se aplica a
         // composite_pk_fast_path_active (PK compuesta = match único
         // por construcción) — esa rama siempre gana.
+        // Bloque R1 (2026-06-11, ADR-0074): stats viejas (>7d) no son
+        // confiables — P5c bow out, preserva comportamiento conservador
+        // pre-P5c. Decisión: mejor mantener el índice "por las dudas"
+        // que matar perf basándose en datos obsoletos.
         let p5c_skip_index: bool = !composite_pk_fast_path_active
             && stmt
                 .where_clause
@@ -9534,6 +9600,9 @@ impl<'a> Engine<'a> {
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case(&meta.name))
                         .map(|(_, v)| v)?;
+                    if stats_are_stale(stats.analyzed_at_nanos) {
+                        return Some(false);
+                    }
                     let sel = estimate_selectivity(stats, expr);
                     Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
                 })
