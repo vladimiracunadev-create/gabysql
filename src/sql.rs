@@ -2291,6 +2291,247 @@ pub struct TableStats {
     pub columns: Vec<ColumnStats>,
 }
 
+/// Bloque P5a (2026-06-11): default cuando no hay stats o tipo de
+/// predicado no estimable (subqueries, expresiones complejas). 0.1 es
+/// la heurística clásica para "no sé" en estimación de cardinalidad
+/// (PostgreSQL usa el mismo valor para selectividad de operadores
+/// desconocidos). Mejor que 0.5 (que asumiría 50% match → infla todo).
+const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
+/// Bloque P5a: default para rangos sin histograma. 1/3 es la
+/// convención clásica (Selinger et al., 1979).
+const DEFAULT_RANGE_SELECTIVITY: f64 = 0.333;
+
+/// Bloque P5a (2026-06-11): estima la fracción de filas que sobrevivirá
+/// el predicado, usando las stats P4 (`null_count`, NDV, MCV,
+/// histograma). Resultado en `[0.0, 1.0]`. Es **solo estimación** — el
+/// plan no la usa todavía. Su consumidor primario en este push es la
+/// anotación `est.match=K` de EXPLAIN; en P5c/P5d el planner basará
+/// choice de índice y JOIN reorder en esto.
+///
+/// Reglas:
+/// - `Eq` con `value ∈ MCV` → `count / row_count` (exacto).
+/// - `Eq` con `value ∉ MCV` → fracción no-MCV-no-NULL repartida entre
+///   los `(NDV - |MCV|)` distinct restantes (heurística uniforme).
+/// - `IS NULL` → `null_count / row_count` (exacto).
+/// - `Compare` (`<`, `<=`, `>`, `>=`) → escaneo de histograma:
+///   sumamos buckets completamente cubiertos + medio bucket parcial.
+/// - `Compare != X` → `1 - sel(= X)`.
+/// - `Between` → similar a Compare pero sobre `[from, to]`.
+/// - `Like` → `DEFAULT_EQ_SELECTIVITY` (sin histograma de prefijos).
+/// - `InList` → suma de sel(eq) por cada literal, clamped a 1.0.
+/// - `And` → producto (independencia).
+/// - `Or` → `sl + sr - sl·sr` (inclusión-exclusión).
+/// - `Not` → `1 - sel(child)`.
+/// - Subqueries / `ExprPredicate` complejos → `DEFAULT_EQ_SELECTIVITY`.
+fn estimate_selectivity(stats: &TableStats, expr: &WhereExpr) -> f64 {
+    match expr {
+        WhereExpr::Atom(c) => estimate_atom_selectivity(stats, c),
+        WhereExpr::And(l, r) => {
+            let sl = estimate_selectivity(stats, l);
+            let sr = estimate_selectivity(stats, r);
+            (sl * sr).clamp(0.0, 1.0)
+        }
+        WhereExpr::Or(l, r) => {
+            let sl = estimate_selectivity(stats, l);
+            let sr = estimate_selectivity(stats, r);
+            (sl + sr - sl * sr).clamp(0.0, 1.0)
+        }
+        WhereExpr::Not(c) => (1.0 - estimate_selectivity(stats, c)).clamp(0.0, 1.0),
+    }
+}
+
+fn estimate_atom_selectivity(stats: &TableStats, atom: &WhereClause) -> f64 {
+    match atom {
+        WhereClause::Eq { column, value } => selectivity_eq(stats, column, value),
+        WhereClause::IsNull { column, negated } => {
+            let s = selectivity_is_null(stats, column);
+            if *negated {
+                (1.0 - s).clamp(0.0, 1.0)
+            } else {
+                s
+            }
+        }
+        WhereClause::Compare { column, op, value } => {
+            selectivity_compare(stats, column, *op, value)
+        }
+        WhereClause::Between { column, from, to } => selectivity_between(stats, column, *from, *to),
+        WhereClause::Like { negated, .. } => {
+            if *negated {
+                1.0 - DEFAULT_EQ_SELECTIVITY
+            } else {
+                DEFAULT_EQ_SELECTIVITY
+            }
+        }
+        WhereClause::InList {
+            column,
+            values,
+            negated,
+        } => {
+            let mut acc = 0.0f64;
+            for v in values {
+                acc += selectivity_eq(stats, column, v);
+            }
+            let acc = acc.clamp(0.0, 1.0);
+            if *negated {
+                (1.0 - acc).clamp(0.0, 1.0)
+            } else {
+                acc
+            }
+        }
+        // Subqueries y predicados expresionales: no estimamos.
+        WhereClause::In { negated, .. } | WhereClause::Exists { negated, .. } => {
+            if *negated {
+                1.0 - DEFAULT_EQ_SELECTIVITY
+            } else {
+                DEFAULT_EQ_SELECTIVITY
+            }
+        }
+        WhereClause::EqSubquery { .. }
+        | WhereClause::EqColumnRef { .. }
+        | WhereClause::ExprPredicate { .. } => DEFAULT_EQ_SELECTIVITY,
+    }
+}
+
+fn find_column_stats<'a>(stats: &'a TableStats, column: &str) -> Option<&'a ColumnStats> {
+    let key = column.to_ascii_lowercase();
+    stats
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&key))
+}
+
+fn selectivity_eq(stats: &TableStats, column: &str, value: &Value) -> f64 {
+    if matches!(value, Value::Null) {
+        // `col = NULL` es UNKNOWN en 3VL → nunca true → 0 rows.
+        return 0.0;
+    }
+    let total = stats.row_count.max(1) as f64;
+    let Some(cs) = find_column_stats(stats, column) else {
+        return DEFAULT_EQ_SELECTIVITY;
+    };
+    if let Some(stats_v) = value_to_stats_value(value) {
+        for (mcv_val, mcv_count) in &cs.mcv {
+            if mcv_val == &stats_v {
+                return (*mcv_count as f64 / total).clamp(0.0, 1.0);
+            }
+        }
+        let mcv_sum: u64 = cs.mcv.iter().map(|(_, c)| *c).sum();
+        let null_frac = (cs.null_count as f64) / total;
+        let mcv_frac = (mcv_sum as f64) / total;
+        let remainder_frac = (1.0 - null_frac - mcv_frac).max(0.0);
+        let remaining_distinct = (cs.ndv as i64) - (cs.mcv.len() as i64);
+        if remaining_distinct > 0 {
+            return (remainder_frac / remaining_distinct as f64).clamp(0.0, 1.0);
+        }
+        if cs.ndv > 0 {
+            return (1.0 / cs.ndv as f64).clamp(0.0, 1.0);
+        }
+    }
+    DEFAULT_EQ_SELECTIVITY
+}
+
+fn selectivity_is_null(stats: &TableStats, column: &str) -> f64 {
+    let total = stats.row_count.max(1) as f64;
+    let Some(cs) = find_column_stats(stats, column) else {
+        return DEFAULT_EQ_SELECTIVITY;
+    };
+    ((cs.null_count as f64) / total).clamp(0.0, 1.0)
+}
+
+fn selectivity_compare(stats: &TableStats, column: &str, op: CompareOp, value: &Value) -> f64 {
+    if matches!(op, CompareOp::Ne) {
+        return (1.0 - selectivity_eq(stats, column, value)).clamp(0.0, 1.0);
+    }
+    let Some(cs) = find_column_stats(stats, column) else {
+        return DEFAULT_RANGE_SELECTIVITY;
+    };
+    let Some(stats_v) = value_to_stats_value(value) else {
+        return DEFAULT_RANGE_SELECTIVITY;
+    };
+    if cs.histogram.is_empty() {
+        return DEFAULT_RANGE_SELECTIVITY;
+    }
+    histogram_compare_selectivity(&cs.histogram, op, &stats_v)
+}
+
+fn selectivity_between(stats: &TableStats, column: &str, from: i64, to: i64) -> f64 {
+    let Some(cs) = find_column_stats(stats, column) else {
+        return DEFAULT_RANGE_SELECTIVITY;
+    };
+    if cs.histogram.is_empty() {
+        return DEFAULT_RANGE_SELECTIVITY;
+    }
+    let from_v = StatsValue::Integer(from);
+    let to_v = StatsValue::Integer(to);
+    histogram_range_selectivity(&cs.histogram, &from_v, &to_v)
+}
+
+fn histogram_compare_selectivity(hist: &[HistogramBucket], op: CompareOp, v: &StatsValue) -> f64 {
+    use std::cmp::Ordering;
+    let total: u64 = hist.iter().map(|b| b.count).sum();
+    if total == 0 {
+        return DEFAULT_RANGE_SELECTIVITY;
+    }
+    let mut acc: u64 = 0;
+    for b in hist {
+        let upper_vs_v = cmp_stats_values(&b.upper, v);
+        let lower_vs_v = cmp_stats_values(&b.lower, v);
+        let matches_all = match op {
+            CompareOp::Lt => matches!(upper_vs_v, Some(Ordering::Less)),
+            CompareOp::Le => matches!(upper_vs_v, Some(Ordering::Less | Ordering::Equal)),
+            CompareOp::Gt => matches!(lower_vs_v, Some(Ordering::Greater)),
+            CompareOp::Ge => matches!(lower_vs_v, Some(Ordering::Greater | Ordering::Equal)),
+            CompareOp::Ne => false,
+        };
+        let matches_none = match op {
+            CompareOp::Lt => matches!(lower_vs_v, Some(Ordering::Greater | Ordering::Equal)),
+            CompareOp::Le => matches!(lower_vs_v, Some(Ordering::Greater)),
+            CompareOp::Gt => matches!(upper_vs_v, Some(Ordering::Less | Ordering::Equal)),
+            CompareOp::Ge => matches!(upper_vs_v, Some(Ordering::Less)),
+            CompareOp::Ne => false,
+        };
+        if matches_all {
+            acc += b.count;
+        } else if !matches_none {
+            acc += b.count / 2;
+        }
+    }
+    (acc as f64 / total as f64).clamp(0.0, 1.0)
+}
+
+fn histogram_range_selectivity(
+    hist: &[HistogramBucket],
+    from: &StatsValue,
+    to: &StatsValue,
+) -> f64 {
+    use std::cmp::Ordering;
+    let total: u64 = hist.iter().map(|b| b.count).sum();
+    if total == 0 {
+        return DEFAULT_RANGE_SELECTIVITY;
+    }
+    let mut acc: u64 = 0;
+    for b in hist {
+        let lower_ge_from = matches!(
+            cmp_stats_values(&b.lower, from),
+            Some(Ordering::Greater | Ordering::Equal)
+        );
+        let upper_le_to = matches!(
+            cmp_stats_values(&b.upper, to),
+            Some(Ordering::Less | Ordering::Equal)
+        );
+        let upper_lt_from = matches!(cmp_stats_values(&b.upper, from), Some(Ordering::Less));
+        let lower_gt_to = matches!(cmp_stats_values(&b.lower, to), Some(Ordering::Greater));
+        if lower_ge_from && upper_le_to {
+            acc += b.count;
+        } else if upper_lt_from || lower_gt_to {
+            // fully outside
+        } else {
+            acc += b.count / 2;
+        }
+    }
+    (acc as f64 / total as f64).clamp(0.0, 1.0)
+}
+
 /// Bloque P4 (VERSION 33): HyperLogLog mínimo para estimar NDV por
 /// columna. m=256 registros (b=8 bits del hash para el índice),
 /// 1 byte por registro. Memoria: 256 B por columna. Error típico
@@ -5833,17 +6074,26 @@ impl<'a> Engine<'a> {
     /// al string del SCAN step. Sin entry → String vacío. No invalida
     /// nada — un INSERT posterior deja la stat **stale** y el usuario
     /// debe re-ejecutar ANALYZE para refrescarla (documentado en ADR-0065).
-    fn stats_annotation(&self, table: &str) -> String {
-        match self.table_stats.get(table) {
-            Some(s) => {
-                if s.columns.is_empty() {
-                    format!(" [est.rows={}]", s.row_count)
-                } else {
-                    format!(" [est.rows={} cols={}]", s.row_count, s.columns.len())
-                }
-            }
-            None => String::new(),
+    /// Bloque P4 (2026-06-10): cuando hay column stats, agrega `cols=M`.
+    /// Bloque P5a (2026-06-11): si hay WHERE y stats, agrega
+    /// `est.match=K` con la cantidad estimada de filas que sobreviven al
+    /// predicado, calculada con `estimate_selectivity` (MCV / NDV /
+    /// histograma + reglas de combinación AND/OR/NOT). Es solo
+    /// anotación — el plan no usa todavía esta estimación (eso es P5c).
+    fn stats_annotation(&self, table: &str, where_clause: Option<&WhereExpr>) -> String {
+        let Some(s) = self.table_stats.get(table) else {
+            return String::new();
+        };
+        let mut parts = format!("est.rows={}", s.row_count);
+        if !s.columns.is_empty() {
+            parts.push_str(&format!(" cols={}", s.columns.len()));
         }
+        if let Some(expr) = where_clause {
+            let sel = estimate_selectivity(s, expr);
+            let est_match = ((s.row_count as f64) * sel).round() as u64;
+            parts.push_str(&format!(" est.match={}", est_match));
+        }
+        format!(" [{}]", parts)
     }
 
     fn classify_scan(&mut self, table: &str, where_clause: Option<&WhereExpr>) -> DbResult<String> {
@@ -5857,7 +6107,7 @@ impl<'a> Engine<'a> {
                 table
             ));
         };
-        let stats = self.stats_annotation(table);
+        let stats = self.stats_annotation(table, where_clause);
         // Sin WHERE → full scan.
         let Some(where_expr) = where_clause else {
             return Ok(format!(

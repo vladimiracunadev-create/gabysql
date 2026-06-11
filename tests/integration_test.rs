@@ -17589,6 +17589,207 @@ fn p4_drop_table_borra_column_stats() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque P5a (2026-06-11): infraestructura de estimación de
+// selectividad sobre WhereExpr. Consume stats P4 y anota EXPLAIN
+// con `est.match=K`. Sin cambios al plan (eso es P5c).
+// ============================================================
+
+fn extract_est_match(detail: &str) -> Option<u64> {
+    let idx = detail.find("est.match=")?;
+    let rest = &detail[idx + "est.match=".len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+#[test]
+fn p5a_explain_sin_where_no_muestra_est_match() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5a-no-where")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.match"),
+        "sin WHERE no debe haber est.match, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5a_selectivity_eq_mcv_exacto() -> Result<(), Box<dyn Error>> {
+    // 'a' aparece 6 de 12 → MCV → est.match exacto = 6.
+    let (db, wal) = p3_setup("p5a-mcv")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, code TEXT);
+         INSERT INTO t (id, code) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),
+            (10,'c'),(11,'c'),
+            (12,'d');
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t WHERE code = 'a' AND id > 0;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    let est = extract_est_match(&detail).expect("debe haber est.match");
+    // sel(code='a') = 6/12 = 0.5. AND sel(id>0) → histograma cubre todo →
+    // sel ~ 1.0 (o 0.5 si solo medio bucket gana). Margen amplio.
+    assert!(
+        (3..=8).contains(&est),
+        "est.match esperado en [3..8] (MCV='a' = 6/12), vi: {} (detail={})",
+        est,
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5a_selectivity_is_null_exacto() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5a-null")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, maybe INT);
+         INSERT INTO t (id, maybe) VALUES (1,10),(2,NULL),(3,30),(4,NULL),(5,NULL);
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t WHERE maybe IS NULL;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    // IS NULL es atom simple, pasa por classify_scan rama Compare/etc → al final
+    // termina con stats. El est.match esperado = 3 (3 NULLs exactos).
+    let est = extract_est_match(&detail).expect("est.match present");
+    assert_eq!(
+        est, 3,
+        "IS NULL debe usar null_count exacto = 3, vi: {} (detail={})",
+        est, detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5a_selectivity_and_es_producto() -> Result<(), Box<dyn Error>> {
+    // 100 filas con `a in [1..10]` (10 distinct, MCV cap-hit posible) y
+    // `b in [1..10]` independiente.
+    // sel(a=5) = 1/10 = 0.10 (MCV con count=10).
+    // sel(b=5) = 0.10.
+    // AND → 0.01 → est.match ~ 1.
+    let (db, wal) = p3_setup("p5a-and")?;
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);\n\
+         INSERT INTO t (id, a, b) VALUES ",
+    );
+    for i in 0..100 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({},{},{})", i + 1, (i % 10) + 1, (i / 10) + 1));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE a = 5 AND b = 5;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    let est = extract_est_match(&detail).expect("est.match present");
+    // Estimado correcto = 1. Aceptamos 0..=3 por ruido del HLL en NDV.
+    assert!(
+        est <= 3,
+        "AND multiplicativo: est.match esperado <= 3 (~1 real), vi: {} (detail={})",
+        est,
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5a_selectivity_or_union() -> Result<(), Box<dyn Error>> {
+    // 12 filas, 'a' x6 y 'b' x3. sel('a' OR 'b') = 9/12 = 0.75.
+    let (db, wal) = p3_setup("p5a-or")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, code TEXT);
+         INSERT INTO t (id, code) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),
+            (10,'c'),(11,'c'),(12,'d');
+         ANALYZE TABLE t;
+         EXPLAIN SELECT * FROM t WHERE code = 'a' OR code = 'b';",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    let est = extract_est_match(&detail).expect("est.match present");
+    // 6/12 + 3/12 - (6/12)*(3/12) = 0.5 + 0.25 - 0.125 = 0.625 → 7.5 → round 8.
+    // Aceptamos 7..=10 por inclusión-exclusión + ruido.
+    assert!(
+        (7..=10).contains(&est),
+        "OR unión: esperaba ~8, vi: {} (detail={})",
+        est,
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5a_sin_stats_usa_default() -> Result<(), Box<dyn Error>> {
+    // Sin ANALYZE → stats_annotation devuelve "" y est.match no aparece.
+    let (db, wal) = p3_setup("p5a-nostats")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);
+         INSERT INTO t (id, n) VALUES (1,1),(2,2),(3,3);
+         EXPLAIN SELECT * FROM t WHERE n = 1;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("est.match"),
+        "sin ANALYZE no debe haber est.match (sin stats), vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5a_selectivity_between_usa_histograma() -> Result<(), Box<dyn Error>> {
+    // 100 filas val 1..=100. BETWEEN 1 AND 25 → ~25% real.
+    let (db, wal) = p3_setup("p5a-between")?;
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT);\n\
+         INSERT INTO t (id, val) VALUES ",
+    );
+    for i in 0..100 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({},{})", i + 1, i + 1));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE val BETWEEN 1 AND 25;")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    let est = extract_est_match(&detail).expect("est.match present");
+    // Real = 25. Tolerancia ±50% para el histograma equi-depth de 16 buckets.
+    assert!(
+        (12..=40).contains(&est),
+        "BETWEEN histograma: esperaba ~25 (real), vi: {} (detail={})",
+        est,
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5b (2026-06-11): composite secondary index lookup.
 // `WHERE c1 = X AND c2 = Y AND ...` con CREATE INDEX (c1, c2, ...)
 // → fast-path por fingerprint en vez de full-scan. Cierra Gap 10
