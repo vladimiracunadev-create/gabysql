@@ -1787,7 +1787,9 @@ fn archive_run(rows: &[BenchRow], date_iso: &str) -> std::io::Result<PathBuf> {
 fn main() {
     let started = Instant::now();
     println!("== gabybench iniciando (pid={}) ==", std::process::id());
-    println!("   target esperado: ~10-15 min (10 DBs, ~85 queries)");
+    println!(
+        "   target esperado: all=~10-15 min (10 DBs), smoke=~1-2 min (microblog+orders_lines)"
+    );
     println!("   ✓ window functions RANK/SUM OVER son O(n) por partition (W4 cerrado 2026-05-30)");
     println!();
     let res = run();
@@ -1827,6 +1829,27 @@ fn run() -> DbResult<()> {
     let p8 = PathBuf::from(format!("{}/procflow.db", DBS_DIR));
     let p9 = PathBuf::from(format!("{}/types_zoo.db", DBS_DIR));
     let p10 = PathBuf::from(format!("{}/constraint_zoo.db", DBS_DIR));
+
+    // M2 (R1+P5c-friendly smoke): solo microblog + orders_lines, lo
+    // suficiente para detectar regresiones obvias del planner sin
+    // costar 10 min por push. Sube bench/results.json como artifact
+    // en CI.
+    if mode == "smoke" {
+        println!("== smoke setup microblog ==");
+        let t0 = Instant::now();
+        setup_microblog(&p1)?;
+        println!("   ok en {:.2}s", t0.elapsed().as_secs_f64());
+        println!("== smoke setup orders_lines ==");
+        let t0 = Instant::now();
+        setup_orders_lines(&p3)?;
+        println!("   ok en {:.2}s", t0.elapsed().as_secs_f64());
+        let mut all_rows: Vec<BenchRow> = Vec::new();
+        suite_microblog(&p1, &mut all_rows)?;
+        suite_orders_lines(&p3, &mut all_rows)?;
+        dump_json(Path::new(RESULTS_JSON), &all_rows)?;
+        println!("\n== smoke OK — resultados en {} ==", RESULTS_JSON);
+        return Ok(());
+    }
 
     if matches!(mode, "all" | "setup") {
         println!(

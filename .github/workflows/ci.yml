@@ -80,6 +80,32 @@ jobs:
       - name: Docker build
         run: docker build -t gabysql .
 
+  bench:
+    # Bloque M2 (2026-06-11): gabybench smoke (microblog + orders_lines)
+    # en CI. ~1-2 min vs 10-15 min del modo `all`. Sube bench/results.json
+    # como artifact por commit — sirve para tracking manual de regresiones
+    # hasta que tengamos baseline persistido (M2-futuro).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+      - name: Build gabybench (release)
+        run: cargo build --release --bin gabybench
+      - name: Run gabybench smoke
+        run: ./target/release/gabybench smoke
+      - name: Upload bench results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: gabybench-smoke-results
+          path: bench/results.json
+          if-no-files-found: error
+
   php:
     runs-on: ubuntu-latest
     permissions:

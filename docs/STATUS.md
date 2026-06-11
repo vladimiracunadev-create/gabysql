@@ -161,6 +161,8 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **2026-06-11** sesión P5d (zero-bump): hash join build-side selection. Cuando `current` (acumulado de joins previos) supera 2× `right_rows`, swap el build side al lado más chico. Cardinalidad real (no estimada). Threshold conservador para preservar orden de output en queries sin ORDER BY. Ver [ADR-0072](adr/0072-p5d-hash-join-build-side.md).
 > - **2026-06-11** sesión P5e (zero-bump): EXPLAIN anota el algoritmo real de JOIN (index-loop / hash / nested-loop) en vez de mentir con "nested-loop" fijo, más cardinality stats de ambos lados. Cierre formal de Fase 3 — EXPLAIN refleja ahora todo el planner. Ver [ADR-0073](adr/0073-p5e-join-algorithm-annotation.md).
 > - **2026-06-11** sesión R1 (zero-bump): detección de stats stale. EXPLAIN muestra `stats.age=Xd Yh` (+`STALE` si >7d). P5c bow out cuando stats stale → preserva path indexado. Cierra la tensión #1 del análisis post-P5. Ver [ADR-0074](adr/0074-r1-stats-stale-detection.md).
+> - **2026-06-11** sesión R4 (zero-bump, sin ADR): validación empírica de HLL+splitmix64 sobre TEXT (500 distinct), UUID (500), DATE (365) y DECIMAL (300). Suite total 789 passing — todos los tipos dentro de ±25% del NDV real.
+> - **2026-06-11** sesión M2 (zero-bump): nuevo modo `gabybench smoke` (microblog + orders_lines, ~1-2 min) y job CI `bench` que sube `bench/results.json` como artifact. Pre-requisito para R2/R3 (calibración de thresholds empíricos). Ver [ADR-0075](adr/0075-m2-gabybench-in-ci.md).
 >
 > **Pendientes priorizados** (orden recomendado, ver [ROADMAP.md](../ROADMAP.md#-próximas-proyecciones-orden-sugerido) sección "🔭 Próximas proyecciones" para el detalle):
 >
