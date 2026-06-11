@@ -18054,6 +18054,156 @@ fn p5e_explain_join_anota_stats_de_ambos_lados() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque R4 (2026-06-11): validación empírica de HLL sobre tipos
+// no-INT. P4 (con hot-fix splitmix64) se validó con INT secuenciales.
+// Estos tests verifican que NDV estimado se mantiene en ±25% del real
+// para DECIMAL, DATE, UUID y TEXT — los tipos donde el encoding
+// `stats_value_bytes` podría sesgar la distribución.
+// ============================================================
+
+fn r4_collect_ndv(db: &Path, table: &str, column: &str) -> Result<u64, Box<dyn Error>> {
+    let mut pager = Pager::open(db)?;
+    let mut catalog = gabysql::catalog::Catalog::open(&mut pager);
+    let list = catalog.list_table_stats()?;
+    let stats = list
+        .into_iter()
+        .find(|s| s.name.eq_ignore_ascii_case(table))
+        .ok_or_else(|| format!("no hay stats para '{}'", table))?;
+    let col = stats
+        .columns
+        .into_iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column))
+        .ok_or_else(|| format!("no hay column stats para '{}.{}'", table, column))?;
+    Ok(col.ndv)
+}
+
+#[test]
+fn r4_hll_text_500_distinct_de_2500_filas() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r4-text")?;
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, label TEXT);\n\
+         INSERT INTO t (id, label) VALUES ",
+    );
+    for i in 0..2500 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({},'label_{}')", i + 1, i % 500));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let ndv = r4_collect_ndv(&db, "t", "label")?;
+    assert!(
+        (375..=625).contains(&ndv),
+        "TEXT NDV ~500 ±25%, vi: {}",
+        ndv
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_hll_uuid_500_distinct() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r4-uuid")?;
+    // 500 UUIDs únicos generados determinísticamente, cada uno repetido 3 veces.
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, ref UUID);\n\
+         INSERT INTO t (id, ref) VALUES ",
+    );
+    for i in 0..1500 {
+        if i > 0 {
+            sql.push(',');
+        }
+        let bucket = i % 500;
+        // UUID canónico determinístico — formato 8-4-4-4-12.
+        let uuid = format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            bucket,
+            bucket & 0xffff,
+            (bucket >> 8) & 0xffff,
+            bucket & 0xffff,
+            bucket as u64
+        );
+        sql.push_str(&format!("({},'{}')", i + 1, uuid));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let ndv = r4_collect_ndv(&db, "t", "ref")?;
+    assert!(
+        (375..=625).contains(&ndv),
+        "UUID NDV ~500 ±25%, vi: {}",
+        ndv
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_hll_date_365_distinct() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r4-date")?;
+    // 365 fechas distintas (un año), 3 filas cada una = 1095 filas.
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, d DATE);\n\
+         INSERT INTO t (id, d) VALUES ",
+    );
+    for i in 0..1095 {
+        if i > 0 {
+            sql.push(',');
+        }
+        let day_idx = i % 365;
+        // Distribuir sobre 2025-01-01..2025-12-31 con simple aritmética
+        // mes/día (aproximada, no calendario real — solo necesitamos
+        // strings DATE-válidos y distintos).
+        let month = (day_idx / 28) + 1;
+        let day = (day_idx % 28) + 1;
+        let date = format!("2025-{:02}-{:02}", month, day);
+        sql.push_str(&format!("({},'{}')", i + 1, date));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let ndv = r4_collect_ndv(&db, "t", "d")?;
+    assert!(
+        (273..=457).contains(&ndv),
+        "DATE NDV ~365 ±25%, vi: {}",
+        ndv
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r4_hll_decimal_300_distinct() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r4-decimal")?;
+    // 300 decimales distintos, 4 filas cada uno = 1200 filas.
+    let mut sql = String::from(
+        "CREATE TABLE t (id INT PRIMARY KEY, price DECIMAL(10,2));\n\
+         INSERT INTO t (id, price) VALUES ",
+    );
+    for i in 0..1200 {
+        if i > 0 {
+            sql.push(',');
+        }
+        // 300 valores distintos: 0.50, 1.50, ..., 299.50.
+        let dec = format!("{}.50", i % 300);
+        sql.push_str(&format!("({},{})", i + 1, dec));
+    }
+    sql.push(';');
+    run_sql(&db, &sql)?;
+    run_sql(&db, "ANALYZE TABLE t;")?;
+    let ndv = r4_collect_ndv(&db, "t", "price")?;
+    assert!(
+        (225..=375).contains(&ndv),
+        "DECIMAL NDV ~300 ±25%, vi: {}",
+        ndv
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque R1 (2026-06-11): detección de stats stale.
 // - EXPLAIN muestra stats.age=Xd Yh (y STALE si >7d).
 // - P5c bow out cuando las stats son stale → preserva path indexado.
