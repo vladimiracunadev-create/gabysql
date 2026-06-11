@@ -163,6 +163,7 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **2026-06-11** sesión R1 (zero-bump): detección de stats stale. EXPLAIN muestra `stats.age=Xd Yh` (+`STALE` si >7d). P5c bow out cuando stats stale → preserva path indexado. Cierra la tensión #1 del análisis post-P5. Ver [ADR-0074](adr/0074-r1-stats-stale-detection.md).
 > - **2026-06-11** sesión R4 (zero-bump, sin ADR): validación empírica de HLL+splitmix64 sobre TEXT (500 distinct), UUID (500), DATE (365) y DECIMAL (300). Suite total 789 passing — todos los tipos dentro de ±25% del NDV real.
 > - **2026-06-11** sesión M2 (zero-bump): nuevo modo `gabybench smoke` (microblog + orders_lines, ~1-2 min) y job CI `bench` que sube `bench/results.json` como artifact. Pre-requisito para R2/R3 (calibración de thresholds empíricos). Ver [ADR-0075](adr/0075-m2-gabybench-in-ci.md).
+> - **2026-06-11** sesión R8 (zero-bump): composite-eq fast-path para UPDATE/DELETE. Cierra la asimetría P5b (que solo cubría SELECT). Bonus: composite PK fast-path para UPDATE/DELETE también. Suite total 794. Ver [ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md).
 >
 > **Pendientes priorizados** (orden recomendado, ver [ROADMAP.md](../ROADMAP.md#-próximas-proyecciones-orden-sugerido) sección "🔭 Próximas proyecciones" para el detalle):
 >

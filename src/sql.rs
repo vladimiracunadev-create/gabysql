@@ -12072,6 +12072,90 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+
+        // Bloque R8 (2026-06-11, ADR-0076): composite PK fast-path para
+        // UPDATE/DELETE. Si el WHERE es AND-eq que cubre EXACTAMENTE
+        // todas las columnas de una PK compuesta, computamos el
+        // fingerprint y vamos directo al B+tree principal. Mismo
+        // patrón que `composite_pk_plan` en exec_select_with_where.
+        if meta.has_composite_pk() {
+            if let Some(map) = extract_and_equality_map(where_clause) {
+                let pk_cols = meta.pk_columns();
+                if map.len() == pk_cols.len() {
+                    let mut ordered: Vec<Value> = Vec::with_capacity(pk_cols.len());
+                    let mut all_present = true;
+                    for pc in &pk_cols {
+                        match map.get(&normalize_ident(pc)) {
+                            Some(v) => ordered.push(v.clone()),
+                            None => {
+                                all_present = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_present {
+                        let col_metas: Vec<Column> = pk_cols
+                            .iter()
+                            .filter_map(|pc| meta.column(pc).cloned())
+                            .collect();
+                        if col_metas.len() == pk_cols.len() {
+                            let col_refs: Vec<&Column> = col_metas.iter().collect();
+                            let val_refs: Vec<&Value> = ordered.iter().collect();
+                            if let Ok(fp) = encode_composite_key(&col_refs, &val_refs) {
+                                let exists = {
+                                    let mut catalog = Catalog::open(self.pager);
+                                    catalog.get_row(meta.root_page, fp)?.is_some()
+                                };
+                                if exists {
+                                    return Ok((vec![fp], true));
+                                }
+                                // No row → return vacío. NO seteamos
+                                // was_explicit_single_pk porque
+                                // semánticamente esto es "WHERE compuesto
+                                // que no matchea", no "PK pedida no
+                                // existe" — el caller no debe emitir
+                                // ROW_NOT_FOUND_FOR_PK.
+                                return Ok((vec![], false));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Bloque R8 (2026-06-11, ADR-0076): composite secondary index
+        // fast-path. Si el WHERE es AND-eq con TODAS las columnas de un
+        // composite index cubiertas, lookup por fingerprint en vez de
+        // FullScan. El post-filter (eval_where_expr_single) descarta
+        // colisiones FNV-1a-64 y aplica predicados extra — misma red de
+        // seguridad que P5b usa en SELECT.
+        if let Some(map) = extract_and_equality_map(where_clause) {
+            if let Some((idx, fp)) = find_matching_composite_index(meta, &map) {
+                let idx_root = idx.root_page;
+                let candidate_pks = composite_index_lookup_pks(self.pager, idx_root, fp)?;
+                // Materializar decoded rows ANTES de soltar el catalog
+                // borrow — eval_where_expr_single necesita &mut self.
+                let candidate_rows: Vec<(i64, HashMap<String, Value>)> = {
+                    let mut catalog = Catalog::open(self.pager);
+                    let mut rows = Vec::with_capacity(candidate_pks.len());
+                    for pk in candidate_pks {
+                        if let Some(bytes) = catalog.get_row(meta.root_page, pk)? {
+                            rows.push((pk, decode_row(meta, &bytes)?));
+                        }
+                    }
+                    rows
+                };
+                let mut pks = Vec::with_capacity(candidate_rows.len());
+                for (pk, decoded) in candidate_rows {
+                    let verdict = self.eval_where_expr_single(where_clause, meta, &decoded)?;
+                    if matches!(verdict, Some(true)) {
+                        pks.push(pk);
+                    }
+                }
+                return Ok((pks, false));
+            }
+        }
+
         // Fallback genérico: FullScan + evaluador 3VL. Reusa el mismo
         // evaluador del SELECT (`eval_where_expr_single`) — la única
         // diferencia es que acá necesitamos las PKs, no las filas

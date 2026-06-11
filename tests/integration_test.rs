@@ -18204,6 +18204,201 @@ fn r4_hll_decimal_300_distinct() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque R8 (2026-06-11): UPDATE/DELETE con composite-eq usan los
+// mismos fast-paths que SELECT (P5b + composite PK). Asimetría
+// heredada de P5b cerrada — resolve_target_pks gana 2 ramas.
+// ============================================================
+
+#[test]
+fn r8_update_composite_index_lookup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r8-update-idx")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT, payload TEXT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio, payload) VALUES
+            (1, 5, 100, 'A'),
+            (2, 5, 200, 'B'),
+            (3, 6, 100, 'C'),
+            (4, 5, 100, 'D');
+         UPDATE lines SET payload = 'X' WHERE qty = 5 AND precio = 100;
+         SELECT id, payload FROM lines ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    let rows: Vec<(i64, String)> = last
+        .rows
+        .iter()
+        .map(|r| {
+            let id = match r[0] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            let pl = match &r[1] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            (id, pl)
+        })
+        .collect();
+    // Filas 1 y 4 matchean → payload='X'. 2 y 3 quedan intactas.
+    assert_eq!(
+        rows,
+        vec![
+            (1, "X".to_string()),
+            (2, "B".to_string()),
+            (3, "C".to_string()),
+            (4, "X".to_string()),
+        ]
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r8_delete_composite_index_lookup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r8-delete-idx")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio) VALUES
+            (1, 5, 100),
+            (2, 5, 200),
+            (3, 6, 100),
+            (4, 5, 100);
+         DELETE FROM lines WHERE qty = 5 AND precio = 100;
+         SELECT id FROM lines ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    let ids: Vec<i64> = last
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    // Filas 1 y 4 borradas → quedan 2 y 3.
+    assert_eq!(ids, vec![2, 3]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r8_update_composite_pk_lookup() -> Result<(), Box<dyn Error>> {
+    // UPDATE sobre PK compuesta con WHERE AND-eq → fast-path nuevo.
+    let (db, wal) = p3_setup("r8-update-pk")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, payload TEXT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, payload) VALUES (1,1,'one'),(1,2,'two'),(2,1,'three');
+         UPDATE t SET payload = 'mod' WHERE a = 1 AND b = 1;
+         SELECT a, b, payload FROM t;",
+    )?;
+    let last = res.last().unwrap();
+    let mut rows: Vec<(i64, i64, String)> = last
+        .rows
+        .iter()
+        .map(|r| {
+            let a = match r[0] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            let b = match r[1] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            let pl = match &r[2] {
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            (a, b, pl)
+        })
+        .collect();
+    rows.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+    assert_eq!(
+        rows,
+        vec![
+            (1, 1, "mod".to_string()),
+            (1, 2, "two".to_string()),
+            (2, 1, "three".to_string()),
+        ]
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r8_delete_composite_pk_lookup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r8-delete-pk")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, payload TEXT, PRIMARY KEY (a, b));
+         INSERT INTO t (a, b, payload) VALUES (1,1,'one'),(1,2,'two'),(2,1,'three');
+         DELETE FROM t WHERE a = 1 AND b = 1;
+         SELECT a, b FROM t;",
+    )?;
+    let last = res.last().unwrap();
+    let mut rows: Vec<(i64, i64)> = last
+        .rows
+        .iter()
+        .map(|r| {
+            let a = match r[0] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            let b = match r[1] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            (a, b)
+        })
+        .collect();
+    rows.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+    assert_eq!(rows, vec![(1, 2), (2, 1)]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r8_update_extra_predicate_post_filter() -> Result<(), Box<dyn Error>> {
+    // composite-eq matchea pero un predicate extra refina.
+    // Solo las filas con sku='A' deben actualizarse.
+    let (db, wal) = p3_setup("r8-extra")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT, sku TEXT, val INT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio, sku, val) VALUES
+            (1, 5, 100, 'A', 0),
+            (2, 5, 100, 'B', 0),
+            (3, 5, 100, 'A', 0);
+         UPDATE lines SET val = 99 WHERE qty = 5 AND precio = 100 AND sku = 'A';
+         SELECT id, val FROM lines ORDER BY id;",
+    )?;
+    let last = res.last().unwrap();
+    let rows: Vec<(i64, i64)> = last
+        .rows
+        .iter()
+        .map(|r| {
+            let id = match r[0] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            let v = match r[1] {
+                Value::Integer(n) => n,
+                _ => -1,
+            };
+            (id, v)
+        })
+        .collect();
+    // 1 y 3 (sku='A') → val=99. 2 (sku='B') intacto.
+    assert_eq!(rows, vec![(1, 99), (2, 0), (3, 99)]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque R1 (2026-06-11): detección de stats stale.
 // - EXPLAIN muestra stats.age=Xd Yh (y STALE si >7d).
 // - P5c bow out cuando las stats son stale → preserva path indexado.
