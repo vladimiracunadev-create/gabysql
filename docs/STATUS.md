@@ -5,6 +5,8 @@
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 >
 > 👉 **Para el balance crítico de la última sesión** (tensiones cerradas, abiertas, deuda residual): [ANALISIS_POST_P5.md](ANALISIS_POST_P5.md).
+>
+> 👉 **Si te perdés con las letras (P5b, R6, M2, …)**: [COMO_TRABAJAMOS.md](COMO_TRABAJAMOS.md) explica de dónde salen los prefijos, cómo nace y se entrega cada bloque, y dónde mirar para qué.
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-33-2d7a66)](TECHNICAL_SPECS.md)
