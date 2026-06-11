@@ -17588,6 +17588,194 @@ fn p4_drop_table_borra_column_stats() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ============================================================
+// Bloque P5b (2026-06-11): composite secondary index lookup.
+// `WHERE c1 = X AND c2 = Y AND ...` con CREATE INDEX (c1, c2, ...)
+// → fast-path por fingerprint en vez de full-scan. Cierra Gap 10
+// del bench (ADR-0066).
+// ============================================================
+
+#[test]
+fn p5b_composite_index_lookup_devuelve_fila_correcta() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5b-correct")?;
+    let results = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT, sku TEXT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio, sku) VALUES
+            (1, 5, 100, 'A'),
+            (2, 5, 200, 'B'),
+            (3, 6, 100, 'C'),
+            (4, 5, 100, 'D');
+         SELECT sku FROM lines WHERE qty = 5 AND precio = 100 ORDER BY sku;",
+    )?;
+    let last = results.last().unwrap();
+    let skus: Vec<String> = last
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(
+        skus,
+        vec!["A".to_string(), "D".to_string()],
+        "esperaba ['A','D'] (filas 1 y 4), vi: {:?}",
+        skus
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5b_explain_muestra_composite_index_lookup() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("p5b-explain")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio) VALUES (1,5,100),(2,5,200),(3,6,100);
+         EXPLAIN SELECT id FROM lines WHERE qty = 5 AND precio = 100;",
+    )?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("composite index lookup") && detail.contains("idx_qp"),
+        "esperaba 'composite index lookup ... idx_qp', vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5b_lookup_parcial_cae_a_full_scan() -> Result<(), Box<dyn Error>> {
+    // Solo cubre una de las 2 columnas del composite — no debe disparar
+    // el fast-path. La query debe devolver el resultado correcto vía
+    // FullScan + post-filter.
+    let (db, wal) = p3_setup("p5b-partial")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio) VALUES (1,5,100),(2,5,200),(3,6,100);
+         EXPLAIN SELECT id FROM lines WHERE qty = 5;
+         SELECT id FROM lines WHERE qty = 5 ORDER BY id;",
+    )?;
+    let explain_detail = extract_scan_detail(&res[res.len() - 2]);
+    assert!(
+        !explain_detail.contains("composite index lookup"),
+        "lookup parcial NO debe disparar composite fast-path, vi: {}",
+        explain_detail
+    );
+    let last = res.last().unwrap();
+    let ids: Vec<i64> = last
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2], "esperaba ids [1,2], vi: {:?}", ids);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5b_extra_predicate_aplica_post_filter() -> Result<(), Box<dyn Error>> {
+    // Composite (qty, precio) cubre AND parcial. WHERE agrega sku='A':
+    // el fast-path devuelve PKs y el post-filter descarta los que no
+    // matchean sku.
+    let (db, wal) = p3_setup("p5b-extra")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT, sku TEXT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio, sku) VALUES
+            (1, 5, 100, 'A'),
+            (2, 5, 100, 'B'),
+            (3, 5, 100, 'A');
+         SELECT id FROM lines WHERE qty = 5 AND precio = 100 AND sku = 'A' ORDER BY id;",
+    )?;
+    let ids: Vec<i64> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "esperaba ids [1,3] (post-filter sku='A'), vi: {:?}",
+        ids
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5b_non_unique_composite_bucket_con_varias_pks() -> Result<(), Box<dyn Error>> {
+    // Composite no-UNIQUE: el bucket puede tener varias PKs. La lookup
+    // las devuelve todas y el SELECT las proyecta.
+    let (db, wal) = p3_setup("p5b-multi")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE lines (id INT PRIMARY KEY, qty INT, precio INT);
+         CREATE INDEX idx_qp ON lines (qty, precio);
+         INSERT INTO lines (id, qty, precio) VALUES
+            (1, 7, 50),
+            (2, 7, 50),
+            (3, 7, 50),
+            (4, 8, 50);
+         SELECT id FROM lines WHERE qty = 7 AND precio = 50 ORDER BY id;",
+    )?;
+    let ids: Vec<i64> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3], "esperaba ids [1,2,3], vi: {:?}", ids);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn p5b_composite_index_unique_lookup() -> Result<(), Box<dyn Error>> {
+    // UNIQUE composite — bucket con 1 PK. Path idéntico al non-unique;
+    // el test verifica que UNIQUE no rompe nada.
+    let (db, wal) = p3_setup("p5b-unique")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, label TEXT);
+         CREATE UNIQUE INDEX uq_ab ON t (a, b);
+         INSERT INTO t (id, a, b, label) VALUES (1,10,20,'x'),(2,10,30,'y'),(3,11,20,'z');
+         SELECT label FROM t WHERE a = 10 AND b = 20;",
+    )?;
+    let labels: Vec<String> = res
+        .last()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::String(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(labels, vec!["x".to_string()]);
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
 #[test]
 fn p3b_db_sin_analyze_arranca_sin_stats() -> Result<(), Box<dyn Error>> {
     // Caso regression: una DB recién creada (o que nunca corrió

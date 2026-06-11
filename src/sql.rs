@@ -5867,6 +5867,21 @@ impl<'a> Engine<'a> {
         };
         // Solo clasificamos átomos simples. AND/OR/NOT cae a full+filter.
         let Some(atom) = where_expr.as_atom() else {
+            // Bloque P5b (2026-06-11): si el WHERE es AND-of-equality
+            // que cubre TODAS las columnas de un índice secundario
+            // compuesto, anunciamos el fast-path por fingerprint.
+            if let Some(eq_map) = extract_and_equality_map(where_expr) {
+                if let Some((idx, _fp)) = find_matching_composite_index(&meta, &eq_map) {
+                    return Ok(format!(
+                        "SCAN `{}` → composite index lookup `{}` ({}) \
+                         (B+tree fingerprint, ~O(log n)){}",
+                        table,
+                        idx.name,
+                        idx.all_columns().join(", "),
+                        stats
+                    ));
+                }
+            }
             return Ok(format!(
                 "SCAN `{}` (full scan + WHERE AND/OR/NOT post-filter){}",
                 table, stats
@@ -9220,7 +9235,34 @@ impl<'a> Engine<'a> {
             None
         };
 
+        // Bloque P5b (2026-06-11, ADR-0069): composite secondary index
+        // lookup. Si el WHERE es AND-of-equality y existe un índice
+        // compuesto cuyas TODAS las columnas están cubiertas, vamos al
+        // bucket por fingerprint en vez de FullScan. El `generic_post_filter`
+        // queda activo: maneja predicados eq EXTRA (más allá del índice)
+        // y descarta falsos positivos por colisión FNV-1a-64 (red de
+        // seguridad estándar — sin él el lookup sería incorrecto).
+        // Cierra Gap 10 de ADR-0066 (composite index lookup full-scan
+        // sobre `WHERE qty = 5 AND precio = 100`).
+        let composite_index_plan: Option<Plan> = if exists_postfilter.is_none() {
+            stmt.where_clause
+                .as_ref()
+                .and_then(extract_and_equality_map)
+                .and_then(|map| {
+                    find_matching_composite_index(&meta, &map).map(|(idx, fp)| (idx.root_page, fp))
+                })
+                .and_then(|(idx_root, fp)| {
+                    composite_index_lookup_pks(self.pager, idx_root, fp)
+                        .ok()
+                        .map(Plan::ByPks)
+                })
+        } else {
+            None
+        };
+
         let plan = if let Some(p) = composite_pk_plan {
+            p
+        } else if let Some(p) = composite_index_plan {
             p
         } else if exists_postfilter.is_some() || generic_post_filter.is_some() {
             // El filtrado real ocurre en el post-filter; el scan barre todo.
@@ -14998,6 +15040,80 @@ fn delete_with_cascade(pager: &mut Pager, root_table: &str, root_pk: i64) -> DbR
 /// existan en `values`; las ausentes caen a `Value::Null` (lo cual el
 /// encoder traduce a un sentinel — no es válido para UNIQUE compuesto
 /// porque K2 exige NOT NULL, pero defendemos en profundidad).
+/// Bloque P5b (2026-06-11): de los índices secundarios COMPUESTOS de
+/// `meta`, encuentra alguno cuyas TODAS las columnas estén cubiertas
+/// por el `eq_map` (AND-of-equality del WHERE). Si hay varios, prefiere
+/// el más largo (más columnas cubiertas → predicado más selectivo, en
+/// ausencia de un modelo de costo por stats; ver P5 futuro).
+///
+/// Devuelve `(idx, fingerprint)` listo para pasar a
+/// [`composite_index_lookup_pks`]. Si alguno de los valores requeridos
+/// es `NULL`, devuelve `None` — `col = NULL` siempre es UNKNOWN en 3VL
+/// y el fast-path simplemente no aplica (el path normal devuelve 0 rows).
+///
+/// El bucket del índice almacena solo PKs (sin valores de columna), por
+/// lo que una colisión FNV-1a-64 podría devolver una PK no-matcheante.
+/// Es responsabilidad del **post-filter** (`generic_post_filter`) del
+/// caller descartar esa PK contra el WHERE real. Por eso esta función
+/// nunca debe invocarse sin un post-filter activo aguas abajo.
+fn find_matching_composite_index<'a>(
+    meta: &'a TableMeta,
+    eq_map: &HashMap<String, Value>,
+) -> Option<(&'a IndexMeta, i64)> {
+    let mut best: Option<(&IndexMeta, i64, usize)> = None;
+    for idx in &meta.indexes {
+        if !idx.is_composite() {
+            continue;
+        }
+        let cols = idx.all_columns();
+        let mut values: Vec<Value> = Vec::with_capacity(cols.len());
+        let mut covered = true;
+        for c in &cols {
+            let key = normalize_ident(c);
+            match eq_map.get(&key) {
+                Some(Value::Null) | None => {
+                    covered = false;
+                    break;
+                }
+                Some(v) => values.push(v.clone()),
+            }
+        }
+        if !covered {
+            continue;
+        }
+        let col_metas: Vec<Column> = cols
+            .iter()
+            .filter_map(|c| meta.column(c).cloned())
+            .collect();
+        if col_metas.len() != cols.len() {
+            continue;
+        }
+        let col_refs: Vec<&Column> = col_metas.iter().collect();
+        let val_refs: Vec<&Value> = values.iter().collect();
+        let Ok(fp) = encode_composite_key(&col_refs, &val_refs) else {
+            continue;
+        };
+        let len = cols.len();
+        match best {
+            Some((_, _, best_len)) if best_len >= len => {}
+            _ => best = Some((idx, fp, len)),
+        }
+    }
+    best.map(|(idx, fp, _)| (idx, fp))
+}
+
+/// Bloque P5b: lee el bucket del índice compuesto en el fingerprint
+/// `fp` y devuelve la lista de PKs. Bucket ausente → `Vec` vacío.
+/// La verificación de valores reales contra el WHERE (necesaria por
+/// posibles colisiones FNV-1a-64) la hace el `generic_post_filter`.
+fn composite_index_lookup_pks(pager: &mut Pager, idx_root: u32, fp: i64) -> DbResult<Vec<i64>> {
+    let mut tree = Tree::new(pager);
+    match tree.get(idx_root, fp)? {
+        Some(bytes) => decode_ordered_bucket(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn composite_fp_for_values(
     meta: &TableMeta,
     idx: &IndexMeta,

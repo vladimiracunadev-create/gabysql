@@ -155,12 +155,14 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **2026-05-29** sesión 3 (P planeación, sin bump on-disk): P1 (EXPLAIN), P2 (EXPLAIN ANALYZE), P3 (ANALYZE TABLE + stats en EXPLAIN).
 > - **2026-06-09** sesión P3b (VERSION 31→32): stats persistidas en catálogo vía `ObjectKind::TableStats`. Sobreviven a reopen; DROP TABLE las borra. Ver [ADR-0067](adr/0067-p3b-persistent-stats.md).
 > - **2026-06-10** sesión P4 (VERSION 32→33): stats por-columna persistidas — `null_count` exacto, NDV vía HyperLogLog (256 reg), MCV top-K=10, histograma equi-depth ~16 buckets. Aún NO consumidas por el planner (eso es P5). Ver [ADR-0068](adr/0068-p4-column-stats.md).
+> - **2026-06-11** sesión P5b (zero-bump): composite secondary index lookup. `WHERE c1 = X AND c2 = Y AND ...` con CREATE INDEX (c1, c2, ...) → fingerprint FNV → bucket lookup en vez de FullScan. Cierra el último gap del bench (ADR-0066 Gap 10). Ver [ADR-0069](adr/0069-p5b-composite-index-lookup.md).
 >
 > **Pendientes priorizados** (orden recomendado, ver [ROADMAP.md](../ROADMAP.md#-próximas-proyecciones-orden-sugerido) sección "🔭 Próximas proyecciones" para el detalle):
 >
 > **Cierre inmediato de Fase 3**:
 > - ~~**P4** — stats por-columna (NDV vía HyperLogLog, MCV top-K, histogramas equi-depth)~~ ✓ entregado 2026-06-10 (ADR-0068, VERSION 33).
-> - **P5** — planner-as-optimizer real (reorden de joins, choice de índice por costo). Sub-tarea P5b cierra el último gap del bench ([ADR-0066 Gap 10](adr/0066-bench-exposed-gaps.md)).
+> - ~~**P5b** — composite secondary index lookup~~ ✓ entregado 2026-06-11 (ADR-0069, zero-bump). Cierra ADR-0066 Gap 10.
+> - **P5** — planner-as-optimizer real (reorden de joins, choice de índice por costo basado en stats P4). Sub-tarea futura P5c: prefix matching sobre composite indexes (requiere cambio de layout on-disk).
 > - **P6** — gabybench con benchmarks reproducibles + tracking de regresiones en CI.
 >
 > **Hilos cruzados** (no atan a una fase):

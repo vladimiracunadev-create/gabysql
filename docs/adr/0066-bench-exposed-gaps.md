@@ -186,17 +186,26 @@ Detalles:
 
 ---
 
-## Gap 10 — `Composite index lookup` no usa el índice compuesto
+## Gap 10 — `Composite index lookup` no usa el índice compuesto ✓ CERRADO (P5b, 2026-06-11)
 
-**Código de error**: ninguno — funciona, pero hace full-scan.
+**Código de error original**: ninguno — funcionaba, pero hacía full-scan.
 **Query del bench**: `orders_lines` → `SELECT order_id FROM lines WHERE qty = 5 AND precio = 100` con `CREATE INDEX idx_lines_qty_precio ON lines (qty, precio)`.
-**Latencia medida**: **161 ms** para 100k rows (devuelve TODAS las rows — el predicado no filtra realmente, pero el planner debería usar el índice).
+**Latencia medida pre-fix**: **161 ms** para 100k rows.
 
-**Causa raíz**: el planner identifica el composite index pero `WHERE col1 = X AND col2 = Y` no se detecta como "AND-composable" — el dispatcher no compone los dos predicados en una fingerprint lookup.
+**Causa raíz** (pre-fix): el planner identificaba el composite index al insertar pero el path de READ no lo usaba — el WHERE multi-atom AND caía a `FullScan + post-filter`. `extract_and_equality_map` producía el map correcto pero el dispatch solo lo usaba para PK compuesta, no para índices secundarios compuestos.
 
-**Fix definitivo**: **bloque P5b** — planner con detección de `WHERE composable AND` → composite index lookup. Sub-tarea del bloque P5 (planner real).
+**Fix aplicado** (commit del bloque P5b, ver [ADR-0069](0069-p5b-composite-index-lookup.md)):
 
-**Prioridad**: P1 (cuando llegue P5).
+1. Nuevo `find_matching_composite_index(meta, eq_map) -> Option<(&IndexMeta, i64)>` (`src/sql.rs:~15001`): si hay índice compuesto cuyas TODAS las columnas están cubiertas por el AND-eq, devuelve el índice y el fingerprint FNV-1a-64. Multiple candidates → pick el más largo (más selectivo en ausencia de stats).
+2. Nuevo `composite_index_lookup_pks(pager, idx_root, fp)`: lee el bucket en `fp`, devuelve `Vec<i64>` de PKs.
+3. Dispatch en `exec_select_with_where` (`src/sql.rs:~9220`): nuevo `composite_index_plan` después de `composite_pk_plan` y antes del fallback a `Plan::FullScan` por post-filter. `generic_post_filter` permanece activo como red de seguridad (collisions + extra predicates).
+4. `classify_scan` (EXPLAIN): nueva rama que detecta el caso y emite `composite index lookup ‘<idx_name>’ (col1, col2, ...) (B+tree fingerprint, ~O(log n))`.
+
+**Limitación residual**: solo full-cover (todas las columnas del índice cubiertas). Prefix matching (`WHERE a=X` con índice `(a, b)`) sigue cayendo a FullScan — requiere cambiar el layout on-disk del índice a tuple-byte-concatenado con orden lexicográfico (potencial P5c).
+
+**Tests**: 6 nuevos en `tests/integration_test.rs` (suite p5b_*). Suite total 762 passing.
+
+**Prioridad**: ~~P1~~ — entregado.
 
 ---
 
@@ -213,7 +222,7 @@ Detalles:
 | 7 | ~~`[GBY-4028]`~~ (vista) | ~~F2~~ ✓ (sub-caso de Gap 1) | ~~P1~~ cerrado 2026-05-30 |
 | 8 | ~~sin código~~ | ~~**W4**~~ ✓ | ~~**P1 crítico**~~ cerrado 2026-05-30 |
 | 9 | ~~sin código~~ | ~~**K4**~~ ✓ | ~~P2~~ cerrado 2026-05-30 |
-| 10 | sin código | **P5b** | P1 (cuando llegue P5) |
+| 10 | ~~sin código~~ | ~~**P5b**~~ ✓ | ~~P1~~ cerrado 2026-06-11 |
 
 ---
 
