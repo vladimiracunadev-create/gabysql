@@ -1,6 +1,6 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-11 contra `main` post-bloques W1+W2+W3, X1→X4f+X6, Y1→Y9, Z1→Z3f, y **Fase 3 cerrada (`P1+P2+P3+P3b+P4+P5a+P5b+P5c+P5d+P5e`)** + hardening post-sesión (`R1+R4+M2+R8+R6`): EXPLAIN/EXPLAIN ANALYZE + ANALYZE con stats persistidas en catálogo + stats por-columna (NDV/MCV/histograma) + planner cost-based con bypass por stats stale + composite secondary index lookup + hash-join build-side selection + JOIN algorithm annotation + UPDATE/DELETE composite-eq fast-paths + post-lookup bucket-size check. **VERSION on-disk = 33** (último bump P4 / 2026-06-10 — column stats; P3b → 32 fue el bump previo). Los 10 bloques P4 → R6 entregados en sesión 2026-06-10/11 son zero-bump excepto P4.
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-15 contra `main` tras la **sesión maratón** que cerró 10 pushes adicionales (`R7+R9+R10+R2+R3+R3-cont+ANSI fix+M3`) sobre el estado que dejó Fase 3 (`P1+P2+P3+P3b+P4+P5a+P5b+P5c+P5d+P5e`) + hardening previo (`R1+R4+M2+R8+R6`). Highlights de la maratón: **R2** calibró `INDEX_BREAKEVEN` con bench data (0.20 → 0.10) + env var override · **R3+R3-cont** cerró el threshold P5d con outcome explícito (sweep inconcluso, default 2.0 stays, env var queda) · **R9** cerró el residual ADR-0066 Gap 1 (COUNT DISTINCT sobre JOIN) · **R7/R10** pulieron EXPLAIN del P5c skip y del USING/NATURAL JOIN · **ANSI fix** alineó `UPDATE/DELETE WHERE pk no-existe` con PostgreSQL/SQLite (0 filas, no error) · **M3** entregó la primera red de seguridad real del optimizer (property tests hand-rolled zero-deps, 240 comparaciones por corrida con seed reproducible). **VERSION on-disk = 33** (último bump P4 / 2026-06-10; los 8 bloques de 2026-06-15 son **todos zero-bump** porque no tocan layout on-disk).
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 >
@@ -10,7 +10,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-33-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%20tests-798%2F798-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%2Bproptest-813%2F813-brightgreen)](../tests/integration_test.rs)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 > **2026-05-29 — Día grande: cierre de Fase 2 (seguridad) + arranque y avance fuerte de Fase 3 (planeación).** Lo entregado hoy en orden cronológico:
@@ -169,6 +169,15 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - **2026-06-11** sesión M2 (zero-bump): nuevo modo `gabybench smoke` (microblog + orders_lines, ~1-2 min) y job CI `bench` que sube `bench/results.json` como artifact. Pre-requisito para R2/R3 (calibración de thresholds empíricos). Ver [ADR-0075](adr/0075-m2-gabybench-in-ci.md).
 > - **2026-06-11** sesión R8 (zero-bump): composite-eq fast-path para UPDATE/DELETE. Cierra la asimetría P5b (que solo cubría SELECT). Bonus: composite PK fast-path para UPDATE/DELETE también. Suite total 794. Ver [ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md).
 > - **2026-06-11** sesión R6 (zero-bump): post-lookup bucket size check. Si el composite devuelve ≥20% de las filas, bail a FullScan + post-filter — usa cardinalidad REAL del bucket, no la estimación con asunción de independencia. Refina P5c en el caso de AND con cols correlacionadas. Suite total 798. Ver [ADR-0077](adr/0077-r6-composite-bucket-size-check.md).
+> - **2026-06-15 — sesión maratón (10 pushes, zero-bump excepto VERSION sin cambios)**:
+>   - **R7** ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)): EXPLAIN del path P5c skip sugiere re-ANALYZE si stats ∈ [24h, 7d).
+>   - **R9** ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)): COUNT(DISTINCT col) sobre JOIN ya soportado — cierra residual ADR-0066 Gap 1.
+>   - **R10** ([ADR-0080](adr/0080-r10-using-natural-explain.md)): EXPLAIN reconoce PK/índice en USING/NATURAL JOIN (no solo ON explícito).
+>   - **R2** ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)): primera constante del optimizer calibrada con números reales — `INDEX_BREAKEVEN` 0.20 → 0.10 + env var `GABYSQL_INDEX_BREAKEVEN`.
+>   - **R3** ([ADR-0082](adr/0082-r3-p5d-swap-threshold-instrumentation.md)) + **R3-cont** ([ADR-0085](adr/0085-r3-cont-p5d-sweep-results.md)): `P5D_SWAP_THRESHOLD` instrumentado con env var; sweep empírico inconcluso → default 2.0 stays.
+>   - **ANSI fix** ([ADR-0083](adr/0083-ansi-update-delete-no-row-zero.md)): `UPDATE/DELETE WHERE pk no-existe` ahora devuelve 0 filas (PostgreSQL/SQLite), no `[GBY-3006]`. Descubierto durante el debug del bench `all`.
+>   - **M3** ([ADR-0084](adr/0084-m3-proptest-planner.md)): primera red de seguridad real del optimizer cost-based. Property tests hand-rolled zero-deps: 240 comparaciones automáticas por corrida verifican que P5c/P5d/R6 NUNCA cambian el resultado de un SELECT, solo el path. Habilita futuros bloques optimizer (M5/M6/M7/M9) sobre confianza empírica.
+>   - **Bench fix** (commit 3c5d97c): warmup del bench era no-tolerante a errores; ahora best-effort. Suite total 798 → **813** (+15: 14 integration nuevos + 3 proptest nuevos − 2 ajustados por R2 + 2 ajustados por ANSI).
 >
 > **Pendientes priorizados** (orden recomendado, ver [ROADMAP.md](../ROADMAP.md#-próximas-proyecciones-orden-sugerido) sección "🔭 Próximas proyecciones" para el detalle):
 >

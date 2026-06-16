@@ -6,6 +6,30 @@
 
 ---
 
+## 2026-06-15 — Sesión maratón: 10 pushes cierran la mayoría de la deuda post-P5
+
+> Sesión de un día que cerró 3 tensiones del análisis post-P5 + las 4
+> reparaciones menores + agregó la red de seguridad del optimizer +
+> alineó a ANSI un error code legacy. Todos los pushes son aislados
+> (1 bloque = 1 push) y verdes en CI. Marcadores antes/después de la
+> sesión:
+>
+> - **Suite tests**: 798 → **813** (+15).
+> - **ADRs**: 0077 → **0085** (+8 nuevos).
+> - **Tensiones post-P5 cerradas**: 5/9 → **7/9** (quedan 2.6 RIGHT/FULL
+>   heurística y 2.9 P5d swap order — ambas documentadas, una mitigada
+>   parcialmente).
+> - **gabybench all**: pasaba 9/10 suites → **12.9 min, 71 queries, 0
+>   SKIPs end-to-end**.
+> - **Próximo norte declarado**: `cargo fuzz` parser + M6 EXPLAIN
+>   ANALYZE compare + Pager proptest. Detalle en
+>   [TAREAS_PENDIENTES.md §📍](docs/TAREAS_PENDIENTES.md).
+>
+> Pushes en orden cronológico (cada uno con su ADR salvo el bench fix):
+> R7 → R9 → R10 → R2 → R3 → bench-fix → ANSI fix → M3 → R3-cont → docs sweep.
+
+---
+
 ## 2026-06-15 — R3-cont: sweep empírico de P5D_SWAP_THRESHOLD (default 2.0 stays)
 
 > Cierre con datos del pendiente que dejó ADR-0082. Sweep manual sobre

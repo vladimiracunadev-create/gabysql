@@ -24,9 +24,44 @@
 > - **Asimetría R8 (UPDATE/DELETE no usaban P5b)** → ✅ **cerrada por R8**
 >   ([ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md)).
 >
-> **Marcador rápido**: 5 de 9 tensiones del análisis original cerradas; 4 abiertas
+> **Marcador rápido al 2026-06-11**: 5 de 9 tensiones del análisis original cerradas; 4 abiertas
 > (2 cosméticas: 2.5, 2.6 · 2 dependientes de bench data: 2.3, 2.4 · 1 deuda
-> documentada: 2.9). Suite tests 745 → **798**. Detalles abajo en cada tensión.
+> documentada: 2.9). Suite tests 745 → **798**.
+>
+> ## Actualización 2026-06-15 (sesión maratón de cierre)
+>
+> Diez pushes en una sesión cerraron 3 tensiones más y la mayoría de las reparaciones
+> abiertas:
+>
+> - **Tensión 2.3 (INDEX_BREAKEVEN sin calibrar)** → ✅ **cerrada por R2**
+>   ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)). Sweep contra
+>   gabybench smoke midió C_RANDOM/C_SEQ ≈ 12× (textbook era 5×). Default
+>   0.20 → 0.10 + env var override `GABYSQL_INDEX_BREAKEVEN`.
+> - **Tensión 2.4 (threshold P5d sin medir)** → ✅ **cerrada con outcome
+>   explícito por R3 + R3-cont** ([ADR-0082](adr/0082-r3-p5d-swap-threshold-instrumentation.md) +
+>   [ADR-0085](adr/0085-r3-cont-p5d-sweep-results.md)). Sweep 1.5/2.0/3.0/10.0
+>   sobre query JOIN nueva — datos inconclusos, default 2.0 stays. Env var
+>   `GABYSQL_P5D_SWAP_THRESHOLD` queda para futuros sweeps.
+> - **Tensión 2.5 (mensaje EXPLAIN P5c ambiguo)** → ✅ **cerrada por R7**
+>   ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)). EXPLAIN del path skip
+>   sugiere re-ANALYZE si stats ∈ [24h, 7d).
+> - **Residual cobertura SQL #1 (COUNT DISTINCT sobre JOIN, ADR-0066 Gap 1)**
+>   → ✅ **cerrada por R9** ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)).
+> - **Heurística USING/NATURAL JOIN en EXPLAIN** → ✅ **completada por R10**
+>   ([ADR-0080](adr/0080-r10-using-natural-explain.md)). Mitigación parcial de 2.6.
+> - **Red de seguridad del optimizer** → ✅ **M3 entregada**
+>   ([ADR-0084](adr/0084-m3-proptest-planner.md)). 240 comparaciones por
+>   corrida defienden correctness de P5c/P5d/R6 con seed reproducible.
+> - **Bonus ANSI fix**: `UPDATE/DELETE WHERE pk = N` con N no presente
+>   ya no devuelve `[GBY-3006]`; devuelve 0 filas como PostgreSQL/SQLite
+>   ([ADR-0083](adr/0083-ansi-update-delete-no-row-zero.md)). Descubierto
+>   por el bug del bench warmup.
+>
+> **Marcador rápido al 2026-06-15**: **7 de 9 tensiones cerradas**. Quedan
+> 2 abiertas: **2.6** (RIGHT/FULL JOIN heurística — documentada en ADR-0073,
+> R10 la mitigó parcialmente) y **2.9** (P5d swap puede cambiar orden sin
+> ORDER BY — deuda documentada; M3 la sortea ordenando en Rust). Suite tests
+> 798 → **813**. ADRs 0078 → **0085** (+8 nuevos).
 
 ---
 
@@ -256,36 +291,48 @@ seguridad que faltó durante esta sesión.
 
 ---
 
-## 6. Recomendación de orden — actualizada 2026-06-11
+## 6. Recomendación de orden — actualizada 2026-06-15
 
 Original (antes de hacer nada): M2 → R1 → R2 → R4 → M4 → R5/R8/R9.
 
-**Lo que efectivamente se hizo**: R1 → R4 → M2 → R8 → R6 (orden distinto al
-propuesto: R1 antes de M2 porque era el bloque más chico y self-contained;
-M2 después porque ya teníamos suficiente confianza en el optimizer post-R1+R4;
-R8/R6 como cierre de residual; R2/R3 quedaron para otro día porque calibrar
-contra bench data requiere análisis manual de N corridas, no un push
-mecánico).
+**Lo que efectivamente se hizo en la sesión 2026-06-11**: R1 → R4 → M2 → R8 → R6.
 
-**Próximo orden recomendado** desde acá:
+**Lo que se hizo en la sesión maratón 2026-06-15** (10 pushes en orden):
+R7 → R9 → R10 → R2 → R3 → bench-fix → ANSI-fix → M3 → R3-cont → docs sweep.
 
-1. **R2 — calibrar `INDEX_BREAKEVEN`** con bench data acumulada (M2 ya está).
-   Requiere recolectar 5-10 corridas de smoke en commits distintos y comparar
-   latencia FullScan vs Index path en queries con sel conocida.
-2. **R3 — calibrar threshold P5d** con el mismo método.
-3. **M4 — `cargo fuzz` sobre el parser** (declarado hace tiempo en
-   TAREAS_PENDIENTES como prioridad alta; sigue ahí).
-4. **M3 — property tests sobre planner** (`proptest` que verifique
-   resultados idénticos con/sin ANALYZE). Defensa contra futuros P5f+.
-5. **R5/R9/R10 — residuales** restantes.
+Diferencias con la recomendación previa:
+- R2 calibró con UN sweep de smoke (no 5-10 cross-commit). Suficiente porque
+  el ratio C_RANDOM/C_SEQ resultó tan distinto al textbook que la decisión
+  fue obvia.
+- R3 se entregó como "calibración con outcome inconcluso, default stays"
+  en vez de "data fija el threshold". Honesto.
+- M4 (`cargo fuzz`) sigue abierto — único bloqueo: setup inicial. Pasa a
+  ser el item más importante de la próxima sesión.
+- ANSI fix apareció como bonus mientras se debugueaba el bench all.
 
-**Lo que NO conviene hacer antes**: cualquier bloque P5f+ (JOIN reorder
-global, multi-column stats M5, prefix matching M8). El optimizer actual con
-P5c+P5d+R6+R1 está en un equilibrio razonable; sumar más antes de calibrar
-R2/R3 multiplica el riesgo de regresiones silenciosas que no podemos detectar.
+**Próximo orden recomendado desde 2026-06-15** (cuando vuelvas):
 
-Otra opción razonable: **parar acá**. La superficie del optimizer está
-internamente consistente, las tensiones de severidad alta están cerradas, la
-suite es 798/798 verde. Es un punto de descanso natural antes de decidir el
-siguiente eje (más optimizer, más DDL como TRUNCATE/M12 SAVEPOINT, o más
-ergonomía operativa como auto-ANALYZE M1).
+1. **M4 — `cargo fuzz` sobre el parser**. 1 hora limpia es la línea de
+   README que sigue faltando. Único bloqueo: setup inicial de `cargo-fuzz`.
+2. **M6 — EXPLAIN ANALYZE compara `est.match` vs `actual=K`**. Diagnóstico
+   directo del bias del estimator. Hoy ANALYZE re-ejecuta; solo falta agregar
+   la columna comparativa. ~200 LOC.
+3. **Proptest sobre Pager** (no sobre planner, eso es M3 ya cerrada).
+   Misma técnica zero-deps que M3 — defiende correctness de
+   begin/insert/commit/rollback bajo input adversarial.
+4. **M12 — SAVEPOINT + ROLLBACK TO SAVEPOINT**. Desbloquea M13 (cross-request
+   tx en server HTTP).
+5. **Demo pública de Fase 5** (MCP gateway + vector search + audit). La
+   palanca real para que el repo "sea visto".
+
+**Lo que NO conviene hacer antes**: M5 (multi-col stats) y M9 (JOIN reorder).
+Sumar más optimizer sin sostener M4 (fuzz) → construir sobre arena.
+M11 (WAL-mode) es Fase 6.
+
+**Otra opción razonable**: **parar acá**. Las 7 de 9 tensiones cerradas, la
+suite es 813/813 verde, gabybench all 71/71 queries sin SKIPs, M3 defiende
+el optimizer contra regresiones futuras, ANSI fix elimina la asimetría más
+visible con clientes portados. Es un punto de descanso natural con el motor
+en mejor estado que nunca antes. El siguiente eje (más optimizer / más DDL /
+más ergonomía / demo pública) puede esperar a contexto externo (tweet,
+proyecto comparativo activo, etc).

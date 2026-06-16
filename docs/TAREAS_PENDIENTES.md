@@ -6,6 +6,32 @@
 
 ---
 
+## 📍 Estado al 2026-06-15 — qué quedó después de la sesión maratón
+
+> Si solo vas a leer una sección de este documento cuando volvés al proyecto, leé esta.
+
+Sesión 2026-06-15 cerró **10 pushes** que terminaron de pagar la deuda de la sesión P5 + endurecieron el motor para iteración futura:
+
+- **R7 / R9 / R10**: pulidos cosméticos del optimizer + cierre del residual ADR-0066 Gap 1 (COUNT DISTINCT sobre JOIN).
+- **R2**: primera constante del optimizer (`INDEX_BREAKEVEN`) calibrada con números (0.20 → 0.10) + env var override para sweep futuros.
+- **R3 + R3-cont**: instrumentación + sweep empírico de `P5D_SWAP_THRESHOLD`. Outcome explícito (datos inconclusos, 2.0 stays). R3 deja de ser deferred indefinido.
+- **bench fix**: warmup del bench era no-tolerante a errores; síntoma del bug del bench, pero también descubrió un bug del motor.
+- **ANSI fix**: `UPDATE/DELETE WHERE pk no-existe` ahora devuelve 0 filas (PostgreSQL/SQLite), no `[GBY-3006]`. Compatibilidad con clientes portados desde otros motores.
+- **M3 (property tests sobre planner)**: la red de seguridad que faltaba para que futuros bloques de optimizer no introduzcan regresiones silenciosas de correctness. 240 comparaciones automáticas por corrida (con seed reproducible).
+
+**Suite local**: 813 verde + 3 ignored (env-var tests). CI verde en 5 runners. gabybench all 12.9 min, 71 queries, 0 SKIPs.
+
+**Lo que viene cuando vuelvas** (en orden recomendado, todos son pushes independientes):
+
+1. **`cargo fuzz` sobre el parser** (§3 abajo) — 1 hora limpia de fuzz es la línea creíble de README que sigue faltando. Único bloqueo: setup inicial de `cargo-fuzz`. Sin él, no podemos defender "hardened parser".
+2. **M6 — EXPLAIN ANALYZE compara `est.match` vs `actual=K`** (§6.5 abajo) — diagnóstico directo del bias del estimator. Hoy ANALYZE re-ejecuta; solo falta agregar la columna comparativa. ~200 LOC. Inmediatamente útil para detectar dónde P5c se equivoca.
+3. **M12 — SAVEPOINT + ROLLBACK TO SAVEPOINT** (§6.5) — desbloquea recuperación parcial de batches. Pre-requisito de M13 (cross-request tx en server HTTP).
+4. **Demo pública de Fase 5** (§6) — sigue siendo la palanca real para que el repo "sea visto". El motor está sólido; el gateway + vector search + audit con razón semántica son lo distintivo.
+
+**Lo que NO conviene abrir todavía**: M5 (multi-col stats) y M9 (JOIN reorder) — sumar más optimizer sin sostener M3 → más fuzz/coverage es construir sobre arena. M11 (WAL-mode) es Fase 6, no antes.
+
+---
+
 ## 🧭 Sobre el contexto operativo (leer antes de las prioridades)
 
 Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversación, recordármelas.
@@ -33,10 +59,10 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 **Estado al 2026-06-11**: cerrada. Existe como binario `src/bin/gabybench.rs`, soporta modo `all` (10 DBs, ~10 min) y modo `smoke` (microblog+orders_lines, ~1-2 min). CI corre el smoke en cada push y sube `bench/results.json` como artifact (job `bench`). Ver [ADR-0075](adr/0075-m2-gabybench-in-ci.md).
 
-**Lo que falta de esta línea**: 
-- **R2**: calibrar `INDEX_BREAKEVEN_SELECTIVITY = 0.2` (constante de P5c) contra datos reales del smoke bench. Hoy es heurística teórica (`C_RANDOM ≈ 5 × C_SEQ`). 
-- **R3**: calibrar `swap_threshold = 2×` de P5d (hash-join build-side) — mismo método.
-- **Comparador entre runs**: el CI sube artifacts pero no hay diff automático contra baseline. Sin esto, una regresión de 50% en una query no falla el push.
+**Lo que falta de esta línea** (al 2026-06-15):
+- ~~**R2**~~ — ✅ entregada ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)): 0.20 → 0.10 + env var override.
+- ~~**R3**~~ — ✅ cerrada con outcome explícito ([ADR-0082](adr/0082-r3-p5d-swap-threshold-instrumentation.md) + [ADR-0085](adr/0085-r3-cont-p5d-sweep-results.md)): sweep inconcluso, default 2.0 stays.
+- **Comparador entre runs**: el CI sube artifacts pero no hay diff automático contra baseline. Sin esto, una regresión de 50% en una query no falla el push. ÚNICA línea pendiente del gabybench original.
 
 ---
 
@@ -53,19 +79,19 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 ---
 
-### 3. Fuzz testing + property tests — **alta, sigue abierta**
+### 3. Fuzz testing + property tests — **parcial, mayoría abierta**
 
 **Qué**:
-- `cargo fuzz` sobre `parse(...)` — 1 hora mínima sin panic ni `unwrap` fallido.
-- `proptest` sobre el Pager: "para cualquier secuencia válida de begin/insert/commit/rollback, el `.db` final pasa `INTEGRITY CHECK`".
-- **`proptest` sobre planner** (NUEVO, post P5c/P5d/R6): "para el mismo dato y WHERE, los resultados con `ANALYZE` corrido y sin correr son idénticos" — defiende correctness de las decisiones cost-based.
-- Extender los 3 crash tests sintéticos actuales a 10+ escenarios.
+- `cargo fuzz` sobre `parse(...)` — 1 hora mínima sin panic ni `unwrap` fallido. **PRINCIPAL pendiente.**
+- `proptest` sobre el Pager: "para cualquier secuencia válida de begin/insert/commit/rollback, el `.db` final pasa `INTEGRITY CHECK`". Pendiente.
+- ~~**`proptest` sobre planner**~~ — ✅ entregada 2026-06-15 ([ADR-0084](adr/0084-m3-proptest-planner.md)). Hand-rolled zero-deps, 240 comparaciones por corrida sobre P5c/P5d/R6.
+- Extender los 3 crash tests sintéticos actuales a 10+ escenarios. Pendiente.
 
-**Por qué importa**: SQLite tiene millones de horas de fuzz acumuladas. **Una hora limpia de fuzz** es una línea creíble en el README; cero horas no lo es. Y con el optimizer P5c/P5d/R6 que cambia planes según stats, las property tests son la red de seguridad real contra regresiones de correctness silenciosas.
+**Por qué importa**: SQLite tiene millones de horas de fuzz acumuladas. **Una hora limpia de fuzz** es una línea creíble en el README; cero horas no lo es. Con M3 ya defendido sobre el planner cost-based, falta la fuzz cobertura del parser/storage para hablar de "hardened".
 
-**Costo**: medio. `cargo fuzz` requiere config inicial + corpus + tiempo de ejecución. `proptest` se integra como `dev-dependency` sin tocar ADR-0001.
+**Costo**: medio. `cargo fuzz` requiere config inicial + corpus + tiempo de ejecución. Choca con ADR-0001 (zero deps) si se quiere el crate `proptest` — para el Pager se puede hacer hand-rolled mismo enfoque que M3.
 
-**Esfuerzo**: 1–2 intervenciones.
+**Esfuerzo**: 1 intervención para fuzz setup + 1ª hora; 1 separada para Pager proptest.
 
 ---
 
@@ -82,10 +108,11 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 | ~~**R9**~~ | ~~`COUNT(DISTINCT col)` sobre JOIN~~ — ✅ entregada 2026-06-15 ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)) | — |
 | ~~**R10**~~ | ~~USING/NATURAL JOIN — EXPLAIN heurística completa~~ — ✅ entregada 2026-06-15 ([ADR-0080](adr/0080-r10-using-natural-explain.md)) | — |
 
-**Tensiones abiertas (no necesariamente reparables sin trabajo nuevo)**:
-- ~~**2.5**~~ — Mensaje EXPLAIN P5c ambiguo — ✅ cerrada por R7 (2026-06-15).
-- **2.6** — RIGHT/FULL JOIN heurística imprecisa en EXPLAIN (documentado).
-- **2.9** — P5d swap puede cambiar orden de filas sin ORDER BY (deuda documentada).
+**Tensiones abiertas tras la sesión 2026-06-15** (de las 9 originales del análisis post-P5):
+- **2.6** — RIGHT/FULL JOIN heurística imprecisa en EXPLAIN (documentado en ADR-0073; mitigado parcialmente por R10 sobre USING/NATURAL, pero RIGHT/FULL siguen aproximando).
+- **2.9** — P5d swap puede cambiar orden de filas sin ORDER BY (deuda documentada; M3 defiende usando sort en Rust para el test, no resuelve la deuda original).
+
+Las **7 restantes (2.1–2.5, 2.7, 2.8)** quedaron cerradas en esta sesión y la anterior.
 
 ---
 
@@ -123,7 +150,7 @@ Items que NO son reparaciones (no hay nada roto), pero amplían lo entregado en 
 | # | Item | Por qué importa | Esfuerzo |
 |---|------|---|---|
 | **M1** | Auto-ANALYZE (scheduler que dispare cuando la tabla cambia >X%) | Hoy las stats son manuales. R1 detecta stale, pero el usuario tiene que mirar EXPLAIN y actuar. Auto-ANALYZE cierra el loop. | 1 push grande (~600 LOC + jobs infra) |
-| **M3** | Property tests para planner (`proptest` sobre P5c/P5d/R6) | Ya mencionado arriba en tarea 3. Crítico antes de cualquier P5f+. | 1 push (~300 LOC) |
+| ~~**M3**~~ | ~~Property tests para planner~~ — ✅ entregada 2026-06-15 ([ADR-0084](adr/0084-m3-proptest-planner.md)). Hand-rolled zero-deps, 240 comparaciones por corrida. | — |
 | **M5** | Multi-column stats (correlación) | Resuelve la asunción de independencia de P5c. PostgreSQL `CREATE STATISTICS`. Reemplazaría R6 conceptualmente. | 1 push grande (~600 LOC + bump VERSION) |
 | **M6** | EXPLAIN ANALYZE compara `est.match` vs `actual` | Diagnóstico directo del bias del estimator. Hoy ANALYZE re-ejecuta — solo falta agregar la columna comparativa. | 1 push (~200 LOC) |
 | **M7** | Hints SQL (`/*+ INDEX(t, idx) */`) | Override per-query del cost model. Estándar en Oracle/MySQL/SQL Server. | 1 push (~400 LOC, requiere parser changes) |
