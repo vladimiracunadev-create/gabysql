@@ -6,6 +6,23 @@
 
 ---
 
+## 2026-06-15 — M3: property tests sobre el planner (red de seguridad cost-based)
+
+> Primera red de seguridad real para el optimizer cost-based de P5*.
+> Property tests hand-rolled (zero deps externas, alinea con ADR-0001)
+> que verifican la invariante crítica: **el resultado de un SELECT
+> NUNCA debe cambiar según si ANALYZE corrió o no**. Si esa invariante
+> se rompe, P5c/P5d/R6 mintieron — eligieron path distinto y devolvieron
+> set distinto. Habilita futuros bloques de optimizer (M5/M7/M9) sobre
+> base de confianza empírica. Suite 810 → **813** (+3 tests con 240
+> comparaciones automáticas internas).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **M3** | test | zero-bump | [0084](docs/adr/0084-m3-proptest-planner.md) | Nuevo binario de test `tests/proptest_planner.rs`. LCG determinístico + generadores de fixtures con distribución skewed para ejercer alta/baja sel (P5c) y JOIN asimétrico (P5d swap). 3 tests: SELECT 50×3=150 comparaciones, COUNT 30 comparaciones, JOIN 20×3=60 comparaciones con sort de defensa contra deuda ADR-0072. Cada fallo imprime seed reproducible. |
+
+---
+
 ## 2026-06-15 — ANSI fix: UPDATE/DELETE WHERE pk no-existe → 0 filas + bench warmup fix
 
 > Doble entrega aislada. (1) El bench `all` fallaba en procflow porque
