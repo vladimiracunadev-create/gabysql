@@ -6,6 +6,22 @@
 
 ---
 
+## 2026-06-15 — ANSI fix: UPDATE/DELETE WHERE pk no-existe → 0 filas + bench warmup fix
+
+> Doble entrega aislada. (1) El bench `all` fallaba en procflow porque
+> el warmup pasaba PKs (1_000_001) que no existen → `[GBY-3006]`. Fix
+> bench: warmup swallow-error. (2) Más importante: el motor mismo era
+> no-ANSI ahí — PostgreSQL/SQLite devuelven `UPDATE 0` / `DELETE 0`
+> cuando el WHERE no matchea. Cambio a esa semántica. Verificación end-
+> to-end: gabybench all 12.9 min, 71 queries, 0 SKIPs. Suite 809 → **810**.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **bench fix** | fix | zero-bump | — | `bench()` warmup `let _ = f(...)?` → `let _ = f(...)` (commit 3c5d97c). Best-effort cache priming; main loop sigue propagando errores. |
+| **ANSI 3006** | feat | zero-bump | [0083](docs/adr/0083-ansi-update-delete-no-row-zero.md) | `exec_update` y `exec_delete` ya no emiten `[GBY-3006]` para `WHERE pk = N` con N no presente. `still_there` check pre-loop en UPDATE (DELETE ya tenía). 2 tests existentes ajustados, 1 nuevo `ansi_delete_*`. El code 3006 permanece para el exception handler PL/pgSQL `no_data_found`. |
+
+---
+
 ## 2026-06-15 — R3: instrumentación de P5D_SWAP_THRESHOLD (sin cambio de valor)
 
 > Entrega parcial. El smoke bench actual no tiene queries que ejerciten

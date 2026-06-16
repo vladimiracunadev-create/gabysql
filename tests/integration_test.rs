@@ -324,9 +324,15 @@ fn update_and_delete_by_pk_roundtrip() -> Result<(), Box<dyn Error>> {
     let res = run_sql(&db, "SELECT id FROM u;")?;
     assert_eq!(res[0].rows.len(), 2);
 
-    // UPDATE on missing row should error.
-    let err = run_sql(&db, "UPDATE u SET name = 'X' WHERE id = 999;").unwrap_err();
-    assert!(err.to_string().contains("fila no existe"));
+    // ANSI 2026-06-15: UPDATE WHERE pk no-existe → 0 filas, no error
+    // (alineado con PostgreSQL/SQLite).
+    let res = run_sql(&db, "UPDATE u SET name = 'X' WHERE id = 999;")?;
+    let msg = res.last().unwrap().message.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("0 fila"),
+        "esperaba '0 filas actualizadas', vi: {}",
+        msg
+    );
 
     // Residual #4 (2026-05-27): UPDATE de PK ahora SÍ está permitido.
     // El motor mueve la fila (delete old + insert new). Tras este
@@ -3872,18 +3878,43 @@ fn e3_update_zero_matches_is_not_error() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn e3_update_by_pk_still_errors_when_not_found() -> Result<(), Box<dyn Error>> {
+fn ansi_delete_by_pk_returns_zero_rows_when_not_found() -> Result<(), Box<dyn Error>> {
+    // ANSI 2026-06-15: DELETE WHERE pk = N no-existe → 0 filas
+    // eliminadas, alineado con PostgreSQL/SQLite. Antes [GBY-3006].
+    let db = temp_db_path("ansi_del_pk_404");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    e3_fixture(&db)?;
+
+    let res = run_sql(&db, "DELETE FROM t WHERE id = 999;")?;
+    let msg = res.last().unwrap().message.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("0 fila"),
+        "esperaba '0 filas eliminadas', vi: {}",
+        msg
+    );
+
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn e3_update_by_pk_returns_zero_rows_when_not_found() -> Result<(), Box<dyn Error>> {
     let db = temp_db_path("e3_upd_pk_404");
     let wal = wal_path(&db);
     cleanup(&[&db, &wal]);
     e3_fixture(&db)?;
 
-    // El fast-path de `pk = N` debe seguir devolviendo
-    // [GBY-3006] ROW_NOT_FOUND_FOR_PK cuando la fila no existe (compat
-    // con apps pre-E3).
-    let err = run_sql(&db, "UPDATE t SET nombre = 'X' WHERE id = 999;").unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("[GBY-3006]"), "esperaba GBY-3006: {}", msg);
+    // ANSI 2026-06-15: UPDATE WHERE pk = N no-existe → 0 filas,
+    // alineado con PostgreSQL/SQLite. Antes devolvía
+    // [GBY-3006] ROW_NOT_FOUND_FOR_PK por compat pre-E3.
+    let res = run_sql(&db, "UPDATE t SET nombre = 'X' WHERE id = 999;")?;
+    let msg = res.last().unwrap().message.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("0 fila"),
+        "esperaba '0 filas actualizadas', vi: {}",
+        msg
+    );
 
     cleanup(&[&db, &wal]);
     Ok(())

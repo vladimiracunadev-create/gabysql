@@ -11643,24 +11643,17 @@ impl<'a> Engine<'a> {
         }
 
         // Bloque E3: resolver target PKs según el WHERE. Fast-path para
-        // Eq sobre PK literal (preserva el comportamiento pre-E3); el
-        // resto cae a FullScan + 3VL. `was_explicit_single_pk` se usa
-        // abajo: cuando el WHERE pidió una PK concreta y la fila no
-        // existe, devolvemos `ROW_NOT_FOUND_FOR_PK` para no romper la
-        // semántica anterior; con WHERE compuesto, 0 matches es OK
-        // (UPDATE de 0 filas, igual que SQL estándar).
-        let (target_pks, was_explicit_single_pk) =
+        // Eq sobre PK literal; el resto cae a FullScan + 3VL.
+        //
+        // Fix ANSI 2026-06-15: cuando `WHERE pk = N` no matchea (N no
+        // existe), devolvemos `0 filas actualizadas` igual que
+        // PostgreSQL/SQLite/ANSI. Antes devolvía `[GBY-3006] ROW_NOT_FOUND_FOR_PK`
+        // por compat pre-E3; el código sigue disponible para el
+        // exception handler de PL/pgSQL (`no_data_found`) pero
+        // UPDATE/DELETE ya no lo emiten desde acá. `was_explicit_single_pk`
+        // queda para futuros usos (e.g. tracing) — no afecta el flujo.
+        let (target_pks, _was_explicit_single_pk) =
             self.resolve_target_pks(&meta, &stmt.where_clause, "UPDATE")?;
-
-        if target_pks.is_empty() && was_explicit_single_pk {
-            // El WHERE original era `pk = N` y N no existe. Mantenemos el
-            // error legado para que callers existentes (CLI, tests) sigan
-            // observando el mismo código.
-            return Err(coded(
-                codes::ROW_NOT_FOUND_FOR_PK,
-                format!("UPDATE sobre '{}': fila no existe", meta.name),
-            ));
-        }
 
         let mut updated = 0usize;
         let mut affected_rows: Vec<HashMap<String, Value>> = Vec::new();
@@ -11672,6 +11665,18 @@ impl<'a> Engine<'a> {
             self.has_trigger(&meta.name, TriggerEvent::Update, TriggerTiming::Before)?;
         let needs_old_snapshot = needs_after || needs_before;
         for pk in &target_pks {
+            // Fix ANSI 2026-06-15: skip silenciosamente si la fila no
+            // existe (e.g. `WHERE pk = N` con N no presente, o cascada
+            // previa que la borró). Antes apply_update_to_pk rebotaba
+            // con [GBY-3006]. Mismo patrón que el `still_there` check
+            // de exec_delete.
+            let still_there = {
+                let mut catalog = Catalog::open(self.pager);
+                catalog.get_row(meta.root_page, *pk)?.is_some()
+            };
+            if !still_there {
+                continue;
+            }
             let old_row: Option<HashMap<String, Value>> = if needs_old_snapshot {
                 let bytes = {
                     let mut catalog = Catalog::open(self.pager);
@@ -12260,9 +12265,13 @@ impl<'a> Engine<'a> {
     /// Bloque E3: dado un WHERE arbitrario sobre una tabla, devuelve la
     /// lista de PKs cuyas filas matchean. Estrategia:
     /// 1. Si el WHERE es exactamente `Eq` sobre la PK con literal INT,
-    ///    devolvemos `vec![n]` directo (sin tocar disco) — flag
-    ///    `was_explicit_single_pk = true` para preservar el error
-    ///    legado `ROW_NOT_FOUND_FOR_PK` cuando la fila no existe.
+    ///    devolvemos `vec![n]` directo (sin tocar disco). El segundo
+    ///    elemento del tuple (`was_explicit_single_pk`) queda como flag
+    ///    histórica — antes señalaba al caller que emitiera
+    ///    `ROW_NOT_FOUND_FOR_PK` cuando la fila no existía. Fix ANSI
+    ///    2026-06-15 la deprecó: UPDATE/DELETE ya devuelven `0 filas`
+    ///    en ese caso. La firma se mantiene por si otros callers (e.g.
+    ///    tracing/EXPLAIN) la consumen en el futuro.
     /// 2. En cualquier otro caso: FullScan de la tabla + evaluador 3VL
     ///    fila-a-fila. Correcto para todos los operadores del WHERE
     ///    (E1+E2 + subqueries). Sin optimización indexada — queda en
@@ -12676,17 +12685,13 @@ impl<'a> Engine<'a> {
         };
 
         // Bloque E3: resolver PKs igual que UPDATE — fast-path para
-        // `WHERE pk = N` (que mantiene el error legado si no existe la
-        // fila), fallback FullScan + 3VL para todo lo demás.
-        let (target_pks, was_explicit_single_pk) =
+        // `WHERE pk = N`, fallback FullScan + 3VL para todo lo demás.
+        //
+        // Fix ANSI 2026-06-15: `WHERE pk = N` no-existe → `0 filas
+        // eliminadas` (PostgreSQL/SQLite/ANSI). Antes [GBY-3006]
+        // ROW_NOT_FOUND_FOR_PK. Mismo cambio que UPDATE arriba.
+        let (target_pks, _was_explicit_single_pk) =
             self.resolve_target_pks(&meta, &stmt.where_clause, "DELETE")?;
-
-        if target_pks.is_empty() && was_explicit_single_pk {
-            return Err(coded(
-                codes::ROW_NOT_FOUND_FOR_PK,
-                format!("DELETE FROM '{}': fila no existe", meta.name),
-            ));
-        }
 
         // Resolvemos las PKs ANTES de empezar a borrar — si borráramos
         // mientras iteramos un FullScan, los efectos de las primeras
