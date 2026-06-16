@@ -2347,6 +2347,42 @@ fn index_breakeven() -> f64 {
     }
 }
 
+/// Bloque P5d (2026-06-11, ADR-0072): threshold para swap del build
+/// side del hash join. Si `current.len() > right_rows.len() × threshold`,
+/// invertimos: build sobre current (lado izquierdo), probe con
+/// right_rows. El valor mínimo razonable es 1.0 (cualquier desnivel
+/// dispara swap); 2.0 da margen para no flippear orden de filas sin
+/// ORDER BY por desniveles chicos.
+///
+/// **NO calibrado empíricamente todavía** (R3 abierto). El smoke bench
+/// actual no tiene queries que ejerciten asimetría grande de
+/// cardinality entre `current` (acumulado de joins previos) y un
+/// `right` chico — todas las JOIN queries del smoke son single-target
+/// (`WHERE id=K`) que matchea fila única, fuera del rango donde el
+/// swap importa. Para mover este número con honestidad necesitamos:
+///
+/// 1. Bench queries chain-join que acumulen current grande.
+/// 2. Corridas a 1.5×, 2.0×, 3.0× sobre el MISMO dataset.
+/// 3. Comparar latencia + memoria del hash table.
+///
+/// R3 (ADR-0082) extrae la constante y agrega override para habilitar
+/// el sweep, sin tocar el valor. Cambio cero-impacto vs ADR-0072.
+const P5D_SWAP_THRESHOLD: f64 = 2.0;
+
+/// Bloque R3 (2026-06-15, ADR-0082): override de [`P5D_SWAP_THRESHOLD`]
+/// por env var `GABYSQL_P5D_SWAP_THRESHOLD`. Mismo patrón fail-soft
+/// que [`index_breakeven`]. Rango aceptado: `>= 1.0` (un threshold < 1
+/// invertiría siempre el más grande, perdiendo el sentido del swap).
+fn p5d_swap_threshold() -> f64 {
+    match std::env::var("GABYSQL_P5D_SWAP_THRESHOLD") {
+        Ok(s) => match s.trim().parse::<f64>() {
+            Ok(v) if v >= 1.0 => v,
+            _ => P5D_SWAP_THRESHOLD,
+        },
+        Err(_) => P5D_SWAP_THRESHOLD,
+    }
+}
+
 /// Bloque R1 (2026-06-11, ADR-0074): edad en segundos a partir de la
 /// cual las stats persistidas se consideran "stale" y P5c deja de
 /// confiar en ellas. 7 días es razonable para workloads que cambian
@@ -10538,11 +10574,14 @@ impl<'a> Engine<'a> {
                 // collisions. La preservación de left_matched/right_matched
                 // sigue exacta — solo cambia QUIÉN se itera primero.
                 //
-                // Threshold 2×: solo invertimos cuando hay ventaja clara,
-                // para no introducir cambios sutiles de orden de filas en
-                // queries sin ORDER BY (SQL no garantiza orden, pero las
-                // tests sí asumen estabilidad).
-                let swap_build_side = current.len() > right_rows.len() * 2;
+                // Threshold default 2×: solo invertimos cuando hay
+                // ventaja clara, para no introducir cambios sutiles de
+                // orden de filas en queries sin ORDER BY (SQL no
+                // garantiza orden, pero las tests sí asumen estabilidad).
+                // R3 (ADR-0082): override en runtime vía
+                // GABYSQL_P5D_SWAP_THRESHOLD. Sin override → 2.0.
+                let swap_build_side =
+                    (current.len() as f64) > (right_rows.len() as f64) * p5d_swap_threshold();
                 // Build: hash sobre los valores del lado más chico.
                 // NULL nunca matchea (SQL standard: NULL = NULL → NULL),
                 // así que filas NULL se omiten del hash y sólo aparecen

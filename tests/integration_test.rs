@@ -18905,6 +18905,82 @@ fn r2_env_var_override_baja_y_sube_umbral() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque R3 (2026-06-15): instrumentación de GABYSQL_P5D_SWAP_THRESHOLD.
+// La constante P5d swap_threshold = 2.0 no se cambia (sin data
+// empírica para moverla), solo se agrega override por env var para
+// habilitar sweeps de calibración futuros. Test smoke verifica que el
+// override no rompe correctness de JOINs.
+// ============================================================
+
+#[test]
+#[ignore]
+fn r3_env_var_override_no_rompe_correctness_de_join() -> Result<(), Box<dyn Error>> {
+    // Ignored por la misma razón que r2_env_var_override (set_var
+    // global). Correr serial con --ignored --test-threads=1.
+    //
+    // Strategy: corremos un INNER JOIN simple con 2 thresholds extremos
+    // (0.5 que activa swap siempre, 10.0 que nunca) y verificamos que
+    // ambos devuelven los mismos rows + count.
+    let (db, wal) = p3_setup("r3-envvar-join")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE o (id INT PRIMARY KEY, user_id INT, val INT);
+         INSERT INTO u (id, name) VALUES (1,'a'),(2,'b'),(3,'c');
+         INSERT INTO o (id, user_id, val) VALUES
+            (10,1,100),(11,1,200),(12,2,300),(13,2,400),(14,3,500);",
+    )?;
+
+    fn run_join(db: &Path) -> Result<Vec<i64>, Box<dyn Error>> {
+        let res = run_sql(
+            db,
+            "SELECT o.val FROM u JOIN o ON o.user_id = u.id ORDER BY o.val;",
+        )?;
+        Ok(res
+            .last()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(n) => n,
+                _ => -1,
+            })
+            .collect())
+    }
+
+    // threshold 0.5 (siempre swap si current > 0.5*right; con datasets
+    // similares, swap dispara).
+    std::env::set_var("GABYSQL_P5D_SWAP_THRESHOLD", "0.5");
+    let with_swap = run_join(&db)?;
+    // threshold 10.0 (rara vez swap).
+    std::env::set_var("GABYSQL_P5D_SWAP_THRESHOLD", "10.0");
+    let no_swap = run_join(&db)?;
+    // default (sin var) — fail-soft sobre nonsense.
+    std::env::set_var("GABYSQL_P5D_SWAP_THRESHOLD", "garbage");
+    let fallback = run_join(&db)?;
+    std::env::remove_var("GABYSQL_P5D_SWAP_THRESHOLD");
+
+    assert_eq!(
+        with_swap,
+        vec![100, 200, 300, 400, 500],
+        "swap activo no debe cambiar el resultado, vi: {:?}",
+        with_swap
+    );
+    assert_eq!(
+        no_swap, with_swap,
+        "threshold 10× no swap, mismo resultado, vi: {:?}",
+        no_swap
+    );
+    assert_eq!(
+        fallback, with_swap,
+        "env var inválida → fail-soft default 2.0, mismo resultado, vi: {:?}",
+        fallback
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque R10 (2026-06-15): EXPLAIN extiende la heurística P5e a
 // USING(...) / NATURAL JOIN. Antes ambos caían a "hash join" como
 // fallback conservador. Ahora, si el nombre matchea PK o índice del

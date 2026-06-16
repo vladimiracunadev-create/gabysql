@@ -93,7 +93,7 @@ FullScan demasiado pronto.
 **Magnitud**: medio. Requiere experimentación con gabybench → ajustar la
 constante.
 
-### 2.4 Threshold de P5d (2×) sin medición
+### 2.4 Threshold de P5d (2×) sin medición — 🟡 INSTRUMENTADA por R3
 
 Mismo problema en menor escala. El swap del build-side se dispara a 2×.
 Pudo haber sido 1.5× o 3×. Sin gabybench JOIN-heavy no sabemos.
@@ -167,7 +167,7 @@ en un JOIN sin ORDER BY, puede romperse al cruzar el 2× con datos nuevos.
 |---|------|-----------|--------|
 | R1 | **Detección de stats stale en EXPLAIN + warning si P5c usa stats > X días vieja** | alta | ✅ entregada ([ADR-0074](adr/0074-r1-stats-stale-detection.md)) |
 | R2 | **Calibrar `INDEX_BREAKEVEN_SELECTIVITY` contra `gabybench` real** | alta | ✅ entregada ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)): 0.20 → 0.10 |
-| R3 | **Calibrar threshold P5d (1.5× vs 2× vs 3×)** | media | 🔴 abierto — depende de M2 |
+| R3 | **Calibrar threshold P5d (1.5× vs 2× vs 3×)** | media | 🟡 parcial — instrumentación ([ADR-0082](adr/0082-r3-p5d-swap-threshold-instrumentation.md)); falta bench chain-join |
 | R4 | **HLL test sobre DECIMAL/DATE/UUID/TEXT** | media | ✅ entregada (sin ADR; ver `r4_*` tests) |
 | R5 | **TRUNCATE TABLE limpia stats persistidas** | media | 🔴 abierto (bloqueado por implementar TRUNCATE como statement) |
 | R6 | **Composite index lookup con bucket gigantesco** — refinamiento de P5c | media | ✅ entregada ([ADR-0077](adr/0077-r6-composite-bucket-size-check.md)) |

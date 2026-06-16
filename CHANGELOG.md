@@ -6,6 +6,22 @@
 
 ---
 
+## 2026-06-15 — R3: instrumentación de P5D_SWAP_THRESHOLD (sin cambio de valor)
+
+> Entrega parcial. El smoke bench actual no tiene queries que ejerciten
+> la asimetría de cardinality del swap P5d; sin data empírica no hay
+> base honesta para mover el threshold. Esta entrega extrae la
+> constante a módulo, agrega override por env var `GABYSQL_P5D_SWAP_THRESHOLD`
+> y reemplaza el callsite hardcoded — habilita sweep-calibration
+> futuro sin recompilar. Valor default 2.0 sin cambios. Suite sin
+> regresiones (test agregado es `#[ignore]`).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **R3** | feat | zero-bump | [0082](docs/adr/0082-r3-p5d-swap-threshold-instrumentation.md) | Constante `P5D_SWAP_THRESHOLD = 2.0` a nivel de módulo + helper `p5d_swap_threshold()` con env var override (rango aceptado `>= 1.0`, fail-soft). Callsite en `exec_select_joined` usa el helper. +1 test `#[ignore]` valida correctness del JOIN a thresholds 0.5/10.0/garbage. Calibración real queda pendiente de bench queries chain-join (ADR detalla los pasos). |
+
+---
+
 ## 2026-06-15 — R2: INDEX_BREAKEVEN calibrado contra gabybench smoke (0.20 → 0.10)
 
 > Primera constante del optimizer ajustada con números empíricos. El
