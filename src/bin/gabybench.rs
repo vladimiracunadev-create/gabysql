@@ -208,11 +208,18 @@ where
     // con el main loop, usamos un offset gigante (1_000_000) en el
     // índice de warmup. Las queries SELECT ignoran `i` así que no las
     // afecta; las DML inserts caen en un rango disjunto al de iters.
+    //
+    // Fix 2026-06-15: ignoramos errores durante el warmup. Es
+    // best-effort cache priming — si la closure usa `i` para construir
+    // una clave que no existe (e.g. procflow `UPDATE accounts WHERE
+    // id = i+1` con i=1_000_000 → PK 1_000_001 no existe → [GBY-3006]
+    // ROW_NOT_FOUND_FOR_PK), el error no debería matar la suite. El
+    // main loop sí propaga errores: queremos detectar fallos reales.
     let warmup = (iters / 10).clamp(5, 50);
     {
         let mut engine = Engine::new(pager);
         for i in 0..warmup {
-            let _ = f(&mut engine, i + 1_000_000)?;
+            let _ = f(&mut engine, i + 1_000_000);
         }
     }
 
