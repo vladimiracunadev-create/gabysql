@@ -6,6 +6,21 @@
 
 ---
 
+## 2026-06-15 — R2: INDEX_BREAKEVEN calibrado contra gabybench smoke (0.20 → 0.10)
+
+> Primera constante del optimizer ajustada con números empíricos. El
+> smoke bench (microblog + orders_lines) midió C_RANDOM/C_SEQ ≈ 12×
+> (textbook 5×). Break-even sel ∈ [0.06, 0.13] → defaulteamos 0.10
+> (conservador, dentro del rango). Env var `GABYSQL_INDEX_BREAKEVEN`
+> permite sweep calibration sin recompilar. Suite 808 → **809** (+1
+> default test; +1 test ignored para el env var path).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **R2** | feat | zero-bump | [0081](docs/adr/0081-r2-index-breakeven-calibration.md) | `INDEX_BREAKEVEN_SELECTIVITY` 0.20 → 0.10. Helper `index_breakeven()` lee env var `GABYSQL_INDEX_BREAKEVEN` por-llamada (fail-soft fuera de [0.0, 1.0]). Aplicado a 3 callsites (classify_scan, exec_select_with_where, composite_bucket check). 2 tests pre-existentes ajustados (sel=0.1 → 0.05); +1 test default + 1 `#[ignore]` para env var serial. |
+
+---
+
 ## 2026-06-15 — R10: EXPLAIN para USING/NATURAL JOIN reconoce PK/índice
 
 > Push aislado. P5e (ADR-0073) caía a "hash join" cuando el JOIN era

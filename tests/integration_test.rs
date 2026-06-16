@@ -17837,7 +17837,8 @@ fn p5c_alta_selectividad_prefiere_fullscan_sobre_hash_idx() -> Result<(), Box<dy
 
 #[test]
 fn p5c_baja_selectividad_sigue_usando_indice() -> Result<(), Box<dyn Error>> {
-    // 'd' aparece 1 de 10 (10%) → sel < 0.2 → mantener índice.
+    // 'd' aparece 1 de 20 (5%) → sel < 0.10 (umbral R2) → mantener
+    // índice.
     let (db, wal) = p3_setup("p5c-keep-idx")?;
     run_sql(
         &db,
@@ -17845,7 +17846,9 @@ fn p5c_baja_selectividad_sigue_usando_indice() -> Result<(), Box<dyn Error>> {
          CREATE INDEX idx_cat ON t (category);
          INSERT INTO t (id, category) VALUES
             (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
-            (7,'b'),(8,'b'),(9,'b'),(10,'d');
+            (7,'a'),(8,'a'),(9,'a'),(10,'a'),(11,'a'),(12,'a'),
+            (13,'b'),(14,'b'),(15,'b'),(16,'b'),(17,'b'),(18,'b'),
+            (19,'c'),(20,'d');
          ANALYZE TABLE t;",
     )?;
     let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'd';")?;
@@ -18772,17 +18775,18 @@ fn r7_p5c_skip_sugiere_reanalyze_con_stats_de_2d() -> Result<(), Box<dyn Error>>
 
 #[test]
 fn r7_p5c_no_aplica_sin_hint_aunque_stats_viejas() -> Result<(), Box<dyn Error>> {
-    // Baja selectividad → P5c no salta el índice. El hint R7 NO debe
-    // aparecer aunque las stats estén calentitas: el hint es solo del
-    // path skip, no de path indexado normal.
+    // Baja selectividad (1/20 = 5% < umbral R2 0.10) → P5c no salta el
+    // índice. El hint R7 NO debe aparecer aunque las stats estén
+    // calentitas: el hint es solo del path skip.
     let (db, wal) = p3_setup("r7-no-p5c")?;
     run_sql(
         &db,
         "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
          CREATE INDEX idx_cat ON t (category);
          INSERT INTO t (id, category) VALUES
-            (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f'),
-            (7,'g'),(8,'h'),(9,'i'),(10,'j');
+            (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f'),(7,'g'),(8,'h'),
+            (9,'i'),(10,'j'),(11,'k'),(12,'l'),(13,'m'),(14,'n'),(15,'o'),
+            (16,'p'),(17,'q'),(18,'r'),(19,'s'),(20,'t');
          ANALYZE TABLE t;",
     )?;
     r1_overwrite_stats_timestamp(&db, "t", 3 * 86_400)?;
@@ -18799,6 +18803,104 @@ fn r7_p5c_no_aplica_sin_hint_aunque_stats_viejas() -> Result<(), Box<dyn Error>>
         detail
     );
     cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
+// Bloque R2 (2026-06-15): INDEX_BREAKEVEN_SELECTIVITY recalibrado de
+// 0.20 a 0.10 contra gabybench smoke. Test verifica:
+//  - default 0.10 dispara sobre sel=0.12 (antes con 0.20 no disparaba).
+//  - env var GABYSQL_INDEX_BREAKEVEN baja el umbral, suprime P5c.
+// ============================================================
+
+#[test]
+fn r2_index_breakeven_default_010_dispara_sobre_sel_012() -> Result<(), Box<dyn Error>> {
+    // 3 filas 'a' de 25 totales → sel('a') = 0.12. Antes (umbral 0.20)
+    // NO disparaba P5c; ahora (umbral 0.10 calibrado) sí debe disparar.
+    // Este test NO toca env vars — alinea con el default de R2.
+    let (db, wal) = p3_setup("r2-default")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),
+            (4,'b'),(5,'b'),(6,'b'),(7,'b'),(8,'b'),(9,'b'),(10,'b'),
+            (11,'c'),(12,'c'),(13,'c'),(14,'c'),(15,'c'),(16,'c'),(17,'c'),
+            (18,'d'),(19,'d'),(20,'d'),(21,'d'),(22,'d'),(23,'d'),(24,'d'),(25,'e');
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("P5c"),
+        "default 0.10 + sel(a)=0.12 debe disparar P5c, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+/// Bloque R2: env-var override (`GABYSQL_INDEX_BREAKEVEN`). Marcado
+/// `#[ignore]` porque `std::env::set_var` es global y rompe a otros
+/// tests P5c que corren en paralelo. Correr explícitamente con:
+///
+///     cargo test --target x86_64-pc-windows-gnu \
+///         -- --ignored --test-threads=1 r2_env_var_override
+///
+/// El path productivo del env var (set una vez al inicio del proceso)
+/// no tiene este problema — solo molesta en testing paralelo.
+#[test]
+#[ignore]
+fn r2_env_var_override_baja_y_sube_umbral() -> Result<(), Box<dyn Error>> {
+    // Sub-fase A: override 0.30 → sel=0.12 < 0.30 → P5c NO dispara.
+    let (db_a, wal_a) = p3_setup("r2-envvar-a")?;
+    run_sql(
+        &db_a,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),
+            (4,'b'),(5,'b'),(6,'b'),(7,'b'),(8,'b'),(9,'b'),(10,'b'),
+            (11,'c'),(12,'c'),(13,'c'),(14,'c'),(15,'c'),(16,'c'),(17,'c'),
+            (18,'d'),(19,'d'),(20,'d'),(21,'d'),(22,'d'),(23,'d'),(24,'d'),(25,'e');
+         ANALYZE TABLE t;",
+    )?;
+    std::env::set_var("GABYSQL_INDEX_BREAKEVEN", "0.30");
+    let res = run_sql(&db_a, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    std::env::remove_var("GABYSQL_INDEX_BREAKEVEN");
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("P5c") && detail.contains("hash-index"),
+        "override 0.30 + sel=0.12 debe mantener índice, vi: {}",
+        detail
+    );
+    cleanup(&[&db_a, &wal_a]);
+
+    // Sub-fase B: env var inválida → fail-soft → default 0.10 → P5c.
+    let (db_b, wal_b) = p3_setup("r2-envvar-b")?;
+    run_sql(
+        &db_b,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),
+            (4,'b'),(5,'b'),(6,'b'),(7,'b'),(8,'b'),(9,'b'),(10,'b'),
+            (11,'c'),(12,'c'),(13,'c'),(14,'c'),(15,'c'),(16,'c'),(17,'c'),
+            (18,'d'),(19,'d'),(20,'d'),(21,'d'),(22,'d'),(23,'d'),(24,'d'),(25,'e');
+         ANALYZE TABLE t;",
+    )?;
+    std::env::set_var("GABYSQL_INDEX_BREAKEVEN", "nonsense-value");
+    let res = run_sql(&db_b, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    std::env::remove_var("GABYSQL_INDEX_BREAKEVEN");
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("P5c"),
+        "env var inválida → default 0.10 → P5c activo, vi: {}",
+        detail
+    );
+    cleanup(&[&db_b, &wal_b]);
+
     Ok(())
 }
 

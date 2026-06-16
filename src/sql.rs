@@ -2302,16 +2302,50 @@ const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.333;
 
 /// Bloque P5c (2026-06-11): punto de break-even entre lookup indexado
-/// (con N random reads) y FullScan secuencial. Derivado del cost model
-/// `FullScan = row_count × C_SEQ` vs `Index = log(N) × C_LOG +
-/// est.match × C_RANDOM` con `C_RANDOM ≈ 5 × C_SEQ` (típico SSD,
-/// peor en HDD): index gana sólo si `est.match / row_count < 0.2`.
-/// Si la selectividad estimada supera este umbral, P5c fuerza
-/// FullScan + post-filter incluso cuando hay índice disponible.
+/// (con N random reads) y FullScan secuencial.
+///
+/// **Calibrado empíricamente (R2, 2026-06-15, ADR-0081)** sobre el
+/// `gabybench smoke`. Medición en mean ns:
+///
+/// | Path | Costo |
+/// |---|---|
+/// | PK lookup cold (random id) | 26.91 µs/lookup → C_RANDOM ≈ 27 µs |
+/// | Index range walk (likes 50..100) | 16.83 µs/row |
+/// | Full scan TEXT (LIKE A%) | 1.59 µs/row → C_SEQ ≈ 1.6 µs |
+/// | BETWEEN scan no-idx | 2.10 µs/row |
+///
+/// Ratio C_RANDOM / C_SEQ ∈ [8×, 17×] (geo mean ≈ 12×). Break-even
+/// matemático: `sel = C_SEQ / C_RANDOM ≈ 0.06..0.13`. **0.10** es
+/// conservador dentro del rango — favorece índice sobre la duda.
+///
+/// El valor teórico anterior (0.20 con `C_RANDOM ≈ 5 × C_SEQ`)
+/// subestimaba C_RANDOM por 2-3×. Causa: cada "random read" en gabysql
+/// incluye walk del B+tree (3+ páginas) + decode de la página + lookup
+/// de la fila — no es un solo seek físico.
 ///
 /// Conservador: sólo aplica cuando HAY stats P4. Sin stats, el
 /// comportamiento es idéntico al pre-P5c (siempre preferir índice).
-const INDEX_BREAKEVEN_SELECTIVITY: f64 = 0.2;
+///
+/// **Override en runtime** vía `GABYSQL_INDEX_BREAKEVEN` (f64 en [0.0, 1.0]).
+/// Útil para sweep-calibration sin recompilar. Lookup vía `index_breakeven()`.
+const INDEX_BREAKEVEN_SELECTIVITY: f64 = 0.10;
+
+/// Bloque R2 (2026-06-15, ADR-0081): override de
+/// [`INDEX_BREAKEVEN_SELECTIVITY`] por env var `GABYSQL_INDEX_BREAKEVEN`.
+/// Lectura por-llamada (no cache) — el costo es ~50 ns por
+/// `std::env::var`, irrelevante frente al cost del scan. Si la env var
+/// es inválida (parse falla, fuera de `[0.0, 1.0]`), devuelve el
+/// default sin warning — modo "fail-soft" para no romper queries por
+/// configuración accidental.
+fn index_breakeven() -> f64 {
+    match std::env::var("GABYSQL_INDEX_BREAKEVEN") {
+        Ok(s) => match s.trim().parse::<f64>() {
+            Ok(v) if (0.0..=1.0).contains(&v) => v,
+            _ => INDEX_BREAKEVEN_SELECTIVITY,
+        },
+        Err(_) => INDEX_BREAKEVEN_SELECTIVITY,
+    }
+}
 
 /// Bloque R1 (2026-06-11, ADR-0074): edad en segundos a partir de la
 /// cual las stats persistidas se consideran "stale" y P5c deja de
@@ -2375,7 +2409,7 @@ fn composite_bucket_too_large_for_index_path(
         return false;
     }
     let ratio = bucket_size as f64 / stats.row_count as f64;
-    ratio >= INDEX_BREAKEVEN_SELECTIVITY
+    ratio >= index_breakeven()
 }
 
 /// Bloque R1: renderiza la edad como string legible (`3d 5h`, `12h`,
@@ -6424,7 +6458,7 @@ impl<'a> Engine<'a> {
                     return Some(false);
                 }
                 let sel = estimate_selectivity(stats_ref, expr);
-                Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
+                Some(sel >= index_breakeven())
             })
             .unwrap_or(false);
         // Bloque R7 (2026-06-15): sufijo "; sugerencia: re-ANALYZE ..."
@@ -9713,10 +9747,11 @@ impl<'a> Engine<'a> {
                 .map(|map| map.len() == meta.pk_columns().len())
                 .unwrap_or(false);
 
-        // Bloque P5c (2026-06-11, ADR-0071): cost-based fallback. Si
-        // hay stats P4 y la selectividad estimada supera
-        // INDEX_BREAKEVEN_SELECTIVITY (~0.2), el lookup indexado con
-        // sus N random reads cuesta más que el FullScan secuencial.
+        // Bloque P5c (2026-06-11, ADR-0071) — recalibrado R2 (2026-06-15,
+        // ADR-0081). Si hay stats P4 y la selectividad estimada supera
+        // INDEX_BREAKEVEN_SELECTIVITY (default 0.10, override via env
+        // var), el lookup indexado con sus N random reads cuesta más
+        // que el FullScan secuencial.
         // Forzamos FullScan + post-filter en ese caso. NO se aplica a
         // composite_pk_fast_path_active (PK compuesta = match único
         // por construcción) — esa rama siempre gana.
@@ -9738,7 +9773,7 @@ impl<'a> Engine<'a> {
                         return Some(false);
                     }
                     let sel = estimate_selectivity(stats, expr);
-                    Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
+                    Some(sel >= index_breakeven())
                 })
                 .unwrap_or(false);
 

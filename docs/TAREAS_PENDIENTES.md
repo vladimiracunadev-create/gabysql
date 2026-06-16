@@ -75,7 +75,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 | # | Item | Esfuerzo |
 |---|------|----------|
-| **R2** | Calibrar `INDEX_BREAKEVEN` con bench data | 1 push (~50 LOC + análisis manual) |
+| ~~**R2**~~ | ~~Calibrar `INDEX_BREAKEVEN` con bench data~~ — ✅ entregada 2026-06-15 ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)): 0.20 → 0.10 + env var override | — |
 | **R3** | Calibrar threshold P5d | 1 push (~50 LOC + análisis) |
 | **R5** | TRUNCATE TABLE limpia stats — **bloqueado por implementar TRUNCATE como statement** | parte de bloque mayor |
 | ~~**R7**~~ | ~~Mensaje EXPLAIN P5c sugiere re-ANALYZE~~ — ✅ entregada 2026-06-15 ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) | — |

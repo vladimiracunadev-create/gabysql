@@ -83,7 +83,7 @@ P5c sub-estima `est.match` y elige el path equivocado. Falla silenciosa.
 
 **Magnitud**: medio — afecta solo a queries con AND correlacionado.
 
-### 2.3 `INDEX_BREAKEVEN = 0.2` sin calibración empírica
+### 2.3 `INDEX_BREAKEVEN = 0.2` sin calibración empírica — ✅ CERRADA por R2
 
 El umbral viene del cost model teórico `C_RANDOM ≈ 5 × C_SEQ`. No está calibrado
 contra `gabybench`. Si en la práctica nuestro motor tiene `C_RANDOM ≈ 2 × C_SEQ`
@@ -166,7 +166,7 @@ en un JOIN sin ORDER BY, puede romperse al cruzar el 2× con datos nuevos.
 | # | Item | Severidad | Estado |
 |---|------|-----------|--------|
 | R1 | **Detección de stats stale en EXPLAIN + warning si P5c usa stats > X días vieja** | alta | ✅ entregada ([ADR-0074](adr/0074-r1-stats-stale-detection.md)) |
-| R2 | **Calibrar `INDEX_BREAKEVEN_SELECTIVITY` contra `gabybench` real** | alta | 🟡 parcial — M2 ya da datos, falta corrida dedicada |
+| R2 | **Calibrar `INDEX_BREAKEVEN_SELECTIVITY` contra `gabybench` real** | alta | ✅ entregada ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)): 0.20 → 0.10 |
 | R3 | **Calibrar threshold P5d (1.5× vs 2× vs 3×)** | media | 🔴 abierto — depende de M2 |
 | R4 | **HLL test sobre DECIMAL/DATE/UUID/TEXT** | media | ✅ entregada (sin ADR; ver `r4_*` tests) |
 | R5 | **TRUNCATE TABLE limpia stats persistidas** | media | 🔴 abierto (bloqueado por implementar TRUNCATE como statement) |
