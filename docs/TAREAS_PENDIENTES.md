@@ -76,7 +76,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 | # | Item | Esfuerzo |
 |---|------|----------|
 | ~~**R2**~~ | ~~Calibrar `INDEX_BREAKEVEN` con bench data~~ — ✅ entregada 2026-06-15 ([ADR-0081](adr/0081-r2-index-breakeven-calibration.md)): 0.20 → 0.10 + env var override | — |
-| **R3** | Calibrar threshold P5d | 🟡 parcial — instrumentación entregada 2026-06-15 ([ADR-0082](adr/0082-r3-p5d-swap-threshold-instrumentation.md)); calibración real bloqueada por falta de bench queries chain-join (~200 LOC adicionales, push separado) |
+| ~~**R3**~~ | ~~Calibrar threshold P5d~~ — ✅ cerrada 2026-06-15 con outcome explícito: instrumentación ([ADR-0082](adr/0082-r3-p5d-swap-threshold-instrumentation.md)) + sweep empírico inconcluso ([ADR-0085](adr/0085-r3-cont-p5d-sweep-results.md)). Default 2.0 stays. | — |
 | **R5** | TRUNCATE TABLE limpia stats — **bloqueado por implementar TRUNCATE como statement** | parte de bloque mayor |
 | ~~**R7**~~ | ~~Mensaje EXPLAIN P5c sugiere re-ANALYZE~~ — ✅ entregada 2026-06-15 ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) | — |
 | ~~**R9**~~ | ~~`COUNT(DISTINCT col)` sobre JOIN~~ — ✅ entregada 2026-06-15 ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)) | — |

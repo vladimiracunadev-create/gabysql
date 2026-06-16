@@ -797,6 +797,22 @@ fn suite_orders_lines(path: &Path, out: &mut Vec<BenchRow>) -> DbResult<()> {
         "SELECT o.id, l.sku FROM orders o JOIN lines l ON l.order_id = o.id WHERE o.id = 7",
     )?);
 
+    // R3-cont (2026-06-15): query para calibrar P5d_SWAP_THRESHOLD.
+    // El predicate `o.total = l.precio` NO matchea PK ni índice del
+    // RHS → forzado por hash join (no index-loop). Lines (100k) JOIN
+    // orders (20k) → current=100k vs right=20k. Con threshold=2.0:
+    // 100k > 40k → swap dispara. Con threshold=10.0: 100k < 200k →
+    // sin swap. La diferencia mide el costo real de elegir build side.
+    // Correr con `GABYSQL_P5D_SWAP_THRESHOLD=1.5/2.0/3.0/10.0` para
+    // comparar latencia y picar el threshold con data.
+    out.push(bench_sql(
+        "orders_lines",
+        "JOIN hash O×L (P5d swap target)",
+        &mut pager,
+        10,
+        "SELECT COUNT(*) FROM lines l JOIN orders o ON o.total = l.precio",
+    )?);
+
     out.push(bench_sql(
         "orders_lines",
         "Aggregate SUM(qty*precio) GROUP",

@@ -6,6 +6,24 @@
 
 ---
 
+## 2026-06-15 — R3-cont: sweep empírico de P5D_SWAP_THRESHOLD (default 2.0 stays)
+
+> Cierre con datos del pendiente que dejó ADR-0082. Sweep manual sobre
+> el smoke bench con `GABYSQL_P5D_SWAP_THRESHOLD=1.5/2.0/3.0/10.0`
+> usando una query JOIN nueva diseñada para forzar hash-join con
+> asimetría 5× (lines 100k × orders 20k). Resultado: data inconclusa
+> — diferencias de mean dentro de ±15% (395-535 ms), no hay base
+> empírica para mover el valor. Decisión: mantener `P5D_SWAP_THRESHOLD
+> = 2.0` (el rationale conservador de ADR-0072 sigue válido). R3 cierra
+> con "calibración intentada con outcome explícito", no como deferred
+> indefinido.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **R3-cont** | bench | zero-bump | [0085](docs/adr/0085-r3-cont-p5d-sweep-results.md) | Nueva query smoke `"JOIN hash O×L (P5d swap target)"` (`SELECT COUNT(*) FROM lines l JOIN orders o ON o.total = l.precio`) — hash join garantizado, asimetría 5×. Habilita re-calibración futura sin re-setup. Constante sin cambios. |
+
+---
+
 ## 2026-06-15 — M3: property tests sobre el planner (red de seguridad cost-based)
 
 > Primera red de seguridad real para el optimizer cost-based de P5*.
