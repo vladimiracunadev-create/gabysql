@@ -47,7 +47,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 **Pendiente residual** (al 2026-06-11):
 - `UPDATE ... FROM` — no implementado.
 - `EXCLUDED.col` en UPSERT — no implementado.
-- `COUNT(DISTINCT col)` sobre JOIN — F2 cerró el caso general (2026-05-30) pero esta variante sigue rebotando con `[GBY-4028]`.
+- ~~`COUNT(DISTINCT col)` sobre JOIN~~ — ✅ cerrada 2026-06-15 por R9 ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)).
 - **`ORDER BY a, b` (multi-col)** — descubierto en R8 (2026-06-11): el parser solo acepta single-col.
 - Ninguno bloquea el proyecto comparativo.
 
@@ -79,7 +79,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 | **R3** | Calibrar threshold P5d | 1 push (~50 LOC + análisis) |
 | **R5** | TRUNCATE TABLE limpia stats — **bloqueado por implementar TRUNCATE como statement** | parte de bloque mayor |
 | ~~**R7**~~ | ~~Mensaje EXPLAIN P5c sugiere re-ANALYZE~~ — ✅ entregada 2026-06-15 ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) | — |
-| **R9** | `COUNT(DISTINCT col)` sobre JOIN | 1 push (~150 LOC) |
+| ~~**R9**~~ | ~~`COUNT(DISTINCT col)` sobre JOIN~~ — ✅ entregada 2026-06-15 ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)) | — |
 | **R10** | USING/NATURAL JOIN — EXPLAIN heurística completa | 1 push (~200 LOC) |
 
 **Tensiones abiertas (no necesariamente reparables sin trabajo nuevo)**:

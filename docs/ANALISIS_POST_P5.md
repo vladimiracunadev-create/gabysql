@@ -173,7 +173,7 @@ en un JOIN sin ORDER BY, puede romperse al cruzar el 2× con datos nuevos.
 | R6 | **Composite index lookup con bucket gigantesco** — refinamiento de P5c | media | ✅ entregada ([ADR-0077](adr/0077-r6-composite-bucket-size-check.md)) |
 | R7 | **Mensaje EXPLAIN del P5c skip — sugerir re-`ANALYZE` si stats viejas** | baja | ✅ entregada ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) |
 | R8 | **UPDATE/DELETE con composite-eq aún hacen FullScan** | media | ✅ entregada ([ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md)) |
-| R9 | **`COUNT(DISTINCT col)` sobre JOIN** — ADR-0066 Gap 1 residual | baja | 🔴 abierto |
+| R9 | **`COUNT(DISTINCT col)` sobre JOIN** — ADR-0066 Gap 1 residual | baja | ✅ entregada ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)) |
 | R10 | **USING/NATURAL JOIN — EXPLAIN heurística conservadora** | baja | 🔴 abierto |
 
 **6 de 10 cerradas.** Las 4 abiertas restantes están detalladas en

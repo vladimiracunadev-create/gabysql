@@ -6,6 +6,21 @@
 
 ---
 
+## 2026-06-15 — R9: COUNT(DISTINCT col) sobre JOIN ya soportado
+
+> Push aislado. `COUNT(DISTINCT o.prod) FROM u JOIN o ON ...` antes
+> rebotaba con `[GBY-4028] AGGREGATE_OVER_JOIN_UNSUPPORTED`. Ahora
+> `exec_aggregate_joined` resuelve la columna a su forma cualificada y
+> evalúa el distinct inline en el bucket loop — mismo encoding que F2,
+> respeta GROUP BY, ignora NULL. Cierra el residual de ADR-0066 Gap 1.
+> Suite 801 → **804** (+3), zero-bump.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **R9** | feat | zero-bump | [0079](docs/adr/0079-r9-count-distinct-over-join.md) | Enum interno `JoinedAggPrep::DistinctExpr(Expr)` en `exec_aggregate_joined`. El rewrite resuelve `DistinctColumn(c)` con `resolve_joined_column_key`, `eval_expr` sobre cada fila del bucket, `HashSet<encode_group_key>` para dedup. +3 tests `r9_*` (sin GROUP BY / con GROUP BY / NULL via LEFT JOIN). |
+
+---
+
 ## 2026-06-15 — R7: EXPLAIN P5c skip sugiere re-ANALYZE si stats ≥1d
 
 > Push aislado de pulido sobre el path P5c skip-index. Cuando `classify_scan`

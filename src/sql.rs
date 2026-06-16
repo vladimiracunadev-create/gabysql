@@ -12909,31 +12909,35 @@ impl<'a> Engine<'a> {
         //    `compute_aggregate` evalúa el Expr fila a fila con `eval_expr`
         //    que sí entiende claves cualificadas (`eval_expr` rama
         //    `Expr::Column` line ~16030 hace fast-path por nombre completo).
-        let prepared_args: Vec<Option<AggArg>> = stmt
+        //
+        // Bloque R9 (2026-06-15): `AggArg::DistinctColumn(c)` se preserva
+        // como variante separada (`JoinedAggPrep::DistinctExpr`) — el path
+        // standard de `compute_aggregate` normaliza el ident y rompe el
+        // qualifier, así que la distinct-count joineada se evalúa inline
+        // en el bucket loop.
+        enum JoinedAggPrep {
+            Standard(AggArg),
+            DistinctExpr(Expr),
+        }
+        let prepared_args: Vec<Option<JoinedAggPrep>> = stmt
             .columns
             .iter()
             .map(|item| match item {
                 SelectItem::Aggregate { arg, .. } => match arg {
-                    AggArg::Star => Ok::<_, DbError>(Some(AggArg::Star)),
+                    AggArg::Star => Ok::<_, DbError>(Some(JoinedAggPrep::Standard(AggArg::Star))),
                     AggArg::Column(c) => {
                         let key = resolve_joined_column_key(scope, c)?;
-                        Ok(Some(AggArg::Expr(Expr::Column(key))))
+                        Ok(Some(JoinedAggPrep::Standard(AggArg::Expr(Expr::Column(
+                            key,
+                        )))))
                     }
-                    AggArg::DistinctColumn(_) => {
-                        // F2: COUNT(DISTINCT col) sobre JOIN no se soporta
-                        // en este release. `compute_aggregate` resuelve la
-                        // columna con `normalize_ident`, que tira el
-                        // qualifier y rompe el lookup. Defer al bloque que
-                        // generalice el dispatch DISTINCT.
-                        Err(coded(
-                            codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
-                            "COUNT(DISTINCT col) sobre SELECT con JOIN aún no se soporta; \
-                             usar subquery agregada sobre la tabla base",
-                        ))
+                    AggArg::DistinctColumn(c) => {
+                        let key = resolve_joined_column_key(scope, c)?;
+                        Ok(Some(JoinedAggPrep::DistinctExpr(Expr::Column(key))))
                     }
                     AggArg::Expr(e) => {
                         let rewritten = rewrite_expr_columns_for_join(e.clone(), scope)?;
-                        Ok(Some(AggArg::Expr(rewritten)))
+                        Ok(Some(JoinedAggPrep::Standard(AggArg::Expr(rewritten))))
                     }
                 },
                 _ => Ok(None),
@@ -12971,7 +12975,36 @@ impl<'a> Engine<'a> {
                         let prepared = prepared_args[idx]
                             .as_ref()
                             .expect("aggregate prepared above");
-                        let v = compute_aggregate(*func, prepared, &bucket_rows)?;
+                        let v = match prepared {
+                            JoinedAggPrep::Standard(arg) => {
+                                compute_aggregate(*func, arg, &bucket_rows)?
+                            }
+                            JoinedAggPrep::DistinctExpr(expr) => {
+                                // R9: COUNT(DISTINCT col) sobre JOIN — sólo
+                                // válido con AggFunc::Count. Cualquier otro
+                                // agregado con DISTINCT no llegaría acá
+                                // (el parser sólo emite DistinctColumn para
+                                // COUNT, ver issue F2).
+                                if !matches!(func, AggFunc::Count) {
+                                    return Err(coded(
+                                        codes::AGGREGATE_OVER_JOIN_UNSUPPORTED,
+                                        format!(
+                                            "DISTINCT solo es válido en COUNT, no en {:?}",
+                                            func
+                                        ),
+                                    ));
+                                }
+                                let mut seen: HashSet<Vec<u8>> = HashSet::new();
+                                for row in &bucket_rows {
+                                    let v = eval_expr(expr, row)?;
+                                    if matches!(v, Value::Null) {
+                                        continue;
+                                    }
+                                    seen.insert(encode_group_key(&[v]));
+                                }
+                                Value::Integer(seen.len() as i64)
+                            }
+                        };
                         // HAVING puede referirse al alias o al canonical
                         // (mismo comportamiento que el path single-table,
                         // ver `exec_aggregate_pipeline` line ~11473).

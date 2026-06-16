@@ -18803,6 +18803,102 @@ fn r7_p5c_no_aplica_sin_hint_aunque_stats_viejas() -> Result<(), Box<dyn Error>>
 }
 
 // ============================================================
+// Bloque R9 (2026-06-15): COUNT(DISTINCT col) sobre JOIN. Antes
+// rebotaba con [GBY-4028] (AGGREGATE_OVER_JOIN_UNSUPPORTED). Ahora
+// `exec_aggregate_joined` resuelve la columna cualificada y cuenta
+// distinct inline. Sin GROUP BY, con GROUP BY, y sobre expresiones.
+// ============================================================
+
+#[test]
+fn r9_count_distinct_sobre_inner_join_sin_group_by() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r9-no-gb")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE o (id INT PRIMARY KEY, user_id INT, prod TEXT);
+         INSERT INTO u (id, name) VALUES (1,'a'),(2,'b'),(3,'c');
+         INSERT INTO o (id, user_id, prod) VALUES
+            (10,1,'p1'),(11,1,'p2'),(12,2,'p1'),(13,2,'p1'),(14,3,'p3');",
+    )?;
+    // Inner join une 5 filas; productos distintos = {p1, p2, p3} = 3.
+    let res = run_sql(
+        &db,
+        "SELECT COUNT(DISTINCT o.prod) FROM u JOIN o ON o.user_id = u.id;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(3));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r9_count_distinct_sobre_inner_join_con_group_by() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r9-gb")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE o (id INT PRIMARY KEY, user_id INT, prod TEXT);
+         INSERT INTO u (id, name) VALUES (1,'a'),(2,'b'),(3,'c');
+         INSERT INTO o (id, user_id, prod) VALUES
+            (10,1,'p1'),(11,1,'p2'),(12,2,'p1'),(13,2,'p1'),(14,3,'p3');",
+    )?;
+    // Por usuario: a → {p1,p2}=2, b → {p1}=1, c → {p3}=1.
+    let res = run_sql(
+        &db,
+        "SELECT u.name, COUNT(DISTINCT o.prod) FROM u JOIN o ON o.user_id = u.id \
+         GROUP BY u.name;",
+    )?;
+    let mut got: Vec<(String, i64)> = res[0]
+        .rows
+        .iter()
+        .map(|r| {
+            let n = if let Value::String(s) = &r[0] {
+                s.clone()
+            } else {
+                panic!("name no String");
+            };
+            let c = if let Value::Integer(i) = r[1] {
+                i
+            } else {
+                panic!("count no Integer");
+            };
+            (n, c)
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("a".to_string(), 2),
+            ("b".to_string(), 1),
+            ("c".to_string(), 1),
+        ]
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r9_count_distinct_ignora_nulls_sobre_left_join() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r9-null")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE o (id INT PRIMARY KEY, user_id INT, prod TEXT);
+         INSERT INTO u (id, name) VALUES (1,'a'),(2,'b'),(3,'c');
+         INSERT INTO o (id, user_id, prod) VALUES (10,1,'p1'),(11,1,'p2');",
+    )?;
+    // LEFT JOIN: 2 rows con prod no-null + 2 con prod=NULL (b,c sin orders).
+    // DISTINCT non-null = {p1,p2} = 2.
+    let res = run_sql(
+        &db,
+        "SELECT COUNT(DISTINCT o.prod) FROM u LEFT JOIN o ON o.user_id = u.id;",
+    )?;
+    assert_eq!(res[0].rows[0][0], Value::Integer(2));
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5d (2026-06-11): hash join build-side selection. Cuando
 // `current` (acumulado de joins previos) es >2× más grande que la
 // próxima `right_rows`, swap el build side al lado más chico.
