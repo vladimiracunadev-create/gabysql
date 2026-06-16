@@ -174,7 +174,7 @@ en un JOIN sin ORDER BY, puede romperse al cruzar el 2× con datos nuevos.
 | R7 | **Mensaje EXPLAIN del P5c skip — sugerir re-`ANALYZE` si stats viejas** | baja | ✅ entregada ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) |
 | R8 | **UPDATE/DELETE con composite-eq aún hacen FullScan** | media | ✅ entregada ([ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md)) |
 | R9 | **`COUNT(DISTINCT col)` sobre JOIN** — ADR-0066 Gap 1 residual | baja | ✅ entregada ([ADR-0079](adr/0079-r9-count-distinct-over-join.md)) |
-| R10 | **USING/NATURAL JOIN — EXPLAIN heurística conservadora** | baja | 🔴 abierto |
+| R10 | **USING/NATURAL JOIN — EXPLAIN heurística conservadora** | baja | ✅ entregada ([ADR-0080](adr/0080-r10-using-natural-explain.md)) |
 
 **6 de 10 cerradas.** Las 4 abiertas restantes están detalladas en
 [TAREAS_PENDIENTES.md §4](TAREAS_PENDIENTES.md) con esfuerzo estimado.

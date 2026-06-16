@@ -6199,7 +6199,7 @@ impl<'a> Engine<'a> {
     /// hash join (equi predicate con keys resolubles), nested-loop
     /// (CROSS, sin predicate, o RHS derived sin index posible).
     /// Heurística estática — no construye el scope ni ejecuta nada.
-    fn classify_join_algorithm(&mut self, join: &JoinClause, _base_table: &str) -> String {
+    fn classify_join_algorithm(&mut self, join: &JoinClause, base_table: &str) -> String {
         // CROSS o sin predicate efectivo → nested-loop.
         if matches!(join.kind, JoinKind::Cross) {
             return "nested-loop, ~O(N×M)".to_string();
@@ -6264,10 +6264,81 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        // USING/NATURAL: si el nombre coincide con PK o índice del right,
-        // también irían a index-loop. Pero no resolvemos los nombres acá
-        // sin scope completo — reportamos hash conservadoramente.
+        // Bloque R10 (2026-06-15): USING/NATURAL — el dispatcher de
+        // `exec_select_joined` los desazucara a equi-predicate con la
+        // misma columna en ambos lados, así que la decisión index-loop
+        // sigue las mismas reglas: si el nombre matchea PK o índice
+        // del right → index-loop, sino hash.
+        let usn_keys: Vec<String> = if let Some(cols) = &join.using {
+            cols.clone()
+        } else if join.natural {
+            self.natural_join_keys(base_table, &join.right.name)
+        } else {
+            Vec::new()
+        };
+        if !usn_keys.is_empty() {
+            let right_meta = {
+                let mut catalog = Catalog::open(self.pager);
+                match catalog.get_table(&join.right.name) {
+                    Ok(Some(m)) => m,
+                    _ => return "hash join, ~O(N+M)".to_string(),
+                }
+            };
+            let right_qual = join
+                .right
+                .alias
+                .clone()
+                .unwrap_or_else(|| join.right.name.clone())
+                .to_ascii_lowercase();
+            for col in &usn_keys {
+                let col_n = normalize_ident(col);
+                if right_meta.primary_key.eq_ignore_ascii_case(&col_n) {
+                    return format!(
+                        "index-loop on `{}`.`{}` (PK), ~O(N × log M)",
+                        right_qual, col
+                    );
+                }
+                if let Some(idx) = right_meta.index_for_column(&col_n) {
+                    return format!(
+                        "index-loop on `{}`.`{}` (index `{}`), ~O(N × log M)",
+                        right_qual, col, idx.name
+                    );
+                }
+            }
+        }
         "hash join, ~O(N+M)".to_string()
+    }
+
+    /// Bloque R10 (2026-06-15): nombres de columna comunes entre dos
+    /// tablas — semántica de `NATURAL JOIN`. Heurística estática: mira
+    /// el catálogo de ambos lados y devuelve la intersección por nombre
+    /// (case-insensitive). Si alguna tabla no existe, devuelve vacío
+    /// — el dispatcher real fallará con `[GBY-4023]` al ejecutar; la
+    /// heurística de EXPLAIN no debe explotar antes.
+    ///
+    /// NOTA: en una cadena de joins, el "lado izquierdo" del join i+1
+    /// es el resultado acumulado de joins[..=i], no la base_table sola.
+    /// Esta función aproxima usando solo `base_table` — basta para el
+    /// caso típico (single join). Cuando hay chain, el resultado puede
+    /// sub-estimar (perdería match si la columna NATURAL viene de una
+    /// tabla agregada por un join previo). Deuda documentada en ADR-0080.
+    fn natural_join_keys(&mut self, left_table: &str, right_table: &str) -> Vec<String> {
+        let mut catalog = Catalog::open(self.pager);
+        let Ok(Some(left_meta)) = catalog.get_table(left_table) else {
+            return Vec::new();
+        };
+        let Ok(Some(right_meta)) = catalog.get_table(right_table) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for lc in &left_meta.columns {
+            for rc in &right_meta.columns {
+                if lc.name.eq_ignore_ascii_case(&rc.name) {
+                    out.push(lc.name.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Bloque P5e: anota ` [side=alias est.rows=N]` cuando hay stats

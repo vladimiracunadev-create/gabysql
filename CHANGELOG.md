@@ -6,6 +6,22 @@
 
 ---
 
+## 2026-06-15 — R10: EXPLAIN para USING/NATURAL JOIN reconoce PK/índice
+
+> Push aislado. P5e (ADR-0073) caía a "hash join" cuando el JOIN era
+> `USING(col)` o `NATURAL JOIN`, aunque el dispatcher real fuera
+> index-loop. Ahora la heurística estática resuelve los nombres y
+> aplica el mismo check de PK/índice del right que ya hace el path ON
+> explícito. Para NATURAL JOIN, intersección por nombre con la base
+> table (aproximación; deuda documentada para chain joins). Suite
+> 804 → **808** (+4), zero-bump.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **R10** | feat | zero-bump | [0080](docs/adr/0080-r10-using-natural-explain.md) | `classify_join_algorithm` extiende el check PK/índice al caso USING (lee `join.using` directo) y NATURAL (helper `natural_join_keys` con intersección de `TableMeta.columns`). Mismo formato de mensaje que ON. +4 tests `r10_*` (USING+PK / USING+índice / NATURAL+PK / USING sin índice → hash fallback). |
+
+---
+
 ## 2026-06-15 — R9: COUNT(DISTINCT col) sobre JOIN ya soportado
 
 > Push aislado. `COUNT(DISTINCT o.prod) FROM u JOIN o ON ...` antes

@@ -18803,6 +18803,98 @@ fn r7_p5c_no_aplica_sin_hint_aunque_stats_viejas() -> Result<(), Box<dyn Error>>
 }
 
 // ============================================================
+// Bloque R10 (2026-06-15): EXPLAIN extiende la heurística P5e a
+// USING(...) / NATURAL JOIN. Antes ambos caían a "hash join" como
+// fallback conservador. Ahora, si el nombre matchea PK o índice del
+// right, se anota index-loop con el mismo formato.
+// ============================================================
+
+#[test]
+fn r10_explain_using_sobre_pk_anota_index_loop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r10-using-pk")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, info TEXT);
+         INSERT INTO a (id, label) VALUES (1,'x');
+         INSERT INTO b (id, info) VALUES (1,'y');
+         EXPLAIN SELECT * FROM a JOIN b USING (id);",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("index-loop") && detail.contains("PK"),
+        "USING sobre PK debe anotar index-loop PK, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r10_explain_using_sobre_indice_secundario() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r10-using-idx")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, code INT);
+         CREATE TABLE b (id INT PRIMARY KEY, code INT);
+         CREATE INDEX idx_b_code ON b (code);
+         INSERT INTO a (id, code) VALUES (1, 10);
+         INSERT INTO b (id, code) VALUES (1, 10);
+         EXPLAIN SELECT * FROM a JOIN b USING (code);",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("index-loop") && detail.contains("idx_b_code"),
+        "USING sobre col indexada debe anotar index-loop con nombre del idx, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r10_explain_natural_sobre_pk_anota_index_loop() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r10-nat-pk")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, info TEXT);
+         INSERT INTO a (id, label) VALUES (1,'x');
+         INSERT INTO b (id, info) VALUES (1,'y');
+         EXPLAIN SELECT * FROM a NATURAL JOIN b;",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("index-loop") && detail.contains("PK"),
+        "NATURAL JOIN sobre PK común debe anotar index-loop PK, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r10_explain_using_sobre_columna_sin_indice_cae_a_hash() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r10-using-noidx")?;
+    let res = run_sql(
+        &db,
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT);
+         INSERT INTO a (id, k) VALUES (1, 1);
+         INSERT INTO b (id, k) VALUES (1, 1);
+         EXPLAIN SELECT * FROM a JOIN b USING (k);",
+    )?;
+    let detail = join_step_detail(res.last().unwrap());
+    assert!(
+        detail.contains("hash join"),
+        "USING sobre col sin índice/PK debe caer a hash, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque R9 (2026-06-15): COUNT(DISTINCT col) sobre JOIN. Antes
 // rebotaba con [GBY-4028] (AGGREGATE_OVER_JOIN_UNSUPPORTED). Ahora
 // `exec_aggregate_joined` resuelve la columna cualificada y cuenta
