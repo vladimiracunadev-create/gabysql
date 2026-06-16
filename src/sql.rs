@@ -2321,6 +2321,15 @@ const INDEX_BREAKEVEN_SELECTIVITY: f64 = 0.2;
 /// alarmar al usuario casual.
 const STATS_STALE_THRESHOLD_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Bloque R7 (2026-06-15): edad a partir de la cual EXPLAIN sugiere
+/// re-`ANALYZE` cuando P5c decide saltar el índice. Más bajo que
+/// `STATS_STALE_THRESHOLD_SECS` porque el objetivo NO es bypassear P5c
+/// (eso lo hace R1 a los 7d), sino avisarle al usuario que la decisión
+/// se tomó con stats no triviales y que un re-ANALYZE valida o cambia
+/// el plan. 24h es el punto donde típicamente ya cambiaron suficientes
+/// filas como para que la heurística pueda haber quedado desfasada.
+const STATS_REANALYZE_HINT_SECS: u64 = 24 * 60 * 60;
+
 /// Bloque R1: edad en segundos de las stats. Calculada con SystemTime
 /// actual; si el sistema da error (reloj atrasado), devuelve 0 (stats
 /// "frescas" — sesgo conservador, evita falsos positivos de stale).
@@ -2386,6 +2395,21 @@ fn format_stats_age(age_secs: u64) -> String {
     } else {
         format!("{}m", mins)
     }
+}
+
+/// Bloque R7 (2026-06-15): sufijo educativo para los mensajes EXPLAIN
+/// de los path P5c skip-index. Si las stats tienen más de
+/// `STATS_REANALYZE_HINT_SECS` (24h) pero todavía NO son stale (R1 ya
+/// hizo bypass), agrega `; sugerencia: re-ANALYZE (stats Xd Yh)` al
+/// final del mensaje. Si están frescas, devuelve vacío — no spamear al
+/// usuario que acaba de correr ANALYZE. Si están stale, P5c no debería
+/// haber disparado (R1 lo bypassea), así que no es nuestro caso.
+fn p5c_reanalyze_hint(analyzed_at_nanos: u128) -> String {
+    let age = stats_age_secs(analyzed_at_nanos);
+    if !(STATS_REANALYZE_HINT_SECS..STATS_STALE_THRESHOLD_SECS).contains(&age) {
+        return String::new();
+    }
+    format!("; sugerencia: re-ANALYZE (stats {})", format_stats_age(age))
 }
 
 /// Bloque P5a (2026-06-11): estima la fracción de filas que sobrevivirá
@@ -6332,6 +6356,19 @@ impl<'a> Engine<'a> {
                 Some(sel >= INDEX_BREAKEVEN_SELECTIVITY)
             })
             .unwrap_or(false);
+        // Bloque R7 (2026-06-15): sufijo "; sugerencia: re-ANALYZE ..."
+        // que se agrega solo cuando P5c skip dispara Y las stats tienen
+        // más de 24h. Calculado una vez acá para que cada rama lo
+        // anexe sin repetir el lookup.
+        let p5c_hint = if p5c_skip_index {
+            self.table_stats
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(table))
+                .map(|(_, s)| p5c_reanalyze_hint(s.analyzed_at_nanos))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         // Sin WHERE → full scan.
         let Some(where_expr) = where_clause else {
             return Ok(format!(
@@ -6349,8 +6386,8 @@ impl<'a> Engine<'a> {
                     if p5c_skip_index {
                         return Ok(format!(
                             "SCAN `{}` (P5c: composite index `{}` disponible \
-                             pero stats prefieren FullScan + post-filter){}",
-                            table, idx.name, stats
+                             pero stats prefieren FullScan + post-filter{}){}",
+                            table, idx.name, p5c_hint, stats
                         ));
                     }
                     return Ok(format!(
@@ -6383,8 +6420,8 @@ impl<'a> Engine<'a> {
                     match idx_kind {
                         Some(IndexKind::Hash) if p5c_skip_index => Ok(format!(
                             "SCAN `{}` (P5c: hash-index `{}` disponible \
-                             pero stats prefieren FullScan + post-filter){}",
-                            table, column, stats
+                             pero stats prefieren FullScan + post-filter{}){}",
+                            table, column, p5c_hint, stats
                         )),
                         Some(IndexKind::Hash) => Ok(format!(
                             "SCAN `{}` → hash-index equality `{}` (bucket lookup, ~O(1)){}",
@@ -6392,8 +6429,8 @@ impl<'a> Engine<'a> {
                         )),
                         Some(IndexKind::OrderedInt) if p5c_skip_index => Ok(format!(
                             "SCAN `{}` (P5c: ordered-int index `{}` disponible \
-                             pero stats prefieren FullScan + post-filter){}",
-                            table, column, stats
+                             pero stats prefieren FullScan + post-filter{}){}",
+                            table, column, p5c_hint, stats
                         )),
                         Some(IndexKind::OrderedInt) => Ok(format!(
                             "SCAN `{}` → ordered-int index equality `{}` (range walk){}",
@@ -6413,8 +6450,8 @@ impl<'a> Engine<'a> {
                 match idx_kind {
                     Some(IndexKind::OrderedInt) if p5c_skip_index => Ok(format!(
                         "SCAN `{}` (P5c: ordered-int index `{}` disponible \
-                         pero stats prefieren FullScan + post-filter){}",
-                        table, column, stats
+                         pero stats prefieren FullScan + post-filter{}){}",
+                        table, column, p5c_hint, stats
                     )),
                     Some(IndexKind::OrderedInt) => Ok(format!(
                         "SCAN `{}` → ordered-int index BETWEEN range `{}` (sequential walk){}",

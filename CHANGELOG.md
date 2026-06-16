@@ -6,6 +6,21 @@
 
 ---
 
+## 2026-06-15 — R7: EXPLAIN P5c skip sugiere re-ANALYZE si stats ≥1d
+
+> Push aislado de pulido sobre el path P5c skip-index. Cuando `classify_scan`
+> decide skip (stats indican alta selectividad), el mensaje EXPLAIN ahora
+> sugiere `re-ANALYZE` si las stats tienen entre 24h y 7d. Cierra la tensión
+> #2.5 ("mensaje EXPLAIN ambiguo entre P5c y no hay índice") y completa el
+> loop R1+R7: hint a las 24h, bypass a los 7d. Suite 798 → **801** (+3),
+> zero-bump VERSION.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **R7** | feat | zero-bump | [0078](docs/adr/0078-r7-p5c-reanalyze-hint.md) | Path P5c skip en `classify_scan` anexa `"; sugerencia: re-ANALYZE (stats Xd Yh)"` si `STATS_REANALYZE_HINT_SECS (24h) ≤ age < STATS_STALE_THRESHOLD_SECS (7d)`. Aplicado a las 5 ramas P5c skip (composite + hash/ordered-int Eq + ordered-int Between). +3 tests `r7_*`. |
+
+---
+
 ## 2026-06-10/11 — Sesión Fase 3 cerrada (P4 + P5a-e) + hardening (R1/R4/M2/R8/R6)
 
 > **12 pushes a `main` en 48h.** Sesión que entregó la Fase 3 completa (planner cost-based real + stats por-columna persistidas) seguida del diagnóstico post-Fase 3 y las reparaciones más urgentes. Suite total 745 → 798 tests (+53). VERSION 32 → 33 (un solo bump, el resto zero-bump). CI verde en Ubuntu/macOS/Windows + Docker + nuevo job `bench`. Ver [`docs/ANALISIS_POST_P5.md`](docs/ANALISIS_POST_P5.md) para el balance crítico.

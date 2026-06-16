@@ -101,7 +101,7 @@ Pudo haber sido 1.5× o 3×. Sin gabybench JOIN-heavy no sabemos.
 **Magnitud**: bajo. El cambio es semánticamente seguro; solo el threshold
 óptimo es desconocido.
 
-### 2.5 Mensaje en EXPLAIN ambiguo entre P5c y "no hay índice"
+### 2.5 Mensaje en EXPLAIN ambiguo entre P5c y "no hay índice" — ✅ MITIGADA por R7
 
 ```
 SCAN `t` (P5c: hash-index `idx_cat` disponible
@@ -171,7 +171,7 @@ en un JOIN sin ORDER BY, puede romperse al cruzar el 2× con datos nuevos.
 | R4 | **HLL test sobre DECIMAL/DATE/UUID/TEXT** | media | ✅ entregada (sin ADR; ver `r4_*` tests) |
 | R5 | **TRUNCATE TABLE limpia stats persistidas** | media | 🔴 abierto (bloqueado por implementar TRUNCATE como statement) |
 | R6 | **Composite index lookup con bucket gigantesco** — refinamiento de P5c | media | ✅ entregada ([ADR-0077](adr/0077-r6-composite-bucket-size-check.md)) |
-| R7 | **Mensaje EXPLAIN del P5c skip — sugerir re-`ANALYZE` si stats viejas** | baja | 🔴 abierto (cosmético) |
+| R7 | **Mensaje EXPLAIN del P5c skip — sugerir re-`ANALYZE` si stats viejas** | baja | ✅ entregada ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) |
 | R8 | **UPDATE/DELETE con composite-eq aún hacen FullScan** | media | ✅ entregada ([ADR-0076](adr/0076-r8-update-delete-composite-fast-path.md)) |
 | R9 | **`COUNT(DISTINCT col)` sobre JOIN** — ADR-0066 Gap 1 residual | baja | 🔴 abierto |
 | R10 | **USING/NATURAL JOIN — EXPLAIN heurística conservadora** | baja | 🔴 abierto |

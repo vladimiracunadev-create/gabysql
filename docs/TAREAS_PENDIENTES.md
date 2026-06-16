@@ -78,12 +78,12 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 | **R2** | Calibrar `INDEX_BREAKEVEN` con bench data | 1 push (~50 LOC + análisis manual) |
 | **R3** | Calibrar threshold P5d | 1 push (~50 LOC + análisis) |
 | **R5** | TRUNCATE TABLE limpia stats — **bloqueado por implementar TRUNCATE como statement** | parte de bloque mayor |
-| **R7** | Mensaje EXPLAIN P5c sugiere re-ANALYZE | 1 push (~30 LOC) |
+| ~~**R7**~~ | ~~Mensaje EXPLAIN P5c sugiere re-ANALYZE~~ — ✅ entregada 2026-06-15 ([ADR-0078](adr/0078-r7-p5c-reanalyze-hint.md)) | — |
 | **R9** | `COUNT(DISTINCT col)` sobre JOIN | 1 push (~150 LOC) |
 | **R10** | USING/NATURAL JOIN — EXPLAIN heurística completa | 1 push (~200 LOC) |
 
 **Tensiones abiertas (no necesariamente reparables sin trabajo nuevo)**:
-- **2.5** — Mensaje EXPLAIN P5c ambiguo (cosmético).
+- ~~**2.5**~~ — Mensaje EXPLAIN P5c ambiguo — ✅ cerrada por R7 (2026-06-15).
 - **2.6** — RIGHT/FULL JOIN heurística imprecisa en EXPLAIN (documentado).
 - **2.9** — P5d swap puede cambiar orden de filas sin ORDER BY (deuda documentada).
 

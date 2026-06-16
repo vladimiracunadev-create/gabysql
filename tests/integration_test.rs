@@ -18702,6 +18702,107 @@ fn r1_p5c_bow_out_si_stats_stale() -> Result<(), Box<dyn Error>> {
 }
 
 // ============================================================
+// Bloque R7 (2026-06-15): EXPLAIN del path P5c skip-index sugiere
+// re-ANALYZE cuando las stats tienen entre 24h y 7d (no stale, pero
+// "calentitas"). <24h: nada. >7d: ya bypassea R1.
+// ============================================================
+
+#[test]
+fn r7_p5c_skip_sin_hint_con_stats_frescas() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r7-fresh")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),(10,'c');
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("P5c"),
+        "stats frescas + alta sel: P5c debe activarse, vi: {}",
+        detail
+    );
+    assert!(
+        !detail.contains("sugerencia: re-ANALYZE"),
+        "stats <24h NO deben sugerir re-ANALYZE, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r7_p5c_skip_sugiere_reanalyze_con_stats_de_2d() -> Result<(), Box<dyn Error>> {
+    let (db, wal) = p3_setup("r7-2d")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),(10,'c');
+         ANALYZE TABLE t;",
+    )?;
+    // 2 días: > 24h pero < 7d → debe sugerir re-ANALYZE.
+    r1_overwrite_stats_timestamp(&db, "t", 2 * 86_400)?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        detail.contains("P5c") && detail.contains("hash-index"),
+        "P5c skip sobre hash-index esperado, vi: {}",
+        detail
+    );
+    assert!(
+        detail.contains("sugerencia: re-ANALYZE"),
+        "stats 2d ∈ [24h, 7d) deben sugerir re-ANALYZE, vi: {}",
+        detail
+    );
+    assert!(
+        detail.contains("stats 2d"),
+        "hint debe incluir la edad legible (`stats 2d ...`), vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn r7_p5c_no_aplica_sin_hint_aunque_stats_viejas() -> Result<(), Box<dyn Error>> {
+    // Baja selectividad → P5c no salta el índice. El hint R7 NO debe
+    // aparecer aunque las stats estén calentitas: el hint es solo del
+    // path skip, no de path indexado normal.
+    let (db, wal) = p3_setup("r7-no-p5c")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f'),
+            (7,'g'),(8,'h'),(9,'i'),(10,'j');
+         ANALYZE TABLE t;",
+    )?;
+    r1_overwrite_stats_timestamp(&db, "t", 3 * 86_400)?;
+    let res = run_sql(&db, "EXPLAIN SELECT * FROM t WHERE category = 'a';")?;
+    let detail = extract_scan_detail(res.last().unwrap());
+    assert!(
+        !detail.contains("P5c"),
+        "baja sel: P5c NO debe activarse, vi: {}",
+        detail
+    );
+    assert!(
+        !detail.contains("sugerencia: re-ANALYZE"),
+        "sin P5c skip → sin hint R7, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque P5d (2026-06-11): hash join build-side selection. Cuando
 // `current` (acumulado de joins previos) es >2× más grande que la
 // próxima `right_rows`, swap el build side al lado más chico.
