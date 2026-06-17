@@ -61,7 +61,31 @@
 > 2 abiertas: **2.6** (RIGHT/FULL JOIN heurística — documentada en ADR-0073,
 > R10 la mitigó parcialmente) y **2.9** (P5d swap puede cambiar orden sin
 > ORDER BY — deuda documentada; M3 la sortea ordenando en Rust). Suite tests
-> 798 → **813**. ADRs 0078 → **0085** (+8 nuevos).
+> 798 → **828** al cierre del día (15 pushes consecutivos). ADRs 0077 → **0090** (+13 nuevos).
+>
+> ## Segunda ola 2026-06-15 (5 pushes adicionales) — endurecimiento y features SQL-estándar
+>
+> Después de cerrar las reparaciones de la primera ola, la sesión siguió con:
+>
+> - **fix(JOIN)** — bug pre-existente de pre-allocation cartesiano (48 GB en CI 8 GB
+>   runner) destapado por R3-cont. `Vec::with_capacity(current.len() * right_rows.len() / 2 + 1)`
+>   → `Vec::with_capacity(current.len())`.
+> - **Pager proptest** ([ADR-0086](adr/0086-pager-proptest.md)) — segunda capa de
+>   la red property-based: 3 invariantes sobre `begin/insert/commit/rollback` +
+>   `INTEGRITY CHECK`. Hermana de M3.
+> - **M4 fuzz parser** ([ADR-0087](adr/0087-m4-fuzz-parser.md)) — 1 hora limpia
+>   sobre 503.8M iters / 139k iters/seg / 0 panics. Evidencia inmutable:
+>   [`docs/fuzz/FUZZ-RUN-2026-06-15.md`](fuzz/FUZZ-RUN-2026-06-15.md). Línea de
+>   README "X horas de fuzz" finalmente con evidencia citable.
+> - **M6** ([ADR-0088](adr/0088-m6-explain-analyze-bias.md)) — `EXPLAIN ANALYZE`
+>   anota `actual.bias` con ratio `actual/est` + clasificación GOOD/MILD/HIGH/MATCH
+>   para queries scan-only. Cierra el loop con R7 (re-ANALYZE hint).
+> - **M12** ([ADR-0089](adr/0089-m12-savepoints.md)) — `SAVEPOINT`/`ROLLBACK TO`/
+>   `RELEASE` (ANSI SQL:2003). Antes `[GBY-4029] "savepoints aún no soportados"`.
+>   Desbloquea M13.
+> - **M13** ([ADR-0090](adr/0090-m13-cross-request-tx.md)) — sessions cross-request
+>   en server HTTP. 3 endpoints nuevos + `/exec` con `X-Gabysql-Session` header.
+>   Backwards compatible (sin session = auto-commit clásico). Habilita ORMs.
 
 ---
 
@@ -330,7 +354,7 @@ Sumar más optimizer sin sostener M4 (fuzz) → construir sobre arena.
 M11 (WAL-mode) es Fase 6.
 
 **Otra opción razonable**: **parar acá**. Las 7 de 9 tensiones cerradas, la
-suite es 813/813 verde, gabybench all 71/71 queries sin SKIPs, M3 defiende
+suite es 828/828 verde, gabybench all 71/71 queries sin SKIPs, 3 redes property-based defienden
 el optimizer contra regresiones futuras, ANSI fix elimina la asimetría más
 visible con clientes portados. Es un punto de descanso natural con el motor
 en mejor estado que nunca antes. El siguiente eje (más optimizer / más DDL /

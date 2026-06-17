@@ -6,29 +6,36 @@
 
 ---
 
-## 📍 Estado al 2026-06-15 — qué quedó después de la sesión maratón
+## 📍 Estado al 2026-06-15 (cierre del día) — qué quedó después de 15 pushes consecutivos
 
 > Si solo vas a leer una sección de este documento cuando volvés al proyecto, leé esta.
 
-Sesión 2026-06-15 cerró **10 pushes** que terminaron de pagar la deuda de la sesión P5 + endurecieron el motor para iteración futura:
+Sesión 2026-06-15 cerró **15 pushes consecutivos** que terminaron de pagar la deuda post-P5, agregaron 3 redes property-based, alinearon a ANSI un error legacy, y entregaron 2 features SQL-estándar grandes (SAVEPOINT + sessions HTTP).
 
-- **R7 / R9 / R10**: pulidos cosméticos del optimizer + cierre del residual ADR-0066 Gap 1 (COUNT DISTINCT sobre JOIN).
-- **R2**: primera constante del optimizer (`INDEX_BREAKEVEN`) calibrada con números (0.20 → 0.10) + env var override para sweep futuros.
-- **R3 + R3-cont**: instrumentación + sweep empírico de `P5D_SWAP_THRESHOLD`. Outcome explícito (datos inconclusos, 2.0 stays). R3 deja de ser deferred indefinido.
-- **bench fix**: warmup del bench era no-tolerante a errores; síntoma del bug del bench, pero también descubrió un bug del motor.
-- **ANSI fix**: `UPDATE/DELETE WHERE pk no-existe` ahora devuelve 0 filas (PostgreSQL/SQLite), no `[GBY-3006]`. Compatibilidad con clientes portados desde otros motores.
-- **M3 (property tests sobre planner)**: la red de seguridad que faltaba para que futuros bloques de optimizer no introduzcan regresiones silenciosas de correctness. 240 comparaciones automáticas por corrida (con seed reproducible).
+**Lo entregado, agrupado por intención**:
 
-**Suite local**: 813 verde + 3 ignored (env-var tests). CI verde en 5 runners. gabybench all 12.9 min, 71 queries, 0 SKIPs.
+- **Cosméticos del optimizer**: R7 (EXPLAIN P5c sugiere re-ANALYZE), R9 (COUNT DISTINCT sobre JOIN — cierra ADR-0066 Gap 1), R10 (EXPLAIN reconoce PK/índice en USING/NATURAL JOIN).
+- **Calibraciones**: R2 (INDEX_BREAKEVEN 0.20→0.10 con bench data + env var), R3+R3-cont (P5D_SWAP_THRESHOLD instrumentado, sweep inconcluso → 2.0 stays).
+- **Alineamiento ANSI**: UPDATE/DELETE WHERE pk no-existe → 0 filas (no `[GBY-3006]`).
+- **Fix de bench**: warmup swallow-error + fix OOM (48 GB pre-alloc cartesiano en JOIN — bug pre-existente destapado por R3-cont en CI).
+- **3 redes property-based zero-deps** (cada una con seed reproducible):
+  - **M3** sobre el planner cost-based (P5c/P5d/R6).
+  - **Pager proptest** sobre `begin/commit/rollback` + INTEGRITY CHECK.
+  - **M4 fuzz parser** — 1h limpia / 503.8M iters / 0 panics ([evidencia](fuzz/FUZZ-RUN-2026-06-15.md)).
+- **Diagnóstico**: M6 (EXPLAIN ANALYZE compara `est.match` vs `actual` con clasificación GOOD/MILD/HIGH/MATCH).
+- **TCL SQL-estándar**: M12 (SAVEPOINT/ROLLBACK TO/RELEASE ANSI SQL:2003).
+- **Server HTTP**: M13 (sessions cross-request via `X-Gabysql-Session` — habilita ORMs).
 
-**Lo que viene cuando vuelvas** (en orden recomendado, todos son pushes independientes):
+**Suite local**: **828 verde + 4 ignored** (818 integration + 4 server E2E + 3 planner proptest + 3 pager proptest). CI verde en 5 runners. gabybench all 12.9 min, 71 queries, 0 SKIPs. ADRs activos: 0001–**0090**.
 
-1. **`cargo fuzz` sobre el parser** (§3 abajo) — 1 hora limpia de fuzz es la línea creíble de README que sigue faltando. Único bloqueo: setup inicial de `cargo-fuzz`. Sin él, no podemos defender "hardened parser".
-2. **M6 — EXPLAIN ANALYZE compara `est.match` vs `actual=K`** (§6.5 abajo) — diagnóstico directo del bias del estimator. Hoy ANALYZE re-ejecuta; solo falta agregar la columna comparativa. ~200 LOC. Inmediatamente útil para detectar dónde P5c se equivoca.
-3. **M12 — SAVEPOINT + ROLLBACK TO SAVEPOINT** (§6.5) — desbloquea recuperación parcial de batches. Pre-requisito de M13 (cross-request tx en server HTTP).
-4. **Demo pública de Fase 5** (§6) — sigue siendo la palanca real para que el repo "sea visto". El motor está sólido; el gateway + vector search + audit con razón semántica son lo distintivo.
+**Lo que viene cuando vuelvas** (todos son pushes independientes; los 5 highest-leverage técnicos están cerrados):
 
-**Lo que NO conviene abrir todavía**: M5 (multi-col stats) y M9 (JOIN reorder) — sumar más optimizer sin sostener M3 → más fuzz/coverage es construir sobre arena. M11 (WAL-mode) es Fase 6, no antes.
+1. **Demo pública de Fase 5** (§6 abajo) — sigue siendo la palanca real para que el repo "sea visto". El motor está sólido (mejor que nunca); el gateway MCP + vector search + audit con razón semántica son lo distintivo vs. SQLite/Postgres. **Requiere repo separado + setup de agente (Claude/Cursor/etc.) — no es 1-push lineal.**
+2. **Comparador entre runs de gabybench** (§1) — el CI sube `bench/results.json` por commit pero no hay diff automático contra baseline. Sin esto, una regresión de 50% en una query no falla el push. ~300 LOC.
+3. **M5 — multi-column stats / correlation** (§6.5) — resuelve la asunción de independencia AND que R6 mitigó parcialmente. PostgreSQL tiene `CREATE STATISTICS` desde 10. Bump de VERSION, ~600 LOC.
+4. **M9 — base table reorder para INNER JOIN chains** (§6.5) — hoy P5d solo swap step current. Reorder global requiere refactor de `build_join_scope`. ~600 LOC, riesgo medio.
+
+**Lo que sigue NO conviene abrir antes**: `cargo fuzz` real en CI Linux (la versión hand-rolled M4 ya cubre la línea de README; el coverage-guided es nice-to-have de Fase 6). M11 (WAL-mode opt-in) es Fase 6 también — requiere repensar single-writer.
 
 ---
 
@@ -79,7 +86,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 ---
 
-### 3. Fuzz testing + property tests — **parcial, mayoría abierta**
+### 3. Fuzz testing + property tests — ✅ entregada en 3 redes (mayoría cerrada)
 
 **Qué**:
 - ~~`cargo fuzz` sobre `parse(...)` — 1 hora mínima sin panic ni `unwrap` fallido~~ — ✅ entregada 2026-06-15 ([ADR-0087](adr/0087-m4-fuzz-parser.md)). Hand-rolled (libFuzzer/AFL choca con Windows+GNU+ADR-0001); 1h limpia = **503.8M iters, 0 panics**. Evidencia: [`docs/fuzz/FUZZ-RUN-2026-06-15.md`](fuzz/FUZZ-RUN-2026-06-15.md). Próxima mejora: `cargo fuzz` real en CI Linux + fuzz sobre `exec()`.
@@ -87,11 +94,12 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 - ~~**`proptest` sobre planner**~~ — ✅ entregada 2026-06-15 ([ADR-0084](adr/0084-m3-proptest-planner.md)). Hand-rolled zero-deps, 240 comparaciones por corrida sobre P5c/P5d/R6.
 - Extender los 3 crash tests sintéticos actuales a 10+ escenarios. Pendiente.
 
-**Por qué importa**: SQLite tiene millones de horas de fuzz acumuladas. **Una hora limpia de fuzz** es una línea creíble en el README; cero horas no lo es. Con M3 ya defendido sobre el planner cost-based, falta la fuzz cobertura del parser/storage para hablar de "hardened".
+**Por qué importa**: SQLite tiene millones de horas de fuzz acumuladas. M4 cierra la primera hora con evidencia citable. M3 + Pager proptest son las redes de seguridad para iterar planner + storage con confianza.
 
-**Costo**: medio. `cargo fuzz` requiere config inicial + corpus + tiempo de ejecución. Choca con ADR-0001 (zero deps) si se quiere el crate `proptest` — para el Pager se puede hacer hand-rolled mismo enfoque que M3.
-
-**Esfuerzo**: 1 intervención para fuzz setup + 1ª hora; 1 separada para Pager proptest.
+**Lo que sigue siendo nice-to-have** (no urgente):
+- `cargo fuzz` real en CI Linux (libFuzzer coverage-guided). M4 hand-rolled ya cubre la línea de README; coverage-guided subiría el bar.
+- Fuzz sobre `exec()` además de `parse()`. Costoso por bench.
+- Extender los 3 crash tests sintéticos actuales a 10+ escenarios.
 
 ---
 

@@ -80,9 +80,14 @@ A diciembre de 2026 el motor tiene una **base estable suficiente como mesa de tr
 | Observabilidad básica (`/metrics`, `-log-json`) | 🟢 | ADR-0014 |
 | Error handling con códigos `[GBY-NNNN]` | 🟢 | ERROR_CODES.md (códigos 1000-4143) |
 | Gateway MCP + vector search + audit log | 🟢 | ADR-0010/0011/0012 |
-| 813/813 tests verdes (810 integration + 3 proptest M3) + 3 ignored (1 Argon2id RFC + 2 env-var serial), CI multi-OS Ubuntu/macOS/Windows + Docker + bench | 🟢 | actualizado al 2026-06-15 (post sesión maratón R7+R9+R10+R2+R3+R3-cont+ANSI+M3) |
+| 828/828 tests verdes (818 integration + 4 server E2E M13 + 3 proptest M3 + 3 proptest Pager) + 4 ignored (1 Argon2id RFC + 2 env-var serial + 1 fuzz on-demand), CI multi-OS Ubuntu/macOS/Windows + Docker + bench | 🟢 | actualizado al cierre 2026-06-15 (15 pushes consecutivos) |
 | Property tests sobre el planner cost-based (P5c/P5d/R6) — 240 comparaciones automáticas por corrida con seed reproducible | 🟢 | ADR-0084 (2026-06-15) — primera red de seguridad del optimizer post-P5 |
+| Property tests sobre el Pager (commit visibility / rollback discards / chained tx integrity) — ~5100 ops random por corrida | 🟢 | ADR-0086 (2026-06-15) — segunda capa de la red de seguridad |
+| Fuzz parser hand-rolled — 503.8M iters / 1h limpia / 0 panics con seed reproducible (evidencia inmutable en `docs/fuzz/`) | 🟢 | ADR-0087 (2026-06-15) — tercera capa de la red |
 | Semántica ANSI en UPDATE/DELETE — `WHERE pk no-existe` devuelve 0 filas (no error) como PostgreSQL/SQLite | 🟢 | ADR-0083 (2026-06-15) |
+| `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (ANSI SQL:2003) — recuperación parcial dentro de tx | 🟢 | ADR-0089 (2026-06-15) — habilita M13 |
+| Cross-request transactions HTTP — sessions single-slot via `X-Gabysql-Session` header; ORMs (SQLAlchemy/Hibernate/Diesel) pueden mantener tx a través de N requests | 🟢 | ADR-0090 (2026-06-15) — backwards compatible |
+| `EXPLAIN ANALYZE` con bias del estimator (clasificación GOOD/MILD/HIGH/MATCH) — diagnóstico directo de cuándo P5a/P5c se equivoca | 🟢 | ADR-0088 (2026-06-15) |
 
 Este conjunto es lo bastante sólido para ser **plataforma de exploración** sin estar quebrándose todo el tiempo. Las invariantes (formato versionado, single-writer, CRC, file lock) son honestas y consistentes.
 

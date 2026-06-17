@@ -1,6 +1,6 @@
 # 📋 Estado actual del producto
 
-> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-15 contra `main` tras la **sesión maratón** que cerró 10 pushes adicionales (`R7+R9+R10+R2+R3+R3-cont+ANSI fix+M3`) sobre el estado que dejó Fase 3 (`P1+P2+P3+P3b+P4+P5a+P5b+P5c+P5d+P5e`) + hardening previo (`R1+R4+M2+R8+R6`). Highlights de la maratón: **R2** calibró `INDEX_BREAKEVEN` con bench data (0.20 → 0.10) + env var override · **R3+R3-cont** cerró el threshold P5d con outcome explícito (sweep inconcluso, default 2.0 stays, env var queda) · **R9** cerró el residual ADR-0066 Gap 1 (COUNT DISTINCT sobre JOIN) · **R7/R10** pulieron EXPLAIN del P5c skip y del USING/NATURAL JOIN · **ANSI fix** alineó `UPDATE/DELETE WHERE pk no-existe` con PostgreSQL/SQLite (0 filas, no error) · **M3** entregó la primera red de seguridad real del optimizer (property tests hand-rolled zero-deps, 240 comparaciones por corrida con seed reproducible). **VERSION on-disk = 33** (último bump P4 / 2026-06-10; los 8 bloques de 2026-06-15 son **todos zero-bump** porque no tocan layout on-disk).
+> **Snapshot técnico — qué funciona hoy, qué está pendiente y por qué subsistema.** Última verificación: 2026-06-15 contra `main` tras la **sesión maratón** (ya 15 pushes consecutivos en el mismo día sobre Fase 3 cerrada). Highlights consolidados: **R2** calibró `INDEX_BREAKEVEN` con bench data real (0.20 → 0.10) · **R3** instrumentó `P5D_SWAP_THRESHOLD` con env var · **R7/R9/R10** pulieron EXPLAIN + COUNT DISTINCT sobre JOIN + USING/NATURAL · **ANSI fix** alineó `UPDATE/DELETE WHERE pk no-existe` con PostgreSQL/SQLite · **M3** + **Pager proptest** = 2 redes property-based defienden planner cost-based y storage layer · **M4 fuzz parser** = 503.8M queries random / 1h limpia / 0 panics (línea README citable) · **M6** `EXPLAIN ANALYZE` clasifica bias del estimator (GOOD/MILD/HIGH) · **M12** `SAVEPOINT` ANSI SQL:2003 · **M13** cross-request tx HTTP — ORMs pueden mantener tx via session header. **VERSION on-disk = 33** (último bump P4 / 2026-06-10; los 15 bloques de 2026-06-15 son **todos zero-bump**).
 >
 > 👉 **Para el inventario exhaustivo del SQL no-soportado** (comandos faltantes uno por uno, con prioridades y bloques de implementación): [MISSING_COMMANDS.md](MISSING_COMMANDS.md).
 >
@@ -10,7 +10,8 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-33-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/integration%2Bproptest-813%2F813-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/tests-828%2F828-brightgreen)](../tests/integration_test.rs)
+[![Fuzz parser](https://img.shields.io/badge/fuzz%20parser-503.8M%20iters%20%2F%201h%20%2F%200%20panics-blue)](fuzz/FUZZ-RUN-2026-06-15.md)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
 > **2026-05-29 — Día grande: cierre de Fase 2 (seguridad) + arranque y avance fuerte de Fase 3 (planeación).** Lo entregado hoy en orden cronológico:
@@ -178,6 +179,14 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 >   - **ANSI fix** ([ADR-0083](adr/0083-ansi-update-delete-no-row-zero.md)): `UPDATE/DELETE WHERE pk no-existe` ahora devuelve 0 filas (PostgreSQL/SQLite), no `[GBY-3006]`. Descubierto durante el debug del bench `all`.
 >   - **M3** ([ADR-0084](adr/0084-m3-proptest-planner.md)): primera red de seguridad real del optimizer cost-based. Property tests hand-rolled zero-deps: 240 comparaciones automáticas por corrida verifican que P5c/P5d/R6 NUNCA cambian el resultado de un SELECT, solo el path. Habilita futuros bloques optimizer (M5/M6/M7/M9) sobre confianza empírica.
 >   - **Bench fix** (commit 3c5d97c): warmup del bench era no-tolerante a errores; ahora best-effort. Suite total 798 → **813** (+15: 14 integration nuevos + 3 proptest nuevos − 2 ajustados por R2 + 2 ajustados por ANSI).
+> - **2026-06-15 — segunda ola de la maratón (5 pushes adicionales)**:
+>   - **fix(JOIN)** (commit 8f156b4): bug pre-existente destapado por R3-cont sobre CI. `Vec::with_capacity(current.len() * right_rows.len() / 2 + 1)` pre-reservaba 48 GB exactos (100k × 20k × 48 bytes/HashMap) → OOM en runner de 8 GB. Cambio a `Vec::with_capacity(current.len())`; el Vec crece amortizado O(1).
+>   - **Pager proptest** ([ADR-0086](adr/0086-pager-proptest.md)): segunda capa de la red de seguridad property-based — 3 invariantes sobre `begin/insert/commit/rollback` (commit visibility, rollback discards, chained tx integrity) sobre secuencias random. ~5100 ops random por corrida.
+>   - **M4 — fuzz parser** ([ADR-0087](adr/0087-m4-fuzz-parser.md) + [evidencia](fuzz/FUZZ-RUN-2026-06-15.md)): generador hand-rolled determinístico + `catch_unwind`. **1 hora limpia → 503.8M iters, 139k/s, 0 panics.** Línea de README "X horas de fuzz" satisfecha con evidencia citable.
+>   - **M6** ([ADR-0088](adr/0088-m6-explain-analyze-bias.md)): `EXPLAIN ANALYZE` anota step `actual.bias` con ratio actual/est y clasificación GOOD/MILD/HIGH/MATCH. Diagnóstico directo del bias del estimator para queries scan-only.
+>   - **M12** ([ADR-0089](adr/0089-m12-savepoints.md)): `SAVEPOINT name` / `ROLLBACK TO [SAVEPOINT]` / `RELEASE [SAVEPOINT]` (ANSI SQL:2003). Pager con full cache snapshot por savepoint. Desbloquea M13. Cierra el `[GBY-4029] "savepoints aún no soportados"`.
+>   - **M13** ([ADR-0090](adr/0090-m13-cross-request-tx.md)): cross-request transactions HTTP. 3 endpoints nuevos (`/tx/begin`, `/tx/commit`, `/tx/rollback`) + `/exec` acepta `X-Gabysql-Session` header. ORMs (SQLAlchemy/Hibernate/Diesel) pueden mantener tx state a través de N requests. Backwards compatible: sin session = comportamiento clásico.
+>   - **Suite final**: 813 → **828** (+15: 5 M12 + 4 M13 + 3 Pager proptest + 3 M6).
 >
 > **Pendientes priorizados** (orden recomendado, ver [ROADMAP.md](../ROADMAP.md#-próximas-proyecciones-orden-sugerido) sección "🔭 Próximas proyecciones" para el detalle):
 >
