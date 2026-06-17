@@ -83,7 +83,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 
 **Qué**:
 - `cargo fuzz` sobre `parse(...)` — 1 hora mínima sin panic ni `unwrap` fallido. **PRINCIPAL pendiente.**
-- `proptest` sobre el Pager: "para cualquier secuencia válida de begin/insert/commit/rollback, el `.db` final pasa `INTEGRITY CHECK`". Pendiente.
+- ~~`proptest` sobre el Pager~~ — ✅ entregada 2026-06-15 ([ADR-0086](adr/0086-pager-proptest.md)). 3 invariantes (commit visibility, rollback discards, chained tx integrity), ~5100 ops random por corrida.
 - ~~**`proptest` sobre planner**~~ — ✅ entregada 2026-06-15 ([ADR-0084](adr/0084-m3-proptest-planner.md)). Hand-rolled zero-deps, 240 comparaciones por corrida sobre P5c/P5d/R6.
 - Extender los 3 crash tests sintéticos actuales a 10+ escenarios. Pendiente.
 

@@ -6,6 +6,22 @@
 
 ---
 
+## 2026-06-15 — test: property tests sobre el Pager (segunda capa de hardening)
+
+> Hermana de M3 (ADR-0084) un nivel más abajo. M3 defendió el planner;
+> esta entrega defiende la capa de storage / transacciones. 3 property
+> tests sobre secuencias random de `begin/insert/commit/rollback`
+> verifican: (1) visibilidad post-commit + reopen, (2) que rollback
+> realmente descarte cambios, (3) integridad tras chain de N tx
+> intercaladas. ~5100 ops random ejercitados por corrida, cada falla
+> con seed reproducible. Suite 813 → **816** (+3).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **proptest Pager** | test | zero-bump | [0086](docs/adr/0086-pager-proptest.md) | Nuevo binario `tests/proptest_pager.rs`. LCG determinístico, modelo Rust `BTreeMap<id, v>` que replica la semántica post-ANSI fix, generador `Op::{Insert\|UpdateById\|DeleteById}` con pool de IDs 0..30 para garantizar overlap. 3 tests: commit visibility (40×50), rollback discards (30×50), chained mixed (20×80) — total ~5100 ops random por corrida con verificación intermedia + `INTEGRITY CHECK` clean al final. |
+
+---
+
 ## 2026-06-15 — fix(JOIN): pre-allocation cartesiano destapado por R3-cont
 
 > Bug pre-existente del motor destapado por la query R3-cont (`o.total =
