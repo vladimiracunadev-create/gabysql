@@ -158,7 +158,7 @@ Items que NO son reparaciones (no hay nada roto), pero amplían lo entregado en 
 | **M9** | Base table reorder para INNER JOIN chains (P5d extendido) | Hoy P5d solo swap el step current. Reorder global requiere refactor de `build_join_scope`. | 1 push (~600 LOC, riesgo medio) |
 | **M11** | WAL-mode opt-in (ADR-0018) | Habilita lectores concurrentes. Espacio comparativo serio vs SQLite. | 1 push grande |
 | ~~**M12**~~ | ~~SAVEPOINT + ROLLBACK TO SAVEPOINT~~ — ✅ entregada 2026-06-15 ([ADR-0089](adr/0089-m12-savepoints.md)). 3 statements + Pager con full cache snapshot por savepoint. Desbloquea M13. | — |
-| **M13** | Cross-request transactions en server HTTP (T2) | Sin esto no se puede escribir un cliente que haga BEGIN/INSERT/INSERT/COMMIT. | 1 push (~500 LOC, depende de M12) |
+| ~~**M13**~~ | ~~Cross-request transactions en server HTTP~~ — ✅ entregada 2026-06-15 ([ADR-0090](adr/0090-m13-cross-request-tx.md)). 3 endpoints `/tx/{begin,commit,rollback}` + `/exec` con session header. Single-slot global; multi-session diferido a Fase 6 con WAL-mode. | — |
 
 ---
 

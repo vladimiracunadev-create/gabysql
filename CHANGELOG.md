@@ -6,6 +6,24 @@
 
 ---
 
+## 2026-06-15 — M13: cross-request transactions HTTP (server sessions)
+
+> Hermana directa de M12 — una capa arriba, sobre el server HTTP. Antes
+> cada `/exec` abría un Pager nuevo, hacía begin/exec/commit/close.
+> Imposible que dos requests compartieran tx. M13 introduce sesiones
+> single-slot via 3 endpoints (`/tx/begin`, `/tx/commit`, `/tx/rollback`)
+> + soporte de session ID en `/exec` via header `X-Gabysql-Session` o
+> query `?session=`. Ahora un ORM puede hacer BEGIN/INSERT/INSERT/COMMIT
+> a través de N requests separados. Backwards compatible: requests sin
+> session se comportan como antes (auto-commit). Suite 824 → **828**
+> (+4 tests E2E sobre HTTP real con TcpStream).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **M13** | feat | zero-bump | [0090](docs/adr/0090-m13-cross-request-tx.md) | `SessionStore` con `Option<Session>` (single-slot global), `Session{id, pager, db_label, last_used}`, `fresh_session_id()` (16-hex via clock+splitmix64). 3 endpoints nuevos + extensión de `/exec`. Idle timeout 300s, GC pasivo (en-request, sin sweeper thread). +4 tests `m13_*` con server real bootstrapped en thread + TcpStream raw + parsing JSON ad-hoc. |
+
+---
+
 ## 2026-06-15 — M12: SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE
 
 > Recuperación parcial dentro de transacción — feature SQL estándar

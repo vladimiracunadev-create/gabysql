@@ -29,6 +29,14 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 /// memory footprint of the server stays bounded under sustained load.
 const LATENCY_SAMPLE_RING: usize = 1024;
 
+/// M13 (2026-06-15): tiempo máximo de inactividad de una sesión cross-
+/// request antes de ser auto-cerrada con `ROLLBACK`. Se chequea al
+/// inicio de cada request al endpoint /tx/* o /exec con session ID. Sin
+/// sweeper thread aparte (mantener simple: el chequeo en-request basta
+/// porque el server es single-writer y cualquier nuevo request natural
+/// activa el GC pasivo).
+pub const SESSION_IDLE_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub single_db: Option<PathBuf>,
@@ -170,6 +178,8 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
     let write_lock = Arc::new(Mutex::new(()));
     let active = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(Mutex::new(Metrics::new()));
+    // M13: store de sesiones cross-request (un slot global por ahora).
+    let sessions = Arc::new(Mutex::new(SessionStore::new()));
     let max_connections = if config.max_connections == 0 {
         DEFAULT_MAX_CONNECTIONS
     } else {
@@ -209,6 +219,7 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
                 let write_lock = Arc::clone(&write_lock);
                 let active = Arc::clone(&active);
                 let metrics_thread = Arc::clone(&metrics);
+                let sessions_thread = Arc::clone(&sessions);
                 thread::spawn(move || {
                     let start = Instant::now();
                     let parsed = read_request(&mut stream);
@@ -217,7 +228,13 @@ pub fn run(addr: &str, config: ServerConfig) -> DbResult<()> {
                         Err(_) => ("?".to_string(), "?".to_string()),
                     };
                     let response = match parsed.and_then(|request| {
-                        handle_request(request, &config, &write_lock, &metrics_thread)
+                        handle_request(
+                            request,
+                            &config,
+                            &write_lock,
+                            &metrics_thread,
+                            &sessions_thread,
+                        )
                     }) {
                         Ok(response) => response,
                         Err(err) => Response::json(
@@ -305,6 +322,7 @@ fn handle_request(
     config: &ServerConfig,
     write_lock: &Arc<Mutex<()>>,
     metrics: &Arc<Mutex<Metrics>>,
+    sessions: &Arc<Mutex<SessionStore>>,
 ) -> DbResult<Response> {
     // CORS preflight: every browser-originated request that carries
     // Authorization (which gabymodeler does when a token is set) sends
@@ -356,7 +374,11 @@ fn handle_request(
         ("GET", "/tables") => tables(request, config),
         ("GET", "/schema") => schema(request, config),
         ("GET", "/rows") => rows(request, config),
-        ("POST", "/exec") => exec_sql(request, config, write_lock),
+        ("POST", "/exec") => exec_sql(request, config, write_lock, sessions),
+        // M13 (2026-06-15): cross-request transactions endpoints.
+        ("POST", "/tx/begin") => tx_begin(request, config, write_lock, sessions),
+        ("POST", "/tx/commit") => tx_commit(request, write_lock, sessions),
+        ("POST", "/tx/rollback") => tx_rollback(request, write_lock, sessions),
         _ => Ok(Response::text(404, "not found")),
     }
 }
@@ -574,6 +596,7 @@ fn exec_sql(
     request: Request,
     config: &ServerConfig,
     write_lock: &Arc<Mutex<()>>,
+    sessions: &Arc<Mutex<SessionStore>>,
 ) -> DbResult<Response> {
     let body = String::from_utf8(request.body).map_err(DbError::from)?;
     let sql = extract_json_string(&body, "sql").unwrap_or_default();
@@ -584,6 +607,15 @@ fn exec_sql(
         ));
     }
     let requested_db = extract_json_string(&body, "db");
+    // M13 (2026-06-15): session ID puede venir por header
+    // `X-Gabysql-Session` o por query param `?session=<id>`. Si está
+    // presente y matchea la sesión activa, NO auto-commit — el caller
+    // sigue siendo dueño del bracket BEGIN/COMMIT.
+    let session_id: Option<String> = request
+        .headers
+        .get("x-gabysql-session")
+        .cloned()
+        .or_else(|| request.query.get("session").cloned());
     let _guard = write_lock.lock().map_err(|_| {
         DbError::new("mutex envenenado: otro thread paniqueó mientras tenía el write_lock")
     })?;
@@ -616,6 +648,64 @@ fn exec_sql(
         return exec_db_level(statements, config);
     }
 
+    // M13: si vino session ID, ejecutar dentro de la sesión activa.
+    // El Pager NO se abre/cierra acá; la sesión es la dueña.
+    if let Some(sid) = &session_id {
+        let mut store = sessions.lock().map_err(|_| {
+            DbError::new("session store envenenado: otro thread paniqueó mientras lo tenía")
+        })?;
+        store.gc_idle();
+        let pager = match store.get_pager_mut(sid) {
+            Some(p) => p,
+            None => {
+                return Ok(Response::json(
+                    404,
+                    "{\"ok\":false,\"error\":\"session id no válido o expirado (idle timeout 300s)\"}".to_string(),
+                ));
+            }
+        };
+        let response = (|| -> DbResult<Response> {
+            let mut engine = Engine::new(pager);
+            let mut results = Vec::new();
+            for statement in statements {
+                results.push(engine.exec(statement)?);
+            }
+            let results_json = results
+                .iter()
+                .map(result_set_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok(Response::json(
+                200,
+                format!(
+                    "{{\"ok\":true,\"session\":{},\"results\":[{}]}}",
+                    json_string(sid),
+                    results_json
+                ),
+            ))
+        })();
+        return match response {
+            Ok(r) => Ok(r),
+            Err(err) => {
+                // Error en exec dentro de sesión: NO cerramos la sesión
+                // automáticamente — el caller decide si hace rollback o
+                // intenta otra sentencia. Mantenemos el comportamiento
+                // de DBs reales (PostgreSQL deja la tx en estado de
+                // error hasta ROLLBACK; gabysql no tiene ese estado
+                // intermedio pero al menos no descarta unilateral).
+                Ok(Response::json(
+                    400,
+                    format!(
+                        "{{\"ok\":false,\"session\":{},\"error\":{}}}",
+                        json_string(sid),
+                        json_string(&err.to_string())
+                    ),
+                ))
+            }
+        };
+    }
+
+    // Sin session: comportamiento clásico — auto-commit por request.
     let (mut pager, _) = open_pager_from_request(config, requested_db.as_ref())?;
     pager.begin()?;
 
@@ -1290,6 +1380,255 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// M13 (2026-06-15): Cross-request transactions.
+//
+// Hasta esta sesión cada `/exec` abría su propio Pager, hacía
+// `begin()` + ejecutar + `commit()`, y lo cerraba. Un cliente que
+// intentara `BEGIN; INSERT; ...` en un request y `INSERT; COMMIT;` en
+// otro no veía continuidad: la primera tx ya estaba commiteada cuando
+// el segundo request llegaba.
+//
+// M13 introduce un **session slot único global**: el servidor mantiene
+// como máximo UNA sesión activa con un Pager + tx abierta. Tres
+// endpoints nuevos (/tx/begin, /tx/commit, /tx/rollback) la gestionan.
+// `/exec` acepta un session ID via header `X-Gabysql-Session` y
+// continúa la tx en vez de auto-committear.
+//
+// El single-slot es suficiente para el caso target (ORMs que serializan
+// requests a una sola "connection"). Multi-session requiere repensar
+// el lock per-DB del Pager (ADR-0013); diferido a Fase 6.
+// ---------------------------------------------------------------------------
+
+/// M13: sesión activa que mantiene una transacción abierta a través de
+/// múltiples requests. El Pager vive aquí entre `/exec` calls — sus
+/// dirty pages persisten, su file lock se mantiene.
+pub struct Session {
+    id: String,
+    pager: Pager,
+    db_label: String,
+    last_used: Instant,
+}
+
+/// M13: store de sesiones. Por ahora un solo slot. Estructura como
+/// `Option<Session>` no como `HashMap` deliberadamente — el upgrade a
+/// multi-session es un cambio breaking porque cada Pager toma file
+/// lock; postergado a Fase 6 cuando se revisite single-writer.
+pub struct SessionStore {
+    current: Option<Session>,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self { current: None }
+    }
+
+    /// Si la sesión activa pasó el threshold de inactividad, hace
+    /// rollback y la descarta. Llamado al inicio de cada handler de
+    /// `/tx/*` o `/exec` con session ID — mantiene el GC pasivo sin
+    /// requerir thread sweeper.
+    fn gc_idle(&mut self) {
+        let expired = matches!(
+            &self.current,
+            Some(sess) if sess.last_used.elapsed().as_secs() >= SESSION_IDLE_TIMEOUT_SECS
+        );
+        if expired {
+            if let Some(mut sess) = self.current.take() {
+                let _ = sess.pager.rollback();
+                let _ = sess.pager.close();
+            }
+        }
+    }
+
+    /// Encuentra la sesión activa si coincide con `id` y la marca como
+    /// usada ahora. Devuelve referencia mutable al Pager o `None` si
+    /// no hay sesión / el ID no coincide.
+    fn get_pager_mut(&mut self, id: &str) -> Option<&mut Pager> {
+        match &mut self.current {
+            Some(sess) if sess.id == id => {
+                sess.last_used = Instant::now();
+                Some(&mut sess.pager)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// M13: genera un session ID hexadecimal de 16 caracteres derivado del
+/// reloj nanosegundo. Cero deps externas (alinea ADR-0001). Suficiente
+/// entropía para un único servidor (no es token de seguridad — solo
+/// identifica la sesión vigente).
+fn fresh_session_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Hash splitmix64 del nanos para distribuir bits — el contador
+    // monotónico no es ideal porque acumula prefijos repetidos.
+    let mut x = nanos as u64;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    format!("{:016x}", x)
+}
+
+/// M13: POST /tx/begin → abre una nueva sesión con tx activa sobre la
+/// DB pedida. Cuerpo opcional: `{"db": "<name>"}`. Devuelve
+/// `{"ok":true,"session":"<hex>","db":"<name>"}`. Si ya hay una sesión
+/// activa, responde 409.
+fn tx_begin(
+    request: Request,
+    config: &ServerConfig,
+    write_lock: &Arc<Mutex<()>>,
+    sessions: &Arc<Mutex<SessionStore>>,
+) -> DbResult<Response> {
+    let body = String::from_utf8(request.body).map_err(DbError::from)?;
+    let requested_db = extract_json_string(&body, "db");
+    let _guard = write_lock.lock().map_err(|_| {
+        DbError::new("mutex envenenado: otro thread paniqueó mientras tenía el write_lock")
+    })?;
+    let mut store = sessions.lock().map_err(|_| {
+        DbError::new("session store envenenado: otro thread paniqueó mientras lo tenía")
+    })?;
+    store.gc_idle();
+    if store.current.is_some() {
+        return Ok(Response::json(
+            409,
+            "{\"ok\":false,\"error\":\"ya hay una sesión activa; cerrala con /tx/commit o /tx/rollback antes de abrir otra\"}".to_string(),
+        ));
+    }
+    let (mut pager, db_label) = open_pager_from_request(config, requested_db.as_ref())?;
+    pager.begin()?;
+    let id = fresh_session_id();
+    store.current = Some(Session {
+        id: id.clone(),
+        pager,
+        db_label: db_label.clone(),
+        last_used: Instant::now(),
+    });
+    Ok(Response::json(
+        200,
+        format!(
+            "{{\"ok\":true,\"session\":{},\"db\":{}}}",
+            json_string(&id),
+            json_string(&db_label)
+        ),
+    ))
+}
+
+/// M13: POST /tx/commit?session=<id> → COMMIT + cierra la sesión.
+fn tx_commit(
+    request: Request,
+    write_lock: &Arc<Mutex<()>>,
+    sessions: &Arc<Mutex<SessionStore>>,
+) -> DbResult<Response> {
+    let id = match request.query.get("session") {
+        Some(v) => v.clone(),
+        None => {
+            return Ok(Response::json(
+                400,
+                "{\"ok\":false,\"error\":\"falta query param ?session=<id>\"}".to_string(),
+            ))
+        }
+    };
+    let _guard = write_lock.lock().map_err(|_| {
+        DbError::new("mutex envenenado: otro thread paniqueó mientras tenía el write_lock")
+    })?;
+    let mut store = sessions.lock().map_err(|_| {
+        DbError::new("session store envenenado: otro thread paniqueó mientras lo tenía")
+    })?;
+    store.gc_idle();
+    let mut sess = match store.current.take() {
+        Some(s) if s.id == id => s,
+        Some(other) => {
+            // Restaurar — la sesión no era de este caller.
+            store.current = Some(other);
+            return Ok(Response::json(
+                404,
+                "{\"ok\":false,\"error\":\"session id no corresponde a la sesión activa\"}"
+                    .to_string(),
+            ));
+        }
+        None => {
+            return Ok(Response::json(
+                404,
+                "{\"ok\":false,\"error\":\"no hay sesión activa\"}".to_string(),
+            ))
+        }
+    };
+    let result = sess.pager.commit();
+    let _ = sess.pager.close();
+    match result {
+        Ok(()) => Ok(Response::json(
+            200,
+            format!(
+                "{{\"ok\":true,\"message\":\"COMMIT\",\"db\":{}}}",
+                json_string(&sess.db_label)
+            ),
+        )),
+        Err(e) => Ok(Response::json(
+            400,
+            format!("{{\"ok\":false,\"error\":{}}}", json_string(&e.to_string())),
+        )),
+    }
+}
+
+/// M13: POST /tx/rollback?session=<id> → ROLLBACK + cierra la sesión.
+fn tx_rollback(
+    request: Request,
+    write_lock: &Arc<Mutex<()>>,
+    sessions: &Arc<Mutex<SessionStore>>,
+) -> DbResult<Response> {
+    let id = match request.query.get("session") {
+        Some(v) => v.clone(),
+        None => {
+            return Ok(Response::json(
+                400,
+                "{\"ok\":false,\"error\":\"falta query param ?session=<id>\"}".to_string(),
+            ))
+        }
+    };
+    let _guard = write_lock.lock().map_err(|_| {
+        DbError::new("mutex envenenado: otro thread paniqueó mientras tenía el write_lock")
+    })?;
+    let mut store = sessions.lock().map_err(|_| {
+        DbError::new("session store envenenado: otro thread paniqueó mientras lo tenía")
+    })?;
+    store.gc_idle();
+    let mut sess = match store.current.take() {
+        Some(s) if s.id == id => s,
+        Some(other) => {
+            store.current = Some(other);
+            return Ok(Response::json(
+                404,
+                "{\"ok\":false,\"error\":\"session id no corresponde a la sesión activa\"}"
+                    .to_string(),
+            ));
+        }
+        None => {
+            return Ok(Response::json(
+                404,
+                "{\"ok\":false,\"error\":\"no hay sesión activa\"}".to_string(),
+            ))
+        }
+    };
+    let _ = sess.pager.rollback();
+    let _ = sess.pager.close();
+    Ok(Response::json(
+        200,
+        format!(
+            "{{\"ok\":true,\"message\":\"ROLLBACK\",\"db\":{}}}",
+            json_string(&sess.db_label)
+        ),
+    ))
 }
 
 #[cfg(test)]
