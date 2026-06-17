@@ -82,7 +82,7 @@ Tres cosas que enmarcan toda esta lista. Si las olvido en una próxima conversac
 ### 3. Fuzz testing + property tests — **parcial, mayoría abierta**
 
 **Qué**:
-- `cargo fuzz` sobre `parse(...)` — 1 hora mínima sin panic ni `unwrap` fallido. **PRINCIPAL pendiente.**
+- ~~`cargo fuzz` sobre `parse(...)` — 1 hora mínima sin panic ni `unwrap` fallido~~ — ✅ entregada 2026-06-15 ([ADR-0087](adr/0087-m4-fuzz-parser.md)). Hand-rolled (libFuzzer/AFL choca con Windows+GNU+ADR-0001); 1h limpia = **503.8M iters, 0 panics**. Evidencia: [`docs/fuzz/FUZZ-RUN-2026-06-15.md`](fuzz/FUZZ-RUN-2026-06-15.md). Próxima mejora: `cargo fuzz` real en CI Linux + fuzz sobre `exec()`.
 - ~~`proptest` sobre el Pager~~ — ✅ entregada 2026-06-15 ([ADR-0086](adr/0086-pager-proptest.md)). 3 invariantes (commit visibility, rollback discards, chained tx integrity), ~5100 ops random por corrida.
 - ~~**`proptest` sobre planner**~~ — ✅ entregada 2026-06-15 ([ADR-0084](adr/0084-m3-proptest-planner.md)). Hand-rolled zero-deps, 240 comparaciones por corrida sobre P5c/P5d/R6.
 - Extender los 3 crash tests sintéticos actuales a 10+ escenarios. Pendiente.

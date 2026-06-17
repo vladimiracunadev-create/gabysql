@@ -6,6 +6,24 @@
 
 ---
 
+## 2026-06-15 — M4: fuzz parser hand-rolled — 1 hora limpia, 500M iters, 0 panics
+
+> Línea pendiente del README ("X horas de fuzz") satisfecha con
+> evidencia citable. `cargo fuzz` real (libFuzzer / AFL) requiere
+> Linux + nightly + setup no trivial — entornos no disponibles. Solución
+> pragmática: generador hand-rolled determinístico + `panic::catch_unwind`
+> ejercitado durante 1 hora en release-mode local. 503 861 946 queries
+> random (70% pseudo-estructuradas tokens SQL + 30% mutación adversarial
+> de bytes) → **0 panics**. Evidencia inmutable en
+> `docs/fuzz/FUZZ-RUN-2026-06-15.md`. Limitaciones honestas en el ADR:
+> generación pura random (no coverage-guided), solo `parse()` no `exec()`.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **M4** | test | zero-bump | [0087](docs/adr/0087-m4-fuzz-parser.md) | Nuevo binario `tests/fuzz_parser.rs` con generador LCG-determinístico de tokens SQL (~90 keywords / 13 ops / literales) + mutación adversarial de bytes. `#[ignore]` para no correr en CI per-commit; runnable con `GABYSQL_FUZZ_PARSER_SECS=3600 cargo test ...`. Evidencia capturada en `docs/fuzz/FUZZ-RUN-2026-06-15.md` (formato reproducible: commit + commando + log). |
+
+---
+
 ## 2026-06-15 — test: property tests sobre el Pager (segunda capa de hardening)
 
 > Hermana de M3 (ADR-0084) un nivel más abajo. M3 defendió el planner;
