@@ -6,6 +6,52 @@
 
 ---
 
+## v0.2.0 — 2026-06-17 — Release tag
+
+> Primer release tageado desde v0.1.0 (2026-05-25, hace 23 días, 136
+> commits atrás). v0.1.0 era pre-Fase 2; v0.2.0 incluye **TODO el
+> trabajo entre medio**. Tag dispara `release.yml` → binarios
+> Linux/macOS/Windows publicados como GitHub Release.
+
+### Highlights respecto a v0.1.0
+
+**Bloques completos entregados**:
+- **Fase 2** completa: Y1-Y9 tipos extendidos (DECIMAL exacto i128, BLOB,
+  UUID, TIME, VARCHAR enforcement, INT widths, UNSIGNED), Z1-Z3 seguridad
+  (PBKDF2/scrypt/Blake2b/Argon2id estructural, GRANT/REVOKE, RLS con
+  USING+WITH CHECK).
+- **Fase 3** completa: P1 EXPLAIN + P2 EXPLAIN ANALYZE + P3+P3b ANALYZE
+  con stats persistidas + P4 stats por-columna (NDV/MCV/histograma) +
+  P5a-e planner cost-based real.
+- **Sesión maratón 2026-06-15** (16 pushes): R2 calibró INDEX_BREAKEVEN
+  con bench, R7+R9+R10 cierre de tensiones post-P5, ANSI fix sobre
+  UPDATE/DELETE WHERE pk no-existe, M3 property tests sobre planner, M4
+  fuzz parser hand-rolled (1h limpia / 503.8M iters / 0 panics), M6
+  EXPLAIN ANALYZE bias del estimator, **M12 SAVEPOINT/ROLLBACK TO/RELEASE
+  (ANSI SQL:2003)**, **M13 cross-request HTTP sessions** (sessions
+  single-slot via `X-Gabysql-Session`), Pager proptest.
+
+**Marcadores en cifras**:
+- Suite tests: ~165 → **828** verde + 4 ignored.
+- ADRs: 0066 → **0090** (+24 ADRs).
+- VERSION on-disk: 31 → **33** (P3b 31→32, P4 32→33).
+- Error codes: hasta 4123 → hasta **4141** (incluye SAVEPOINT_OUTSIDE_TX /
+  NOT_FOUND).
+- gabybench: nuevo modo `smoke` en CI con artifact + `all` 12.9 min sin SKIPs.
+
+**Breaking changes vs v0.1.0**:
+- Bases `.db` creadas con v0.1.0 (VERSION 13 o similar pre-Fase 2) son
+  rechazadas con `[GBY-1003]`. Migración manual: dump + recreate.
+- Sintaxis del server HTTP: `/exec` ahora acepta header
+  `X-Gabysql-Session` (backwards compatible — sin el header funciona
+  como antes).
+
+**Docs barridos**: 4 pases de coherencia detallista (commits 18bf3ef →
+7be3516 → fb7ca7a → 12d21ee) sincronizando README/STATUS/landing page
+GitHub Pages/ADRs viejos con el estado del código.
+
+---
+
 ## 2026-06-15 — M13: cross-request transactions HTTP (server sessions)
 
 > Hermana directa de M12 — una capa arriba, sobre el server HTTP. Antes
