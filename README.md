@@ -16,6 +16,50 @@
 📖 **Documentación online**: <https://vladimiracunadev-create.github.io/gabysql/> (auto-deploy desde `docs/` en cada push a `main`).
 📦 **Instalar en Windows**: `iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1 | iex` — ver [INSTALL.md](INSTALL.md).
 
+---
+
+## ⚡ Quickstart (30 segundos)
+
+**1) Bajar el binario** (Linux/macOS/Windows) desde la [release v0.2.0](https://github.com/vladimiracunadev-create/gabysql/releases/tag/v0.2.0). En Windows alcanza con:
+
+```powershell
+iwr https://raw.githubusercontent.com/vladimiracunadev-create/gabysql/main/scripts/install.ps1 | iex
+```
+
+**2) Crear una DB y meter datos** desde la CLI:
+
+```bash
+gabysql init demo.db
+gabysql exec demo.db "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL);"
+gabysql exec demo.db "INSERT INTO users VALUES (1, 'Ana'), (2, 'Beto');"
+gabysql exec demo.db "SELECT * FROM users;"
+```
+
+**3) Levantar el server HTTP** + abrir una sesión cross-request (M13, ANSI tx state mantenido a través de N requests — un ORM moderno puede usarlo):
+
+```bash
+gabysql-server -db demo.db -addr :8080 &
+
+# Abrir sesión
+SESSION=$(curl -sX POST http://localhost:8080/tx/begin -d '{}' | jq -r '.session')
+
+# Operar en varios requests dentro de la misma tx
+curl -X POST http://localhost:8080/exec \
+    -H "X-Gabysql-Session: $SESSION" \
+    -d '{"sql":"INSERT INTO users VALUES (3, \"Carla\")"}'
+
+curl -X POST http://localhost:8080/exec \
+    -H "X-Gabysql-Session: $SESSION" \
+    -d '{"sql":"SAVEPOINT antes_de_test; INSERT INTO users VALUES (4, \"X\"); ROLLBACK TO SAVEPOINT antes_de_test"}'
+
+# Confirmar (Ana, Beto, Carla persisten; X fue rollbackeado por el SAVEPOINT)
+curl -X POST "http://localhost:8080/tx/commit?session=$SESSION"
+```
+
+5 minutos, cero dependencias instaladas, transacciones serias vía HTTP.
+
+---
+
 `gabysql` es **un proyecto de aprendizaje + exploración sobre cómo se construye una base de datos**, escrito en Rust desde cero, usando la pregunta *"¿cómo se vería una DB nativa de la era de los agentes LLM?"* como hilo conductor. **No es un producto comercial y no apunta a serlo**: no hay usuarios, no hay clientes, no hay validación externa, y eso está bien. El objetivo es entender bases de datos a fondo y, en paralelo, explorar qué cambia cuando el consumidor principal no es un humano escribiendo SQL ni una app, sino un agente que razona sobre datos.
 
 El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica como **plataforma de exploración** (no como producto). El detalle de hacia dónde va el proyecto vive en **[docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md)**.
