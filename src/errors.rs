@@ -707,11 +707,11 @@ pub mod codes {
     /// `RELEASE SAVEPOINT` emitido fuera de una transacción explícita.
     /// Los savepoints solo tienen sentido dentro de un `BEGIN`/`COMMIT`
     /// — fuera del bloque no hay nada que checkpointear.
-    pub const SAVEPOINT_OUTSIDE_TX: u32 = 4143;
+    pub const SAVEPOINT_OUTSIDE_TX: u32 = 4140;
     /// M12: `ROLLBACK TO SAVEPOINT name` o `RELEASE SAVEPOINT name`
     /// con un `name` que no fue declarado en la tx actual (o que ya
     /// fue liberado con RELEASE).
-    pub const SAVEPOINT_NOT_FOUND: u32 = 4144;
+    pub const SAVEPOINT_NOT_FOUND: u32 = 4141;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

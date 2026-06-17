@@ -40,15 +40,15 @@ PostgreSQL).
 
 - **`SAVEPOINT name`**: pushea un snapshot completo del cache de
   páginas + header. Cero efecto sobre la transacción — solo
-  bookkeeping interno. `[GBY-4143]` si no hay `BEGIN` activo.
+  bookkeeping interno. `[GBY-4140]` si no hay `BEGIN` activo.
 - **`ROLLBACK TO SAVEPOINT name`**: busca el savepoint más reciente con
   ese nombre, descarta cualquier savepoint declarado DESPUÉS, y
   restaura el cache + header desde el snapshot. El savepoint **sigue
-  en la stack** (semántica ANSI: ROLLBACK TO no libera). `[GBY-4144]`
-  si el nombre no existe, `[GBY-4143]` si no hay tx.
+  en la stack** (semántica ANSI: ROLLBACK TO no libera). `[GBY-4141]`
+  si el nombre no existe, `[GBY-4140]` si no hay tx.
 - **`RELEASE SAVEPOINT name`**: pop del savepoint + todos los
   posteriores. NO revierte cambios — los inserts entre el savepoint y
-  el RELEASE permanecen. `[GBY-4144]` / `[GBY-4143]` igual que arriba.
+  el RELEASE permanecen. `[GBY-4141]` / `[GBY-4140]` igual que arriba.
 - **`COMMIT`** y **`ROLLBACK`** (full): limpian la stack de
   savepoints automáticamente.
 
@@ -93,8 +93,8 @@ verifican `explicit_tx` y forwardean al Pager.
 
 **Error codes nuevos** (`src/errors.rs`):
 
-- `SAVEPOINT_OUTSIDE_TX = 4143`.
-- `SAVEPOINT_NOT_FOUND = 4144`.
+- `SAVEPOINT_OUTSIDE_TX = 4140`.
+- `SAVEPOINT_NOT_FOUND = 4141`.
 
 ### Costo de memoria
 
@@ -159,11 +159,11 @@ Cinco tests `m12_*` en `tests/integration_test.rs`:
 - `m12_nested_savepoints_rollback_outer_invalidates_inner`:
   SAVEPOINT outer; INSERT(2); SAVEPOINT inner; INSERT(3); ROLLBACK TO
   outer → la stack pierde `inner`; `ROLLBACK TO inner` ahora rebota
-  `[GBY-4144]`.
+  `[GBY-4141]`.
 - `m12_savepoint_outside_tx_errors`: `SAVEPOINT sp` sin BEGIN →
-  `[GBY-4143]`.
+  `[GBY-4140]`.
 - `m12_rollback_to_unknown_savepoint_errors`: `BEGIN; ROLLBACK TO
-  nope` → `[GBY-4144]`.
+  nope` → `[GBY-4141]`.
 
 **Suite total**: 819 → **824** (+5 tests; el Pager proptest tampoco se
 rompe porque el modelo `BTreeMap<id, v>` no toca savepoints).

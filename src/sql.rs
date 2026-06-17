@@ -3315,7 +3315,7 @@ impl<'a> Engine<'a> {
     }
 
     /// M12 (2026-06-15, ADR-0089): marca un savepoint dentro de la
-    /// transacción explícita. `[GBY-4143]` si no hay `BEGIN` activo.
+    /// transacción explícita. `[GBY-4140]` si no hay `BEGIN` activo.
     fn exec_savepoint(&mut self, name: String) -> DbResult<ResultSet> {
         if !self.explicit_tx {
             return Err(coded(

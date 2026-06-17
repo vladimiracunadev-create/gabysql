@@ -194,20 +194,20 @@ CI corre todo lo anterior automáticamente en cada push a `main` y en cada PR. L
 > - ~~**P4** — stats por-columna (NDV vía HyperLogLog, MCV top-K, histogramas equi-depth)~~ ✓ entregado 2026-06-10 (ADR-0068, VERSION 33).
 > - ~~**P5b** — composite secondary index lookup~~ ✓ entregado 2026-06-11 (ADR-0069, zero-bump). Cierra ADR-0066 Gap 10.
 > - ~~**P5a** — selectivity estimation (consumir stats P4, anotar EXPLAIN)~~ ✓ entregado 2026-06-11 (ADR-0070, zero-bump).
-> - **P5c** — cost-based index choice: cuando hay múltiples paths (FullScan / single-col idx / composite idx), elegir por `est.match × cost_per_row(path)`. Consume `estimate_selectivity` de P5a.
-> - **P5d** — JOIN reorder por cardinalidad (commutative INNER JOINs primero — semánticamente seguro). Más adelante: choice de algoritmo (nested vs hash vs index-loop).
-> - **P5c-futuro** — prefix matching sobre composite indexes (requiere cambio de layout on-disk).
-> - **P6** — gabybench con benchmarks reproducibles + tracking de regresiones en CI.
+> - ~~**P5c** — cost-based index choice~~ ✓ entregado 2026-06-11 (ADR-0071, zero-bump) + R2 calibró umbral a 0.10 (ADR-0081).
+> - ~~**P5d** — JOIN reorder por cardinalidad~~ ✓ entregado 2026-06-11 como hash-join build-side swap (ADR-0072) + R3-cont sweep empírico (ADR-0085). JOIN reorder global (commutative) sigue siendo M9, pendiente.
+> - **M8** (ex "P5c-futuro") — prefix matching sobre composite indexes (requiere cambio de layout on-disk). Pendiente, ver TAREAS_PENDIENTES §6.5.
+> - ~~**P6** (ahora **M2**) — gabybench con benchmarks reproducibles en CI~~ ✓ entregado 2026-06-11 (ADR-0075). job CI `bench` sube `bench/results.json` como artifact por commit. Falta el comparador entre runs (diff vs baseline) — ver TAREAS_PENDIENTES.
 >
 > **Hilos cruzados** (no atan a una fase):
 > - **Z1g** — Argon2id RFC 9106 §A.3 fix definitivo (hoy estructural, no matchea vector; default sigue scrypt). Ver ADR-0061.
-> - **T1** — `SAVEPOINT` + `ROLLBACK TO SAVEPOINT`. Hoy `ROLLBACK` descarta todo el batch.
-> - **T2** — cross-request transactions en el server HTTP.
+> - ~~**T1** — `SAVEPOINT` + `ROLLBACK TO SAVEPOINT`~~ ✓ entregado 2026-06-15 como **M12** (ADR-0089). ANSI SQL:2003 completo: `SAVEPOINT name` / `ROLLBACK TO [SAVEPOINT] name` / `RELEASE [SAVEPOINT] name`.
+> - ~~**T2** — cross-request transactions en el server HTTP~~ ✓ entregado 2026-06-15 como **M13** (ADR-0090). 3 endpoints `/tx/{begin,commit,rollback}` + `/exec` con header `X-Gabysql-Session`. Single-slot global.
 > - **N1** — parámetros bind (`?`, `$1`) en API.
 > - **N2** — `PREPARE` / `EXECUTE` + plan cache.
 > - **N3** — `COPY FROM` / `COPY TO` streaming.
-> - **N4** — nested transactions (depende de T1).
-> - ~~**F2** — agregados sobre `SELECT` con JOIN~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 1+7). Limitación residual: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando.
+> - **N4** — nested transactions (T1/M12 entregado; N4 propiamente dicho — tx anidadas con BEGIN dentro de BEGIN — sigue pendiente, distinto de savepoints).
+> - ~~**F2** — agregados sobre `SELECT` con JOIN~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 1+7). ~~Limitación residual: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando~~ ✓ cerrado 2026-06-15 por **R9** (ADR-0079).
 > - ~~**F3** — full-scan-fallback para `BETWEEN` sin índice~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 2).
 > - ~~**W4** — window functions O(n²) → O(n) por partition~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 8 crítico).
 > - ~~**E5** — bare-SELECT sin FROM~~ ✓ cerrado 2026-05-30 (ADR-0066 Gap 3+5).

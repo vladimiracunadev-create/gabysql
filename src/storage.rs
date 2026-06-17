@@ -693,7 +693,7 @@ impl Pager {
     /// pocos MB) por savepoint.
     ///
     /// SQL: `SAVEPOINT my_point` solo es válido dentro de una
-    /// transacción activa — `[GBY-4143]` si no hay tx.
+    /// transacción activa — `[GBY-4140]` si no hay tx.
     ///
     /// Re-SAVEPOINT con el mismo nombre marca un nuevo punto sin
     /// borrar el anterior (semántica ANSI estándar: el nombre se
@@ -722,8 +722,8 @@ impl Pager {
     /// permanece en la stack (siguiendo SQL ANSI: ROLLBACK TO no lo
     /// libera, hay que llamar RELEASE).
     ///
-    /// SQL: `ROLLBACK TO [SAVEPOINT] my_point`. `[GBY-4144]` si el
-    /// nombre no existe, `[GBY-4143]` si no hay tx.
+    /// SQL: `ROLLBACK TO [SAVEPOINT] my_point`. `[GBY-4141]` si el
+    /// nombre no existe, `[GBY-4140]` si no hay tx.
     pub fn rollback_to_savepoint(&mut self, name: &str) -> DbResult<()> {
         if !self.in_tx {
             return Err(coded(
@@ -763,8 +763,8 @@ impl Pager {
     /// cualquier savepoint declarado después. NO restaura nada — los
     /// cambios entre el savepoint y el momento del RELEASE se quedan.
     ///
-    /// SQL: `RELEASE [SAVEPOINT] my_point`. `[GBY-4144]` si el nombre
-    /// no existe, `[GBY-4143]` si no hay tx.
+    /// SQL: `RELEASE [SAVEPOINT] my_point`. `[GBY-4141]` si el nombre
+    /// no existe, `[GBY-4140]` si no hay tx.
     pub fn release_savepoint(&mut self, name: &str) -> DbResult<()> {
         if !self.in_tx {
             return Err(coded(

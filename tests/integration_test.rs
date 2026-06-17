@@ -5150,7 +5150,7 @@ fn m12_nested_savepoints_rollback_outer_invalidates_inner() -> Result<(), Box<dy
     run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
     // SAVEPOINT outer; INSERT; SAVEPOINT inner; INSERT; ROLLBACK TO outer;
     // Tras ROLLBACK TO outer, el savepoint `inner` queda invalidado —
-    // referenciarlo debe fallar con [GBY-4144].
+    // referenciarlo debe fallar con [GBY-4141].
     // run_sql abre una sesión por call → todo en un único batch para
     // que la tx siga activa cuando intentamos el ROLLBACK TO inner_sp.
     let err = run_sql(
@@ -5167,8 +5167,8 @@ fn m12_nested_savepoints_rollback_outer_invalidates_inner() -> Result<(), Box<dy
     )
     .unwrap_err();
     assert!(
-        err.to_string().contains("[GBY-4144]"),
-        "esperaba GBY-4144 SAVEPOINT_NOT_FOUND, vi: {}",
+        err.to_string().contains("[GBY-4141]"),
+        "esperaba GBY-4141 SAVEPOINT_NOT_FOUND, vi: {}",
         err
     );
     cleanup(&[&db, &wal]);
@@ -5183,11 +5183,11 @@ fn m12_savepoint_outside_tx_errors() -> Result<(), Box<dyn Error>> {
     let mut pager = Pager::create(&db)?;
     pager.close()?;
     run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
-    // SAVEPOINT sin BEGIN previo → [GBY-4143].
+    // SAVEPOINT sin BEGIN previo → [GBY-4140].
     let err = run_sql(&db, "SAVEPOINT sp;").unwrap_err();
     assert!(
-        err.to_string().contains("[GBY-4143]"),
-        "esperaba GBY-4143 SAVEPOINT_OUTSIDE_TX, vi: {}",
+        err.to_string().contains("[GBY-4140]"),
+        "esperaba GBY-4140 SAVEPOINT_OUTSIDE_TX, vi: {}",
         err
     );
     cleanup(&[&db, &wal]);
@@ -5210,8 +5210,8 @@ fn m12_rollback_to_unknown_savepoint_errors() -> Result<(), Box<dyn Error>> {
     )
     .unwrap_err();
     assert!(
-        err.to_string().contains("[GBY-4144]"),
-        "esperaba GBY-4144 SAVEPOINT_NOT_FOUND, vi: {}",
+        err.to_string().contains("[GBY-4141]"),
+        "esperaba GBY-4141 SAVEPOINT_NOT_FOUND, vi: {}",
         err
     );
     cleanup(&[&db, &wal]);
