@@ -218,6 +218,15 @@ pub enum Statement {
     /// se pierden, porque el wrap externo es una única transacción
     /// física; documentado como limitación de la versión inicial de T.
     Rollback,
+    /// M12 (2026-06-15): `SAVEPOINT name` marca un punto-de-retorno
+    /// dentro de la transacción explícita. `ROLLBACK TO SAVEPOINT name`
+    /// revierte solo los cambios posteriores; `RELEASE SAVEPOINT name`
+    /// libera el slot sin restaurar. SQL ANSI estándar.
+    Savepoint(String),
+    /// M12: ver [`Statement::Savepoint`].
+    RollbackToSavepoint(String),
+    /// M12: ver [`Statement::Savepoint`].
+    ReleaseSavepoint(String),
 }
 
 /// Bloque I (2026-05-26): nivel superior de un statement SELECT.
@@ -3225,6 +3234,9 @@ impl<'a> Engine<'a> {
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
+            Statement::Savepoint(name) => self.exec_savepoint(name),
+            Statement::RollbackToSavepoint(name) => self.exec_rollback_to_savepoint(name),
+            Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(name),
             Statement::CreateDatabase(_)
             | Statement::DropDatabase(_)
             | Statement::ShowDatabases => Err(DbError::new(
@@ -3299,6 +3311,62 @@ impl<'a> Engine<'a> {
             columns: Vec::new(),
             rows: Vec::new(),
             message: Some("ROLLBACK".to_string()),
+        })
+    }
+
+    /// M12 (2026-06-15, ADR-0089): marca un savepoint dentro de la
+    /// transacción explícita. `[GBY-4143]` si no hay `BEGIN` activo.
+    fn exec_savepoint(&mut self, name: String) -> DbResult<ResultSet> {
+        if !self.explicit_tx {
+            return Err(coded(
+                codes::SAVEPOINT_OUTSIDE_TX,
+                format!(
+                    "SAVEPOINT '{}': no hay BEGIN activo; los savepoints \
+                     solo viven dentro de un bloque BEGIN/COMMIT",
+                    name
+                ),
+            ));
+        }
+        self.pager.savepoint(name.clone())?;
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("SAVEPOINT `{}`", name)),
+        })
+    }
+
+    /// M12: revierte cambios posteriores al savepoint `name`. El
+    /// savepoint sigue activo (puede haber otro `ROLLBACK TO` después).
+    /// Para liberarlo, `RELEASE SAVEPOINT name`.
+    fn exec_rollback_to_savepoint(&mut self, name: String) -> DbResult<ResultSet> {
+        if !self.explicit_tx {
+            return Err(coded(
+                codes::SAVEPOINT_OUTSIDE_TX,
+                format!("ROLLBACK TO SAVEPOINT '{}': no hay BEGIN activo", name),
+            ));
+        }
+        self.pager.rollback_to_savepoint(&name)?;
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("ROLLBACK TO SAVEPOINT `{}`", name)),
+        })
+    }
+
+    /// M12: libera el savepoint `name` (y cualquier posterior). Los
+    /// cambios entre savepoint y release se quedan — esto NO es rollback.
+    fn exec_release_savepoint(&mut self, name: String) -> DbResult<ResultSet> {
+        if !self.explicit_tx {
+            return Err(coded(
+                codes::SAVEPOINT_OUTSIDE_TX,
+                format!("RELEASE SAVEPOINT '{}': no hay BEGIN activo", name),
+            ));
+        }
+        self.pager.release_savepoint(&name)?;
+        Ok(ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            message: Some(format!("RELEASE SAVEPOINT `{}`", name)),
         })
     }
 
@@ -22782,9 +22850,27 @@ impl Parser {
             return Ok(Statement::Commit);
         }
         if self.match_keyword("ROLLBACK") {
+            // M12 (2026-06-15): `ROLLBACK TO [SAVEPOINT] name` lookahead.
+            // Si el siguiente keyword es TO, parseamos savepoint rollback;
+            // sino, es el ROLLBACK full clásico.
+            if self.match_keyword("TO") {
+                let _ = self.match_keyword("SAVEPOINT");
+                let name = self.expect_ident()?;
+                return Ok(Statement::RollbackToSavepoint(name));
+            }
             let _ = self.match_keyword("TRANSACTION");
             let _ = self.match_keyword("WORK");
             return Ok(Statement::Rollback);
+        }
+        // M12 (2026-06-15): SAVEPOINT name / RELEASE [SAVEPOINT] name.
+        if self.match_keyword("SAVEPOINT") {
+            let name = self.expect_ident()?;
+            return Ok(Statement::Savepoint(name));
+        }
+        if self.match_keyword("RELEASE") {
+            let _ = self.match_keyword("SAVEPOINT");
+            let name = self.expect_ident()?;
+            return Ok(Statement::ReleaseSavepoint(name));
         }
         Err(DbError::new(
             "sentencia no soportada (solo CREATE/INSERT/SELECT/UPDATE/DELETE/DROP/ALTER/RENAME/SHOW/INTEGRITY/TRUNCATE/BEGIN/COMMIT/ROLLBACK)",

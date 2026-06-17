@@ -5058,6 +5058,167 @@ fn t_begin_can_be_followed_by_begin_after_commit() -> Result<(), Box<dyn Error>>
 }
 
 // ============================================================
+// Bloque M12 (2026-06-15): SAVEPOINT / ROLLBACK TO SAVEPOINT /
+// RELEASE SAVEPOINT — recuperación parcial dentro de una transacción.
+// ============================================================
+
+#[test]
+fn m12_rollback_to_savepoint_preserves_pre_changes() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("m12_basic");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    // BEGIN; INSERT (1,10); SAVEPOINT sp1; INSERT (2,20); INSERT (3,30);
+    // ROLLBACK TO sp1; COMMIT;
+    // → debe quedar solo (1,10).
+    run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id, v) VALUES (1, 10);
+         SAVEPOINT sp1;
+         INSERT INTO t (id, v) VALUES (2, 20);
+         INSERT INTO t (id, v) VALUES (3, 30);
+         ROLLBACK TO SAVEPOINT sp1;
+         COMMIT;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t ORDER BY id;")?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "esperaba solo (1) tras ROLLBACK TO sp1, vi: {:?}",
+        ids
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn m12_release_savepoint_keeps_changes() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("m12_release");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    // BEGIN; INSERT (1); SAVEPOINT sp; INSERT (2); RELEASE sp; COMMIT;
+    // → quedan (1,2). RELEASE NO revierte.
+    run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id, v) VALUES (1, 10);
+         SAVEPOINT sp;
+         INSERT INTO t (id, v) VALUES (2, 20);
+         RELEASE SAVEPOINT sp;
+         COMMIT;",
+    )?;
+    let res = run_sql(&db, "SELECT id FROM t ORDER BY id;")?;
+    let ids: Vec<i64> = res[0]
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            _ => -1,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "RELEASE SAVEPOINT no debe revertir, vi: {:?}",
+        ids
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn m12_nested_savepoints_rollback_outer_invalidates_inner() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("m12_nested");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    // SAVEPOINT outer; INSERT; SAVEPOINT inner; INSERT; ROLLBACK TO outer;
+    // Tras ROLLBACK TO outer, el savepoint `inner` queda invalidado —
+    // referenciarlo debe fallar con [GBY-4144].
+    // run_sql abre una sesión por call → todo en un único batch para
+    // que la tx siga activa cuando intentamos el ROLLBACK TO inner_sp.
+    let err = run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id, v) VALUES (1, 10);
+         SAVEPOINT outer_sp;
+         INSERT INTO t (id, v) VALUES (2, 20);
+         SAVEPOINT inner_sp;
+         INSERT INTO t (id, v) VALUES (3, 30);
+         ROLLBACK TO SAVEPOINT outer_sp;
+         ROLLBACK TO SAVEPOINT inner_sp;
+         COMMIT;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4144]"),
+        "esperaba GBY-4144 SAVEPOINT_NOT_FOUND, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn m12_savepoint_outside_tx_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("m12_outside");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    // SAVEPOINT sin BEGIN previo → [GBY-4143].
+    let err = run_sql(&db, "SAVEPOINT sp;").unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4143]"),
+        "esperaba GBY-4143 SAVEPOINT_OUTSIDE_TX, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn m12_rollback_to_unknown_savepoint_errors() -> Result<(), Box<dyn Error>> {
+    let db = temp_db_path("m12_unknown");
+    let wal = wal_path(&db);
+    cleanup(&[&db, &wal]);
+    let mut pager = Pager::create(&db)?;
+    pager.close()?;
+    run_sql(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT);")?;
+    let err = run_sql(
+        &db,
+        "BEGIN;
+         INSERT INTO t (id, v) VALUES (1, 10);
+         ROLLBACK TO SAVEPOINT nope;",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("[GBY-4144]"),
+        "esperaba GBY-4144 SAVEPOINT_NOT_FOUND, vi: {}",
+        err
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque J: DML masivo — multi-row INSERT, INSERT...SELECT, TRUNCATE
 // ============================================================
 

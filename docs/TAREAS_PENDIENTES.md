@@ -157,7 +157,7 @@ Items que NO son reparaciones (no hay nada roto), pero amplían lo entregado en 
 | **M8** | Prefix matching sobre composite indexes (`WHERE a=X` con índice `(a,b)`) | Hoy cae a FullScan. Requiere cambio de layout on-disk a lexicographic tuple-bytes. | 1 push grande (~800 LOC + bump VERSION) |
 | **M9** | Base table reorder para INNER JOIN chains (P5d extendido) | Hoy P5d solo swap el step current. Reorder global requiere refactor de `build_join_scope`. | 1 push (~600 LOC, riesgo medio) |
 | **M11** | WAL-mode opt-in (ADR-0018) | Habilita lectores concurrentes. Espacio comparativo serio vs SQLite. | 1 push grande |
-| **M12** | SAVEPOINT + ROLLBACK TO SAVEPOINT (T1) | Hoy ROLLBACK descarta todo el batch. | 1 push (~400 LOC) |
+| ~~**M12**~~ | ~~SAVEPOINT + ROLLBACK TO SAVEPOINT~~ — ✅ entregada 2026-06-15 ([ADR-0089](adr/0089-m12-savepoints.md)). 3 statements + Pager con full cache snapshot por savepoint. Desbloquea M13. | — |
 | **M13** | Cross-request transactions en server HTTP (T2) | Sin esto no se puede escribir un cliente que haga BEGIN/INSERT/INSERT/COMMIT. | 1 push (~500 LOC, depende de M12) |
 
 ---

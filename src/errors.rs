@@ -703,6 +703,15 @@ pub mod codes {
     /// `EXPLAIN ANALYZE` (defer P2). El mensaje detalla qué falta y
     /// dónde se planea entregar.
     pub const UNSUPPORTED_SYNTAX: u32 = 4139;
+    /// M12 (2026-06-15): `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` /
+    /// `RELEASE SAVEPOINT` emitido fuera de una transacción explícita.
+    /// Los savepoints solo tienen sentido dentro de un `BEGIN`/`COMMIT`
+    /// — fuera del bloque no hay nada que checkpointear.
+    pub const SAVEPOINT_OUTSIDE_TX: u32 = 4143;
+    /// M12: `ROLLBACK TO SAVEPOINT name` o `RELEASE SAVEPOINT name`
+    /// con un `name` que no fue declarado en la tx actual (o que ya
+    /// fue liberado con RELEASE).
+    pub const SAVEPOINT_NOT_FOUND: u32 = 4144;
 
     // ---------- Server / HTTP (5000s) ----------
     /// Falta el parámetro `?db=...` en una request multi-DB.

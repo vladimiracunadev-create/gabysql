@@ -6,6 +6,20 @@
 
 ---
 
+## 2026-06-15 — M12: SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE
+
+> Recuperación parcial dentro de transacción — feature SQL estándar
+> (ANSI SQL:2003) que cualquier ORM y herramienta de migración asume.
+> Antes, intentar `SAVEPOINT` rebotaba con `[GBY-4029] "savepoints aún
+> no soportados"`. Ahora funciona. Desbloquea M13 (cross-request tx en
+> server HTTP) que requería este primitivo. Suite 819 → **824** (+5).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **M12** | feat | zero-bump | [0089](docs/adr/0089-m12-savepoints.md) | 3 statements nuevos (`SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name`). Pager con `savepoints: Vec<Savepoint>` (full cache snapshot + header por savepoint, ~4MB). PageCache gana `full_snapshot()` y `restore_snapshot()`. 3 exec methods, 5 lookaheads del parser, 2 error codes (`SAVEPOINT_OUTSIDE_TX = 4143`, `SAVEPOINT_NOT_FOUND = 4144`). +5 tests `m12_*` (rollback preserva pre-changes, release no revierte, nested invalidation, outside-tx, unknown name). |
+
+---
+
 ## 2026-06-15 — M6: EXPLAIN ANALYZE anota bias del estimator (est vs actual)
 
 > Diagnóstico directo del estimator en una sola lectura. Pre-M6 había

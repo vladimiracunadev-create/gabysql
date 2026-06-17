@@ -389,6 +389,35 @@ impl PageCache {
         self.map.clear();
     }
 
+    /// M12 (2026-06-15): full clone del cache (todas las páginas, dirty
+    /// y clean, con su flag). Usado por `Pager::savepoint` para
+    /// snapshotear el estado completo y permitir restauración por
+    /// `ROLLBACK TO SAVEPOINT`. Costo: O(N × page_size) por savepoint.
+    fn full_snapshot(&self) -> HashMap<u32, CachedPage> {
+        self.map
+            .iter()
+            .map(|(k, slot)| (*k, slot.page.clone()))
+            .collect()
+    }
+
+    /// M12: reemplaza el contenido del cache por un snapshot previo.
+    /// Las páginas que estaban en cache pero NO en el snapshot se
+    /// descartan (fueron loaded/created post-savepoint). Mantiene el
+    /// counter para no perturbar la lógica LRU.
+    fn restore_snapshot(&mut self, snapshot: HashMap<u32, CachedPage>) {
+        self.map.clear();
+        for (no, page) in snapshot {
+            self.counter += 1;
+            self.map.insert(
+                no,
+                CacheSlot {
+                    page,
+                    last_access: self.counter,
+                },
+            );
+        }
+    }
+
     /// Snapshot of (page_no, page) for every dirty entry. Used by
     /// `commit` to pull the WAL payload before fsync-ing.
     fn dirty_snapshot(&self) -> Vec<(u32, CachedPage)> {
@@ -414,6 +443,16 @@ impl PageCache {
     }
 }
 
+/// M12 (2026-06-15): snapshot inmutable del Pager en el punto de un
+/// SAVEPOINT. Permite revertir mediante `ROLLBACK TO SAVEPOINT` sin
+/// descartar el resto de la transacción. Costo de memoria por
+/// savepoint: ~tamaño del cache (incluye dirty + clean).
+struct Savepoint {
+    name: String,
+    header: Header,
+    cache_snapshot: HashMap<u32, CachedPage>,
+}
+
 pub struct Pager {
     path: PathBuf,
     file: File,
@@ -421,6 +460,14 @@ pub struct Pager {
     header: Header,
     cache: PageCache,
     in_tx: bool,
+    /// M12: stack de savepoints activos en la transacción actual. Cada
+    /// `begin()` arranca vacío; `commit()`/`rollback()` también limpian.
+    /// Snapshots se push-ean en orden cronológico; los más recientes al
+    /// final. Nombres pueden repetirse — SQL estándar: re-SAVEPOINT con
+    /// el mismo nombre marca un nuevo punto y "deactiva" el anterior
+    /// (no lo borra). `rollback_to_savepoint` busca rposition (el más
+    /// reciente con ese nombre).
+    savepoints: Vec<Savepoint>,
 }
 
 impl Pager {
@@ -476,6 +523,7 @@ impl Pager {
             header,
             cache: PageCache::new(DEFAULT_CACHE_PAGES),
             in_tx: false,
+            savepoints: Vec::new(),
         })
     }
 
@@ -525,6 +573,7 @@ impl Pager {
             header,
             cache: PageCache::new(DEFAULT_CACHE_PAGES),
             in_tx: false,
+            savepoints: Vec::new(),
         })
     }
 
@@ -609,6 +658,9 @@ impl Pager {
         self.wal = None;
         let _ = fs::remove_file(wal_path_for(&self.path));
         self.in_tx = false;
+        // M12: commit cierra la tx — todos los savepoints quedan
+        // invalidados (sus snapshots ya están en disco vía el WAL).
+        self.savepoints.clear();
         Ok(())
     }
 
@@ -629,6 +681,112 @@ impl Pager {
         verify_page_checksum(&page0)?;
         self.header = Header::decode(&page0)?;
         self.in_tx = false;
+        // M12: full rollback descarta TODO — savepoints incluidos.
+        self.savepoints.clear();
+        Ok(())
+    }
+
+    /// M12 (2026-06-15): marca un punto-de-retorno con `name` dentro de
+    /// la transacción activa. Snapshotea el estado completo del cache
+    /// más el header. Cuando se hace `rollback_to_savepoint(name)`, ese
+    /// snapshot se restaura. Costo: ~tamaño del cache (en general unos
+    /// pocos MB) por savepoint.
+    ///
+    /// SQL: `SAVEPOINT my_point` solo es válido dentro de una
+    /// transacción activa — `[GBY-4143]` si no hay tx.
+    ///
+    /// Re-SAVEPOINT con el mismo nombre marca un nuevo punto sin
+    /// borrar el anterior (semántica ANSI estándar: el nombre se
+    /// "esconde" hasta release).
+    pub fn savepoint(&mut self, name: String) -> DbResult<()> {
+        if !self.in_tx {
+            return Err(coded(
+                codes::SAVEPOINT_OUTSIDE_TX,
+                format!(
+                    "SAVEPOINT '{}': no hay transacción activa; usar BEGIN antes",
+                    name
+                ),
+            ));
+        }
+        self.savepoints.push(Savepoint {
+            name,
+            header: self.header.clone(),
+            cache_snapshot: self.cache.full_snapshot(),
+        });
+        Ok(())
+    }
+
+    /// M12: revierte el estado del Pager al snapshot capturado por el
+    /// `SAVEPOINT name` más reciente. Savepoints declarados DESPUÉS de
+    /// `name` quedan invalidados (popped); el savepoint con `name`
+    /// permanece en la stack (siguiendo SQL ANSI: ROLLBACK TO no lo
+    /// libera, hay que llamar RELEASE).
+    ///
+    /// SQL: `ROLLBACK TO [SAVEPOINT] my_point`. `[GBY-4144]` si el
+    /// nombre no existe, `[GBY-4143]` si no hay tx.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> DbResult<()> {
+        if !self.in_tx {
+            return Err(coded(
+                codes::SAVEPOINT_OUTSIDE_TX,
+                format!(
+                    "ROLLBACK TO SAVEPOINT '{}': no hay transacción activa",
+                    name
+                ),
+            ));
+        }
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| {
+                coded(
+                    codes::SAVEPOINT_NOT_FOUND,
+                    format!(
+                        "ROLLBACK TO SAVEPOINT '{}': el savepoint no existe en \
+                         la transacción actual",
+                        name
+                    ),
+                )
+            })?;
+        // Pop savepoints declarados después de `pos` — quedan
+        // invalidados porque ahora estamos antes de ellos.
+        self.savepoints.truncate(pos + 1);
+        // Restaurar desde el snapshot de `pos`. Clonamos porque el
+        // savepoint permanece en la stack (no se libera con ROLLBACK TO).
+        let sp = &self.savepoints[pos];
+        self.header = sp.header.clone();
+        self.cache.restore_snapshot(sp.cache_snapshot.clone());
+        Ok(())
+    }
+
+    /// M12: libera (quita de la stack) el savepoint con `name` y
+    /// cualquier savepoint declarado después. NO restaura nada — los
+    /// cambios entre el savepoint y el momento del RELEASE se quedan.
+    ///
+    /// SQL: `RELEASE [SAVEPOINT] my_point`. `[GBY-4144]` si el nombre
+    /// no existe, `[GBY-4143]` si no hay tx.
+    pub fn release_savepoint(&mut self, name: &str) -> DbResult<()> {
+        if !self.in_tx {
+            return Err(coded(
+                codes::SAVEPOINT_OUTSIDE_TX,
+                format!("RELEASE SAVEPOINT '{}': no hay transacción activa", name),
+            ));
+        }
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| {
+                coded(
+                    codes::SAVEPOINT_NOT_FOUND,
+                    format!(
+                        "RELEASE SAVEPOINT '{}': el savepoint no existe en la \
+                         transacción actual",
+                        name
+                    ),
+                )
+            })?;
+        self.savepoints.truncate(pos);
         Ok(())
     }
 
