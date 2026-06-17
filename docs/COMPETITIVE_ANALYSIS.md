@@ -59,13 +59,15 @@ Leyenda: 🟢 = gana / 🟡 = empate o aceptable / 🔴 = pierde / ⚪ = no apli
 | **CRUD básico (INSERT/UPDATE/DELETE)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Índices secundarios (equality)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **`UNIQUE` (single-column, inline + standalone)** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **Índices compuestos / multi-column UNIQUE** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Índices compuestos / multi-column UNIQUE** | 🟢 (K2 all-INT + K3 TEXT/UUID/etc) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **JOIN** (INNER/CROSS/LEFT/RIGHT/FULL/USING/NATURAL + index-loop) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
 | **Subqueries** (`IN`/`=`/`EXISTS` correlacionado) | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **ORDER BY** | 🟢 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **GROUP BY / HAVING / agregados (COUNT/SUM/AVG/MIN/MAX/DISTINCT)** | 🟢 (single-table) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **Window functions** | 🔴 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
-| **Optimizer cost-based** | 🔴 | 🟡 | 🟢 | ⚪ | 🟢 | 🟢 | 🟡 |
+| **ORDER BY** | 🟢 (single-col; multi-col pendiente) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **GROUP BY / HAVING / agregados (COUNT/SUM/AVG/MIN/MAX/DISTINCT)** | 🟢 (incl. agregados sobre JOIN F2 + COUNT(DISTINCT) sobre JOIN R9) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Window functions** | 🟢 (W3+W4 O(n) por partition; sin frame explícito) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Optimizer cost-based** | 🟡 (P5a-e + R6: stats persistidas, skip-index, hash-join build-side; sin JOIN reorder global) | 🟡 | 🟢 | ⚪ | 🟢 | 🟢 | 🟡 |
+| **SAVEPOINT (ANSI SQL:2003)** | 🟢 (M12, ADR-0089) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 | 🟢 |
+| **Cross-request tx HTTP** | 🟢 (M13 single-slot via X-Gabysql-Session) | 🟢 | 🟢 (vía connection pooling cliente) | ⚪ | 🟢 | 🟢 | 🟢 |
 | **MVCC** | 🔴 | 🔴 | 🟢 | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Concurrencia (multi-writer)** | 🔴 (mutex) | 🔴 (single writer) | 🟢 | 🟡 | 🟢 | 🟢 | 🟢 |
 | **Replicación** | 🔴 | 🔴 (fuera del core) | 🔴 | 🔴 | 🟢 | 🟢 | 🟢 |
@@ -223,8 +225,8 @@ GROUP BY region;
 
 ## 🧠 Resumen ejecutivo: ¿cuándo elegir `gabysql`?
 
-> Hoy, sin caminar A todavía, `gabysql` es razonable si **(1) tu app es Rust nativa**, **(2) rechazas C en el core por compliance o gusto técnico**, **(3) tu workload es OLTP relacional clásico** (lookups por PK/índice, JOINs equi-predicado, subqueries `IN`/`EXISTS`, reporting básico con `GROUP BY`/`HAVING`/agregados single-table desde el bloque F), **(4) valoras supply-chain integrada** y **(5) podés vivir sin window functions / CTE recursivas / agregados sobre JOIN todavía**.
+> Hoy `gabysql` es razonable si **(1) tu app es Rust nativa**, **(2) rechazas C en el core por compliance o gusto técnico**, **(3) tu workload es OLTP relacional clásico o reporting analítico modesto** (lookups por PK/índice, JOINs equi-predicado con index-loop optimization, subqueries `IN`/`EXISTS` correlated, agregados con `GROUP BY`/`HAVING` también sobre `SELECT con JOIN` desde F2, `COUNT(DISTINCT col)` sobre JOIN desde R9, window functions `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`/`SUM OVER` O(n) por partition desde W3+W4, CTEs `WITH [RECURSIVE]` desde W1+W2), **(4) valoras supply-chain integrada** y **(5) querés transacciones serias** (`BEGIN`/`COMMIT`/`ROLLBACK` + `SAVEPOINT`/`ROLLBACK TO`/`RELEASE` ANSI SQL:2003 desde M12 + cross-request HTTP sessions desde M13 — ORMs pueden mantener tx state a través de N requests).
 
-Si rompes alguno de esos cinco puntos, hay un competidor mejor: SQLite, DuckDB, Postgres o SurrealDB según el caso.
+Si necesitás **MVCC**, **multi-writer concurrente**, **OLAP analítico con compresión columnar**, **replicación o wire-protocol compatible con Postgres/MySQL**, hay un competidor mejor: SQLite, DuckDB, Postgres o SurrealDB según el caso.
 
 Eso no es un defecto del producto — es la consecuencia honesta de que `gabysql` es un **MVP de un solo desarrollador con disciplina, no una alternativa enterprise**. La pregunta correcta no es "¿es mejor que Postgres?" — la pregunta correcta es "¿en qué nicho específico vale más este producto que sus alternativas, y cómo lo expandimos?". El [Camino A](COMMERCIAL_ROADMAP.md) responde a esa segunda pregunta.

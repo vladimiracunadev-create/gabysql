@@ -12,7 +12,7 @@
 
 | Fase | Subsistema | Estado | Detalle |
 |---|---|:---:|---|
-| **Fase 1** | Core (Pager, B+Tree, WAL, catálogo, índices) | 🟢 | VERSION on-disk 32, CRC32 trailer, replay, autovacuum no-impl |
+| **Fase 1** | Core (Pager, B+Tree, WAL, catálogo, índices) | 🟢 | VERSION on-disk **33** (último bump P4 / 2026-06-10), CRC32 trailer, replay, autovacuum no-impl |
 | **Fase 1** | SQL declarativo y procedural | 🟢 | DDL+DML+JOINs+CTEs+window functions+triggers+procedures+functions+IF/CASE/WHILE/FOR/RAISE/EXCEPTION |
 | **Fase 1** | Tipos extendidos (Y1→Y9) | 🟢 | INT widths, DECIMAL exacto i128, BLOB, TIME, UUID, UNSIGNED, aliases ANSI |
 | **Fase 2** | Identidad SQL-level (Z1+Z1b+Z1c+Z1d+Z1e+Z1f) | 🟡 | USERS+ROLES, PBKDF2 default, scrypt scheme=2, Blake2b RFC 7693, Argon2id estructural (no matchea vector RFC 9106 §A.3, mar­cado en ADR-0061) |
@@ -21,10 +21,11 @@
 | **Cross-fase** | ADR-0066 (F3+F2+W4+E5+K3+K4+N5+P5b) | 🟢 | **10/10 gaps del bench cerrados**. 9 primeros en 7 bloques el 2026-05-30 (BETWEEN sin idx, agregados sobre JOIN/view, window funcs O(n), bare-SELECT, UNIQUE multi-col TEXT, auto-index prefix PK, DEFAULT con función). Gap 10 cerrado el 2026-06-11 por P5b (composite secondary index lookup). |
 | **Fase 3** | Cost estimates per-column (P4) | 🟢 | P4 cerrado 2026-06-10. NDV vía HyperLogLog 256-reg + splitmix64 + MCV top-K=10 + histograma equi-depth ~16 buckets persistidos. VERSION 32→33. Ver [ADR-0068](docs/adr/0068-p4-column-stats.md). |
 | **Fase 3** | Planner-as-optimizer (P5a-e) | 🟢 | Fase 3 cerrada 2026-06-11. P5a (selectivity), P5b (composite idx), P5c (cost-based skip), P5d (hash-join build-side), P5e (JOIN annotation). Reparaciones: R1 (stats stale), R4 (HLL tests), M2 (bench en CI), R8 (UPDATE/DELETE composite), R6 (bucket size check). |
+| **Cross-fase** | Sesión maratón 2026-06-15 (R7+R9+R10+R2+R3+R3-cont+ANSI+M3+M4+M6+M12+M13 + Pager proptest) | 🟢 | 7/9 tensiones post-P5 cerradas + 3 redes property-based (planner M3, Pager, parser fuzz M4 con 503.8M iters / 1h limpia) + ANSI fix UPDATE/DELETE WHERE pk no-existe → 0 filas + M6 EXPLAIN ANALYZE bias + **M12 SAVEPOINT ANSI SQL:2003** + **M13 cross-request tx HTTP via X-Gabysql-Session**. R2 calibró INDEX_BREAKEVEN con bench real (0.20 → 0.10). R9 cerró COUNT(DISTINCT col) sobre JOIN. |
 | **Fase 4** | Operación de producto, release, backups | 🟡 | gabysql backup/restore/verify funciona, falta release process formal |
-| **Fase 5** | AI-native (MCP gateway) | 🟡 | binario `gabysql-mcp` existe, falta endurecer |
+| **Fase 5** | AI-native (MCP gateway) | 🟡 | binario `gabysql-mcp` existe, falta endurecer + demo pública con agente real |
 
-**Tests integración: 749 verdes + 1 ignored** (Argon2id RFC test marcado por la limitación arriba; +4 P3b suite).
+**Tests: 828 verdes + 4 ignored** (818 integration + 4 server E2E M13 + 3 proptest planner M3 + 3 proptest Pager; ignored: 1 Argon2id RFC + 2 env-var serial + 1 fuzz parser on-demand).
 
 ---
 
@@ -36,8 +37,8 @@
 
 1. ~~**P3b — Persistir stats en el catálogo.**~~ ✅ **cerrado 2026-06-09** ([ADR-0067](docs/adr/0067-p3b-persistent-stats.md)). Nuevo `ObjectKind::TableStats` + bump VERSION 31→32. Lifecycle ligado a la tabla (DROP TABLE borra). Hidratación automática en `Engine::new`. +4 tests `p3b_*`.
 2. **P4 — Stats por-columna.** NDV vía HyperLogLog (8KB por columna), top-K MCV (K=10), histogramas equi-depth (50 buckets). Habilita estimación de selectividad real: `WHERE col = 'X'` puede estimar rows en lugar de mostrar solo `est.rows=total`. El slot `ObjectKind::TableStats` ya existe (P3b); P4 extiende `StatsMeta` con un `Vec<ColumnStats>`.
-3. **P5 — Planner-as-optimizer.** Reordena INNER JOINs por costo (selectividad acumulada × cardinalidad), elige índice cuando hay varios candidatos sobre la misma tabla, decide hash-join vs nested-loop por tamaño relativo. Sin esto, gabysql sigue siendo "ejecutor con plan fijo". Sub-tarea **P5b** cierra el Gap 10 del bench ([ADR-0066](docs/adr/0066-bench-exposed-gaps.md)).
-4. **P6 — `gabybench` con benchmarks reproducibles** + tracking de regresiones en CI.
+3. ~~**P5 — Planner-as-optimizer.**~~ ✅ **cerrado 2026-06-11** ([ADR-0070 P5a / ADR-0069 P5b / ADR-0071 P5c / ADR-0072 P5d / ADR-0073 P5e](docs/adr/0070-p5a-selectivity-estimation.md)) + **calibrado 2026-06-15** por R2 (INDEX_BREAKEVEN 0.20 → 0.10, ADR-0081). M3 property tests (ADR-0084) defienden correctness.
+4. ~~**P6 — `gabybench` con benchmarks reproducibles**~~ ✅ **cerrado 2026-06-11 como M2** ([ADR-0075](docs/adr/0075-m2-gabybench-in-ci.md)). Job CI `bench` corre smoke en cada commit + sube `bench/results.json` como artifact. Falta el comparador entre runs (diff vs baseline) para detectar regresiones automáticamente.
 
 ### Fase 4 — operación de producto
 
@@ -73,7 +74,7 @@ Ver [docs/AGENDA_INVESTIGACION.md](docs/AGENDA_INVESTIGACION.md): schema semánt
 ## 🚦 Estado actual
 
 - Core reescrito en Rust
-- Pager con header, páginas fijas y formato en disco **versión `31`** (Z1f, 2026-05-29). Los 7 bloques del 2026-05-30 (F3/F2/W4/E5/K3/K4/N5) son planner-only — sin bump on-disk.
+- Pager con header, páginas fijas y formato en disco **versión `33`** (último bump P4 = column stats / 2026-06-10; P3b 31→32, P4 32→33). Los 7 bloques del 2026-05-30 (F3/F2/W4/E5/K3/K4/N5) + los 15 de 2026-06-15 son planner-only o storage-runtime — sin bump on-disk.
 - Cada página persistida lleva trailer CRC32-IEEE (4 bytes); corrupción se detecta al leer y al replay del WAL
 - WAL after-image con replay por `COMMIT` y verificación CRC del payload de cada página
 - **B+Tree real** con nodos internos sobre PK `INT`; `root_page` permanece estable cruzando splits

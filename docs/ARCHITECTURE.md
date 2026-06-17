@@ -61,7 +61,7 @@ graph LR
 Responsable de:
 - crear (sin sobrescribir) y abrir archivos `.db`; expone `create_force` para reset explícito
 - adquirir un **lock exclusivo cross-process** sobre el `.db` con `File::try_lock()` en cada `create/open`: dos procesos `gabysql` apuntando al mismo archivo → el segundo falla rápido con `database is locked by another process` (ver [ADR-0013](adr/0013-process-level-file-lock.md))
-- mantener el header del formato `VERSION=31` (corte semántico Z1f/Argon2id partial fix; bumps 14→31 extendieron triggers/procedures/functions/types extendidos/security; rechaza explícitamente versiones anteriores; ver [COMPATIBILITY.md](../COMPATIBILITY.md) y [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md))
+- mantener el header del formato `VERSION=33` (corte vigente al 2026-06-15; último bump P4 = column stats / 2026-06-10; bumps 14→33 extendieron triggers/procedures/functions/types extendidos/security/stats persistidas; rechaza explícitamente versiones anteriores; ver [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md))
 - gestionar páginas (4096 bytes, los últimos 4 son trailer CRC32-IEEE)
 - finalizar el checksum antes de cada flush y verificarlo al leer
 - escribir WAL after-image, validar el CRC del payload de cada record y aplicar replay si hay marcador `COMMIT`

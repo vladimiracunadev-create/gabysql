@@ -13,7 +13,7 @@ Este documento es el ancla central. Las políticas (cómo reportar, qué está i
 | :--- | :--- | :--- | :--- |
 | Corrupción accidental (corte de luz, fallo de disco, escritura torcida) | CRC32-IEEE en los últimos 4 bytes de cada página; verificación en cada lectura del `.db` y al replay del WAL | [`src/storage.rs:finalize_page_checksum / verify_page_checksum`](../src/storage.rs) | [docs/TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) §Identidad del formato y §WAL |
 | Replay de WAL truncado | Verificación CRC sobre el payload de cada record antes de aplicar al `.db`; abort explícito | [`src/storage.rs:Wal::replay_to`](../src/storage.rs) | [RUNBOOK.md §Recovery tras caída](../RUNBOOK.md) |
-| Apertura de DB con formato incompatible | `Header::decode` rechaza con mensaje explícito y bumpea `VERSION` cada vez que cambia el formato | [`src/storage.rs:Header::decode`](../src/storage.rs) | [CHANGELOG.md](../CHANGELOG.md), [COMPATIBILITY.md §Formato en disco](../COMPATIBILITY.md) |
+| Apertura de DB con formato incompatible | `Header::decode` rechaza con mensaje explícito y bumpea `VERSION` cada vez que cambia el formato | [`src/storage.rs:Header::decode`](../src/storage.rs) | [CHANGELOG.md](../CHANGELOG.md), [TECHNICAL_SPECS.md §Identidad del formato](TECHNICAL_SPECS.md) |
 | Pérdida silenciosa por `gabysql init` sobre archivo existente | `Pager::create` rehúsa overwrite; se requiere `create_force` (CLI: `--force`) | [`src/storage.rs:Pager::create_internal`](../src/storage.rs) | [USER_MANUAL.md §1. CLI](../USER_MANUAL.md), [TROUBLESHOOTING.md §refusing to overwrite](../TROUBLESHOOTING.md) |
 | Apertura concurrente del mismo `.db` por dos procesos (corrupción por escrituras intercaladas) | Lock exclusivo cross-process vía `File::try_lock()` en `Pager::create/open` — advisory en Linux/macOS, mandatory en Windows. El segundo proceso falla fast con `database is locked by another process`. | [`src/storage.rs:Pager::open` / `Pager::create_internal`](../src/storage.rs) | [ADR-0013](adr/0013-process-level-file-lock.md), [TROUBLESHOOTING.md §database is locked](../TROUBLESHOOTING.md) |
 | Hash del catálogo dependiente de la versión de Rust (DBs ilegibles tras toolchain upgrade) | FNV-1a-64 fijado en código, independiente de `std` | [`src/catalog.rs:hash_name`](../src/catalog.rs), [`src/index.rs:hash_value`](../src/index.rs) | [docs/TECHNICAL_SPECS.md §Catálogo](TECHNICAL_SPECS.md) |
@@ -103,7 +103,7 @@ Esta postura es deliberada y se prefiere a:
 | Tema | Documento |
 | :--- | :--- |
 | Política de disclosure responsable, scope in/out, SLA de respuesta | [SECURITY.md](../SECURITY.md) |
-| Versiones soportadas y formato en disco vigente | [SECURITY.md §Versiones soportadas](../SECURITY.md), [COMPATIBILITY.md](../COMPATIBILITY.md) |
+| Versiones soportadas y formato en disco vigente | [SECURITY.md §Versiones soportadas](../SECURITY.md), [TECHNICAL_SPECS.md](TECHNICAL_SPECS.md) |
 | Actualizaciones automáticas de dependencias | [`.github/dependabot.yml`](../.github/dependabot.yml) — cargo + github-actions + docker, semanal |
 | Checklist pre-release (incl. comprobación de detect-secrets) | [RELEASE.md](../RELEASE.md) |
 | Cómo pedir ayuda sin filtrar payloads sensibles | [SUPPORT.md](../SUPPORT.md) |

@@ -51,13 +51,12 @@ Ver el contexto extenso en [RECRUITER.md](../RECRUITER.md) y la postura completa
 
 Antes de invertir tiempo o de adoptarlo:
 
-- ❌ **Reemplazo directo de PostgreSQL/MySQL** — sin MVCC, sin planner cost-based, sin replicación, sin window functions ni CTE recursivas. Ver [docs/COMMERCIAL_ROADMAP.md](COMMERCIAL_ROADMAP.md) para la diferencia entre los caminos A/B/C.
+- ❌ **Reemplazo directo de PostgreSQL/MySQL en el wire-protocol** — los clientes tienen que hablar HTTP/JSON o usar el crate embebido (no hay implementación del Postgres/MySQL wire protocol). Sin MVCC, sin replicación. El **planner SÍ es cost-based** (P5a-e + R6 + R2 calibrated) pero sin JOIN reorder global. Ver [docs/COMMERCIAL_ROADMAP.md](COMMERCIAL_ROADMAP.md) para los caminos A/B/C.
 - ❌ **Workloads analíticos OLAP** — el motor es row-oriented, sin compresión columnar. Para eso está DuckDB.
-- ❌ **Concurrencia masiva** — un solo mutex de proceso para escrituras; lecturas concurrentes sin MVCC.
-- 🟡 **Window functions** ✅ (W3 + W4 O(n) por partition, 2026-05-30), **CTE recursivas** ✅ (W2, anchor bare-SELECT vía E5/2026-05-30), **vistas** ✅ (V; agregados sobre vista vía F2/2026-05-30) — **vistas materializadas con REFRESH** sigue pendiente. Reporting con `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT` ahora cubre también `SELECT con JOIN` (F2, 2026-05-30). Único residual: `COUNT(DISTINCT col)` sobre JOIN sigue `[GBY-4028]`.
-- ❌ **Compatibilidad wire-protocol con Postgres/MySQL** — los clientes tienen que hablar HTTP/JSON o usar el crate embebido.
+- ❌ **Concurrencia masiva** — single-writer estricto (Mutex global + file lock cross-process); cross-request sessions HTTP también son single-slot (M13). Lectores concurrentes sin MVCC.
+- 🟢 **Window functions** ✅ (W3 + W4 O(n) por partition, 2026-05-30), **CTE recursivas** ✅ (W2, 2026-05-30), **vistas** ✅ (V; agregados sobre vista vía F2/2026-05-30) — **vistas materializadas con REFRESH** sigue pendiente. Reporting con `GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`DISTINCT` cubre `SELECT con JOIN` (F2, 2026-05-30) **y `COUNT(DISTINCT col)` sobre JOIN (R9, 2026-06-15, ADR-0079)**.
 
-> **Lo que ya entrega hoy en SQL relacional clásico:** `JOIN` completo (INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING, NATURAL, multi-tabla, self-join), `WHERE col IN/= (SELECT ...)`, `WHERE [NOT] EXISTS (SELECT ...)` correlacionada, `ORDER BY ASC/DESC`, `LIMIT/OFFSET`, índices secundarios (hash + INT-ordered con `BETWEEN`), `FOREIGN KEY` con `ON DELETE`, constraints declarativas. Ver [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) para la gramática completa.
+> **Lo que ya entrega hoy en SQL relacional clásico:** `JOIN` completo (INNER, CROSS, LEFT/RIGHT/FULL [OUTER], USING, NATURAL, multi-tabla, self-join), `WHERE col IN/= (SELECT ...)`, `WHERE [NOT] EXISTS (SELECT ...)` correlacionada, `ORDER BY ASC/DESC` (single-col), `LIMIT/OFFSET`, índices secundarios (hash + INT-ordered con `BETWEEN`, composite K2+K3), `FOREIGN KEY` con `ON DELETE`/`ON UPDATE` y multi-col, constraints declarativas (`NOT NULL`/`UNIQUE`/`DEFAULT`/`CHECK`/named), `BEGIN`/`COMMIT`/`ROLLBACK` + **`SAVEPOINT`/`ROLLBACK TO`/`RELEASE`** (M12 ANSI SQL:2003) + **sessions cross-request HTTP** (M13 vía `X-Gabysql-Session`). Ver [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) para la gramática completa.
 
 ---
 

@@ -93,12 +93,17 @@
 <span class="c-out">│  3 │ sur    │</span>
 <span class="c-out">└────┴────────┘</span>
 
+<span class="c-kw">SAVEPOINT</span> antes_de_ajuste;
+<span class="c-kw">UPDATE</span> ventas <span class="c-kw">SET</span> monto = monto + 50 <span class="c-kw">WHERE</span> region = <span class="c-str">'sur'</span>;
+<span class="c-out">OK (2 filas actualizadas)</span>
+<span class="c-kw">ROLLBACK TO SAVEPOINT</span> antes_de_ajuste;       <span class="c-com">-- M12 (ANSI SQL:2003)</span>
+<span class="c-out">OK</span>
+
 <span class="c-kw">SELECT</span> region, <span class="c-fn">SUM</span>(monto) <span class="c-kw">AS</span> total
   <span class="c-kw">FROM</span> ventas
  <span class="c-kw">WHERE</span> monto <span class="c-kw">IS NOT NULL</span> <span class="c-kw">AND</span> region <span class="c-kw">LIKE</span> <span class="c-str">'%r%'</span>
  <span class="c-kw">GROUP BY</span> region
-<span class="c-kw">HAVING</span> <span class="c-fn">SUM</span>(monto) &gt; 100
- <span class="c-kw">ORDER BY</span> total <span class="c-kw">DESC</span>;
+<span class="c-kw">HAVING</span> <span class="c-fn">SUM</span>(monto) &gt; 100;
 <span class="c-out">┌────────┬───────┐</span>
 <span class="c-out">│ region │ total │</span>
 <span class="c-out">├────────┼───────┤</span>
