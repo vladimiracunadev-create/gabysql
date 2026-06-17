@@ -25,7 +25,7 @@ RAISE 'aborted';                        -- = RAISE EXCEPTION (default)
 ```
 
 - **Default level es EXCEPTION** (consistente con PG).
-- **Mensaje es un literal STRING** — formato `%` estilo PG diferido a X4d (workaround: `CONCAT` antes).
+- **Mensaje es un literal STRING** — formato `%` estilo PG diferido a X4d (workaround: `CONCAT` antes). **Actualización 2026-06-15**: el formato `%` con arity validation entró en X5 ([ADR-0041](0041-x5-procedural-refinements.md), `[GBY-4120]` si los `%` no matchean los args). X4d ([ADR-0036](0036-exception-loop-x4d.md)) entregó los handlers `EXCEPTION WHEN`.
 - **EXCEPTION**: levanta `DbError::new("[GBY-4111] <msg>")`. Propaga normalmente — el wrap del caller hace rollback de la transacción. No hay handler en X4c (X4d).
 - **NOTICE**: retorna ResultSet vacío con `message = "NOTICE: <msg>"`. No interrumpe el flujo.
 

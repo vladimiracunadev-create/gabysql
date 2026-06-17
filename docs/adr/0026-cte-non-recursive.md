@@ -54,7 +54,7 @@ Las CTEs viven solo en el AST en runtime. No tocan `Catalog`, no agregan slots a
 | Código | Nombre | Cuándo |
 |---|---|---|
 | `GBY-4079` | `CTE_DUPLICATE_NAME` | Dos CTEs con el mismo nombre dentro del mismo `WITH` (case-insensitive). |
-| `GBY-4080` | `CTE_RECURSIVE_NOT_SUPPORTED` | `WITH RECURSIVE` — diferido a W2. |
+| `GBY-4080` | `CTE_RECURSIVE_NOT_SUPPORTED` | `WITH RECURSIVE` — diferido a W2. **Actualización 2026-06-15**: W2 entregado por [ADR-0027](0027-with-recursive.md) el 2026-05-28; `[GBY-4080]` ya no se emite desde el path `WITH RECURSIVE`. |
 | `GBY-4081` | `CTE_COLUMN_ALIASES_NOT_SUPPORTED` | `WITH name(c1, c2) AS (...)` — diferido. Workaround inline. |
 
 ## 🧪 Validación

@@ -82,6 +82,14 @@ no recibir un Err que descarta el plan.
    (PostgreSQL ofrece `EXPLAIN (ANALYZE) BEGIN; ... ROLLBACK`).
    Descartado: gabysql aún no expone transacciones explícitas como
    primer-clase. Sería una abstracción nueva. Lo dejo para Fase 4 (TX).
+
+   > 📝 **Actualización 2026-06-15**: gabysql SÍ expone transacciones
+   > explícitas desde el bloque T (`BEGIN`/`COMMIT`/`ROLLBACK`, 2026-05-25)
+   > + M12 SAVEPOINT ([ADR-0089](0089-m12-savepoints.md)) + M13 cross-request
+   > sessions ([ADR-0090](0090-m13-cross-request-tx.md)). El descarte
+   > de "EXPLAIN ANALYZE con rollback automático" sigue válido por la
+   > **segunda** razón (sería una abstracción que cambia semántica del
+   > EXPLAIN ANALYZE) — no por la primera.
 2. **Reportar tiempo por sub-step (per-scan timing)**.
    Descartado para P2: requiere instrumentar cada loop interno
    (exec_select, exec_join, exec_filter, exec_order). Demasiado scope

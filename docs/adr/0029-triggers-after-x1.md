@@ -74,7 +74,7 @@ donde `body_sql` es el texto SQL del body — mismo enfoque que `ViewMeta.source
 | Código | Nombre | Cuándo |
 |---|---|---|
 | `GBY-4092` | `TRIGGER_NAME_COLLIDES` | El nombre colisiona con una tabla, vista u otro trigger. |
-| `GBY-4093` | `TRIGGER_BODY_INVALID` | Body no es DML, body vacío, o BEFORE pedido (diferido a X2). |
+| `GBY-4093` | `TRIGGER_BODY_INVALID` | Body no es DML, body vacío, o BEFORE pedido (diferido a X2). **Actualización 2026-06-15**: X2 ([ADR-0030](0030-triggers-before-multistmt-x2.md), 2026-05-28) entregó BEFORE triggers + body multi-statement. Hoy `[GBY-4093]` se emite solo si el body es inválido por otra razón. |
 | `GBY-4094` | `TRIGGER_NEW_OLD_OUT_OF_SCOPE` | `NEW.x` en DELETE, `OLD.x` en INSERT, o columna inexistente. |
 | `GBY-4095` | `TRIGGER_RECURSION_DEPTH_EXCEEDED` | Cascada de triggers > 16 niveles. |
 | `GBY-4096` | `TRIGGER_NOT_FOUND` | `DROP TRIGGER` sobre un nombre que no existe (sin `IF EXISTS`). |

@@ -102,14 +102,16 @@ Suite total: **567/567 pass** (`cargo test --lib --tests`).
 
 ## 🔭 Futuro
 
+> 📝 **Actualización 2026-06-15**: el "item grande" (DECIMAL exacto) y UUID v7 ya entregados. Lista anotada abajo.
+
 Lo que queda en familia tipos:
 
-- **`DECIMAL(p,s)` exacto** (`Value::Decimal` con i128+scale) — el item grande que queda.
-- **`UNSIGNED BIGINT` real** (`u64`) — requiere ampliar `Value::Integer` a un wrapper signed/unsigned.
-- **`CHAR(n)` con padding** ANSI strict a la derecha.
-- **Conteo por code points** en VARCHAR(n) (vs bytes UTF-8).
-- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**, **TZ types**.
-- **BLOB indexable** (overflow chain + bytewise key).
-- **`CONVERT(blob USING utf8)`**.
-- **UUID v1/v6/v7** (timestamp-based) además de v4.
-- **`gen_random_bytes(n)`** scalar function.
+- ~~**`DECIMAL(p,s)` exacto** (`Value::Decimal` con i128+scale)~~ ✅ entregado por **Y6** ([ADR-0046](0046-decimal-exact-y6.md), 2026-05-29) + aritmética Y7/Y8 + cierre Y9.
+- **`UNSIGNED BIGINT` real** (`u64`) — requiere ampliar `Value::Integer` a un wrapper signed/unsigned. **Sigue pendiente** (UNSIGNED INT/SMALLINT/TINYINT sí enforcen rango desde Y5; el caso BIGINT u64 real no).
+- **`CHAR(n)` con padding** ANSI strict a la derecha. **Sigue pendiente.**
+- **Conteo por code points** en VARCHAR(n) (vs bytes UTF-8). **Sigue pendiente.**
+- **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**, **TZ types**. **Siguen pendientes.**
+- **BLOB indexable** (overflow chain + bytewise key). **Sigue pendiente** (BLOB existe pero no es indexable).
+- **`CONVERT(blob USING utf8)`**. **Sigue pendiente.**
+- **UUID v1/v6/v7** (timestamp-based) además de v4 — **v7 entregado por Y9** ([ADR-0049](0049-y9-closure-y-block.md), `UUID_V7()`). v1/v6 siguen pendientes.
+- **`gen_random_bytes(n)`** scalar function. **Sigue pendiente.**

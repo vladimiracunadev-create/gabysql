@@ -88,7 +88,7 @@ Necesario por el code 11 en disco y el nuevo flag bit. V21 rechazado con `[GBY-1
 
 ## 🚫 Limitaciones documentadas
 
-- **Aritmética mixta promueve a f64** (lossy). Aritmética Decimal-pura aún no implementada.
+- **Aritmética mixta promueve a f64** (lossy). Aritmética Decimal-pura aún no implementada. **Actualización 2026-06-15**: Y7 ([ADR-0047](0047-decimal-arith-compare-y7.md), 2026-05-29) entregó `+`/`-`/comparaciones exactas. Y8 ([ADR-0048](0048-decimal-mul-div-mod-y8.md), 2026-05-29) entregó `*`/`/`/`%` exactos. Hoy la aritmética Decimal-pura existe en SUM/AVG agregados también (Y9, [ADR-0049](0049-y9-closure-y-block.md)).
 - **CAST AS DECIMAL no admite sufijo `(p,s)`** — usar columna tipada para precisión declarativa.
 - **`DEFAULT DECIMAL` se persiste como string** y se re-parsea al insertar (no compromete precisión, pero requiere round-trip).
 - **No indexable como ordered** (la representación i128+scale no es lex-comparable directo).

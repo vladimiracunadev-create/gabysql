@@ -11,6 +11,8 @@ X1 ([ADR-0029](0029-triggers-after-x1.md)) y X2 ([ADR-0030](0030-triggers-before
 
 Funciones escalares invocables desde SELECT (`CREATE FUNCTION RETURNS scalar`) quedan diferidas a X3b — requieren extender el AST de `Expr` con un variant nuevo y tocar ~160 match arms. Procedures como statement-level routines son una pieza mucho más acotada que paga sola.
 
+> 📝 **Actualización 2026-06-15**: X3b entregada por [ADR-0032](0032-user-functions-x3b.md) el 2026-05-28. Funciones escalares ya son invocables desde SELECT/WHERE/CHECK/HAVING/UPDATE SET.
+
 ## 💡 Decisión
 
 ### 1. Sintaxis canónica

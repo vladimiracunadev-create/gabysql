@@ -49,6 +49,8 @@ V8 nunca pudo persistir 2/3 (el parser los rechazaba), así que la extensión es
 
 **Hoy `ON UPDATE` no se dispara**: gabysql prohíbe `UPDATE` sobre la PK del padre con `[GBY-4008] UPDATE_PK_NOT_ALLOWED`, así que no hay ocasión para que el motor evalúe la acción. Persistirla igual permite que un release futuro lift la restricción sin otro bump de formato.
 
+> 📝 **Actualización 2026-06-15**: residual #4 ([ADR-0024](0024-on-update-activation.md), 2026-05-27) levantó la restricción — `UPDATE` de PK ahora funciona y `ON UPDATE CASCADE/SET NULL/SET DEFAULT` se dispara en cascada sobre todas las FKs entrantes.
+
 ### 3. Parser: `parse_fk_actions` reemplaza a `parse_on_delete`
 
 Acepta `ON DELETE` y `ON UPDATE` en **cualquier orden**, cada uno una sola vez. Acciones soportadas idénticas en ambos:

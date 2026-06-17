@@ -140,9 +140,11 @@ cuenta como suma, era ya parte del conteo.
 - (-) `analyzed_at_nanos` no se usa todavía en ninguna decisión — EXPLAIN
   no muestra "stats stale (analizadas hace X minutos)". Queda para P4/P5.
 - (-) `TRUNCATE TABLE` no resetea las stats persistidas. Quien trunque y
-  no re-ejecute `ANALYZE` verá `est.rows` viejos en EXPLAIN. Esperable
-  porque TRUNCATE en gabysql aún no está implementado como statement
-  separado; cuando llegue, debe borrar el record igual que DROP.
+  no re-ejecute `ANALYZE` verá `est.rows` viejos en EXPLAIN. **Actualización
+  2026-06-15**: TRUNCATE como statement existe desde el bloque J
+  (`Statement::Truncate` / `exec_truncate`). Lo que sigue pendiente es
+  que `TRUNCATE` borre el record `ObjectKind::TableStats` análogamente
+  a DROP — ver R5 en [TAREAS_PENDIENTES.md §4](../TAREAS_PENDIENTES.md).
 - (-) Auto-ANALYZE (autovacuum-style) sigue pendiente. P3b solo persiste
   lo que el usuario disparó explícitamente. Sin un scheduler, las stats
   pueden volverse stale silenciosamente si la tabla cambia mucho.

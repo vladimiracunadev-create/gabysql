@@ -119,12 +119,14 @@ Suite total: **544/544 pass** (`cargo test --lib --tests`).
 
 ## 🔭 Futuro (Y4+)
 
+> 📝 **Actualización 2026-06-15**: 3 de los 4 ítems ya fueron entregados. Lista actualizada abajo.
+
 Lo que aún queda en la familia "tipos":
 
-- **`BLOB` / `BYTEA` / `BINARY`** — requiere `Value::Bytes` y cambio de serialización (no es alias, es nueva variante).
-- **`DECIMAL(p,s)` exacto** — requiere `Value::Decimal` (string interno o `i128 + scale`); cambia aritmética también.
-- **`UNSIGNED TINYINT/SMALLINT/INT/BIGINT`** (MySQL-style) — Y3 sólo enforce signed.
-- **`CHAR(n)` con padding** a la derecha (estándar SQL).
+- ~~**`BLOB` / `BYTEA` / `BINARY`**~~ ✅ entregado por **Y4** ([ADR-0044](0044-blob-bytea-y4.md), 2026-05-29) — `Value::Bytes` real.
+- ~~**`DECIMAL(p,s)` exacto**~~ ✅ entregado por **Y6** ([ADR-0046](0046-decimal-exact-y6.md), 2026-05-29) — `Value::Decimal` con `i128 + scale`. Aritmética en Y7/Y8.
+- ~~**`UNSIGNED TINYINT/SMALLINT/INT/BIGINT`**~~ ✅ entregado por **Y5** ([ADR-0045](0045-unsigned-and-uuid-y5.md), 2026-05-29) — bit alto del `int_width`.
+- **`CHAR(n)` con padding** a la derecha (estándar SQL). **Sigue pendiente.**
 - **Conteo por code points** en `VARCHAR(n)` (vs bytes UTF-8 actual de Y2).
 - **`ARRAY[T]`**, **`ENUM(...)`**, **`INTERVAL`**, **`TIME WITH TIME ZONE`**, **`TIMESTAMP WITH TIME ZONE`**.
 - **Generación auto de UUID** (`gen_random_uuid()`, `uuid_v4()`).

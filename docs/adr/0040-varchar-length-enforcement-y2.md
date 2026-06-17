@@ -114,10 +114,12 @@ Suite total: **510/510 pass** (`cargo test --lib --tests`).
 
 ## 🔭 Futuro
 
+> 📝 **Actualización 2026-06-15**: la mayoría de estos pendientes ya fueron entregados en bloques posteriores. Lista anotada abajo.
+
 Pendientes que aún no entran:
 
-- **Conteo por code points** en `CHAR(n)`/`VARCHAR(n)` (opt-in vía cláusula `CHARACTER SET`).
-- **Range enforcement** para `SMALLINT` ([-32768, 32767]) y `TINYINT` ([-128, 127]) — requiere persistir el `int_width` análogamente.
-- **`BLOB`/`BYTEA`** con `Value::Bytes` real (Y3).
-- **`DECIMAL(p,s)` exacto** con `Value::Decimal` (Y3).
-- **`CHAR(n)` con padding** (estándar SQL exige padding a `n` espacios — hoy se guarda como vino).
+- **Conteo por code points** en `CHAR(n)`/`VARCHAR(n)` (opt-in vía cláusula `CHARACTER SET`). **Sigue pendiente.**
+- ~~**Range enforcement** para `SMALLINT` y `TINYINT`~~ ✅ entregado por **Y3** ([ADR-0043](0043-int-range-enforcement-y3.md), 2026-05-29). Hoy también `MEDIUMINT`, `INT4` y `UNSIGNED` (Y5/[ADR-0045](0045-unsigned-and-uuid-y5.md)).
+- ~~**`BLOB`/`BYTEA`** con `Value::Bytes` real~~ ✅ entregado por **Y4** ([ADR-0044](0044-blob-bytea-y4.md), 2026-05-29).
+- ~~**`DECIMAL(p,s)` exacto** con `Value::Decimal`~~ ✅ entregado por **Y6** ([ADR-0046](0046-decimal-exact-y6.md), 2026-05-29) + aritmética Y7/Y8 ([ADR-0047](0047-decimal-arith-compare-y7.md)/[ADR-0048](0048-decimal-mul-div-mod-y8.md)).
+- **`CHAR(n)` con padding** (estándar SQL exige padding a `n` espacios — hoy se guarda como vino). **Sigue pendiente.**
