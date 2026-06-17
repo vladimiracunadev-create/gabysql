@@ -41,7 +41,8 @@
 | `WHERE` con `AND`/`OR`/`NOT` + paréntesis y 3VL para NULL (bloque E1) | DML | 🟢 |
 | `WHERE` con `<`, `>`, `<=`, `>=`, `<>`/`!=`, `[NOT] LIKE` (con `%`/`_`), `IS [NOT] NULL`, `[NOT] IN (lista)` (bloque E2) | DML | 🟢 |
 | Agregaciones: `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`, `DISTINCT` (bloque F) | DML | 🟢 (sin JOINs aún) |
-| Transacciones explícitas: `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, `ROLLBACK` (bloque T) | TCL | 🟢 (batch-local; `SAVEPOINT` y cross-request pendientes) |
+| Transacciones explícitas: `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, `ROLLBACK` (bloque T) | TCL | 🟢 (batch-local + `SAVEPOINT`/`ROLLBACK TO`/`RELEASE` desde M12, ADR-0089) |
+| Cross-request transactions HTTP via `X-Gabysql-Session` header + endpoints `/tx/{begin,commit,rollback}` (M13) | TCL | 🟢 (single-slot global; ver API.md) |
 | Multi-row `INSERT` `VALUES (...), (...)`, `INSERT INTO t SELECT ...`, `TRUNCATE [TABLE]` (bloque J) | DML | 🟢 |
 | `UPSERT` (`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE SET ...`), `REPLACE INTO`, `RETURNING` (bloque J2) | DML | 🟢 (sin `EXCLUDED.col`) |
 | `INNER JOIN ... ON l = r`, `CROSS JOIN`, comma-syntax, aliases (`AS`), multi-tabla chain, self-join | DML | 🟢 |
@@ -954,7 +955,7 @@ SELECT COUNT(DISTINCT user_id) FROM sessions;
 -- - Las funciones agregadas solo se permiten en SELECT y HAVING, no en WHERE ([GBY-4025]).
 -- - Sin GROUP BY pero con agregados → UNA fila global (incluso sobre input vacío: COUNT=0, resto=NULL).
 -- - Agregados sobre SELECT con JOIN funcionan desde F2 (2026-05-30, ADR-0066 Gap 1+7).
---   Único residual: COUNT(DISTINCT col) sobre JOIN sigue rebotando con [GBY-4028].
+-- - COUNT(DISTINCT col) sobre JOIN funciona desde R9 (2026-06-15, ADR-0079).
 
 -- AND / OR / NOT + paréntesis (bloque E1)
 SELECT id FROM users WHERE active = TRUE AND score BETWEEN 80 AND 100;
@@ -1234,10 +1235,14 @@ tcl ::= "BEGIN" ["TRANSACTION" | "WORK"]
       | "COMMIT" ["TRANSACTION" | "WORK"]
       | "END" ["TRANSACTION" | "WORK"]
       | "ROLLBACK" ["TRANSACTION" | "WORK"]
+      | "ROLLBACK" "TO" ["SAVEPOINT"] ident                  -- M12
+      | "SAVEPOINT" ident                                    -- M12
+      | "RELEASE" ["SAVEPOINT"] ident                        -- M12
 ```
 
 Sinónimos ANSI aceptados: `BEGIN` = `START TRANSACTION`. `COMMIT` = `END`.
 Las palabras `TRANSACTION` y `WORK` después de `BEGIN`/`COMMIT`/`END`/`ROLLBACK` son opcionales.
+Las palabras `SAVEPOINT` después de `ROLLBACK TO` o `RELEASE` son opcionales (compat con PostgreSQL).
 
 ### ✅ Ejemplos
 
@@ -1252,14 +1257,37 @@ BEGIN;
   UPDATE inventory SET stock = stock - 1 WHERE sku = 'ABC';
   -- ... validación adicional falla ...
 ROLLBACK;
+
+-- M12: recuperación parcial con SAVEPOINT (ANSI SQL:2003).
+BEGIN;
+  INSERT INTO usuarios (id, nombre) VALUES (1, 'Ana');
+  SAVEPOINT antes_de_imports;
+    INSERT INTO usuarios SELECT * FROM csv_dump;  -- falla con PK dup
+  ROLLBACK TO SAVEPOINT antes_de_imports;          -- vuelve al checkpoint
+  -- Ana sigue intacta. Sigo con otro intento.
+  INSERT INTO usuarios (id, nombre) VALUES (2, 'Beto');
+  RELEASE SAVEPOINT antes_de_imports;              -- libera el slot (no revierte)
+COMMIT;
 ```
+
+### 🧠 Semántica `SAVEPOINT` (M12)
+
+- **`SAVEPOINT name`** marca un punto-de-retorno dentro de la tx. Cero efecto sobre la tx en sí; solo bookkeeping (snapshot del cache del Pager).
+- **`ROLLBACK TO [SAVEPOINT] name`** descarta cambios desde el savepoint. **El savepoint sigue en la stack** — hay que `RELEASE` para liberarlo. Cualquier savepoint declarado DESPUÉS de `name` queda invalidado.
+- **`RELEASE [SAVEPOINT] name`** libera el slot del savepoint (y los posteriores). **NO revierte cambios** — los inserts entre savepoint y release permanecen.
+- `COMMIT` y `ROLLBACK` full limpian toda la stack automáticamente.
+- Re-`SAVEPOINT` con el mismo nombre marca un nuevo punto sin borrar el anterior (semántica ANSI).
+- **`[GBY-4140]`** si SAVEPOINT/ROLLBACK TO/RELEASE se emite sin `BEGIN` activo.
+- **`[GBY-4141]`** si el nombre no existe en la tx actual.
+
+Ver [ADR-0089](adr/0089-m12-savepoints.md).
 
 ### ⚠️ Limitaciones
 
-- **`ROLLBACK` descarta TODO el cache del Pager**: en un batch que mezcla sentencias antes y después de `BEGIN`, las anteriores también se pierden. `BEGIN`/`ROLLBACK` funciona limpio cuando `BEGIN` es la primera sentencia del batch.
-- **No hay transacciones cross-request en el server HTTP**: cada `/exec` es independiente. Mantener una tx abierta entre requests requiere session state — pendiente para una iteración futura.
-- **`SAVEPOINT` / `ROLLBACK TO SAVEPOINT`** no implementados (P1).
-- **`SET TRANSACTION ISOLATION LEVEL ...`** y `BEGIN READ ONLY` no implementados (P2).
+- **`ROLLBACK` descarta TODO el cache del Pager**: en un batch que mezcla sentencias antes y después de `BEGIN`, las anteriores también se pierden. `BEGIN`/`ROLLBACK` funciona limpio cuando `BEGIN` es la primera sentencia del batch. **Para revertir parcialmente** dentro de la tx, usar `SAVEPOINT` (M12).
+- ~~No hay transacciones cross-request en el server HTTP~~ ✅ entregado por **M13** (2026-06-15, ADR-0090). El cliente abre sesión con `POST /tx/begin`, envía el `session_id` en cada `/exec` (header `X-Gabysql-Session` o `?session=<id>`), y cierra con `POST /tx/commit` o `POST /tx/rollback`. Ver [API.md](API.md).
+- ~~**`SAVEPOINT` / `ROLLBACK TO SAVEPOINT`** no implementados (P1).~~ ✅ implementados desde **M12** (2026-06-15, ADR-0089). Sintaxis: `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name`. ANSI SQL:2003 completo.
+- **`SET TRANSACTION ISOLATION LEVEL ...`** y `BEGIN READ ONLY` no implementados (P2). gabysql es single-writer estricto — el isolation siempre es serializable de facto; no hay nivel para configurar.
 
 ### ❌ Errores típicos
 
@@ -1846,7 +1874,7 @@ DROP TRIGGER IF EXISTS audit_user_insert;
 | Mensaje | Causa |
 | :--- | :--- |
 | `[GBY-4092] CREATE TRIGGER '...': ya existe un objeto ...` | Colisión de nombre con tabla / vista / trigger. |
-| `[GBY-4093] BEFORE triggers no se soportan en este release` | Diferido a X2. |
+| `[GBY-4093] el body debe arrancar con INSERT, UPDATE, DELETE o REPLACE` (también body inválido por otras razones) | Body con shape no soportado. Históricamente este mismo código bloqueaba `BEFORE` triggers en X1 (pre-X2); `BEFORE` está soportado desde X2 (2026-05-28). |
 | `[GBY-4093] el body debe arrancar con INSERT, UPDATE, DELETE o REPLACE` | Body es SELECT u otra cosa. |
 | `[GBY-4094] trigger 'X': NEW.y no es una columna válida` | Referencia a columna inexistente o NEW/OLD en evento incompatible. |
 | `[GBY-4095] cascada de triggers excedió la profundidad 16` | Recursión runaway (un trigger dispara otro DML que dispara más triggers). |
@@ -1865,14 +1893,19 @@ DROP TRIGGER IF EXISTS audit_user_insert;
 
 Las sentencias dentro del block se separan con `;` y se ejecutan en orden. Si alguna falla, las restantes NO se ejecutan y el error se propaga al DML principal — toda la transacción rollback. `BEGIN ... END` puede anidarse aunque no agrega expresividad en X2 (no hay scope ni control de flujo).
 
-### ⚠️ No soportado todavía
+### ⚠️ No soportado (estado al 2026-06-15)
 
-- **NEW mutable en BEFORE** (`NEW.updated_at := NOW()`) — diferido a X3+.
-- **Control de flujo en el body** (`IF`/`LOOP`/`WHILE`, variables `DECLARE`) — diferido a X3+.
-- **`RAISE EXCEPTION` / `RAISE NOTICE`** — workaround: hacer un DML que falle.
+**Entregado posteriormente** (notar que esta sección estaba escrita para X1/X2):
+
+- ~~**Control de flujo en el body** (`IF`/`LOOP`/`WHILE`, variables `DECLARE`)~~ ✅ entregado por X4 → X4f (PL/pgSQL completo, 2026-05-29). `IF`/`CASE`/`WHILE`/`FOR`/`LOOP`/`DECLARE`/`SET`/`RAISE`/`EXCEPTION`/`RETURN`. Ver secciones X4b–X4f y X5–X6 abajo.
+- ~~**`RAISE EXCEPTION` / `RAISE NOTICE`**~~ ✅ entregado por X4c (2026-05-28). Sintaxis `RAISE [EXCEPTION|NOTICE] 'msg'`.
+- ~~**Lenguaje procedural** (variables, IF/THEN, LOOP, EXCEPTION)~~ ✅ entregado por X4 → X6.
+
+**Sigue pendiente**:
+
+- **NEW mutable en BEFORE** (`NEW.updated_at := NOW()` desde dentro del body del trigger). Lo que pasó el caller persiste tal cual.
 - **`FOR EACH STATEMENT`** (vs `FOR EACH ROW`) — fuera de scope.
 - **`INSTEAD OF` triggers** (sobre vistas) — fuera de scope.
-- **Lenguaje procedural** (variables, IF/THEN, LOOP, EXCEPTION) — X3+.
 - **OLD en UPSERT que terminó en UPDATE** — el path `INSERT ... ON CONFLICT DO UPDATE` que dispara AFTER UPDATE fire con OLD=None.
 
 ---
@@ -2169,13 +2202,20 @@ END;
 | `[GBY-4108] DECLARE '...': ya declarada en el scope` | Redeclare. PG permite shadowing en sub-blocks; X4b scope plano no. |
 | `[GBY-4109] WHILE LOOP: superó el límite de 100000 iter` | Condición no converge. Agregar `EXIT WHEN` o revisar SET. |
 
-### ⚠️ No soportado todavía
+### ⚠️ No soportado al cierre de X4b (estado de la sub-sección X4b — desde 2026-06-15 muchos están entregados, ver bloques X4c/X4d/X4e/X4f/X5/X6 abajo)
 
-- **`FOR i IN a..b LOOP`** / **`FOR row IN SELECT ... LOOP`** — diferido a X4c.
-- **`LOOP ... END LOOP`** standalone (sin WHILE) — diferido.
-- **`RAISE EXCEPTION`** / **`EXCEPTION WHEN`** handlers — X4c.
+**Entregado posteriormente**:
+
+- ~~**`FOR i IN a..b LOOP`**~~ ✅ X4c (2026-05-28).
+- ~~**`FOR row IN SELECT ... LOOP`**~~ ✅ X6 (2026-05-29, ADR-0042).
+- ~~**`RAISE EXCEPTION`**~~ ✅ X4c (2026-05-28).
+- ~~**`EXCEPTION WHEN`** handlers~~ ✅ X4d (2026-05-28).
+- ~~**`LOOP ... END LOOP`** standalone~~ ✅ X4d (2026-05-28).
+
+**Sigue pendiente**:
+
 - **Nested scope** real por BEGIN..END block — diferido.
-- **Type checking estricto** en DECLARE/SET — diferido.
+- **Type checking estricto** en DECLARE/SET — diferido (parser acepta sin validar el tipo declarado).
 - **Variables en `INSERT VALUES`** — requiere lift de la restricción de VALUES.
 
 ---
@@ -2198,7 +2238,7 @@ for_stmt   ::= "FOR" ident "IN" expr "TO" expr "LOOP" stmt_list "END" "LOOP"
 - Si no se especifica level, default es EXCEPTION.
 - EXCEPTION → `[GBY-4111]` con el mensaje del user. Propaga normalmente; el wrap caller hace rollback de la transacción.
 - NOTICE → ResultSet vacío con `message = "NOTICE: <msg>"`. No interrumpe el flujo.
-- En X4c no hay `EXCEPTION WHEN ...` handlers (diferido a X4d).
+- En X4c no había `EXCEPTION WHEN ...` handlers — entregados en X4d (2026-05-28, ADR-0036).
 
 **FOR:**
 

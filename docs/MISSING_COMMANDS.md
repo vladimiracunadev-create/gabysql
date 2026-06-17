@@ -21,9 +21,9 @@ Si vas a ordenar bloques por ROI funcional **hoy**, este es el orden:
 |---|---|---|---|
 | 1 | **Planner-as-optimizer cost-based** | Queries analíticas (full scan, agregados sobre 200k rows) cuestan 0.5–4 s en el bench 2026-05-29. Sin reorden de joins ni elección de índice por costo, gabysql es "ejecutor con plan fijo". | **P5** (depende de P4) |
 | 2 | **Stats por-columna** (NDV vía HyperLogLog, MCV top-K, histogramas) | P3 ya da `est.rows` global; sin per-column no se puede estimar selectividad de un predicado. Sin esto, P5 no tiene insumos. | **P4** |
-| 3 | **`SAVEPOINT` + `ROLLBACK TO SAVEPOINT`** | Hoy `ROLLBACK` descarta TODO el batch. Imposible deshacer una violation de constraint sin perder el resto. | **T1** |
+| ~~3~~ | ~~**`SAVEPOINT` + `ROLLBACK TO SAVEPOINT`**~~ | ✅ **cerrado 2026-06-15 (M12 / ADR-0089)**. ANSI SQL:2003 completo: `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name`. Pager con full cache snapshot. | ~~T1~~ ✓ |
 | 4 | **Bind params (`?`, `$1`) + `PREPARE`/`EXECUTE` + plan cache** | Sin esto, hay que concatenar SQL → riesgo de inyección si el caller no escapa. Plan cache habilita reuso del plan parseado. | **N1+N2** |
-| ~~5~~ | ~~**Agregados sobre `SELECT` con `JOIN`** (`[GBY-4028]`)~~ | ✅ **cerrado 2026-05-30 (F2 + Gap 7)**. La query del bench mide sin SKIP. Único residual: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando, defer al bloque que generalice DISTINCT. | ~~F2~~ ✓ |
+| ~~5~~ | ~~**Agregados sobre `SELECT` con `JOIN`** (`[GBY-4028]`)~~ | ✅ **cerrado 2026-05-30 (F2 + Gap 7)**. La query del bench mide sin SKIP. ~~Único residual: `COUNT(DISTINCT col)` sobre JOIN sigue rebotando~~ ✅ **cerrado 2026-06-15 (R9 / ADR-0079)**. | ~~F2~~ ✓ + ~~R9~~ ✓ |
 
 Estos 5 bloques son los que más mueven la aguja a partir de hoy. Los 3 primeros (P4+P5+T1) son los que el usuario sentido como "esta DB rinde" o "esta DB no rinde".
 
@@ -50,7 +50,7 @@ Cada bloque deja `main` verde con tests + docs + nuevos códigos de error. Pensa
 | **L1** ✅ | Referential actions: `ON DELETE SET NULL`, `ON DELETE SET DEFAULT`, `ON DELETE NO ACTION`, `ON UPDATE ...` (parsea + persiste; no se dispara hoy), `UNIQUE (a, b, ...)` table-level + parche al composite UNIQUE de K2. Bump VERSION 8→9. **Cerrado 2026-05-27** ([ADR-0020](adr/0020-fk-referential-actions.md)). | Medio | K |
 | **L2** ✅ | Constraints: `CHECK (expr)` column-level y table-level (con/sin `CONSTRAINT name`), evaluación en INSERT/UPDATE/UPSERT/DO UPDATE/cascade, 3VL ANSI, subqueries rechazadas en DDL. Bump VERSION 9→10. **Cerrado 2026-05-27** ([ADR-0021](adr/0021-check-constraints.md)). | Medio-Alto | L1, G3 |
 | **L3** ✅ | `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)` con re-validación O(n) de las filas existentes antes de persistir. Sin estado parcial. Sin bump de formato. **Cerrado 2026-05-27.** | Bajo | L2 |
-| **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25; `SAVEPOINT`, read-only y cross-request quedan pendientes) | Alto | — |
+| **T** ✅ | Transacciones explícitas: `BEGIN`/`COMMIT`/`ROLLBACK` (cerrado 2026-05-25) + `SAVEPOINT`/`ROLLBACK TO`/`RELEASE` (M12, 2026-06-15, ADR-0089) + cross-request HTTP (M13, 2026-06-15, ADR-0090). Read-only (`BEGIN READ ONLY` / `SET TRANSACTION ISOLATION LEVEL`) sigue pendiente — gabysql es single-writer estricto, el isolation siempre es serializable. | Alto | ✓ + ✓ M12 + ✓ M13 |
 | **V** ✅ | Vistas lógicas: `CREATE VIEW [IF NOT EXISTS] v [(col_aliases)] AS &lt;select_query&gt;`, `DROP VIEW [IF EXISTS] v`. Expansion como derived table en cualquier FROM. Read-only (`[GBY-4075]`). Bump VERSION 12→13 con discriminator byte tabla/vista. **Cerrado 2026-05-27** ([ADR-0025](adr/0025-views.md)). | Medio | F |
 | **W** | Window functions + CTE: `WITH ... AS`, `WITH RECURSIVE`, `ROW_NUMBER`/`RANK`/`LAG`/`LEAD`, `SUM() OVER (PARTITION BY ...)` | Muy alto | F |
 | **X** | Stored procedures + triggers: `CREATE FUNCTION`, `CREATE TRIGGER`, lenguaje procedural | Muy alto | T, F |

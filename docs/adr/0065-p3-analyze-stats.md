@@ -64,8 +64,10 @@ pub struct TableStats {
 `exec_analyze_table(table)`:
 
 1. Chequea `PRIV_SELECT` (mismo que un SELECT * — ANALYZE es lectura).
-2. Carga `TableMeta` del catálogo. Error `[GBY-4143]` (TABLE_NOT_FOUND
-   reutilizado) si no existe.
+2. Carga `TableMeta` del catálogo. Error `[GBY-2001]` (`TABLE_NOT_FOUND`)
+   si no existe. [Fix 2026-06-15: el ADR original cita por error
+   `[GBY-4143]`; el código real es `2001` — rango Catalog según
+   `ERROR_CODES.md`.]
 3. `catalog.scan_rows(meta.root_page, 0, None)?.len()` → row_count exacto.
 4. `analyzed_at_nanos = SystemTime::now().duration_since(UNIX_EPOCH)`.
 5. `self.table_stats.insert(table, TableStats { row_count, analyzed_at_nanos })`.
@@ -119,7 +121,7 @@ Ocho tests `p3_*`:
 
 - `p3_analyze_returns_row_count` — INSERT 3 rows → ANALYZE → row_count=3.
 - `p3_analyze_sin_keyword_table_funciona` — `ANALYZE u` (sin TABLE) parsea.
-- `p3_analyze_table_inexistente_falla` — `[GBY-4143]` o "no existe".
+- `p3_analyze_table_inexistente_falla` — `[GBY-2001]` o "no existe".
 - `p3_explain_sin_analyze_previo_no_muestra_est_rows` — EXPLAIN cold no anota.
 - `p3_explain_post_analyze_muestra_est_rows` — `[est.rows=5]` en SCAN.
 - `p3_explain_con_where_pk_lookup_muestra_est_rows` — PK lookup también

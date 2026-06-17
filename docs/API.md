@@ -24,6 +24,9 @@ Si el server se arranca con `-token <valor>`, cada request debe incluir uno de e
 
 Sin token válido, el server responde `401`.
 
+Para **sesiones cross-request** (M13) hay un header adicional sin relación con autenticación:
+- `X-Gabysql-Session: <hex16>` — ID de sesión devuelto por `/tx/begin`. Equivalente al query param `?session=<hex16>` en cualquier endpoint que lo acepte. Ver [`POST /tx/begin`](#post-txbegin--post-txcommit--post-txrollback-m13) abajo.
+
 ---
 
 ## 🗂️ Modos de operación
@@ -46,7 +49,10 @@ Sin token válido, el server responde `401`.
 | `GET` | `/tables` | lista tablas de una DB |
 | `GET` | `/schema` | devuelve schema de una tabla |
 | `GET` | `/rows` | devuelve filas con paginación |
-| `POST` | `/exec` | ejecuta una o más sentencias SQL |
+| `POST` | `/exec` | ejecuta una o más sentencias SQL (auto-commit por request, o dentro de sesión con `X-Gabysql-Session`) |
+| `POST` | `/tx/begin` | **M13 (2026-06-15)** — abre una sesión cross-request con tx activa, devuelve `session_id` |
+| `POST` | `/tx/commit?session=<id>` | **M13** — commit + cierra la sesión |
+| `POST` | `/tx/rollback?session=<id>` | **M13** — rollback + cierra la sesión |
 
 ---
 
@@ -271,6 +277,61 @@ Ejemplo de respuesta:
   ]
 }
 ```
+
+---
+
+## `POST /tx/begin` · `POST /tx/commit` · `POST /tx/rollback` (M13)
+
+**Cross-request transactions** vía sesión single-slot global. Habilitado por
+[ADR-0090](adr/0090-m13-cross-request-tx.md). Permite que un cliente externo
+(ORM, batch loader, script) abra una transacción en un request, ejecute N
+sentencias en requests subsiguientes, y commitee/rolbackee al final.
+
+### Flujo
+
+1. **Abrir sesión** — `POST /tx/begin` (opcionalmente `{"db":"<name>"}` en modo `-dir`).
+   - 200 → `{"ok":true,"session":"<hex16>","db":"<name>"}`. Guardar el `session` para usarlo en cada `/exec` y para cerrar la tx.
+   - 409 → ya hay una sesión activa. El server es single-slot: el cliente debe esperar a que la sesión existente cierre, o forzar cierre con `/tx/rollback` si conoce el ID.
+2. **Ejecutar SQL en la sesión** — `POST /exec` con header `X-Gabysql-Session: <hex16>` o query param `?session=<hex16>`. El server NO auto-commit; el `Pager` de la sesión persiste sus dirty pages entre requests.
+   - 200 → `{"ok":true,"session":"<hex16>","results":[...]}`.
+   - 404 → el `session` no existe o expiró (idle timeout 300s).
+3. **Cerrar sesión** — `POST /tx/commit?session=<hex16>` o `POST /tx/rollback?session=<hex16>`. Devuelve `{"ok":true,"message":"COMMIT","db":"<name>"}` (o `ROLLBACK`).
+
+### Ejemplo `curl`
+
+```bash
+# 1) Abrir sesión.
+SESSION=$(curl -sX POST http://127.0.0.1:8080/tx/begin -d '{}' | jq -r '.session')
+
+# 2) Operar varios requests dentro de la misma tx.
+curl -sX POST http://127.0.0.1:8080/exec \
+    -H "X-Gabysql-Session: $SESSION" \
+    -d '{"sql":"INSERT INTO users (id, name) VALUES (1, \"Ana\")"}'
+
+curl -sX POST http://127.0.0.1:8080/exec \
+    -H "X-Gabysql-Session: $SESSION" \
+    -d '{"sql":"INSERT INTO users (id, name) VALUES (2, \"Beto\")"}'
+
+# 3) Decidir commit o rollback al final.
+curl -sX POST "http://127.0.0.1:8080/tx/commit?session=$SESSION"
+```
+
+### Headers
+
+- **`X-Gabysql-Session: <hex16>`** — alternativa al query param. Para SDKs que prefieren mantener el ID fuera de la URL.
+
+### Errores específicos
+
+- `400` — `/tx/commit` o `/tx/rollback` sin `?session=<id>`.
+- `404` — session ID no corresponde a la sesión activa (ya cerrada o nunca existió).
+- `409` — segundo `/tx/begin` con sesión activa (single-slot).
+
+### Notas
+
+- **Single-slot global**: solo una sesión cross-request activa a la vez en todo el server. Multi-session real depende de WAL-mode (ADR-0018, Fase 6).
+- **Idle timeout**: 300s. Cualquier request a `/tx/*` o `/exec` con session ID checkea el last_used; si pasó el threshold, hace rollback + cierre silencioso.
+- **Backwards compatible**: requests sin session ID se comportan exactamente como antes de M13 (auto-commit por request).
+- **Cómo combina con SAVEPOINT (M12)**: el cliente puede hacer `BEGIN` (implícito por `/tx/begin`), múltiples `SAVEPOINT` / `ROLLBACK TO` parciales en requests separados, y decidir `/tx/commit` o `/tx/rollback` al final.
 
 ---
 
