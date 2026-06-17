@@ -4,176 +4,302 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>gabymodeler · gabysql</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
+  /* ---------- design tokens (aligned with phpgabyadmin v2 + landing) ---------- */
+  :root{
+    --bg-0:#0a0e14;          /* deepest */
+    --bg-1:#0d1117;          /* base canvas */
+    --bg-2:#11161d;          /* panels */
+    --bg-3:#161b22;          /* hover */
+    --bg-4:#1c2128;          /* selected */
+    --border:#21262d;
+    --border-strong:#30363d;
+    --text:#e6edf3;
+    --text-muted:#7d8590;
+    --text-dim:#484f58;
+    --accent:#58a6ff;        /* GitHub blue */
+    --accent-2:#1f6feb;
+    --success:#7ee787;
+    --warning:#f0883e;
+    --danger:#ff7b72;
+    --pk:#7ee787;
+    --fk:#f0883e;
+    --uq:#79c0ff;
+    --nn:#a5a5a5;
+    --check:#d2a8ff;
+    --shadow:0 6px 22px rgba(0,0,0,.5);
+    --shadow-lg:0 20px 56px rgba(0,0,0,.6);
+    --radius:6px;
+  }
+
   /* ---------- base ---------- */
   *,*::before,*::after{box-sizing:border-box}
   html,body{height:100%;margin:0}
   body{
-    font-family:Georgia,"Times New Roman",serif;
-    color:#edf3ff;
-    background:#0d1117;
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    color:var(--text);
+    background:var(--bg-1);
     overflow:hidden;
+    font-size:13px;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
   }
-  a{color:#7cc4ff}
-  code,pre{font-family:ui-monospace,Menlo,Consolas,monospace}
-  button,select,input{font-family:inherit;font-size:13px;color:#edf3ff}
-  button{background:#1f2a3a;border:1px solid #2c3b50;border-radius:6px;padding:5px 10px;cursor:pointer}
-  button:hover{background:#27344a}
-  button.primary{background:#2a4470;border-color:#3c5d96}
-  button.primary:hover{background:#345287}
-  button.danger{background:#5a2030;border-color:#7a2c44;color:#ffd6e0}
-  button.ghost{background:transparent;border:1px dashed #2c3b50}
-  input,select{background:#0e1622;border:1px solid #2c3b50;border-radius:5px;padding:3px 7px}
-  .muted{color:#90a4c0}
-  .row{display:flex;gap:6px;align-items:center}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre,.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+  button,select,input{font-family:inherit;font-size:13px;color:var(--text)}
+  button{
+    background:var(--bg-3);border:1px solid var(--border-strong);border-radius:var(--radius);
+    padding:6px 12px;cursor:pointer;font-weight:500;transition:all .12s;
+  }
+  button:hover{background:var(--bg-4);border-color:#484f58}
+  button.primary{background:var(--accent-2);border-color:var(--accent-2);color:#fff}
+  button.primary:hover{background:#388bfd;border-color:#388bfd}
+  button.danger{background:transparent;border-color:var(--danger);color:var(--danger)}
+  button.danger:hover{background:rgba(255,123,114,.1)}
+  button.ghost{background:transparent;border:1px dashed var(--border-strong);color:var(--text-muted)}
+  button.ghost:hover{color:var(--text);border-style:solid}
+  input,select{
+    background:var(--bg-1);border:1px solid var(--border-strong);border-radius:5px;
+    padding:5px 9px;transition:border-color .12s;
+  }
+  input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+  .muted{color:var(--text-muted)}
+  .row{display:flex;gap:8px;align-items:center}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:var(--bg-1)}
+  ::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:5px}
+  ::-webkit-scrollbar-thumb:hover{background:#484f58}
 
   /* ---------- top toolbar ---------- */
   header{
-    position:fixed;inset:0 0 auto 0;height:48px;
-    background:#0e1622;border-bottom:1px solid #243244;
-    display:flex;align-items:center;gap:8px;padding:0 12px;z-index:5;
+    position:fixed;inset:0 0 auto 0;height:52px;
+    background:var(--bg-2);border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;padding:0 16px;z-index:5;
   }
-  header h1{margin:0;font-size:16px;letter-spacing:.3px}
+  header .brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:15px;letter-spacing:-.2px}
+  header .brand-mark{
+    width:26px;height:26px;border-radius:6px;
+    background:linear-gradient(135deg,var(--accent) 0%,var(--accent-2) 100%);
+    display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff;font-weight:700;
+  }
+  header h1{margin:0;font-size:15px;letter-spacing:-.2px}
   header .spacer{flex:1}
 
   /* ---------- main 3-pane layout ---------- */
   main{
-    position:fixed;inset:48px 0 28px 0;
-    display:grid;grid-template-columns:280px 1fr;grid-template-rows:1fr 220px;
+    position:fixed;inset:52px 0 30px 0;
+    display:grid;grid-template-columns:300px 1fr;grid-template-rows:1fr 240px;
     grid-template-areas: "browser canvas" "browser results";
   }
-  main.results-collapsed{grid-template-rows:1fr 32px}
+  main.results-collapsed{grid-template-rows:1fr 34px}
   aside.browser{
-    grid-area:browser;background:#141d2a;border-right:1px solid #243244;
-    overflow-y:auto;padding:10px;
+    grid-area:browser;background:var(--bg-2);border-right:1px solid var(--border);
+    overflow-y:auto;padding:14px;
   }
-  #canvas-wrap{grid-area:canvas;position:relative;overflow:auto;background:
-    repeating-linear-gradient(0deg,transparent 0 49px,#1a2434 49px 50px),
-    repeating-linear-gradient(90deg,transparent 0 49px,#1a2434 49px 50px),
-    #0d1119;
+  aside.browser .form-row{margin-bottom:10px}
+  aside.browser .form-label{
+    font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;
+    color:var(--text-muted);font-weight:600;margin-bottom:4px;
+  }
+  aside.browser input[type="text"]{width:100%}
+  aside.browser .section-title{
+    font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;
+    color:var(--text-muted);font-weight:600;margin:14px 0 6px;padding:0 2px;
+  }
+  #canvas-wrap{
+    grid-area:canvas;position:relative;overflow:auto;
+    background:
+      radial-gradient(circle at 1px 1px, rgba(125,133,144,.12) 1px, transparent 0),
+      var(--bg-1);
+    background-size:24px 24px;
   }
   svg.relations{position:absolute;inset:0;width:5000px;height:3000px;pointer-events:none;z-index:1}
 
   section.results{
-    grid-area:results;background:#0e1622;border-top:1px solid #243244;
+    grid-area:results;background:var(--bg-2);border-top:1px solid var(--border);
     display:flex;flex-direction:column;overflow:hidden;
   }
-  .results-tabs{display:flex;align-items:center;background:#101a26;border-bottom:1px solid #243244;padding:0 8px;height:32px;gap:2px;flex-shrink:0}
-  .results-tab{padding:6px 12px;cursor:pointer;font-size:12px;color:#90a4c0;border-bottom:2px solid transparent}
-  .results-tab.active{color:#edf3ff;border-bottom-color:#3c5d96}
+  .results-tabs{
+    display:flex;align-items:center;background:var(--bg-2);
+    border-bottom:1px solid var(--border);padding:0 10px;height:34px;gap:2px;flex-shrink:0;
+  }
+  .results-tab{
+    padding:8px 14px;cursor:pointer;font-size:12px;color:var(--text-muted);
+    border-bottom:2px solid transparent;font-weight:500;transition:color .12s;
+  }
+  .results-tab:hover{color:var(--text)}
+  .results-tab.active{color:var(--text);border-bottom-color:var(--accent)}
   .results-spacer{flex:1}
-  .results-tab.collapse{cursor:pointer;color:#90a4c0;padding:4px 8px}
+  .results-tab.collapse{cursor:pointer;color:var(--text-muted);padding:6px 10px;border-bottom:0}
+  .results-tab.collapse:hover{color:var(--text)}
   .results-body{flex:1;overflow:auto;padding:0;display:none}
   .results-body.active{display:block}
   table.findings{width:100%;border-collapse:collapse;font-size:12.5px}
-  table.findings th, table.findings td{text-align:left;padding:5px 10px;border-bottom:1px solid #1a2536}
-  table.findings th{background:#101a26;color:#a8b9d4;font-weight:normal;position:sticky;top:0}
-  table.findings tr.error td:first-child{color:#ff8b9b}
-  table.findings tr.warn td:first-child{color:#f5c46b}
-  table.findings tr.info td:first-child{color:#7be0a3}
-  table.findings tr:hover{background:rgba(60,93,150,.12);cursor:pointer}
-  pre.sql-preview{margin:0;padding:10px 14px;color:#cfe3ff;font-size:12.5px;white-space:pre;overflow:auto}
+  table.findings th, table.findings td{text-align:left;padding:8px 14px;border-bottom:1px solid var(--border)}
+  table.findings th{
+    background:var(--bg-2);color:var(--text-muted);font-weight:600;
+    font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;
+  }
+  table.findings tr.error td:first-child{color:var(--danger);font-weight:600}
+  table.findings tr.warn td:first-child{color:var(--warning);font-weight:600}
+  table.findings tr.info td:first-child{color:var(--success);font-weight:600}
+  table.findings tr:hover{background:var(--bg-3);cursor:pointer}
+  table.findings td.ok{color:var(--success)}
+  pre.sql-preview{
+    margin:0;padding:14px 18px;color:var(--text);
+    font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px;
+    line-height:1.55;white-space:pre;overflow:auto;
+  }
 
   /* ---------- status bar ---------- */
   footer.statusbar{
-    position:fixed;left:0;right:0;bottom:0;height:28px;
-    background:#0a1019;border-top:1px solid #243244;
-    display:flex;align-items:center;gap:14px;padding:0 12px;
-    font-size:12px;color:#a8b9d4;z-index:4;
+    position:fixed;left:0;right:0;bottom:0;height:30px;
+    background:var(--bg-0);border-top:1px solid var(--border);
+    display:flex;align-items:center;gap:16px;padding:0 14px;
+    font-size:11.5px;color:var(--text-muted);z-index:4;
   }
-  footer .ok{color:#7be0a3}
-  footer .warn{color:#f5c46b}
-  footer .err{color:#ff8b9b}
+  footer .ok{color:var(--success)}
+  footer .warn{color:var(--warning)}
+  footer .err{color:var(--danger)}
 
   /* ---------- object browser tree ---------- */
-  .tree{font-size:13px;line-height:1.7}
-  .tree details > summary{cursor:pointer;list-style:none;padding:2px 4px;border-radius:4px}
+  .tree{font-size:13px;line-height:1.65}
+  .tree details > summary{cursor:pointer;list-style:none;padding:4px 6px;border-radius:4px;font-weight:500}
   .tree details > summary::-webkit-details-marker{display:none}
-  .tree details > summary:hover{background:#1c2738}
-  .tree details > summary::before{content:"▸";display:inline-block;width:14px;color:#90a4c0;transition:transform .1s}
+  .tree details > summary:hover{background:var(--bg-3)}
+  .tree details > summary::before{content:"▸";display:inline-block;width:14px;color:var(--text-muted);transition:transform .12s}
   .tree details[open] > summary::before{transform:rotate(90deg)}
-  .tree .leaf{padding:2px 4px 2px 22px;cursor:pointer;border-radius:4px;color:#cfe3ff}
-  .tree .leaf:hover{background:#1c2738}
-  .tree .leaf.selected{background:#2a4470;color:#fff}
-  .tree .pkbadge{font-size:10px;color:#7be0a3;margin-left:6px}
-  .tree .fkbadge{font-size:10px;color:#f5c46b;margin-left:6px}
-  .tree .nnbadge{font-size:10px;color:#90a4c0;margin-left:4px}
-  .tree .ublbadge{font-size:10px;color:#7cc4ff;margin-left:4px}
+  .tree .leaf{
+    padding:3px 6px 3px 24px;cursor:pointer;border-radius:4px;color:var(--text);
+    font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;
+    display:flex;align-items:center;gap:6px;
+  }
+  .tree .leaf:hover{background:var(--bg-3)}
+  .tree .leaf.selected{background:var(--accent-2);color:#fff}
+  .tree .pkbadge{font-size:9.5px;color:var(--pk);font-weight:600;letter-spacing:.3px;margin-left:auto}
+  .tree .fkbadge{font-size:9.5px;color:var(--fk);font-weight:600;letter-spacing:.3px}
+  .tree .nnbadge{font-size:9.5px;color:var(--nn);font-weight:600;letter-spacing:.3px}
+  .tree .ublbadge{font-size:9.5px;color:var(--uq);font-weight:600;letter-spacing:.3px}
+  .tree .chkbadge{font-size:9.5px;color:var(--check);font-weight:600;letter-spacing:.3px}
 
   /* ---------- entity card ---------- */
   .entity{
-    position:absolute;min-width:240px;max-width:340px;
-    background:#141d2a;border:1px solid #2c3b50;border-radius:8px;
-    box-shadow:0 6px 22px rgba(0,0,0,.4);z-index:2;
+    position:absolute;min-width:260px;max-width:360px;
+    background:var(--bg-2);border:1px solid var(--border-strong);border-radius:8px;
+    box-shadow:var(--shadow);z-index:2;
   }
-  .entity.selected{border-color:#3c5d96;box-shadow:0 0 0 2px rgba(60,93,150,.55),0 6px 22px rgba(0,0,0,.4)}
+  .entity.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(88,166,255,.3),var(--shadow)}
   .entity-head{
-    display:flex;gap:6px;align-items:center;padding:6px 8px;
-    background:#1c2738;border-bottom:1px solid #2c3b50;
+    display:flex;gap:8px;align-items:center;padding:8px 10px;
+    background:var(--bg-3);border-bottom:1px solid var(--border-strong);
     border-radius:8px 8px 0 0;cursor:move;user-select:none;
   }
-  .entity-head input{flex:1;background:transparent;border:1px solid transparent;font-size:13px;font-weight:bold}
-  .entity-head input:focus{background:#0e1622;border-color:#2c3b50}
-  .entity-body{padding:4px 8px}
+  .entity-head::before{content:"▦";color:var(--text-muted);font-size:13px}
+  .entity-head input{
+    flex:1;background:transparent;border:1px solid transparent;font-size:13.5px;
+    font-weight:600;color:var(--text);padding:2px 4px;
+  }
+  .entity-head input:focus{background:var(--bg-1);border-color:var(--border-strong)}
+  .entity-body{padding:4px 10px}
   .entity-body table{width:100%;border-collapse:collapse;font-size:12px}
-  .entity-body th{font-weight:normal;color:#90a4c0;text-align:left;padding:3px 3px;border-bottom:1px solid #243244;font-size:11px}
-  .entity-body td{padding:3px 2px;border-bottom:1px solid #1a2536}
+  .entity-body th{
+    font-weight:600;color:var(--text-muted);text-align:left;padding:4px 3px;
+    border-bottom:1px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.4px;
+  }
+  .entity-body td{padding:4px 2px;border-bottom:1px solid var(--border)}
   .entity-body tr:last-child td{border-bottom:0}
-  .entity-body input[type="text"]{width:100%;padding:2px 5px;font-size:12px}
-  .entity-body select{padding:2px 3px;font-size:11px}
-  .entity-foot{padding:4px 8px;display:flex;gap:4px;flex-wrap:wrap}
-  .entity-foot button{font-size:11px;padding:2px 6px}
-  .colflag{cursor:pointer;font-size:10px;padding:1px 4px;border-radius:3px;border:1px solid #2c3b50;color:#90a4c0;user-select:none;margin-right:1px}
-  .colflag.on{background:#3c5d96;border-color:#3c5d96;color:#fff}
-  .colflag.un.on{background:#7cc4ff;border-color:#7cc4ff;color:#0d1117}
-  .colflag.nn.on{background:#90a4c0;border-color:#90a4c0;color:#0d1117}
-  .colflag.fk.on{background:#f5c46b;border-color:#f5c46b;color:#0d1117}
-  .col-default{width:60px;font-size:11px}
+  .entity-body input[type="text"]{
+    width:100%;padding:3px 6px;font-size:12px;
+    font-family:'JetBrains Mono',ui-monospace,monospace;
+  }
+  .entity-body select{padding:3px 4px;font-size:11px;font-family:'JetBrains Mono',ui-monospace,monospace}
+  .entity-foot{padding:6px 10px 8px;display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--border)}
+  .entity-foot button{font-size:11px;padding:3px 8px}
+  .colflag{
+    cursor:pointer;font-size:9.5px;padding:2px 5px;border-radius:3px;
+    border:1px solid var(--border-strong);color:var(--text-muted);user-select:none;
+    margin-right:2px;font-weight:600;letter-spacing:.3px;transition:all .1s;
+  }
+  .colflag:hover{border-color:#484f58;color:var(--text)}
+  .colflag.pk.on{background:var(--pk);border-color:var(--pk);color:#0a0e14}
+  .colflag.un.on{background:var(--uq);border-color:var(--uq);color:#0a0e14}
+  .colflag.nn.on{background:var(--nn);border-color:var(--nn);color:#0a0e14}
+  .colflag.fk.on{background:var(--fk);border-color:var(--fk);color:#0a0e14}
+  .colflag.chk.on{background:var(--check);border-color:var(--check);color:#0a0e14}
+  .col-default{width:64px;font-size:11px}
 
   /* ---------- modal ---------- */
-  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)}
+  .modal-bg{
+    position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;
+    align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(6px);
+  }
   .modal-bg.show{display:flex}
   .modal{
-    background:#141d2a;border:1px solid #2c3b50;border-radius:10px;
+    background:var(--bg-2);border:1px solid var(--border-strong);border-radius:10px;
     width:min(560px,92vw);max-height:80vh;display:flex;flex-direction:column;
-    box-shadow:0 20px 56px rgba(0,0,0,.55);
+    box-shadow:var(--shadow-lg);
   }
-  .modal-head{display:flex;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid #243244}
-  .modal-head h2{margin:0;font-size:15px}
-  .modal-body{padding:12px 14px;overflow:auto}
-  .modal-body label{display:block;font-size:12px;color:#a8b9d4;margin-top:8px}
-  .modal-body input,.modal-body select{width:100%;margin-top:4px}
-  .modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;border-top:1px solid #243244}
+  .modal-head{
+    display:flex;gap:10px;align-items:center;padding:14px 18px;
+    border-bottom:1px solid var(--border);
+  }
+  .modal-head h2{margin:0;font-size:15px;font-weight:600;letter-spacing:-.1px}
+  .modal-body{padding:16px 18px;overflow:auto}
+  .modal-body label{display:block;font-size:11px;color:var(--text-muted);margin-top:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+  .modal-body input,.modal-body select{width:100%;margin-top:5px}
+  .modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:12px 18px;border-top:1px solid var(--border)}
 
-  .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid #2c3b50;color:#a8b9d4}
-  .toast{position:fixed;right:14px;top:60px;padding:8px 12px;border-radius:6px;background:#2d7a66;color:#dffaee;font-size:12px;z-index:60}
+  .pill{
+    display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;
+    border-radius:99px;border:1px solid var(--border-strong);color:var(--text-muted);
+    background:var(--bg-3);font-weight:500;
+  }
+  .pill.accent{color:var(--accent);border-color:rgba(88,166,255,.3);background:rgba(88,166,255,.08)}
+  .pill.success{color:var(--success);border-color:rgba(126,231,135,.3);background:rgba(126,231,135,.08)}
+  .pill::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.7}
+  .pill.no-dot::before{display:none}
+  .toast{
+    position:fixed;right:18px;top:68px;padding:10px 14px;border-radius:6px;
+    background:var(--bg-3);border:1px solid var(--success);color:var(--success);
+    font-size:12px;font-weight:500;z-index:60;box-shadow:var(--shadow);
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>📐 gabymodeler</h1>
-  <span class="pill">PowerDesigner-style · gabysql VERSION 6</span>
+  <div class="brand">
+    <div class="brand-mark">▦</div>
+    <span>gabymodeler</span>
+    <span class="pill no-dot" style="font-family:'JetBrains Mono',monospace">v3</span>
+  </div>
+  <span class="pill accent">gabysql VERSION 33</span>
   <span class="spacer"></span>
-  <button id="btn-new-entity" class="primary">＋ Entidad</button>
-  <button id="btn-import">↘ Importar de gabysql</button>
-  <button id="btn-export">📋 Ver SQL</button>
-  <button id="btn-load-sample">📦 Ejemplo</button>
-  <button id="btn-clear" class="danger">🗑️</button>
-  <a href="../" class="pill" style="text-decoration:none">← Landing</a>
+  <button id="btn-new-entity" class="primary">+ Entidad</button>
+  <button id="btn-import">Importar</button>
+  <button id="btn-export">Ver SQL</button>
+  <button id="btn-load-sample">Ejemplo</button>
+  <button id="btn-clear" class="danger">Borrar</button>
+  <a href="../" class="pill no-dot">← Landing</a>
 </header>
 
 <main id="main-grid">
   <aside class="browser">
-    <div class="row" style="margin-bottom:8px">
-      <label class="muted" style="font-size:12px">DB:</label>
-      <input id="db-name" type="text" value="modeler_demo" style="flex:1" />
+    <div class="form-row">
+      <div class="form-label">Database</div>
+      <input id="db-name" type="text" value="modeler_demo" />
     </div>
-    <div class="row" style="margin-bottom:10px">
-      <label class="row muted" style="font-size:11px;cursor:pointer">
-        <input id="opt-ifnotexists" type="checkbox" checked /> CREATE DATABASE IF NOT EXISTS
+    <div class="form-row">
+      <label class="row muted" style="font-size:11.5px;cursor:pointer">
+        <input id="opt-ifnotexists" type="checkbox" checked style="width:auto;margin:0 4px 0 0" />
+        IF NOT EXISTS
       </label>
     </div>
 
+    <div class="section-title">Schema</div>
     <div id="object-browser" class="tree"></div>
   </aside>
 
@@ -201,7 +327,7 @@
 </main>
 
 <footer class="statusbar">
-  <span id="status-target">Target: gabysql VERSION 6</span>
+  <span id="status-target">Target: gabysql VERSION 33</span>
   <span id="status-counts" class="muted">0 tablas · 0 columnas · 0 índices · 0 FKs</span>
   <span class="spacer" style="flex:1"></span>
   <span id="status-findings" class="ok">0 errores · 0 warnings</span>
@@ -241,7 +367,8 @@
       <label>Database (.db)</label>
       <input id="imp-db" type="text" placeholder="demo.db" />
       <p class="muted" style="font-size:11px;margin-top:10px">
-        El modeler hace <code>GET /tables?db=&lt;db&gt;</code> y reconstruye entidades, columnas, constraints e índices con la información que devuelve <code>/schema</code>. Necesita CORS habilitado en el server (lo está desde gabysql VERSION 6).
+        El modeler hace <code>GET /tables?db=&lt;db&gt;</code> y reconstruye entidades, columnas, constraints e índices con la información que devuelve <code>/schema</code>. Necesita CORS habilitado en el server (lo está desde gabysql VERSION 33).
+        Si tu server requiere autenticación cookie-based, pasá un Bearer token.
       </p>
     </div>
     <div class="modal-foot">
@@ -281,7 +408,7 @@
 
 <script>
 /* =========================================================
-   gabymodeler v2 — PowerDesigner-style ER → DDL gabysql.
+   gabymodeler v3 — ER → DDL gabysql VERSION 33.
    Vanilla HTML+CSS+JS, sin frameworks, sin servidor.
 
    State schema:
@@ -291,30 +418,55 @@
          id, name, x, y,
          columns: [{
            id, name, type,
-           pk, notNull, unique, hasDefault, defaultValue,
+           pk, notNull, unique,
+           hasDefault, defaultValue,
+           hasCheck,   checkExpr,
            fk: null | { table, column, onDelete }
          }]
        }]
      }
 
-   Match con motor gabysql VERSION 6:
-   - Tipos: INT, TEXT, BOOL, FLOAT, DATE, DATETIME, JSON
-   - PK debe ser INT y es implícitamente NOT NULL
+   Match con motor gabysql VERSION 33:
+   - Tipos núcleo:    INT, TEXT, BOOL, FLOAT, DATE, DATETIME, TIME, JSON
+   - Tipos extendidos (Y1-Y9): TINYINT, SMALLINT, MEDIUMINT, BIGINT,
+                               INT UNSIGNED variants, DECIMAL(p,s), VARCHAR(n), BLOB, UUID
+   - PK debe ser tipo entero o UUID y es implícitamente NOT NULL
    - DEFAULT permite literal o NULL; rechazado en PK
    - UNIQUE inline → CREATE TABLE genera el constraint, motor crea uq_<t>_<c>
    - REFERENCES <tabla>(<col>) [ON DELETE RESTRICT|CASCADE]
+   - FK debe matchear el tipo de la PK destino (no force a INT como en v2)
+   - CHECK constraint inline (col-level): CHECK (expr)
    - Identificadores: [a-z_][a-z0-9_]*, max 64, no reservados
    ========================================================= */
 
-const TYPES = ["INT","TEXT","BOOL","FLOAT","DATE","DATETIME","JSON"];
+const TYPES = [
+  "INT","TINYINT","SMALLINT","MEDIUMINT","BIGINT",
+  "INT UNSIGNED","TINYINT UNSIGNED","SMALLINT UNSIGNED","MEDIUMINT UNSIGNED","BIGINT UNSIGNED",
+  "FLOAT","DOUBLE","DECIMAL(10,2)",
+  "TEXT","VARCHAR(255)","CHAR(36)",
+  "BOOL",
+  "DATE","DATETIME","TIME","TIMESTAMP",
+  "JSON","BLOB","UUID"
+];
+const PK_ALLOWED_TYPES = new Set([
+  "INT","TINYINT","SMALLINT","MEDIUMINT","BIGINT",
+  "INT UNSIGNED","TINYINT UNSIGNED","SMALLINT UNSIGNED","MEDIUMINT UNSIGNED","BIGINT UNSIGNED",
+  "UUID"
+]);
+function isIntegerType(t){
+  return /^(TINY|SMALL|MEDIUM|BIG)?INT( UNSIGNED)?$/.test(t || "");
+}
 const STORAGE_KEY = "gabymodeler.v2";
 const LEGACY_KEY  = "gabymodeler.v1";
 const RESERVED = new Set([
   "create","drop","alter","add","column","table","index","unique","database","databases",
   "show","if","exists","not","insert","into","select","update","delete","from","set","values",
-  "where","between","and","limit","offset","on","primary","key","default","null","true","false",
-  "foreign","references","cascade","restrict","integrity","check",
-  "int","text","bool","float","date","datetime","json"
+  "where","between","and","or","limit","offset","on","primary","key","default","null","true","false",
+  "foreign","references","cascade","restrict","integrity","check","savepoint","release","rollback",
+  "commit","begin","transaction","policy","view","explain","analyze","union","join","inner","left",
+  "right","outer","using","natural","group","by","having","order","asc","desc","distinct","as",
+  "int","tinyint","smallint","mediumint","bigint","text","varchar","char","bool","boolean","float",
+  "double","decimal","date","datetime","time","timestamp","json","blob","uuid","unsigned"
 ]);
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_IDENT = 64;
@@ -324,16 +476,19 @@ const SAMPLE = {
   ifNotExists: true,
   entities: [
     { id:id_(), name:"users", x:80, y:80, columns:[
-      col("id",   "INT",  {pk:true}),
-      col("email","TEXT", {notNull:true, unique:true}),
-      col("name", "TEXT"),
-      col("status","TEXT", {notNull:true, hasDefault:true, defaultValue:"pending"}),
+      col("id",      "BIGINT",       {pk:true}),
+      col("email",   "VARCHAR(255)", {notNull:true, unique:true}),
+      col("name",    "VARCHAR(255)", {notNull:true}),
+      col("age",     "TINYINT UNSIGNED", {hasCheck:true, checkExpr:"age >= 0 AND age < 150"}),
+      col("status",  "TEXT",         {notNull:true, hasDefault:true, defaultValue:"pending"}),
+      col("created", "DATETIME",     {notNull:true}),
     ]},
-    { id:id_(), name:"orders", x:430, y:80, columns:[
-      col("id",         "INT", {pk:true}),
-      col("user_id",    "INT", {fk:{table:"users", column:"id", onDelete:"CASCADE"}}),
-      col("total",      "FLOAT"),
-      col("tries",      "INT", {hasDefault:true, defaultValue:0}),
+    { id:id_(), name:"orders", x:480, y:80, columns:[
+      col("id",       "BIGINT",       {pk:true}),
+      col("user_id",  "BIGINT",       {notNull:true, fk:{table:"users", column:"id", onDelete:"CASCADE"}}),
+      col("total",    "DECIMAL(10,2)",{notNull:true, hasCheck:true, checkExpr:"total >= 0"}),
+      col("tries",    "SMALLINT",     {hasDefault:true, defaultValue:0}),
+      col("placed",   "DATETIME"),
     ]}
   ]
 };
@@ -352,6 +507,7 @@ function col(name, type, extra){
     id:id_(), name, type,
     pk:false, notNull:false, unique:false,
     hasDefault:false, defaultValue:"",
+    hasCheck:false, checkExpr:"",
     fk:null
   }, extra || {});
 }
@@ -446,6 +602,7 @@ function renderBrowser(){
       if (c.notNull && !c.pk) badges.push(el("span", { class:"nnbadge" }, "NN"));
       if (c.unique && !c.pk) badges.push(el("span", { class:"ublbadge" }, "UN"));
       if (c.fk) badges.push(el("span", { class:"fkbadge" }, "FK"));
+      if (c.hasCheck) badges.push(el("span", { class:"chkbadge" }, "CHK"));
       const leaf = el("div", {
         class:"leaf" + (selectedColumnId === c.id ? " selected" : ""),
         onclick: e => { e.stopPropagation(); selectColumn(ent.id, c.id); }
@@ -556,7 +713,10 @@ function renderColumnRow(ent, c){
     onclick: () => {
       if (!c.pk) ent.columns.forEach(x => x.pk = false);
       c.pk = !c.pk;
-      if (c.pk){ c.type = "INT"; c.notNull = true; c.hasDefault = false; c.defaultValue = ""; }
+      if (c.pk){
+        if (!PK_ALLOWED_TYPES.has(c.type)) c.type = "BIGINT";
+        c.notNull = true; c.hasDefault = false; c.defaultValue = "";
+      }
       save(); rerender();
     }
   }, "PK");
@@ -572,6 +732,19 @@ function renderColumnRow(ent, c){
     class: "colflag fk" + (c.fk?" on":""), title:"FOREIGN KEY",
     onclick: () => openFkModal(ent.id, c.id)
   }, "FK");
+  const flagCHK = el("span", {
+    class: "colflag chk" + (c.hasCheck?" on":""), title:"CHECK constraint",
+    onclick: e => {
+      e.stopPropagation();
+      const cur = c.hasCheck ? String(c.checkExpr || "") : "";
+      const expr = prompt(`Expresión CHECK para ${c.name}\n(ej: ${c.name} > 0   o   ${c.name} IN ('a','b'))\nVacío = deshabilitar`, cur);
+      if (expr === null) return;
+      const trimmed = expr.trim();
+      if (!trimmed){ c.hasCheck = false; c.checkExpr = ""; }
+      else { c.hasCheck = true; c.checkExpr = trimmed; }
+      save(); rerender();
+    }
+  }, "CHK");
 
   return el("tr", { onclick: () => selectColumn(ent.id, c.id) },
     el("td", {}, el("input", {
@@ -581,13 +754,13 @@ function renderColumnRow(ent, c){
     el("td", {}, (() => {
       const sel = el("select", { onchange: e => {
         c.type = e.target.value;
-        if (c.pk && c.type !== "INT") c.type = "INT";
+        if (c.pk && !PK_ALLOWED_TYPES.has(c.type)) c.type = "BIGINT";
         save(); rerender();
       }});
       for (const t of TYPES) sel.append(el("option", { value:t, ...(t===c.type?{selected:true}:{}) }, t));
       return sel;
     })()),
-    el("td", { style:"white-space:nowrap" }, flagPK, " ", flagNN, " ", flagUN, " ", flagFK),
+    el("td", { style:"white-space:nowrap" }, flagPK, " ", flagNN, " ", flagUN, " ", flagFK, " ", flagCHK),
     el("td", {}, el("input", {
       type:"text", class:"col-default", value: c.hasDefault ? String(c.defaultValue) : "",
       placeholder: c.pk ? "—" : "literal",
@@ -717,11 +890,17 @@ function checkModel(){
       if (c.pk && c.hasDefault){
         findings.push(["error", `${ename}.${cname}`, "PRIMARY KEY no admite DEFAULT", ent.id, c.id]);
       }
-      if (c.unique && c.type === "JSON"){
-        findings.push(["warn", `${ename}.${cname}`, "índice UNIQUE sobre JSON será rechazado por el motor", ent.id, c.id]);
+      if (c.pk && !PK_ALLOWED_TYPES.has(c.type)){
+        findings.push(["error", `${ename}.${cname}`, `PK tipo '${c.type}' no permitido (usá un entero o UUID)`, ent.id, c.id]);
+      }
+      if (c.unique && (c.type === "JSON" || c.type === "BLOB")){
+        findings.push(["warn", `${ename}.${cname}`, `índice UNIQUE sobre ${c.type} será rechazado por el motor`, ent.id, c.id]);
       }
       if (c.hasDefault && !defaultMatchesType(c)){
         findings.push(["error", `${ename}.${cname}`, `DEFAULT '${c.defaultValue}' incompatible con ${c.type}`, ent.id, c.id]);
+      }
+      if (c.hasCheck && !String(c.checkExpr || "").trim()){
+        findings.push(["error", `${ename}.${cname}`, "CHECK habilitado pero expresión vacía", ent.id, c.id]);
       }
 
       if (c.fk){
@@ -735,7 +914,11 @@ function checkModel(){
           } else if (!targetCol.pk){
             findings.push(["error", `${ename}.${cname}`, `FK debe apuntar a la PK de '${c.fk.table}' (es '${targetCol.name}', no PK)`, ent.id, c.id]);
           } else if (targetCol.type !== c.type){
-            findings.push(["error", `${ename}.${cname}`, `FK type mismatch: ${c.type} vs ${targetCol.type}`, ent.id, c.id]);
+            const bothInt = isIntegerType(targetCol.type) && isIntegerType(c.type);
+            const sev = bothInt ? "warn" : "error";
+            findings.push([sev, `${ename}.${cname}`,
+              `FK type ${bothInt ? "mismatch tolerable" : "mismatch"}: ${c.type} vs ${targetCol.type}`,
+              ent.id, c.id]);
           }
         }
       }
@@ -748,16 +931,24 @@ function checkModel(){
 function defaultMatchesType(c){
   const v = String(c.defaultValue);
   if (v.toUpperCase() === "NULL") return true;
-  switch(c.type){
-    case "INT":      return /^-?\d+$/.test(v);
-    case "FLOAT":    return /^-?\d+(\.\d+)?$/.test(v);
-    case "BOOL":     return /^(true|false)$/i.test(v);
-    case "TEXT":
-    case "DATE":
-    case "DATETIME":
-    case "JSON":     return true; // any literal accepted
-    default:         return true;
+  const t = c.type;
+  if (isIntegerType(t)){
+    if (!/^-?\d+$/.test(v)) return false;
+    if (/UNSIGNED/.test(t) && /^-/.test(v)) return false;
+    return true;
   }
+  if (t === "FLOAT" || t === "DOUBLE" || /^DECIMAL\(/.test(t)){
+    return /^-?\d+(\.\d+)?$/.test(v);
+  }
+  if (t === "BOOL") return /^(true|false)$/i.test(v);
+  if (t === "DATE")     return /^\d{4}-\d{2}-\d{2}$/.test(v) || v.toUpperCase()==="CURRENT_DATE";
+  if (t === "TIME")     return /^\d{2}:\d{2}:\d{2}$/.test(v) || v.toUpperCase()==="CURRENT_TIME";
+  if (t === "DATETIME" || t === "TIMESTAMP")
+    return /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(v) || /CURRENT_/i.test(v);
+  if (t === "UUID")
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+  // TEXT, VARCHAR(n), CHAR(n), JSON, BLOB → cualquier literal
+  return true;
 }
 
 function renderFindings(findings){
@@ -785,7 +976,7 @@ function generateSQL(){
   const dbName = sanitizeIdent(state.dbName || "modeler_demo");
   const ifne = state.ifNotExists ? " IF NOT EXISTS" : "";
   lines.push(`-- Generado por gabymodeler · ${new Date().toISOString()}`);
-  lines.push(`-- Target: gabysql VERSION 6`);
+  lines.push(`-- Target: gabysql VERSION 33`);
   lines.push(`CREATE DATABASE${ifne} ${dbName};`);
   lines.push(``);
 
@@ -804,6 +995,9 @@ function generateSQL(){
       if (c.hasDefault && !c.pk){
         s += " DEFAULT " + sqlLiteral(c);
       }
+      if (c.hasCheck && String(c.checkExpr || "").trim()){
+        s += ` CHECK (${String(c.checkExpr).trim()})`;
+      }
       if (c.fk){
         s += ` REFERENCES ${c.fk.table}(${c.fk.column})`;
         if (c.fk.onDelete && c.fk.onDelete !== "RESTRICT") s += ` ON DELETE ${c.fk.onDelete}`;
@@ -820,13 +1014,17 @@ function generateSQL(){
 
 function sqlLiteral(c){
   const v = String(c.defaultValue);
-  if (v.toUpperCase() === "NULL") return "NULL";
-  switch(c.type){
-    case "INT":   return /^-?\d+$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`;
-    case "FLOAT": return /^-?\d+(\.\d+)?$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`;
-    case "BOOL":  return /^true$/i.test(v) ? "TRUE" : /^false$/i.test(v) ? "FALSE" : `'${v.replace(/'/g, "''")}'`;
-    default:      return `'${v.replace(/'/g, "''")}'`;
-  }
+  const u = v.toUpperCase();
+  if (u === "NULL") return "NULL";
+  if (/^CURRENT_(DATE|TIME|TIMESTAMP)$/.test(u)) return u;
+  const t = c.type;
+  if (isIntegerType(t))
+    return /^-?\d+$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`;
+  if (t === "FLOAT" || t === "DOUBLE" || /^DECIMAL\(/.test(t))
+    return /^-?\d+(\.\d+)?$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`;
+  if (t === "BOOL")
+    return /^true$/i.test(v) ? "TRUE" : /^false$/i.test(v) ? "FALSE" : `'${v.replace(/'/g, "''")}'`;
+  return `'${v.replace(/'/g, "''")}'`;
 }
 
 function topoOrder(entities){
@@ -887,8 +1085,11 @@ $("#btn-fk-save").onclick = () => {
   const col = $("#fk-column").value;
   const od = $("#fk-on-delete").value;
   if (!tbl || !col){ toast("Elegí tabla y columna PK."); return; }
+  // En v3 (VERSION 33) la PK puede ser cualquier entero/UUID. Auto-coercemos al tipo del PK target.
+  const targetEnt = state.entities.find(e => e.name.toLowerCase() === tbl.toLowerCase());
+  const targetCol = targetEnt && targetEnt.columns.find(cc => cc.name.toLowerCase() === col.toLowerCase());
   c.fk = { table: tbl, column: col, onDelete: od };
-  if (c.type !== "INT") c.type = "INT"; // FK must match parent PK type, which is INT in v6
+  if (targetCol && targetCol.type && c.type !== targetCol.type) c.type = targetCol.type;
   save(); rerender(); closeModals();
 };
 $("#btn-fk-clear").onclick = () => {
@@ -931,6 +1132,8 @@ function importTablesFromJson(tables, dbName){
         unique: !!c.unique,
         hasDefault: !!c.hasDefault,
         defaultValue: c.default == null ? "" : String(c.default),
+        hasCheck: !!(c.check || c.hasCheck),
+        checkExpr: c.check || c.checkExpr || "",
         fk: c.references ? {
           table: c.references.table,
           column: c.references.column,

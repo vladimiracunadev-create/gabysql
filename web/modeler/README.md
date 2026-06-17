@@ -1,8 +1,16 @@
-# 📐 gabymodeler v2
+# 📐 gabymodeler v3
 
-> **Modelador ER → DDL** para `gabysql`, layout PowerDesigner-style.
+> **Modelador ER → DDL** para `gabysql`.
 > Single-page HTML+CSS+JS vanilla, sin frameworks, sin servidor obligatorio.
-> Persistencia local en `localStorage`. Espejo del motor `gabysql VERSION 8`.
+> Persistencia local en `localStorage`. Espejo del motor `gabysql VERSION 33`.
+
+**Cambios v3 vs v2** (2026-06-17):
+- 🎨 Refresh visual completo: paleta GitHub-style (#0a0e14/#58a6ff), tipografía **Inter** + **JetBrains Mono**, alineado con phpgabyadmin v2 y la landing.
+- 📦 Tipos extendidos (Y1-Y9): `TINYINT/SMALLINT/MEDIUMINT/BIGINT` (firmados y `UNSIGNED`), `DECIMAL(p,s)`, `VARCHAR(n)`, `CHAR(n)`, `DOUBLE`, `TIME`, `TIMESTAMP`, `BLOB`, `UUID`.
+- 🔑 PK ahora puede ser cualquier entero o `UUID` (antes forzaba `INT`).
+- 🔗 FK auto-coerciona al tipo de la PK target (antes forzaba `INT`).
+- ✅ Flag **CHK**: CHECK constraint inline por columna (expresión editable vía prompt).
+- 🌱 SAMPLE actualizado con `BIGINT` PK, `VARCHAR(255)`, `DECIMAL(10,2)`, `TINYINT UNSIGNED` con CHECK.
 
 ---
 
@@ -36,7 +44,7 @@
 |        | [Check Model] [SQL Preview]      |
 |        | severidad | objeto | detalle ...  |
 +--------+-----------------------------------+
-| Status: VERSION 8 · N tablas · 0 errores  |
+| Status: VERSION 33 · N tablas · 0 errores |
 +-------------------------------------------+
 ```
 
@@ -71,7 +79,7 @@ python3 -m http.server 8000 --directory web
 # http://localhost:8000/modeler/
 ```
 
-> Para usar **↘ Importar de gabysql**, levantá también el server: `gabysql-server -dir ./data -addr :8080`. Desde gabysql VERSION 8 el server emite headers CORS, por lo que el modeler en `:8000` puede leer el API en `:8080` sin proxy.
+> Para usar **Importar**, levantá también el server: `gabysql-server -dir ./data -addr :8080`. Desde gabysql VERSION 6 el server emite headers CORS, por lo que el modeler en `:8000` puede leer el API en `:8080` sin proxy.
 
 ---
 
