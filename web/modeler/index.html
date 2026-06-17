@@ -378,6 +378,46 @@
   </div>
 </div>
 
+<!-- modal: composite constraint / index -->
+<div class="modal-bg" id="modal-composite">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="comp-title">Constraint compuesto</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-composite">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <div id="comp-kind-row" style="display:none">
+        <label>Tipo</label>
+        <select id="comp-kind">
+          <option value="pk">PRIMARY KEY (compuesta)</option>
+          <option value="unique">UNIQUE constraint</option>
+        </select>
+      </div>
+      <label>Nombre (opcional, dejá vacío para auto-generar)</label>
+      <input id="comp-name" type="text" placeholder="ej: uq_orders_user_status" />
+      <label id="comp-unique-row" style="display:none">
+        <input id="comp-unique" type="checkbox" style="width:auto;margin-right:5px" />
+        UNIQUE INDEX
+      </label>
+      <label>Columnas (orden = orden del índice)</label>
+      <div id="comp-cols" style="
+        max-height:240px;overflow:auto;border:1px solid var(--border-strong);
+        border-radius:5px;padding:8px;background:var(--bg-1);
+      "></div>
+      <p class="muted" style="font-size:11px;margin-top:8px">
+        Click para agregar/quitar. El orden refleja el orden de selección.
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="danger" id="btn-comp-delete" style="display:none">Eliminar</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-composite">cancelar</button>
+      <button id="btn-comp-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
 <!-- modal: edit FK -->
 <div class="modal-bg" id="modal-fk">
   <div class="modal">
@@ -422,7 +462,9 @@
            hasDefault, defaultValue,
            hasCheck,   checkExpr,
            fk: null | { table, column, onDelete }
-         }]
+         }],
+         constraints: [{ id, kind:'pk'|'unique', name?, columns:[colName] }],
+         indexes:     [{ id, name?, unique, columns:[colName] }]
        }]
      }
 
@@ -489,7 +531,23 @@ const SAMPLE = {
       col("total",    "DECIMAL(10,2)",{notNull:true, hasCheck:true, checkExpr:"total >= 0"}),
       col("tries",    "SMALLINT",     {hasDefault:true, defaultValue:0}),
       col("placed",   "DATETIME"),
-    ]}
+    ]},
+    { id:id_(), name:"order_lines", x:880, y:80,
+      columns:[
+        col("order_id", "BIGINT",       {notNull:true, fk:{table:"orders", column:"id", onDelete:"CASCADE"}}),
+        col("line_no",  "INT",          {notNull:true}),
+        col("sku",      "VARCHAR(64)",  {notNull:true}),
+        col("qty",      "INT",          {notNull:true, hasCheck:true, checkExpr:"qty > 0"}),
+        col("price",    "DECIMAL(10,2)",{notNull:true}),
+      ],
+      constraints:[
+        { id:id_(), kind:"pk",     name:"",                   columns:["order_id","line_no"] },
+        { id:id_(), kind:"unique", name:"uq_lines_order_sku", columns:["order_id","sku"] },
+      ],
+      indexes:[
+        { id:id_(), name:"ix_lines_sku_qty", unique:false, columns:["sku","qty"] },
+      ]
+    }
   ]
 };
 
@@ -527,6 +585,21 @@ function el(tag, attrs={}, ...children){
     n.append(c.nodeType ? c : document.createTextNode(c));
   }
   return n;
+}
+function ensureEntityShape(e){
+  // backward-compat para state cargado de localStorage anterior a constraints/indexes.
+  if (!Array.isArray(e.constraints)) e.constraints = [];
+  if (!Array.isArray(e.indexes))     e.indexes     = [];
+  return e;
+}
+function compName(ent, c){
+  if (c.name) return c.name;
+  const prefix = c.kind === "pk" ? "pk_" : c.kind === "unique" ? "uq_" : "ix_";
+  return prefix + ent.name + "_" + c.columns.join("_");
+}
+function indexName(ent, ix){
+  if (ix.name) return ix.name;
+  return (ix.unique ? "uq_" : "ix_") + ent.name + "_" + ix.columns.join("_");
 }
 function sanitizeIdent(s){
   return (s||"").trim().replace(/[^A-Za-z0-9_]/g,"_").replace(/^[^A-Za-z_]/, "_");
@@ -613,12 +686,35 @@ function renderBrowser(){
   }
   dbBlock.append(tablesBlock);
 
-  // Indexes section: collect all uq_<t>_<c> + (no explicit CREATE INDEX in this UI; engine creates them on UNIQUE).
+  // Constraints + Indexes section.
+  const constraintBlock = el("details");
+  const constraints = [];
+  for (const ent of state.entities){
+    ensureEntityShape(ent);
+    for (const c of ent.constraints){
+      constraints.push({ ent, name: compName(ent, c), kind: c.kind, cols: c.columns });
+    }
+  }
+  constraintBlock.append(el("summary", {}, "Constraints compuestos (" + constraints.length + ")"));
+  if (constraints.length === 0){
+    constraintBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(ninguno declarado)"));
+  }
+  for (const c of constraints){
+    constraintBlock.append(el("div", { class:"leaf" },
+      c.name + " (" + c.cols.join(", ") + ")",
+      el("span", { class: c.kind === "pk" ? "pkbadge" : "ublbadge" }, c.kind === "pk" ? "PK" : "UQ")
+    ));
+  }
+  dbBlock.append(constraintBlock);
+
   const indexBlock = el("details");
   const indexes = [];
   for (const ent of state.entities){
     for (const c of ent.columns){
-      if (c.unique && !c.pk) indexes.push(`uq_${ent.name}_${c.name}`);
+      if (c.unique && !c.pk) indexes.push({ name:`uq_${ent.name}_${c.name}`, unique:true, source:"col" });
+    }
+    for (const ix of ent.indexes){
+      indexes.push({ name: indexName(ent, ix), unique: !!ix.unique, source:"composite", cols: ix.columns });
     }
   }
   indexBlock.append(el("summary", {}, "Indexes (" + indexes.length + ")"));
@@ -626,7 +722,9 @@ function renderBrowser(){
     indexBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin índices declarativos)"));
   }
   for (const i of indexes){
-    indexBlock.append(el("div", { class:"leaf" }, i, " ", el("span", { class:"ublbadge" }, "UNIQUE")));
+    const cols = i.cols ? " (" + i.cols.join(", ") + ")" : "";
+    indexBlock.append(el("div", { class:"leaf" }, i.name + cols, " ",
+      el("span", { class:"ublbadge" }, i.unique ? "UNIQUE" : "IDX")));
   }
   dbBlock.append(indexBlock);
 
@@ -696,14 +794,18 @@ function renderEntity(ent){
   for (const c of ent.columns) tbody.append(renderColumnRow(ent, c));
   tbl.append(thead, tbody);
 
+  ensureEntityShape(ent);
+  const compBlock = renderCompositeBlock(ent);
   const foot = el("div", { class:"entity-foot" },
     el("button", { onclick: () => {
       ent.columns.push(col("col" + (ent.columns.length + 1), "TEXT"));
       save(); rerender();
-    }}, "＋ columna")
+    }}, "+ col"),
+    el("button", { onclick: () => openCompositeModal(ent.id, "constraint", null) }, "+ constraint"),
+    el("button", { onclick: () => openCompositeModal(ent.id, "index", null) }, "+ index")
   );
 
-  card.append(head, el("div", { class:"entity-body" }, tbl), foot);
+  card.append(head, el("div", { class:"entity-body" }, tbl), compBlock, foot);
   return card;
 }
 
@@ -852,18 +954,45 @@ function checkModel(){
     }
     tableNames.set(ename.toLowerCase(), ent.id);
 
+    ensureEntityShape(ent);
     const pks = ent.columns.filter(c => c.pk);
-    if (pks.length === 0){
+    const compositePks = ent.constraints.filter(c => c.kind === "pk");
+    if (pks.length === 0 && compositePks.length === 0){
       findings.push(["error", ename, "tabla sin PRIMARY KEY", ent.id, null]);
     } else if (pks.length > 1){
-      findings.push(["error", ename, `${pks.length} PRIMARY KEYs (esta versión solo admite una)`, ent.id, null]);
-    } else if (pks[0].type !== "INT"){
-      findings.push(["error", `${ename}.${pks[0].name}`, `PK debe ser INT (es ${pks[0].type})`, ent.id, pks[0].id]);
+      findings.push(["error", ename, `${pks.length} columnas PK (declará una PK compuesta en su lugar)`, ent.id, null]);
+    } else if (pks.length === 1 && compositePks.length > 0){
+      findings.push(["error", ename, "PK individual y PK compuesta declaradas simultáneamente", ent.id, null]);
+    } else if (compositePks.length > 1){
+      findings.push(["error", ename, `${compositePks.length} PRIMARY KEYs compuestas (solo una permitida)`, ent.id, null]);
+    } else if (pks.length === 1 && !PK_ALLOWED_TYPES.has(pks[0].type)){
+      findings.push(["error", `${ename}.${pks[0].name}`, `PK tipo '${pks[0].type}' no permitido (usá entero o UUID)`, ent.id, pks[0].id]);
     }
 
-    if (ent.columns.length <= 1){
+    if (ent.columns.length <= 1 && compositePks.length === 0){
       findings.push(["warn", ename, "tabla sin columnas además de la PK", ent.id, null]);
     }
+
+    // Validar composite constraints + indexes
+    const colNameSet = new Set(ent.columns.map(c => (c.name || "").toLowerCase()).filter(Boolean));
+    const validateCompositeCols = (label, cols) => {
+      if (!cols || cols.length === 0){
+        findings.push(["error", `${ename}:${label}`, "constraint/índice sin columnas", ent.id, null]);
+        return;
+      }
+      const seen = new Set();
+      for (const cn of cols){
+        if (!colNameSet.has(String(cn).toLowerCase())){
+          findings.push(["error", `${ename}:${label}`, `columna '${cn}' no existe`, ent.id, null]);
+        }
+        if (seen.has(cn.toLowerCase())){
+          findings.push(["error", `${ename}:${label}`, `columna '${cn}' duplicada en la definición`, ent.id, null]);
+        }
+        seen.add(cn.toLowerCase());
+      }
+    };
+    for (const c of ent.constraints) validateCompositeCols(compName(ent, c), c.columns);
+    for (const ix of ent.indexes)    validateCompositeCols(indexName(ent, ix), ix.columns);
 
     const colNames = new Map();
     for (const c of ent.columns){
@@ -983,8 +1112,10 @@ function generateSQL(){
   // Topological order: tables that are referenced first.
   const ordered = topoOrder(state.entities);
 
+  const allCreateIndexes = [];
   for (const ent of ordered){
     if (!ent.name) continue;
+    ensureEntityShape(ent);
     const cols = ent.columns.filter(c => c.name);
     if (cols.length === 0) continue;
     const colDefs = cols.map(c => {
@@ -1003,10 +1134,29 @@ function generateSQL(){
         if (c.fk.onDelete && c.fk.onDelete !== "RESTRICT") s += ` ON DELETE ${c.fk.onDelete}`;
       }
       return s;
-    }).join(",\n");
+    });
+    // Composite table-level constraints
+    for (const c of ent.constraints){
+      if (!c.columns || c.columns.length === 0) continue;
+      const nm = c.name ? `CONSTRAINT ${c.name} ` : "";
+      if (c.kind === "pk")     colDefs.push(`  ${nm}PRIMARY KEY (${c.columns.join(", ")})`);
+      if (c.kind === "unique") colDefs.push(`  ${nm}UNIQUE (${c.columns.join(", ")})`);
+    }
     lines.push(`CREATE TABLE ${ent.name} (`);
-    lines.push(colDefs);
+    lines.push(colDefs.join(",\n"));
     lines.push(`);`);
+    lines.push(``);
+    // Composite CREATE INDEX statements (after table)
+    for (const ix of ent.indexes){
+      if (!ix.columns || ix.columns.length === 0) continue;
+      const nm = ix.name || indexName(ent, ix);
+      const uq = ix.unique ? "UNIQUE " : "";
+      allCreateIndexes.push(`CREATE ${uq}INDEX ${nm} ON ${ent.name} (${ix.columns.join(", ")});`);
+    }
+  }
+  if (allCreateIndexes.length){
+    lines.push(`-- Indexes`);
+    for (const s of allCreateIndexes) lines.push(s);
     lines.push(``);
   }
   return lines.join("\n");
@@ -1047,6 +1197,154 @@ function topoOrder(entities){
 }
 
 /* ---------- FK modal ---------- */
+/* ---------- composite constraints + indexes ---------- */
+function renderCompositeBlock(ent){
+  const items = [];
+  for (const c of (ent.constraints || [])){
+    const kindLabel = c.kind === "pk" ? "PK" : "UQ";
+    const kindCol   = c.kind === "pk" ? "var(--pk)" : "var(--uq)";
+    items.push(el("div", {
+      style:`display:flex;align-items:center;gap:6px;padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;border-bottom:1px solid var(--border);cursor:pointer;color:var(--text)`,
+      title:"Editar constraint compuesto",
+      onclick: () => openCompositeModal(ent.id, "constraint", c.id)
+    },
+      el("span", { style:`color:${kindCol};font-weight:600;letter-spacing:.3px` }, kindLabel),
+      el("span", {}, compName(ent, c)),
+      el("span", { class:"muted", style:"margin-left:auto" }, "(" + c.columns.join(", ") + ")")
+    ));
+  }
+  for (const ix of (ent.indexes || [])){
+    items.push(el("div", {
+      style:`display:flex;align-items:center;gap:6px;padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;border-bottom:1px solid var(--border);cursor:pointer;color:var(--text)`,
+      title:"Editar índice compuesto",
+      onclick: () => openCompositeModal(ent.id, "index", ix.id)
+    },
+      el("span", { style:`color:${ix.unique?"var(--uq)":"var(--accent)"};font-weight:600;letter-spacing:.3px` }, ix.unique?"UIX":"IDX"),
+      el("span", {}, indexName(ent, ix)),
+      el("span", { class:"muted", style:"margin-left:auto" }, "(" + ix.columns.join(", ") + ")")
+    ));
+  }
+  if (items.length === 0) return el("span"); // placeholder vacío
+  return el("div", { style:"border-top:1px solid var(--border);background:var(--bg-1)" }, ...items);
+}
+
+let activeComp = null; // { entityId, kind:'constraint'|'index', id|null, selectedCols:[] }
+
+function openCompositeModal(entityId, kind, existingId){
+  const ent = state.entities.find(e => e.id === entityId);
+  if (!ent) return;
+  ensureEntityShape(ent);
+
+  let existing = null;
+  if (existingId){
+    existing = kind === "constraint"
+      ? ent.constraints.find(x => x.id === existingId)
+      : ent.indexes.find(x => x.id === existingId);
+  }
+
+  activeComp = {
+    entityId, kind, id: existingId,
+    selectedCols: existing ? existing.columns.slice() : []
+  };
+
+  $("#comp-title").textContent = existing
+    ? (kind === "constraint" ? "Editar constraint compuesto" : "Editar índice compuesto")
+    : (kind === "constraint" ? "Nuevo constraint compuesto" : "Nuevo índice compuesto");
+
+  $("#comp-kind-row").style.display    = kind === "constraint" ? "block" : "none";
+  $("#comp-unique-row").style.display  = kind === "index"      ? "block" : "none";
+  $("#btn-comp-delete").style.display  = existingId            ? ""      : "none";
+
+  if (kind === "constraint"){
+    $("#comp-kind").value = existing ? existing.kind : "pk";
+    $("#comp-name").value = existing ? (existing.name || "") : "";
+  } else {
+    $("#comp-unique").checked = existing ? !!existing.unique : false;
+    $("#comp-name").value     = existing ? (existing.name || "") : "";
+  }
+
+  renderCompColsPicker(ent);
+  $("#modal-composite").classList.add("show");
+}
+
+function renderCompColsPicker(ent){
+  const box = $("#comp-cols");
+  box.innerHTML = "";
+  const usable = ent.columns.filter(c => c.name);
+  if (usable.length === 0){
+    box.append(el("div", { class:"muted", style:"font-size:11px" }, "(la entidad no tiene columnas con nombre)"));
+    return;
+  }
+  for (const c of usable){
+    const idx = activeComp.selectedCols.indexOf(c.name);
+    const selected = idx >= 0;
+    const chip = el("div", {
+      style: `
+        display:inline-flex;align-items:center;gap:6px;padding:5px 10px;margin:3px 4px 3px 0;
+        border-radius:5px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11.5px;
+        border:1px solid ${selected?"var(--accent)":"var(--border-strong)"};
+        background:${selected?"rgba(88,166,255,.15)":"var(--bg-2)"};
+        color:${selected?"var(--accent)":"var(--text)"};
+      `,
+      onclick: () => {
+        const i = activeComp.selectedCols.indexOf(c.name);
+        if (i >= 0) activeComp.selectedCols.splice(i, 1);
+        else        activeComp.selectedCols.push(c.name);
+        renderCompColsPicker(ent);
+      }
+    },
+      selected ? el("span", { style:"font-weight:700" }, "#" + (idx + 1)) : "",
+      el("span", {}, c.name),
+      el("span", { class:"muted", style:"font-size:10px" }, c.type)
+    );
+    box.append(chip);
+  }
+}
+
+$("#btn-comp-save").onclick = () => {
+  if (!activeComp) return;
+  const ent = state.entities.find(e => e.id === activeComp.entityId);
+  if (!ent) return;
+  if (activeComp.selectedCols.length === 0){ toast("Elegí al menos una columna."); return; }
+
+  const name = sanitizeIdent($("#comp-name").value.trim() || "");
+  const cols = activeComp.selectedCols.slice();
+
+  if (activeComp.kind === "constraint"){
+    const k = $("#comp-kind").value;
+    if (activeComp.id){
+      const c = ent.constraints.find(x => x.id === activeComp.id);
+      c.kind = k; c.name = name; c.columns = cols;
+    } else {
+      ent.constraints.push({ id: id_(), kind: k, name, columns: cols });
+    }
+    if (k === "pk"){
+      // si declaramos PK compuesta, despromover cualquier PK individual
+      ent.columns.forEach(x => x.pk = false);
+    }
+  } else {
+    const uq = $("#comp-unique").checked;
+    if (activeComp.id){
+      const ix = ent.indexes.find(x => x.id === activeComp.id);
+      ix.name = name; ix.unique = uq; ix.columns = cols;
+    } else {
+      ent.indexes.push({ id: id_(), name, unique: uq, columns: cols });
+    }
+  }
+  save(); rerender(); closeModals();
+};
+
+$("#btn-comp-delete").onclick = () => {
+  if (!activeComp || !activeComp.id) return;
+  const ent = state.entities.find(e => e.id === activeComp.entityId);
+  if (activeComp.kind === "constraint"){
+    ent.constraints = ent.constraints.filter(x => x.id !== activeComp.id);
+  } else {
+    ent.indexes = ent.indexes.filter(x => x.id !== activeComp.id);
+  }
+  save(); rerender(); closeModals();
+};
+
 function openFkModal(entityId, columnId){
   activeFkColumn = { entityId, columnId };
   const ent = state.entities.find(e => e.id === entityId);
@@ -1125,6 +1423,14 @@ function importTablesFromJson(tables, dbName){
     const ent = {
       id: id_(), name: t.name,
       x: 60 + (n % 4) * 320, y: 60 + Math.floor(n / 4) * 240,
+      constraints: (t.constraints || []).map(cc => ({
+        id: id_(), kind: cc.kind || "unique",
+        name: cc.name || "", columns: (cc.columns || []).slice()
+      })),
+      indexes: (t.indexes || []).filter(ix => (ix.columns || []).length > 1).map(ix => ({
+        id: id_(), name: ix.name || "", unique: !!ix.unique,
+        columns: (ix.columns || []).slice()
+      })),
       columns: (t.columns || []).map(c => ({
         id: id_(), name: c.name, type: c.type,
         pk: !!c.pk,
@@ -1173,7 +1479,9 @@ $("#btn-new-entity").onclick = () => {
     name: "tabla" + (state.entities.length + 1),
     x: 60 + (state.entities.length * 30) % 400,
     y: 60 + (state.entities.length * 30) % 250,
-    columns: [col("id", "INT", { pk:true })]
+    columns: [col("id", "BIGINT", { pk:true })],
+    constraints: [],
+    indexes: []
   };
   state.entities.push(e);
   save(); rerender(); selectEntity(e.id);
@@ -1222,10 +1530,12 @@ function rerender(){
 
   $("#sql-preview").textContent = generateSQL();
 
+  state.entities.forEach(ensureEntityShape);
   const cols = state.entities.reduce((s,e) => s + e.columns.length, 0);
-  const idxs = state.entities.reduce((s,e) => s + e.columns.filter(c => c.unique && !c.pk).length, 0);
+  const idxs = state.entities.reduce((s,e) => s + e.columns.filter(c => c.unique && !c.pk).length + e.indexes.length, 0);
   const fks  = state.entities.reduce((s,e) => s + e.columns.filter(c => !!c.fk).length, 0);
-  $("#status-counts").textContent = `${state.entities.length} tablas · ${cols} columnas · ${idxs} índices · ${fks} FKs`;
+  const cks  = state.entities.reduce((s,e) => s + e.constraints.length, 0);
+  $("#status-counts").textContent = `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite`;
 
   const errs = findings.filter(f => f[0] === "error").length;
   const warns = findings.filter(f => f[0] === "warn").length;
