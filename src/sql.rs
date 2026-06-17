@@ -10539,8 +10539,17 @@ impl<'a> Engine<'a> {
             // 100 posts × 10K users ≈ 479 ms; post-fix esperado: <20 ms.
             let right = &scope.tables[i + 1];
             let right_rows = self.scan_qualified(right)?;
-            let mut next: Vec<HashMap<String, Value>> =
-                Vec::with_capacity(current.len() * right_rows.len() / 2 + 1);
+            // Fix 2026-06-15: pre-allocar `current.len() * right_rows.len() / 2`
+            // asumía cartesiano denso (~50% match). Para tablas grandes con
+            // predicate selectivo es catastrófico — e.g. lines(100k) ×
+            // orders(20k) / 2 = 10⁹ slots × ~48 bytes/HashMap = **48 GB**.
+            // En CI runner (8 GB RAM) abortaba con
+            // "memory allocation of 48000000048 bytes failed" (bench `smoke`,
+            // query R3-cont "JOIN hash O×L"). Cambio: capacity = current.len()
+            // (estimación inicial razonable; el Vec dobla amortizado O(1) si
+            // hay más matches). Pérdida de perf en JOIN denso real (raro)
+            // queda dentro de la curva de realloc estándar de Vec.
+            let mut next: Vec<HashMap<String, Value>> = Vec::with_capacity(current.len());
             let mut left_matched = vec![false; current.len()];
             let mut right_matched = vec![false; right_rows.len()];
 

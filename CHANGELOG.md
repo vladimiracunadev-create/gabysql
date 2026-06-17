@@ -6,6 +6,25 @@
 
 ---
 
+## 2026-06-15 — fix(JOIN): pre-allocation cartesiano destapado por R3-cont
+
+> Bug pre-existente del motor destapado por la query R3-cont (`o.total =
+> l.precio` sobre lines × orders, 100k × 20k sin filtro fuerte). En CI
+> abortó con `memory allocation of 48000000048 bytes failed` (8 GB RAM
+> runner). La línea 10543 de `sql.rs` pre-allocaba `current.len() *
+> right_rows.len() / 2 + 1` slots de HashMap para el resultado del
+> JOIN — asumía cartesiano denso al 50%. Para tablas grandes con
+> predicate selectivo es catastrófico: 100k × 20k / 2 = 10⁹ slots ×
+> ~48 bytes/HashMap = **48 GB exactos**. Solo se manifestaba con tablas
+> grandes en JOIN hash sin pre-filter — el smoke pre-R3-cont las
+> filtraba todas con `WHERE id=K`.
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **fix JOIN OOM** | fix | zero-bump | — | `Vec::with_capacity(current.len() * right_rows.len() / 2 + 1)` → `Vec::with_capacity(current.len())`. El Vec crece amortizado O(1); pérdida de perf en JOIN denso real cae dentro de la curva de realloc estándar. Verificado: bench `smoke` 5.3 min con la query R3-cont en 469 ms mean (igual que pre-fix, sin OOM). |
+
+---
+
 ## 2026-06-15 — Sesión maratón: 10 pushes cierran la mayoría de la deuda post-P5
 
 > Sesión de un día que cerró 3 tensiones del análisis post-P5 + las 4
