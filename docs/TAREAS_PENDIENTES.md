@@ -152,7 +152,7 @@ Items que NO son reparaciones (no hay nada roto), pero amplían lo entregado en 
 | **M1** | Auto-ANALYZE (scheduler que dispare cuando la tabla cambia >X%) | Hoy las stats son manuales. R1 detecta stale, pero el usuario tiene que mirar EXPLAIN y actuar. Auto-ANALYZE cierra el loop. | 1 push grande (~600 LOC + jobs infra) |
 | ~~**M3**~~ | ~~Property tests para planner~~ — ✅ entregada 2026-06-15 ([ADR-0084](adr/0084-m3-proptest-planner.md)). Hand-rolled zero-deps, 240 comparaciones por corrida. | — |
 | **M5** | Multi-column stats (correlación) | Resuelve la asunción de independencia de P5c. PostgreSQL `CREATE STATISTICS`. Reemplazaría R6 conceptualmente. | 1 push grande (~600 LOC + bump VERSION) |
-| **M6** | EXPLAIN ANALYZE compara `est.match` vs `actual` | Diagnóstico directo del bias del estimator. Hoy ANALYZE re-ejecuta — solo falta agregar la columna comparativa. | 1 push (~200 LOC) |
+| ~~**M6**~~ | ~~EXPLAIN ANALYZE compara `est.match` vs `actual`~~ — ✅ entregada 2026-06-15 ([ADR-0088](adr/0088-m6-explain-analyze-bias.md)). Step `actual.bias` con clasificación GOOD/MILD/HIGH/MATCH para queries scan-only. | — |
 | **M7** | Hints SQL (`/*+ INDEX(t, idx) */`) | Override per-query del cost model. Estándar en Oracle/MySQL/SQL Server. | 1 push (~400 LOC, requiere parser changes) |
 | **M8** | Prefix matching sobre composite indexes (`WHERE a=X` con índice `(a,b)`) | Hoy cae a FullScan. Requiere cambio de layout on-disk a lexicographic tuple-bytes. | 1 push grande (~800 LOC + bump VERSION) |
 | **M9** | Base table reorder para INNER JOIN chains (P5d extendido) | Hoy P5d solo swap el step current. Reorder global requiere refactor de `build_join_scope`. | 1 push (~600 LOC, riesgo medio) |

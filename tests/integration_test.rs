@@ -18838,6 +18838,123 @@ fn r7_p5c_no_aplica_sin_hint_aunque_stats_viejas() -> Result<(), Box<dyn Error>>
 }
 
 // ============================================================
+// Bloque M6 (2026-06-15): EXPLAIN ANALYZE compara est.match vs actual
+// para queries scan-only (sin JOIN/GROUP BY/aggregate/LIMIT/etc.).
+// Anota un step `actual.bias` con ratio actual/est y clasificación
+// GOOD/MILD/HIGH/MATCH.
+// ============================================================
+
+#[test]
+fn m6_explain_analyze_bias_good_cuando_estimador_da_en_el_clavo() -> Result<(), Box<dyn Error>> {
+    // 6 filas 'a' de 25 con MCV → est.match=6 exacto. actual=6 → ratio=1.0
+    // → BIAS=GOOD.
+    let (db, wal) = p3_setup("m6-good")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES
+            (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a'),(6,'a'),
+            (7,'b'),(8,'b'),(9,'b'),(10,'b'),(11,'b'),(12,'b'),(13,'b'),
+            (14,'c'),(15,'c'),(16,'c'),(17,'c'),(18,'c'),(19,'c'),(20,'c'),
+            (21,'d'),(22,'d'),(23,'d'),(24,'d'),(25,'e');
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(
+        &db,
+        "EXPLAIN ANALYZE SELECT id FROM t WHERE category = 'a';",
+    )?;
+    // Buscar el step actual.bias en el ResultSet.
+    let last = res.last().unwrap();
+    let bias_row = last
+        .rows
+        .iter()
+        .find(|r| matches!(&r[0], Value::String(s) if s == "actual.bias"));
+    assert!(
+        bias_row.is_some(),
+        "esperaba step actual.bias en EXPLAIN ANALYZE; rows = {:?}",
+        last.rows
+    );
+    let detail = match &bias_row.unwrap()[1] {
+        Value::String(s) => s.clone(),
+        _ => panic!("detail no es String"),
+    };
+    assert!(
+        detail.contains("actual=6") && detail.contains("BIAS=GOOD"),
+        "esperaba actual=6 BIAS=GOOD, vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn m6_explain_analyze_sin_bias_en_query_con_join() -> Result<(), Box<dyn Error>> {
+    // Query con JOIN no es scan-only → NO debe emitirse `actual.bias`.
+    let (db, wal) = p3_setup("m6-join")?;
+    run_sql(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE o (id INT PRIMARY KEY, user_id INT);
+         INSERT INTO u (id, name) VALUES (1,'a'),(2,'b'),(3,'c');
+         INSERT INTO o (id, user_id) VALUES (10,1),(11,2),(12,3);
+         ANALYZE TABLE u; ANALYZE TABLE o;",
+    )?;
+    let res = run_sql(
+        &db,
+        "EXPLAIN ANALYZE SELECT u.id FROM u JOIN o ON o.user_id = u.id;",
+    )?;
+    let last = res.last().unwrap();
+    let has_bias = last
+        .rows
+        .iter()
+        .any(|r| matches!(&r[0], Value::String(s) if s == "actual.bias"));
+    assert!(
+        !has_bias,
+        "JOIN no es scan-only — actual.bias NO debe aparecer; rows = {:?}",
+        last.rows
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+#[test]
+fn m6_explain_analyze_bias_high_cuando_estimador_sobreestima() -> Result<(), Box<dyn Error>> {
+    // WHERE sobre valor que no existe en MCV → P5a usa DEFAULT_EQ_SELECTIVITY
+    // y estima ≥1 fila. Actual es 0 → ratio 0 → BIAS=HIGH. Exactamente
+    // el caso de uso de M6: detectar cuándo el estimator se equivoca.
+    let (db, wal) = p3_setup("m6-high")?;
+    run_sql(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, category TEXT);
+         CREATE INDEX idx_cat ON t (category);
+         INSERT INTO t (id, category) VALUES (1,'a'),(2,'b'),(3,'c');
+         ANALYZE TABLE t;",
+    )?;
+    let res = run_sql(
+        &db,
+        "EXPLAIN ANALYZE SELECT id FROM t WHERE category = 'no_existe';",
+    )?;
+    let last = res.last().unwrap();
+    let bias_row = last
+        .rows
+        .iter()
+        .find(|r| matches!(&r[0], Value::String(s) if s == "actual.bias"));
+    assert!(bias_row.is_some(), "esperaba step actual.bias");
+    let detail = match &bias_row.unwrap()[1] {
+        Value::String(s) => s.clone(),
+        _ => panic!("detail no es String"),
+    };
+    assert!(
+        detail.contains("actual=0") && detail.contains("BIAS=HIGH"),
+        "esperaba actual=0 BIAS=HIGH (estimator se equivoca), vi: {}",
+        detail
+    );
+    cleanup(&[&db, &wal]);
+    Ok(())
+}
+
+// ============================================================
 // Bloque R2 (2026-06-15): INDEX_BREAKEVEN_SELECTIVITY recalibrado de
 // 0.20 a 0.10 contra gabybench smoke. Test verifica:
 //  - default 0.10 dispara sobre sel=0.12 (antes con 0.20 no disparaba).

@@ -2467,6 +2467,71 @@ fn format_stats_age(age_secs: u64) -> String {
     }
 }
 
+/// Bloque M6 (2026-06-15): detecta si un Statement es un SELECT
+/// "scan-only" — sin JOIN/GROUP BY/aggregate/LIMIT/DISTINCT/HAVING/OFFSET
+/// y sin derived/values. Para ese subconjunto, el row_count final de
+/// la query iguala la cantidad de filas que matchearon el WHERE — la
+/// misma cantidad que estima P5a en `est.match=K`. Compararlas mide
+/// directamente el bias del estimator.
+fn is_scan_only_select(stmt: &Statement) -> bool {
+    let Statement::Select(q) = stmt else {
+        return false;
+    };
+    // Set-ops (UNION/INTERSECT/EXCEPT) y VALUES standalone post-procesan,
+    // no son scan-only por construcción.
+    let SelectQuery::Select(s) = q.as_ref() else {
+        return false;
+    };
+    s.joins.is_empty()
+        && s.group_by.is_empty()
+        && s.having.is_none()
+        && !s.distinct
+        && s.limit.is_none()
+        && s.offset == 0
+        && s.derived_source.is_none()
+        && s.values_source.is_none()
+        && !s
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectItem::Aggregate { .. } | SelectItem::Window { .. }))
+}
+
+/// Bloque M6: extrae el número `K` de un substring `est.match=K` dentro
+/// de la annotation de un SCAN step. Devuelve `None` si no aparece — el
+/// SCAN no tenía stats o no había WHERE.
+fn extract_est_match(detail: &str) -> Option<u64> {
+    let needle = "est.match=";
+    let pos = detail.find(needle)?;
+    let after = &detail[pos + needle.len()..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+/// Bloque M6: clasifica el ratio `actual / est` en bandas legibles.
+/// - `MATCH`: ambos 0 (degenerate, perfecto trivial).
+/// - `GOOD`:  ratio ∈ [0.5, 2.0] — estimación dentro de 2× del real.
+/// - `MILD`:  ratio ∈ [0.25, 0.5] ∪ [2.0, 4.0] — 2-4× off.
+/// - `HIGH`:  fuera de [0.25, 4.0] — >4× off. Sospechar P5c eligió mal.
+fn classify_bias(est: u64, actual: u64) -> (String, &'static str) {
+    if est == 0 && actual == 0 {
+        return ("1.00".to_string(), "MATCH");
+    }
+    if est == 0 {
+        return (format!("∞ (est=0, actual={})", actual), "HIGH");
+    }
+    let ratio = actual as f64 / est as f64;
+    let band = if (0.5..=2.0).contains(&ratio) {
+        "GOOD"
+    } else if (0.25..=4.0).contains(&ratio) {
+        "MILD"
+    } else {
+        "HIGH"
+    };
+    (format!("{:.2}", ratio), band)
+}
+
 /// Bloque R7 (2026-06-15): sufijo educativo para los mensajes EXPLAIN
 /// de los path P5c skip-index. Si las stats tienen más de
 /// `STATS_REANALYZE_HINT_SECS` (24h) pero todavía NO son stale (R1 ya
@@ -5898,6 +5963,13 @@ impl<'a> Engine<'a> {
         // en el match plan-walker, porque después hay que volver a
         // pasarlo a `exec()` para la ejecución real.
         let inner_for_exec = if analyze { Some(inner.clone()) } else { None };
+        // Bloque M6 (2026-06-15): captura si el inner es un SELECT
+        // "scan-only" — sin JOIN/GROUP BY/aggregate/LIMIT/DISTINCT/HAVING.
+        // Para ese subconjunto, `row_count` final == `est.match` esperado,
+        // y podemos comparar bias del estimator directamente. Para queries
+        // post-procesadas (filtros agregados, LIMIT, etc.) la comparación
+        // sería engañosa, así que skip.
+        let analyze_scan_only = analyze && is_scan_only_select(&inner);
         match inner {
             Statement::Select(query) => self.explain_select_query(&query, &mut steps, 0)?,
             Statement::SelectRecursive(stmt) => {
@@ -6054,6 +6126,28 @@ impl<'a> Engine<'a> {
                             }
                         ),
                     ));
+                    // Bloque M6 (2026-06-15): si el inner era scan-only y
+                    // el primer SCAN step trae `est.match=K1`, comparamos
+                    // contra `actual=K2` y clasificamos el bias. Útil
+                    // para diagnosticar cuándo P5a/P5c subestima o sobre-
+                    // estima — el optimizer toma decisiones a partir de
+                    // K1, si está sesgado el plan elegido también lo
+                    // estará.
+                    if analyze_scan_only {
+                        if let Some((est_step, est_match)) = steps
+                            .iter()
+                            .find_map(|(s, d)| extract_est_match(d).map(|n| (s.clone(), n)))
+                        {
+                            let (ratio_str, bias) = classify_bias(est_match, row_count as u64);
+                            steps.push((
+                                "actual.bias".to_string(),
+                                format!(
+                                    "est.match={} actual={} ratio={} BIAS={} (sobre step `{}`)",
+                                    est_match, row_count, ratio_str, bias, est_step
+                                ),
+                            ));
+                        }
+                    }
                     Some(format!(
                         "EXPLAIN ANALYZE: plan + ejecución real ({:.3} ms, {} rows). \
                          Cuidado: side-effects PERSISTIDOS.",

@@ -6,6 +6,23 @@
 
 ---
 
+## 2026-06-15 — M6: EXPLAIN ANALYZE anota bias del estimator (est vs actual)
+
+> Diagnóstico directo del estimator en una sola lectura. Pre-M6 había
+> que mirar `est.match=K1` en el SCAN step + `actual.rows=K2` al final
+> y hacer la cuenta. Ahora se anota un step `actual.bias` con ratio +
+> clasificación GOOD/MILD/HIGH/MATCH. Solo aplica a SELECT scan-only
+> (sin JOIN/GROUP BY/aggregate/LIMIT/etc.) donde el row_count final
+> representa exactamente las filas que sobrevivieron al WHERE — para
+> queries post-procesadas la comparación sería engañosa y se omite.
+> Suite 816 → **819** (+3).
+
+| Bloque | Tipo | VERSION | ADR | Resumen |
+|---|---|---|---|---|
+| **M6** | feat | zero-bump | [0088](docs/adr/0088-m6-explain-analyze-bias.md) | 3 helpers nuevos (`is_scan_only_select`, `extract_est_match`, `classify_bias`) + ~12 LOC en `exec_explain`. Bandas: MATCH (0/0), GOOD ([0.5, 2.0]), MILD ([0.25, 0.5] ∪ [2.0, 4.0]), HIGH (resto). +3 tests `m6_*`: GOOD con MCV exacto, sin bias en JOIN, HIGH cuando estimador sobreestima. |
+
+---
+
 ## 2026-06-15 — M4: fuzz parser hand-rolled — 1 hora limpia, 500M iters, 0 panics
 
 > Línea pendiente del README ("X horas de fuzz") satisfecha con
