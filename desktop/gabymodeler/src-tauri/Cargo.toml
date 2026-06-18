@@ -1,0 +1,38 @@
+[package]
+name = "gabymodeler-desktop"
+version = "0.1.0"
+description = "gabymodeler — modelador ER para gabysql (app de escritorio)"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+authors = ["gabysql contributors"]
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "1.6", features = [
+  "dialog-open",
+  "dialog-save",
+  "fs-read-file",
+  "fs-write-file",
+  "shell-open",
+  "window-close",
+  "window-minimize",
+  "window-maximize",
+  "updater",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

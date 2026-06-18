@@ -3331,6 +3331,55 @@ $("#file-input").onchange = e => {
 pushHistory();
 updateUndoRedoUi();
 
+/* ---------- Bridge Tauri (Push 32) ----------
+   Cuando el modeler corre dentro de la app de escritorio (vía Tauri),
+   `window.__TAURI__` está disponible y el menú nativo emite el evento
+   `menu` con un id como "file:open". Los IDs coinciden con los atajos
+   que ya tenemos en JS — el handler sólo despacha. Si __TAURI__ no
+   existe (modo web puro), todo este bloque es no-op. */
+if (typeof window !== "undefined" && window.__TAURI__){
+  const t = window.__TAURI__;
+  const router = id => {
+    switch (id){
+      case "file:open":    $("#file-input").click(); break;
+      case "file:save":    save(); toast("Guardado"); break;
+      case "file:save-as": saveToFile(); break;
+      case "file:export-svg": exportSvg(); break;
+      case "file:export-png": exportPng(); break;
+      case "file:quit":    if (t.window && t.window.getCurrent) t.window.getCurrent().close(); break;
+      case "edit:undo":    undo(); break;
+      case "edit:redo":    redo(); break;
+      case "edit:select-all": selectAllEntities(); break;
+      case "edit:duplicate":  duplicateSelectedEntities(); break;
+      case "edit:search":  openSearch(); break;
+      case "view:zoom-in":  setZoom(canvasZoom * 1.2); break;
+      case "view:zoom-out": setZoom(canvasZoom / 1.2); break;
+      case "view:zoom-reset": resetZoom(); break;
+      case "view:fit-all": fitAll(); break;
+      case "view:autolayout": autoLayout(); break;
+      case "tools:migrate": openMigrateModal(); break;
+      case "help:docs": if (t.shell && t.shell.open) t.shell.open("https://github.com/vladimiracunadev-create/gabysql"); break;
+      case "help:about": alert("gabymodeler\nModelador ER para gabysql\nVERSION 33 compatible"); break;
+    }
+  };
+  if (t.event && t.event.listen){
+    t.event.listen("menu",      e => router(String(e.payload)));
+    t.event.listen("open-file", async e => {
+      // Cuando Windows pasa un .gby por argumento de CLI (file association)
+      try {
+        const path = String(e.payload);
+        if (t.fs && t.fs.readTextFile){
+          const text = await t.fs.readTextFile(path);
+          // Reusamos el reader del file input simulando un File
+          const blob = new Blob([text], { type:"application/json" });
+          const f = new File([blob], path.split(/[\\/]/).pop() || "model.gby");
+          loadFromFile(f);
+        }
+      } catch (err){ toast("Error abriendo archivo: " + err.message); }
+    });
+  }
+}
+
 /* ---------- bulk toolbar (Push 28) ---------- */
 /* ---------- search palette (Push 30) ---------- */
 let searchResults = [];

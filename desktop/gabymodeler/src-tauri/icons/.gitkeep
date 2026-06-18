@@ -1,0 +1,6 @@
+# Iconos pendientes
+Generá con `cargo tauri icon icon-source.png` (1024x1024 recomendado).
+Producirá: 32x32.png, 128x128.png, 128x128@2x.png, icon.icns (mac),
+icon.ico (Windows), Square*Logo*.png (Microsoft Store).
+Mientras tanto Tauri usa un icono default — la app funciona pero el
+bundle no firma sin ico real.

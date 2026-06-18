@@ -1,0 +1,100 @@
+{
+  "$schema": "https://schema.tauri.app/config/1",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devPath": "../../../web/modeler",
+    "distDir": "../../../web/modeler",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "gabymodeler",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": { "all": false, "open": true },
+      "dialog": { "open": true, "save": true },
+      "fs": {
+        "readFile": true,
+        "writeFile": true,
+        "scope": ["$HOME/**", "$DOCUMENT/**", "$DESKTOP/**", "$DOWNLOAD/**"]
+      },
+      "window": { "close": true, "minimize": true, "maximize": true }
+    },
+    "bundle": {
+      "active": true,
+      "category": "DeveloperTool",
+      "copyright": "© 2026 gabysql contributors",
+      "deb": { "depends": [] },
+      "externalBin": [],
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ],
+      "identifier": "dev.gabysql.gabymodeler",
+      "longDescription": "Modelador ER profesional para gabysql: composite PK/UNIQUE/INDEX, CHECK constraints, Views, RLS Policies, Triggers/Procedures/Functions, Users/Roles/Grants. Canvas con zoom/pan/minimap, búsqueda global, auto-layout, migraciones diff→ALTER.",
+      "macOS": {
+        "entitlements": null,
+        "exceptionDomain": "",
+        "frameworks": [],
+        "providerShortName": null,
+        "signingIdentity": null
+      },
+      "resources": [],
+      "shortDescription": "ER modeler para gabysql",
+      "targets": ["msi", "nsis", "deb", "appimage", "dmg"],
+      "windows": {
+        "certificateThumbprint": null,
+        "digestAlgorithm": "sha256",
+        "timestampUrl": "",
+        "webviewInstallMode": { "type": "embedBootstrapper" },
+        "wix": {
+          "language": ["en-US", "es-AR"],
+          "license": "../../../LICENSE"
+        },
+        "nsis": {
+          "installerIcon": "icons/icon.ico",
+          "displayLanguageSelector": true,
+          "languages": ["English", "Spanish"]
+        }
+      },
+      "fileAssociations": [
+        {
+          "ext": ["gby"],
+          "name": "gabymodeler model",
+          "description": "Modelo de schema gabymodeler",
+          "role": "Editor",
+          "mimeType": "application/x-gabymodeler"
+        }
+      ]
+    },
+    "security": {
+      "csp": "default-src 'self' tauri: https://fonts.googleapis.com https://fonts.gstatic.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*"
+    },
+    "updater": {
+      "active": false,
+      "endpoints": ["https://gabysql.dev/desktop/updates/{{target}}/{{current_version}}"],
+      "dialog": true,
+      "pubkey": ""
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "resizable": true,
+        "title": "gabymodeler",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1000,
+        "minHeight": 650,
+        "decorations": true,
+        "transparent": false,
+        "fileDropEnabled": true
+      }
+    ]
+  }
+}
