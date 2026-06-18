@@ -435,6 +435,7 @@
   <button id="btn-redo" title="Rehacer (Ctrl+Y / Ctrl+Shift+Z)" disabled>↷</button>
   <button id="btn-search" title="Buscar (Ctrl+F)">🔍</button>
   <button id="btn-autolayout" title="Auto-layout (force-directed)">⚛</button>
+  <button id="btn-migrate" title="Diff vs snapshot → ALTER statements">⇄ Migrar</button>
   <div class="dd">
     <button id="btn-file" title="Archivo">📁 Archivo ▾</button>
     <div class="dd-menu" id="file-menu">
@@ -796,6 +797,56 @@
       <span class="spacer" style="flex:1"></span>
       <button class="ghost" data-close="modal-routine">cancelar</button>
       <button id="btn-routine-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- modal: migrations (diff schemas → ALTER) -->
+<div class="modal-bg" id="modal-migrate">
+  <div class="modal" style="width:min(900px,94vw);max-height:90vh">
+    <div class="modal-head">
+      <h2>⇄ Generar migración</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-migrate">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="font-size:12.5px;margin:0 0 12px 0">
+        Compará el modelo actual contra un snapshot anterior (un <code>.gby</code> guardado, o un JSON exportado).
+        Generamos los <code>CREATE / ALTER / DROP</code> necesarios para llegar del baseline al estado actual.
+      </p>
+      <label>Baseline — pegá JSON o subí archivo</label>
+      <div class="row" style="gap:8px;margin-top:5px">
+        <input id="mig-baseline-file" type="file" accept=".gby,.json,application/json" style="flex:1" />
+        <button class="ghost" id="mig-from-localstorage">Cargar de localStorage actual</button>
+      </div>
+      <textarea id="mig-baseline" rows="6" style="
+        width:100%;margin-top:8px;background:var(--bg-1);color:var(--text);
+        border:1px solid var(--border-strong);border-radius:5px;padding:10px;
+        font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11.5px;line-height:1.45;
+      " placeholder='{"format":"gabymodeler","version":1,"state":{...}}'></textarea>
+
+      <div class="row" style="gap:8px;margin-top:14px">
+        <button class="primary" id="mig-compute">Calcular diff</button>
+        <button class="ghost" id="mig-copy" disabled>Copiar SQL</button>
+        <button class="ghost" id="mig-download" disabled>Descargar .sql</button>
+      </div>
+
+      <div id="mig-summary" style="margin-top:12px;display:none">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-muted);font-weight:600;margin-bottom:6px">
+          Cambios detectados
+        </div>
+        <div id="mig-changes" style="
+          background:var(--bg-1);border:1px solid var(--border);border-radius:5px;
+          padding:8px 12px;max-height:200px;overflow:auto;font-size:12.5px;line-height:1.6;
+        "></div>
+      </div>
+
+      <div id="mig-sql-wrap" style="margin-top:12px;display:none">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-muted);font-weight:600;margin-bottom:6px">
+          SQL de migración
+        </div>
+        <pre id="mig-sql" class="code" style="margin:0;max-height:280px;overflow:auto"></pre>
+      </div>
     </div>
   </div>
 </div>
@@ -3461,6 +3512,341 @@ function autoLayout(){
 }
 
 $("#btn-autolayout").onclick = autoLayout;
+
+/* ---------- Migrations (Push 31) ----------
+   Diff entre un baseline (state snapshot anterior) y el state
+   actual, emitiendo SQL para llegar del primero al segundo.
+
+   El motor gabysql VERSION 33 soporta:
+   - ALTER TABLE ADD COLUMN
+   - ALTER TABLE DROP COLUMN [IF EXISTS]
+   - ALTER TABLE RENAME COLUMN
+   - ALTER TABLE RENAME TO
+   - ALTER TABLE ADD [CONSTRAINT name] CHECK (expr)
+   - ALTER TABLE DROP CONSTRAINT name
+   - CREATE/DROP TABLE | VIEW | POLICY | TRIGGER | PROCEDURE |
+     FUNCTION | USER | ROLE
+   - GRANT/REVOKE
+
+   NO soporta hoy:
+   - ALTER COLUMN TYPE (cambiar tipo de columna existente)
+   - ALTER TABLE ADD FOREIGN KEY post-creación
+   El emisor marca esos casos como warning con comentario en el SQL,
+   sugiriendo recrear la tabla manualmente (CREATE_TABLE_NEW +
+   INSERT_SELECT + DROP_TABLE_OLD + RENAME). */
+
+let migLastSql = "";
+
+function indexBy(arr, key){
+  const m = new Map();
+  for (const x of (arr || [])){
+    const k = String(x[key] || "").toLowerCase();
+    if (k) m.set(k, x);
+  }
+  return m;
+}
+
+function colInline(c){
+  let s = `${c.name} ${c.type}`;
+  if (c.notNull && !c.pk) s += " NOT NULL";
+  if (c.unique && !c.pk)  s += " UNIQUE";
+  if (c.pk)               s += " PRIMARY KEY";
+  if (c.hasDefault && !c.pk){
+    s += " DEFAULT " + sqlLiteral(c);
+  }
+  if (c.hasCheck && String(c.checkExpr || "").trim()){
+    s += ` CHECK (${String(c.checkExpr).trim()})`;
+  }
+  if (c.fk){
+    s += ` REFERENCES ${c.fk.table}(${c.fk.column})`;
+    if (c.fk.onDelete && c.fk.onDelete !== "RESTRICT") s += ` ON DELETE ${c.fk.onDelete}`;
+  }
+  return s;
+}
+
+function computeMigration(baseline, current){
+  const changes = [];
+  const sql = [];
+
+  // ---- TABLES ----
+  const bTables = indexBy(baseline.entities, "name");
+  const cTables = indexBy(current.entities,  "name");
+
+  // Nuevas
+  for (const [name, ent] of cTables){
+    if (!bTables.has(name)){
+      changes.push({ kind:"+", what:"tabla", text:ent.name });
+      const cols = (ent.columns || []).filter(c => c.name);
+      const colDefs = cols.map(c => "  " + colInline(c));
+      for (const cc of (ent.constraints || [])){
+        if (!cc.columns || cc.columns.length === 0) continue;
+        const nm = cc.name ? `CONSTRAINT ${cc.name} ` : "";
+        if (cc.kind === "pk")     colDefs.push(`  ${nm}PRIMARY KEY (${cc.columns.join(", ")})`);
+        if (cc.kind === "unique") colDefs.push(`  ${nm}UNIQUE (${cc.columns.join(", ")})`);
+      }
+      sql.push(`CREATE TABLE ${ent.name} (\n${colDefs.join(",\n")}\n);`);
+      for (const ix of (ent.indexes || [])){
+        if (!ix.columns || ix.columns.length === 0) continue;
+        const nm = ix.name || ((ix.unique?"uq_":"ix_") + ent.name + "_" + ix.columns.join("_"));
+        sql.push(`CREATE ${ix.unique?"UNIQUE ":""}INDEX ${nm} ON ${ent.name} (${ix.columns.join(", ")});`);
+      }
+    }
+  }
+  // Eliminadas
+  for (const [name, ent] of bTables){
+    if (!cTables.has(name)){
+      changes.push({ kind:"-", what:"tabla", text:ent.name });
+      sql.push(`DROP TABLE IF EXISTS ${ent.name};`);
+    }
+  }
+  // Modificadas
+  for (const [name, cur] of cTables){
+    const base = bTables.get(name);
+    if (!base) continue;
+    const bCols = indexBy(base.columns, "name");
+    const cCols = indexBy(cur.columns,  "name");
+
+    // Columnas nuevas
+    for (const [cname, c] of cCols){
+      if (!bCols.has(cname)){
+        changes.push({ kind:"+", what:"col", text:`${cur.name}.${c.name}` });
+        sql.push(`ALTER TABLE ${cur.name} ADD COLUMN ${colInline(c)};`);
+      }
+    }
+    // Columnas eliminadas
+    for (const [cname, c] of bCols){
+      if (!cCols.has(cname)){
+        changes.push({ kind:"-", what:"col", text:`${cur.name}.${c.name}` });
+        sql.push(`ALTER TABLE ${cur.name} DROP COLUMN IF EXISTS ${c.name};`);
+      }
+    }
+    // Columnas modificadas
+    for (const [cname, c] of cCols){
+      const b = bCols.get(cname);
+      if (!b) continue;
+      if (b.type !== c.type){
+        changes.push({ kind:"!", what:"col-type", text:`${cur.name}.${c.name}: ${b.type} → ${c.type}` });
+        sql.push(`-- WARN: ALTER COLUMN TYPE no soportado por gabysql.`);
+        sql.push(`-- Para ${cur.name}.${c.name}: ${b.type} → ${c.type}`);
+        sql.push(`-- Recreá la tabla manualmente o haz: ADD COLUMN tmp + UPDATE + DROP + RENAME.`);
+      }
+      // CHECK: añadido / eliminado / cambiado
+      const bChk = b.hasCheck && String(b.checkExpr || "").trim();
+      const cChk = c.hasCheck && String(c.checkExpr || "").trim();
+      if (!bChk && cChk){
+        const nm = `chk_${cur.name}_${c.name}`;
+        changes.push({ kind:"+", what:"check", text:`${cur.name}.${c.name}` });
+        sql.push(`ALTER TABLE ${cur.name} ADD CONSTRAINT ${nm} CHECK (${cChk});`);
+      } else if (bChk && !cChk){
+        const nm = `chk_${cur.name}_${c.name}`;
+        changes.push({ kind:"-", what:"check", text:`${cur.name}.${c.name}` });
+        sql.push(`ALTER TABLE ${cur.name} DROP CONSTRAINT ${nm};`);
+      } else if (bChk && cChk && bChk !== cChk){
+        const nm = `chk_${cur.name}_${c.name}`;
+        changes.push({ kind:"!", what:"check", text:`${cur.name}.${c.name}` });
+        sql.push(`ALTER TABLE ${cur.name} DROP CONSTRAINT ${nm};`);
+        sql.push(`ALTER TABLE ${cur.name} ADD CONSTRAINT ${nm} CHECK (${cChk});`);
+      }
+      // FK: añadida / eliminada
+      if (!b.fk && c.fk){
+        changes.push({ kind:"!", what:"fk", text:`${cur.name}.${c.name} → ${c.fk.table}(${c.fk.column})` });
+        sql.push(`-- WARN: ALTER TABLE ADD FOREIGN KEY post-creación no soportado por gabysql.`);
+        sql.push(`-- ${cur.name}.${c.name} → ${c.fk.table}(${c.fk.column}) ON DELETE ${c.fk.onDelete || "RESTRICT"}`);
+        sql.push(`-- Re-crear la tabla con el FK inline.`);
+      } else if (b.fk && !c.fk){
+        changes.push({ kind:"-", what:"fk", text:`${cur.name}.${c.name}` });
+        sql.push(`-- WARN: DROP FK requiere conocer el nombre del constraint generado por el motor (uq/fk_${cur.name}_${c.name}).`);
+      }
+    }
+  }
+
+  // ---- VIEWS ----
+  const bViews = indexBy(baseline.views, "name");
+  const cViews = indexBy(current.views,  "name");
+  for (const [name, v] of cViews){
+    if (!bViews.has(name)){
+      changes.push({ kind:"+", what:"view", text:v.name });
+      sql.push(`CREATE VIEW ${v.name} AS ${v.body};`);
+    } else if (bViews.get(name).body !== v.body){
+      changes.push({ kind:"!", what:"view", text:v.name });
+      sql.push(`DROP VIEW IF EXISTS ${v.name};`);
+      sql.push(`CREATE VIEW ${v.name} AS ${v.body};`);
+    }
+  }
+  for (const [name, v] of bViews){
+    if (!cViews.has(name)){
+      changes.push({ kind:"-", what:"view", text:v.name });
+      sql.push(`DROP VIEW IF EXISTS ${v.name};`);
+    }
+  }
+
+  // ---- POLICIES ----
+  const bPols = indexBy(baseline.policies, "name");
+  const cPols = indexBy(current.policies,  "name");
+  for (const [name, p] of cPols){
+    if (!bPols.has(name)){
+      changes.push({ kind:"+", what:"policy", text:p.name });
+      let s = `CREATE POLICY ${p.name} ON ${p.table} FOR ${p.action || "SELECT"}`;
+      if (p.role)  s += ` TO ${p.role}`;
+      if (p.using) s += ` USING (${p.using})`;
+      if (p.check) s += ` WITH CHECK (${p.check})`;
+      sql.push(s + ";");
+    }
+  }
+  for (const [name, p] of bPols){
+    if (!cPols.has(name)){
+      changes.push({ kind:"-", what:"policy", text:p.name });
+      sql.push(`DROP POLICY ${p.name};`);
+    }
+  }
+
+  // ---- USERS / ROLES / GRANTS ----
+  const bUsers = indexBy(baseline.users, "name");
+  const cUsers = indexBy(current.users,  "name");
+  for (const [name, u] of cUsers){
+    if (!bUsers.has(name)){
+      changes.push({ kind:"+", what:"user", text:u.name });
+      sql.push(u.password ? `CREATE USER ${u.name} WITH PASSWORD '${String(u.password).replace(/'/g,"''")}';` : `CREATE USER ${u.name};`);
+    }
+  }
+  for (const [name, u] of bUsers){
+    if (!cUsers.has(name)){
+      changes.push({ kind:"-", what:"user", text:u.name });
+      sql.push(`DROP USER ${u.name};`);
+    }
+  }
+
+  const bRoles = indexBy(baseline.roles, "name");
+  const cRoles = indexBy(current.roles,  "name");
+  for (const [name, r] of cRoles)  if (!bRoles.has(name)){ changes.push({ kind:"+", what:"role", text:r.name }); sql.push(`CREATE ROLE ${r.name};`); }
+  for (const [name, r] of bRoles)  if (!cRoles.has(name)){ changes.push({ kind:"-", what:"role", text:r.name }); sql.push(`DROP ROLE ${r.name};`); }
+
+  // Grants: key compuesta grantee+object
+  const grantKey = g => (g.grantee || "") + ":" + (g.object || "");
+  const bGrants = new Map((baseline.grants || []).map(g => [grantKey(g), g]));
+  const cGrants = new Map((current.grants  || []).map(g => [grantKey(g), g]));
+  for (const [k, g] of cGrants){
+    const b = bGrants.get(k);
+    const newPrivs = (g.privs || []).filter(p => !b || !(b.privs || []).includes(p));
+    if (newPrivs.length){
+      changes.push({ kind:"+", what:"grant", text:`${newPrivs.join(",")} ON ${g.object} → ${g.grantee}` });
+      sql.push(`GRANT ${newPrivs.join(", ")} ON ${g.object} TO ${g.grantee};`);
+    }
+  }
+  for (const [k, b] of bGrants){
+    const c = cGrants.get(k);
+    const droppedPrivs = (b.privs || []).filter(p => !c || !(c.privs || []).includes(p));
+    if (droppedPrivs.length){
+      changes.push({ kind:"-", what:"grant", text:`${droppedPrivs.join(",")} ON ${b.object} → ${b.grantee}` });
+      sql.push(`REVOKE ${droppedPrivs.join(", ")} ON ${b.object} FROM ${b.grantee};`);
+    }
+  }
+
+  // Triggers / Procs / Funcs: comparación por nombre, drop+create si body cambió
+  const compareRoutines = (bArr, cArr, kind, emit) => {
+    const b = indexBy(bArr, "name");
+    const c = indexBy(cArr, "name");
+    for (const [name, r] of c){
+      const prev = b.get(name);
+      if (!prev){ changes.push({ kind:"+", what:kind, text:r.name }); sql.push(emit(r, true)); }
+      else if (JSON.stringify(prev) !== JSON.stringify(r)){
+        changes.push({ kind:"!", what:kind, text:r.name });
+        sql.push(`DROP ${kind.toUpperCase()} ${r.name};`);
+        sql.push(emit(r, true));
+      }
+    }
+    for (const [name, r] of b){
+      if (!c.has(name)){ changes.push({ kind:"-", what:kind, text:r.name }); sql.push(`DROP ${kind.toUpperCase()} ${r.name};`); }
+    }
+  };
+  compareRoutines(baseline.triggers, current.triggers, "trigger", t =>
+    `CREATE TRIGGER ${t.name} ${t.timing || "BEFORE"} ${t.event || "INSERT"} ON ${t.table} FOR EACH ROW ${t.body};`);
+  compareRoutines(baseline.procedures, current.procedures, "procedure", p =>
+    `CREATE PROCEDURE ${p.name}(${(p.params||[]).map(x=>x.name+" "+x.type).join(", ")}) AS ${p.body};`);
+  compareRoutines(baseline.functions, current.functions, "function", f =>
+    `CREATE FUNCTION ${f.name}(${(f.params||[]).map(x=>x.name+" "+x.type).join(", ")}) RETURNS ${f.returnType || "INT"} AS ${f.body};`);
+
+  return { changes, sql };
+}
+
+function openMigrateModal(){
+  $("#mig-baseline").value = "";
+  $("#mig-changes").innerHTML = "";
+  $("#mig-sql").textContent = "";
+  $("#mig-summary").style.display = "none";
+  $("#mig-sql-wrap").style.display = "none";
+  $("#mig-copy").disabled = true;
+  $("#mig-download").disabled = true;
+  $("#modal-migrate").classList.add("show");
+}
+$("#btn-migrate").onclick = openMigrateModal;
+
+$("#mig-baseline-file").onchange = e => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = ev => { $("#mig-baseline").value = String(ev.target.result || ""); };
+  reader.readAsText(f);
+  e.target.value = "";
+};
+$("#mig-from-localstorage").onclick = () => {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw){ toast("No hay snapshot en localStorage"); return; }
+  $("#mig-baseline").value = JSON.stringify({ format:"gabymodeler", version:1, state: JSON.parse(raw) }, null, 2);
+};
+
+$("#mig-compute").onclick = () => {
+  const text = $("#mig-baseline").value.trim();
+  if (!text){ toast("Pegá o subí el baseline"); return; }
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (err){ toast("JSON inválido: " + err.message); return; }
+  const baseline = parsed && parsed.format === "gabymodeler" && parsed.state ? parsed.state : parsed;
+  if (!baseline || !Array.isArray(baseline.entities)){ toast("Baseline inválido"); return; }
+  // Ensure colecciones top-level
+  ["views","policies","triggers","procedures","functions","users","roles","grants"].forEach(k => {
+    if (!Array.isArray(baseline[k])) baseline[k] = [];
+  });
+
+  const { changes, sql } = computeMigration(baseline, state);
+
+  const cBox = $("#mig-changes");
+  cBox.innerHTML = "";
+  if (changes.length === 0){
+    cBox.append(el("div", { class:"muted" }, "Sin cambios — el modelo coincide con el baseline."));
+  } else {
+    for (const ch of changes){
+      const color = ch.kind === "+" ? "var(--success)" : ch.kind === "-" ? "var(--danger)" : "var(--warning)";
+      cBox.append(el("div", { style:"font-family:'JetBrains Mono',monospace" },
+        el("span", { style:`color:${color};font-weight:700` }, ch.kind + " "),
+        el("span", { class:"muted", style:"font-size:10.5px;text-transform:uppercase" }, ch.what + " "),
+        el("span", {}, ch.text)
+      ));
+    }
+  }
+  $("#mig-summary").style.display = "block";
+
+  const header = [
+    `-- Migración generada por gabymodeler`,
+    `-- Baseline: ${baseline.dbName || "(?)"} → Current: ${state.dbName || "(?)"}`,
+    `-- ${changes.length} cambios detectados`,
+    ``,
+  ];
+  migLastSql = (sql.length === 0 ? header.concat(["-- (sin cambios)"]) : header.concat(sql)).join("\n");
+  $("#mig-sql").textContent = migLastSql;
+  $("#mig-sql-wrap").style.display = "block";
+  $("#mig-copy").disabled = false;
+  $("#mig-download").disabled = false;
+};
+
+$("#mig-copy").onclick = async () => {
+  try { await navigator.clipboard.writeText(migLastSql); toast("SQL copiado"); }
+  catch { toast("No se pudo copiar"); }
+};
+$("#mig-download").onclick = () => {
+  const blob = new Blob([migLastSql], { type:"text/plain" });
+  downloadBlob(blob, sanitizeFilename(state.dbName) + "_migration.sql");
+};
 
 /* ---------- drag-to-create FK (Push 29) ---------- */
 document.addEventListener("mousemove", e => {
