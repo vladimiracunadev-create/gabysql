@@ -1244,6 +1244,60 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
           </div>
         <?php endif; ?>
 
+        <?php
+          [$viewsResp, $viewsErr] = http_get_json($server . '/views?db=' . urlencode($db), $apiToken);
+          $viewsList = (!$viewsErr && ($viewsResp['ok'] ?? false)) ? ($viewsResp['views'] ?? []) : [];
+          [$polStatResp, $polStatErr] = http_get_json($server . '/policies?db=' . urlencode($db), $apiToken);
+          $polStatList = (!$polStatErr && ($polStatResp['ok'] ?? false)) ? ($polStatResp['policies'] ?? []) : [];
+        ?>
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Views</h2>
+            <span class="muted"><?= count($viewsList) ?> declaradas</span>
+          </div>
+          <?php if (empty($viewsList)): ?>
+            <div class="muted" style="font-size:13px">No hay vistas en este DB.</div>
+          <?php else: ?>
+            <?php foreach ($viewsList as $v): ?>
+              <details style="margin-bottom:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
+                <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px">
+                  <?= htmlspecialchars($v['name'] ?? '') ?>
+                  <?php if (!empty($v['columnAliases'])): ?>
+                    <span class="muted">(<?= htmlspecialchars(implode(', ', $v['columnAliases'])) ?>)</span>
+                  <?php endif; ?>
+                </summary>
+                <pre class="code" style="margin-top:8px"><?= htmlspecialchars($v['source'] ?? '') ?></pre>
+              </details>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Policies — resumen</h2>
+            <span class="muted"><?= count($polStatList) ?> declaradas · ver tab Policies para gestionar</span>
+          </div>
+          <?php if (empty($polStatList)): ?>
+            <div class="muted" style="font-size:13px">No hay policies declaradas.</div>
+          <?php else: ?>
+            <div class="table-wrapper">
+              <table class="data">
+                <thead><tr><th>Nombre</th><th>Tabla</th><th>Acción</th><th>Roles</th></tr></thead>
+                <tbody>
+                  <?php foreach ($polStatList as $p): ?>
+                    <tr>
+                      <td class="col-mono"><?= htmlspecialchars($p['name'] ?? '') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars($p['table'] ?? '') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars($p['action'] ?? 'ALL') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars(implode(', ', (array)($p['roles'] ?? []))) ?: '—' ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+        </div>
+
         <?php [$metricsResp, $metricsErr] = http_get_json($server . '/metrics', $apiToken); ?>
         <?php if (!$metricsErr && is_array($metricsResp)): ?>
           <div class="card">
@@ -1307,17 +1361,47 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
           </form>
         </div>
 
+        <?php
+          [$polListResp, $polListErr] = http_get_json($server . '/policies?db=' . urlencode($db), $apiToken);
+          $policiesList = (!$polListErr && ($polListResp['ok'] ?? false)) ? ($polListResp['policies'] ?? []) : [];
+        ?>
         <div class="card">
-          <div class="card-header"><h2 class="card-title">Eliminar policy</h2></div>
-          <form method="post" class="row" style="gap:10px;flex-wrap:wrap">
-            <?= csrf_field() ?>
-            <input class="input" type="text" name="dp_name" placeholder="nombre exacto de la policy" required style="flex:1;min-width:240px" />
-            <button class="btn btn-danger" name="drop_policy" type="submit">🗑 DROP POLICY</button>
-          </form>
-          <p class="muted" style="font-size:12px;margin-top:10px">
-            El listado completo de policies (GET /policies) se agrega cuando el server
-            exponga el endpoint. Hoy podés crear, eliminar y consultarlas vía SQL.
-          </p>
+          <div class="card-header">
+            <h2 class="card-title">Policies activas</h2>
+            <span class="muted"><?= count($policiesList) ?> declaradas</span>
+          </div>
+          <?php if ($polListErr): ?>
+            <div class="alert alert-error"><?= htmlspecialchars($polListErr) ?></div>
+          <?php elseif (empty($policiesList)): ?>
+            <div class="muted" style="font-size:13px">No hay policies declaradas en este DB.</div>
+          <?php else: ?>
+            <div class="table-wrapper">
+              <table class="data">
+                <thead><tr>
+                  <th>Nombre</th><th>Tabla</th><th>Acción</th><th>Roles</th><th>USING</th><th>WITH CHECK</th><th></th>
+                </tr></thead>
+                <tbody>
+                  <?php foreach ($policiesList as $p): ?>
+                    <tr>
+                      <td class="col-mono"><?= htmlspecialchars($p['name'] ?? '') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars($p['table'] ?? '') ?></td>
+                      <td><span class="tag tag-pk"><?= htmlspecialchars($p['action'] ?? 'ALL') ?></span></td>
+                      <td class="col-mono"><?= htmlspecialchars(implode(', ', (array)($p['roles'] ?? []))) ?: '<span class="muted">— (any)</span>' ?></td>
+                      <td class="col-mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis"><?= htmlspecialchars($p['using'] ?? '') ?: '<span class="muted">—</span>' ?></td>
+                      <td class="col-mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis"><?= htmlspecialchars($p['withCheck'] ?? '') ?: '<span class="muted">—</span>' ?></td>
+                      <td>
+                        <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar policy <?= htmlspecialchars($p['name']) ?>?')">
+                          <?= csrf_field() ?>
+                          <input type="hidden" name="dp_name" value="<?= htmlspecialchars($p['name'] ?? '') ?>" />
+                          <button class="btn btn-ghost btn-sm" name="drop_policy" type="submit" title="DROP POLICY">🗑</button>
+                        </form>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
         </div>
 
       <?php endif; ?>
