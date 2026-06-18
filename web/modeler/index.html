@@ -330,6 +330,8 @@
   </div>
   <span class="pill accent">gabysql VERSION 33</span>
   <span class="spacer"></span>
+  <button id="btn-undo" title="Deshacer (Ctrl+Z)" disabled>↶</button>
+  <button id="btn-redo" title="Rehacer (Ctrl+Y / Ctrl+Shift+Z)" disabled>↷</button>
   <button id="btn-new-entity" class="primary">+ Entidad</button>
   <button id="btn-new-view">+ View</button>
   <button id="btn-new-policy">+ Policy</button>
@@ -959,7 +961,70 @@ function syncFormToState(){
   state.dbName      = $("#db-name").value.trim() || "modeler_demo";
   state.ifNotExists = $("#opt-ifnotexists").checked;
 }
+/* ---------- Undo / Redo (history stack) ----------
+   Cada llamada a save() snapshotea el state JSON antes de
+   persistir. La rama redo se trunca al primer cambio que sigue
+   a un undo (semántica estándar). Límite duro 50 entries para
+   acotar memoria — schemas grandes con 50 acciones ~ pocos MB.
+   applyingHistory previene loops cuando undo/redo dispara
+   rerender → save (no debería, pero defensa en profundidad). */
+const MAX_HISTORY = 50;
+let history = [];
+let historyIdx = -1;
+let applyingHistory = false;
+
+function snapshotState(){ return JSON.stringify(state); }
+
+function pushHistory(){
+  if (applyingHistory) return;
+  const snap = snapshotState();
+  // No pushear si nada cambió desde el último (evita ruido por
+  // re-renders puros que igual llaman save).
+  if (history[historyIdx] === snap) return;
+  // Truncar la rama redo si hubo undo previo + cambio nuevo.
+  history = history.slice(0, historyIdx + 1);
+  history.push(snap);
+  if (history.length > MAX_HISTORY){
+    history.shift();
+  } else {
+    historyIdx++;
+  }
+  updateUndoRedoUi();
+}
+
+function applyHistoryAt(idx){
+  applyingHistory = true;
+  try {
+    historyIdx = idx;
+    const snap = history[idx];
+    state = JSON.parse(snap);
+    localStorage.setItem(STORAGE_KEY, snap);
+    rerender();
+  } finally {
+    applyingHistory = false;
+    updateUndoRedoUi();
+  }
+}
+
+function undo(){
+  if (historyIdx <= 0){ toast("Nada que deshacer"); return; }
+  applyHistoryAt(historyIdx - 1);
+  toast("Undo · " + (historyIdx + 1) + "/" + history.length);
+}
+function redo(){
+  if (historyIdx >= history.length - 1){ toast("Nada que rehacer"); return; }
+  applyHistoryAt(historyIdx + 1);
+  toast("Redo · " + (historyIdx + 1) + "/" + history.length);
+}
+
+function updateUndoRedoUi(){
+  const u = $("#btn-undo"), r = $("#btn-redo");
+  if (u) u.disabled = (historyIdx <= 0);
+  if (r) r.disabled = (historyIdx >= history.length - 1);
+}
+
 function save(){
+  pushHistory();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 function toast(msg){
@@ -2676,12 +2741,29 @@ $("#zoom-fit").onclick   = () => fitAll();
 
 // Atajos teclado: + / - / 0 / F (no interfiere con inputs)
 document.addEventListener("keydown", e => {
+  // Undo/Redo/Save funcionan también con foco en inputs — son
+  // expectativa universal (Ctrl+Z dentro de un input de la entity
+  // card también deshace cambios de la entity, no solo del char).
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && !e.shiftKey && (e.key === "z" || e.key === "Z")){ undo(); e.preventDefault(); return; }
+  if (mod && ((e.key === "y" || e.key === "Y") || (e.shiftKey && (e.key === "z" || e.key === "Z")))){ redo(); e.preventDefault(); return; }
+  if (mod && (e.key === "s" || e.key === "S")){ save(); toast("Guardado"); e.preventDefault(); return; }
+
+  // Atajos de canvas: ignorados con foco en form fields.
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
   if (e.key === "+" || e.key === "=") { setZoom(canvasZoom * 1.2); e.preventDefault(); }
   else if (e.key === "-" || e.key === "_") { setZoom(canvasZoom / 1.2); e.preventDefault(); }
   else if (e.key === "0") { resetZoom(); e.preventDefault(); }
   else if (e.key === "f" || e.key === "F") { fitAll(); e.preventDefault(); }
 });
+
+$("#btn-undo").onclick = undo;
+$("#btn-redo").onclick = redo;
+
+// Boot: snapshot inicial para que el primer cambio sea undo-able
+// hacia el estado de arranque (load del localStorage o SAMPLE).
+pushHistory();
+updateUndoRedoUi();
 
 /* ---------- minimap ---------- */
 const ENT_W = 280, ENT_H = 220; // estimación bbox por entidad
