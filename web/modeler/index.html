@@ -279,6 +279,8 @@
   <span class="pill accent">gabysql VERSION 33</span>
   <span class="spacer"></span>
   <button id="btn-new-entity" class="primary">+ Entidad</button>
+  <button id="btn-new-view">+ View</button>
+  <button id="btn-new-policy">+ Policy</button>
   <button id="btn-import">Importar</button>
   <button id="btn-export">Ver SQL</button>
   <button id="btn-load-sample">Ejemplo</button>
@@ -378,6 +380,86 @@
   </div>
 </div>
 
+<!-- modal: CREATE VIEW -->
+<div class="modal-bg" id="modal-view">
+  <div class="modal" style="width:min(720px,92vw)">
+    <div class="modal-head">
+      <h2 id="view-title">Nueva VIEW</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-view">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <label>Nombre</label>
+      <input id="view-name" type="text" placeholder="ej: active_users" />
+      <label>Cuerpo SELECT</label>
+      <textarea id="view-body" rows="9" style="
+        width:100%;margin-top:5px;background:var(--bg-1);color:var(--text);
+        border:1px solid var(--border-strong);border-radius:5px;padding:10px;
+        font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px;line-height:1.5;
+      " placeholder="SELECT id, email FROM users WHERE status = 'active'"></textarea>
+      <p class="muted" style="font-size:11px;margin-top:8px">
+        El modeler emite <code>CREATE VIEW &lt;name&gt; AS &lt;cuerpo&gt;;</code>. La validación
+        sintáctica del SELECT corre del lado del motor.
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="danger" id="btn-view-delete" style="display:none">Eliminar</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-view">cancelar</button>
+      <button id="btn-view-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- modal: CREATE POLICY (RLS) -->
+<div class="modal-bg" id="modal-policy">
+  <div class="modal" style="width:min(720px,92vw)">
+    <div class="modal-head">
+      <h2 id="policy-title">Nueva POLICY (RLS)</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-policy">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <label>Nombre</label>
+      <input id="policy-name" type="text" placeholder="ej: p_users_self" />
+      <label>Tabla</label>
+      <select id="policy-table"></select>
+      <label>Acción</label>
+      <select id="policy-action">
+        <option value="SELECT">SELECT</option>
+        <option value="INSERT">INSERT</option>
+        <option value="UPDATE">UPDATE</option>
+        <option value="DELETE">DELETE</option>
+        <option value="ALL">ALL</option>
+      </select>
+      <label>Rol (opcional, omitir = ANY role)</label>
+      <input id="policy-role" type="text" placeholder="ej: bob" />
+      <label>USING (read-side predicate; valid en SELECT/UPDATE/DELETE)</label>
+      <textarea id="policy-using" rows="3" style="
+        width:100%;margin-top:5px;background:var(--bg-1);color:var(--text);
+        border:1px solid var(--border-strong);border-radius:5px;padding:8px;
+        font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;
+      " placeholder="country = 'AR'"></textarea>
+      <label>WITH CHECK (write-side predicate; valid en INSERT/UPDATE)</label>
+      <textarea id="policy-check" rows="3" style="
+        width:100%;margin-top:5px;background:var(--bg-1);color:var(--text);
+        border:1px solid var(--border-strong);border-radius:5px;padding:8px;
+        font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;
+      " placeholder="credit_limit <= 100000.00"></textarea>
+      <p class="muted" style="font-size:11px;margin-top:8px">
+        Emite <code>CREATE POLICY &lt;name&gt; ON &lt;table&gt; FOR &lt;action&gt; [TO &lt;role&gt;]
+        [USING (...)] [WITH CHECK (...)];</code>. Al menos uno de USING / WITH CHECK requerido.
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="danger" id="btn-policy-delete" style="display:none">Eliminar</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-policy">cancelar</button>
+      <button id="btn-policy-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
 <!-- modal: composite constraint / index -->
 <div class="modal-bg" id="modal-composite">
   <div class="modal">
@@ -465,7 +547,9 @@
          }],
          constraints: [{ id, kind:'pk'|'unique', name?, columns:[colName] }],
          indexes:     [{ id, name?, unique, columns:[colName] }]
-       }]
+       }],
+       views:    [{ id, name, body }],
+       policies: [{ id, name, table, action, role, using, check }]
      }
 
    Match con motor gabysql VERSION 33:
@@ -516,6 +600,16 @@ const MAX_IDENT = 64;
 const SAMPLE = {
   dbName: "shop",
   ifNotExists: true,
+  views: [
+    { id: id_(), name: "active_users",
+      body: "SELECT id, email, name FROM users WHERE status = 'active'" }
+  ],
+  policies: [
+    { id: id_(), name: "p_self_users", table: "users", action: "SELECT",
+      role: "user_role", using: "id = current_user_id()", check: "" },
+    { id: id_(), name: "p_credit_cap", table: "orders", action: "INSERT",
+      role: "", using: "", check: "total <= 100000.00" }
+  ],
   entities: [
     { id:id_(), name:"users", x:80, y:80, columns:[
       col("id",      "BIGINT",       {pk:true}),
@@ -551,7 +645,9 @@ const SAMPLE = {
   ]
 };
 
-let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[] };
+let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[] };
+if (!Array.isArray(state.views))    state.views    = [];
+if (!Array.isArray(state.policies)) state.policies = [];
 let selectedColumnId = null;
 let selectedEntityId = null;
 let activeFkColumn = null;     // { entityId, columnId } during FK modal
@@ -727,6 +823,38 @@ function renderBrowser(){
       el("span", { class:"ublbadge" }, i.unique ? "UNIQUE" : "IDX")));
   }
   dbBlock.append(indexBlock);
+
+  // Views
+  const viewsBlock = el("details");
+  viewsBlock.append(el("summary", {}, "Views (" + state.views.length + ")"));
+  if (state.views.length === 0){
+    viewsBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin vistas)"));
+  }
+  for (const v of state.views){
+    viewsBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openViewModal(v.id); }
+    }, v.name || "(sin nombre)"));
+  }
+  dbBlock.append(viewsBlock);
+
+  // Policies
+  const polBlock = el("details");
+  polBlock.append(el("summary", {}, "Policies (" + state.policies.length + ")"));
+  if (state.policies.length === 0){
+    polBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin policies)"));
+  }
+  for (const p of state.policies){
+    polBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openPolicyModal(p.id); }
+    },
+      (p.name || "(sin nombre)"),
+      el("span", { class:"chkbadge" }, p.action || "ALL"),
+      el("span", { class:"muted", style:"margin-left:auto;font-size:10px" }, "→ " + (p.table || "?"))
+    ));
+  }
+  dbBlock.append(polBlock);
 
   root.append(dbBlock);
 }
@@ -1054,6 +1182,30 @@ function checkModel(){
     }
   }
 
+  // Validar policies y views (global-level)
+  const tableLower = new Set([...tableNames.keys()]);
+  for (const p of (state.policies || [])){
+    if (!p.name)                        findings.push(["error", `policy:${p.name||"(sin nombre)"}`, "nombre requerido", null, null]);
+    if (p.name && RESERVED.has((p.name || "").toLowerCase()))
+                                        findings.push(["error", `policy:${p.name}`, "nombre reservado", null, null]);
+    if (!p.table)                       findings.push(["error", `policy:${p.name}`, "tabla requerida", null, null]);
+    else if (!tableLower.has(p.table.toLowerCase()))
+                                        findings.push(["error", `policy:${p.name}`, `tabla '${p.table}' no existe`, null, null]);
+    if (!p.using && !p.check)           findings.push(["error", `policy:${p.name}`, "USING o WITH CHECK requerido", null, null]);
+    if (p.check && p.action === "SELECT") findings.push(["warn", `policy:${p.name}`, "WITH CHECK ignorado en SELECT (sólo USING aplica)", null, null]);
+  }
+  const viewNames = new Set();
+  for (const v of (state.views || [])){
+    if (!v.name)                        findings.push(["error", `view:${v.name||"(sin nombre)"}`, "nombre requerido", null, null]);
+    else if (!isValidIdent(v.name))     findings.push(["error", `view:${v.name}`, "nombre inválido/reservado", null, null]);
+    else if (viewNames.has(v.name.toLowerCase()))
+                                        findings.push(["error", `view:${v.name}`, "nombre de view duplicado", null, null]);
+    else if (tableLower.has(v.name.toLowerCase()))
+                                        findings.push(["error", `view:${v.name}`, "view colisiona con nombre de tabla", null, null]);
+    viewNames.add((v.name || "").toLowerCase());
+    if (!v.body)                        findings.push(["error", `view:${v.name}`, "cuerpo SELECT vacío", null, null]);
+  }
+
   return findings;
 }
 
@@ -1159,6 +1311,26 @@ function generateSQL(){
     for (const s of allCreateIndexes) lines.push(s);
     lines.push(``);
   }
+  if ((state.views || []).length){
+    lines.push(`-- Views`);
+    for (const v of state.views){
+      if (!v.name || !v.body) continue;
+      lines.push(`CREATE VIEW ${v.name} AS ${v.body.trim().replace(/;\s*$/, "")};`);
+    }
+    lines.push(``);
+  }
+  if ((state.policies || []).length){
+    lines.push(`-- RLS Policies`);
+    for (const p of state.policies){
+      if (!p.name || !p.table) continue;
+      let s = `CREATE POLICY ${p.name} ON ${p.table} FOR ${p.action || "SELECT"}`;
+      if (p.role) s += ` TO ${p.role}`;
+      if (p.using) s += ` USING (${p.using})`;
+      if (p.check) s += ` WITH CHECK (${p.check})`;
+      lines.push(s + ";");
+    }
+    lines.push(``);
+  }
   return lines.join("\n");
 }
 
@@ -1197,6 +1369,88 @@ function topoOrder(entities){
 }
 
 /* ---------- FK modal ---------- */
+/* ---------- views + policies ---------- */
+let activeViewId = null;
+let activePolicyId = null;
+
+function openViewModal(viewId){
+  activeViewId = viewId;
+  const v = viewId ? state.views.find(x => x.id === viewId) : null;
+  $("#view-title").textContent = v ? "Editar VIEW" : "Nueva VIEW";
+  $("#view-name").value = v ? (v.name || "") : "";
+  $("#view-body").value = v ? (v.body || "") : "";
+  $("#btn-view-delete").style.display = v ? "" : "none";
+  $("#modal-view").classList.add("show");
+}
+$("#btn-view-save").onclick = () => {
+  const name = sanitizeIdent($("#view-name").value.trim());
+  const body = $("#view-body").value.trim();
+  if (!name){ toast("Nombre requerido."); return; }
+  if (!body){ toast("Cuerpo SELECT requerido."); return; }
+  if (activeViewId){
+    const v = state.views.find(x => x.id === activeViewId);
+    v.name = name; v.body = body;
+  } else {
+    state.views.push({ id: id_(), name, body });
+  }
+  save(); rerender(); closeModals();
+};
+$("#btn-view-delete").onclick = () => {
+  if (!activeViewId) return;
+  state.views = state.views.filter(x => x.id !== activeViewId);
+  save(); rerender(); closeModals();
+};
+
+function openPolicyModal(policyId){
+  activePolicyId = policyId;
+  const p = policyId ? state.policies.find(x => x.id === policyId) : null;
+  $("#policy-title").textContent = p ? "Editar POLICY" : "Nueva POLICY (RLS)";
+
+  const tableSel = $("#policy-table");
+  tableSel.innerHTML = "";
+  for (const e of state.entities){
+    tableSel.append(el("option", { value: e.name }, e.name));
+  }
+
+  $("#policy-name").value   = p ? (p.name || "") : "";
+  $("#policy-table").value  = p ? (p.table || "") : (state.entities[0] && state.entities[0].name) || "";
+  $("#policy-action").value = p ? (p.action || "SELECT") : "SELECT";
+  $("#policy-role").value   = p ? (p.role || "") : "";
+  $("#policy-using").value  = p ? (p.using || "") : "";
+  $("#policy-check").value  = p ? (p.check || "") : "";
+  $("#btn-policy-delete").style.display = p ? "" : "none";
+  $("#modal-policy").classList.add("show");
+}
+$("#btn-policy-save").onclick = () => {
+  const name   = sanitizeIdent($("#policy-name").value.trim());
+  const table  = $("#policy-table").value;
+  const action = $("#policy-action").value;
+  const role   = $("#policy-role").value.trim();
+  const using  = $("#policy-using").value.trim();
+  const check  = $("#policy-check").value.trim();
+  if (!name){ toast("Nombre requerido."); return; }
+  if (!table){ toast("Tabla requerida."); return; }
+  if (!using && !check){ toast("USING o WITH CHECK requerido."); return; }
+  const data = { name, table, action, role, using, check };
+  if (activePolicyId){
+    Object.assign(state.policies.find(x => x.id === activePolicyId), data);
+  } else {
+    state.policies.push({ id: id_(), ...data });
+  }
+  save(); rerender(); closeModals();
+};
+$("#btn-policy-delete").onclick = () => {
+  if (!activePolicyId) return;
+  state.policies = state.policies.filter(x => x.id !== activePolicyId);
+  save(); rerender(); closeModals();
+};
+
+$("#btn-new-view").onclick   = () => openViewModal(null);
+$("#btn-new-policy").onclick = () => {
+  if (state.entities.length === 0){ toast("Creá al menos una tabla primero."); return; }
+  openPolicyModal(null);
+};
+
 /* ---------- composite constraints + indexes ---------- */
 function renderCompositeBlock(ent){
   const items = [];
@@ -1499,7 +1753,7 @@ $("#btn-do-import").onclick = doImport;
 $("#btn-load-sample").onclick = () => { state = JSON.parse(JSON.stringify(SAMPLE)); save(); rerender(); };
 $("#btn-clear").onclick = () => {
   if (!confirm("¿Borrar el modelo y limpiar localStorage?")) return;
-  state = { dbName:"modeler_demo", ifNotExists:true, entities:[] };
+  state = { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[] };
   localStorage.removeItem(STORAGE_KEY);
   rerender();
 };
@@ -1535,7 +1789,9 @@ function rerender(){
   const idxs = state.entities.reduce((s,e) => s + e.columns.filter(c => c.unique && !c.pk).length + e.indexes.length, 0);
   const fks  = state.entities.reduce((s,e) => s + e.columns.filter(c => !!c.fk).length, 0);
   const cks  = state.entities.reduce((s,e) => s + e.constraints.length, 0);
-  $("#status-counts").textContent = `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite`;
+  const vws = (state.views    || []).length;
+  const pol = (state.policies || []).length;
+  $("#status-counts").textContent = `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite · ${vws} views · ${pol} policies`;
 
   const errs = findings.filter(f => f[0] === "error").length;
   const warns = findings.filter(f => f[0] === "warn").length;
