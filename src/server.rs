@@ -1,6 +1,7 @@
 use crate::catalog::{
-    Catalog, DefaultLiteral, PolicyMeta, TableMeta, ViewMeta, POLICY_ACTION_ALL,
-    POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
+    Catalog, DefaultLiteral, FunctionMeta, PolicyMeta, ProcedureMeta, TableMeta, TriggerMeta,
+    ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT,
+    POLICY_ACTION_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::sql::{decimal_to_string, decode_row, parse, Engine, ResultSet, Statement, Value};
@@ -377,6 +378,9 @@ fn handle_request(
         ("GET", "/tables") => tables(request, config),
         ("GET", "/views") => views(request, config),
         ("GET", "/policies") => policies(request, config),
+        ("GET", "/triggers") => triggers(request, config),
+        ("GET", "/procedures") => procedures(request, config),
+        ("GET", "/functions") => functions(request, config),
         ("GET", "/schema") => schema(request, config),
         ("GET", "/rows") => rows(request, config),
         ("POST", "/exec") => exec_sql(request, config, write_lock, sessions),
@@ -525,6 +529,65 @@ fn policies(request: Request, config: &ServerConfig) -> DbResult<Response> {
     Ok(Response::json(
         200,
         format!("{{\"ok\":true,\"policies\":[{}]}}", policies_json),
+    ))
+}
+
+/// `GET /triggers?db=<db>[&table=<t>]` — devuelve los triggers del DB.
+/// El filtro `table` se aplica client-side post-list para no exponer una
+/// API alterna; el catálogo es chico.
+fn triggers(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let triggers = catalog.list_triggers()?;
+    let filter = request
+        .query
+        .get("table")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let items_json = triggers
+        .iter()
+        .filter(|t| match &filter {
+            Some(f) => t.table.eq_ignore_ascii_case(f),
+            None => true,
+        })
+        .map(trigger_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"triggers\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /procedures?db=<db>` — listado de procedimientos almacenados.
+fn procedures(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let procs = catalog.list_procedures()?;
+    let items_json = procs
+        .iter()
+        .map(procedure_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"procedures\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /functions?db=<db>` — listado de funciones definidas por el usuario.
+fn functions(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let funcs = catalog.list_functions()?;
+    let items_json = funcs
+        .iter()
+        .map(function_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"functions\":[{}]}}", items_json),
     ))
 }
 
@@ -1091,6 +1154,78 @@ fn policy_meta_json(meta: &PolicyMeta) -> String {
         roles_json,
         json_string(&meta.using_sql),
         check_field
+    )
+}
+
+/// JSON encoding for `TriggerMeta`. Los codes binarios (timing/event)
+/// se traducen a keywords SQL para que el cliente pinte directo.
+fn trigger_meta_json(meta: &TriggerMeta) -> String {
+    let timing_str = match meta.timing_code {
+        0 => "BEFORE",
+        1 => "AFTER",
+        _ => "UNKNOWN",
+    };
+    let event_str = match meta.event_code {
+        0 => "INSERT",
+        1 => "UPDATE",
+        2 => "DELETE",
+        _ => "UNKNOWN",
+    };
+    format!(
+        "{{\"name\":{},\"table\":{},\"timing\":{},\"event\":{},\"body\":{}}}",
+        json_string(&meta.name),
+        json_string(&meta.table),
+        json_string(timing_str),
+        json_string(event_str),
+        json_string(&meta.body_sql)
+    )
+}
+
+/// JSON encoding for `ProcedureMeta`. Los params son tuplas
+/// (nombre, ColumnType) → array de `{name, type}` para que el cliente
+/// pueda re-emitir la firma sin lookup adicional.
+fn procedure_meta_json(meta: &ProcedureMeta) -> String {
+    let params_json = meta
+        .params
+        .iter()
+        .map(|(name, ty)| {
+            format!(
+                "{{\"name\":{},\"type\":{}}}",
+                json_string(name),
+                json_string(ty.as_sql())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"name\":{},\"params\":[{}],\"body\":{}}}",
+        json_string(&meta.name),
+        params_json,
+        json_string(&meta.body_sql)
+    )
+}
+
+/// JSON encoding for `FunctionMeta`. Igual que procedure pero incluye
+/// `returnType` para que el cliente sepa si es escalar.
+fn function_meta_json(meta: &FunctionMeta) -> String {
+    let params_json = meta
+        .params
+        .iter()
+        .map(|(name, ty)| {
+            format!(
+                "{{\"name\":{},\"type\":{}}}",
+                json_string(name),
+                json_string(ty.as_sql())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"name\":{},\"params\":[{}],\"returnType\":{},\"body\":{}}}",
+        json_string(&meta.name),
+        params_json,
+        json_string(meta.return_type.as_sql()),
+        json_string(&meta.body_sql)
     )
 }
 
