@@ -111,13 +111,34 @@
     color:var(--text-muted);font-weight:600;margin:14px 0 6px;padding:0 2px;
   }
   #canvas-wrap{
-    grid-area:canvas;position:relative;overflow:auto;
+    grid-area:canvas;position:relative;overflow:hidden;
     background:
       radial-gradient(circle at 1px 1px, rgba(125,133,144,.12) 1px, transparent 0),
       var(--bg-1);
     background-size:24px 24px;
   }
+  #canvas-content{
+    position:absolute;top:0;left:0;width:5000px;height:3000px;
+    transform-origin:0 0;
+    will-change:transform;
+  }
+  #canvas-wrap.panning{cursor:grabbing}
+  #canvas-wrap.panning *{cursor:grabbing !important}
   svg.relations{position:absolute;inset:0;width:5000px;height:3000px;pointer-events:none;z-index:1}
+  .canvas-zoom-toolbar{
+    position:absolute;bottom:14px;right:14px;z-index:8;
+    display:flex;gap:4px;background:var(--bg-2);border:1px solid var(--border-strong);
+    border-radius:8px;padding:5px;box-shadow:var(--shadow);
+  }
+  .canvas-zoom-toolbar button{
+    width:32px;height:28px;padding:0;font-size:13px;font-weight:600;
+    background:transparent;border:1px solid transparent;
+  }
+  .canvas-zoom-toolbar button:hover{background:var(--bg-3);border-color:var(--border-strong)}
+  .canvas-zoom-toolbar .zoom-label{
+    display:inline-flex;align-items:center;padding:0 8px;font-size:11px;
+    font-family:'JetBrains Mono',monospace;color:var(--text-muted);min-width:48px;justify-content:center;
+  }
 
   section.results{
     grid-area:results;background:var(--bg-2);border-top:1px solid var(--border);
@@ -306,7 +327,16 @@
   </aside>
 
   <div id="canvas-wrap">
-    <svg class="relations" id="rel-svg"></svg>
+    <div id="canvas-content">
+      <svg class="relations" id="rel-svg"></svg>
+    </div>
+    <div class="canvas-zoom-toolbar">
+      <button id="zoom-out"  title="Zoom out (Ctrl + Wheel)">−</button>
+      <span class="zoom-label" id="zoom-label">100%</span>
+      <button id="zoom-in"   title="Zoom in (Ctrl + Wheel)">+</button>
+      <button id="zoom-reset" title="Reset zoom y centrar (0)">⌂</button>
+      <button id="zoom-fit"  title="Fit all (F)">⛶</button>
+    </div>
   </div>
 
   <section class="results">
@@ -861,10 +891,10 @@ function renderBrowser(){
 
 /* ---------- canvas: entities + relations ---------- */
 function renderCanvas(){
-  const wrap = $("#canvas-wrap");
-  $$(".entity", wrap).forEach(n => n.remove());
+  const content = $("#canvas-content");
+  $$(".entity", content).forEach(n => n.remove());
   for (const ent of state.entities){
-    wrap.append(renderEntity(ent));
+    content.append(renderEntity(ent));
   }
   renderRelations();
 }
@@ -892,18 +922,23 @@ function renderEntity(ent){
     }, "✕")
   );
 
-  // drag entity
+  // drag entity (compensa por zoom: el delta en clientX/Y es screen-px,
+  // pero ent.x/y son lógicos — dividimos por canvasZoom para mantener
+  // el cursor pegado a la entidad bajo cualquier nivel de zoom).
   let dragging = null;
   head.addEventListener("mousedown", e => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
+    if (e.button !== 0) return; // dejar middle/right para pan / context
     selectEntity(ent.id);
-    dragging = { dx: e.clientX - ent.x, dy: e.clientY - ent.y };
+    dragging = { startCx: e.clientX, startCy: e.clientY, startEx: ent.x, startEy: ent.y };
     e.preventDefault();
   });
   document.addEventListener("mousemove", e => {
     if (!dragging) return;
-    ent.x = Math.max(0, e.clientX - dragging.dx);
-    ent.y = Math.max(0, e.clientY - dragging.dy);
+    const dx = (e.clientX - dragging.startCx) / canvasZoom;
+    const dy = (e.clientY - dragging.startCy) / canvasZoom;
+    ent.x = Math.max(0, dragging.startEx + dx);
+    ent.y = Math.max(0, dragging.startEy + dy);
     card.style.left = ent.x + "px";
     card.style.top  = ent.y + "px";
     renderRelations();
@@ -1800,6 +1835,102 @@ function rerender(){
   sf.className = errs > 0 ? "err" : warns > 0 ? "warn" : "ok";
 }
 
+/* ---------- canvas zoom + pan ---------- */
+let canvasZoom = 1, canvasPanX = 0, canvasPanY = 0;
+const ZOOM_MIN = 0.25, ZOOM_MAX = 2.5;
+
+function applyCanvasTransform(){
+  const c = $("#canvas-content");
+  if (!c) return;
+  c.style.transform = `translate(${canvasPanX}px, ${canvasPanY}px) scale(${canvasZoom})`;
+  const lbl = $("#zoom-label");
+  if (lbl) lbl.textContent = Math.round(canvasZoom * 100) + "%";
+}
+function setZoom(newZoom, anchorX, anchorY){
+  newZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, newZoom));
+  if (anchorX == null){
+    const r = $("#canvas-wrap").getBoundingClientRect();
+    anchorX = r.width / 2; anchorY = r.height / 2;
+  }
+  // Mantener el punto bajo el cursor estático: panX' = anchor - (anchor - panX) * (newZoom/oldZoom)
+  const k = newZoom / canvasZoom;
+  canvasPanX = anchorX - (anchorX - canvasPanX) * k;
+  canvasPanY = anchorY - (anchorY - canvasPanY) * k;
+  canvasZoom = newZoom;
+  applyCanvasTransform();
+}
+function resetZoom(){ canvasZoom = 1; canvasPanX = 0; canvasPanY = 0; applyCanvasTransform(); }
+function fitAll(){
+  if (state.entities.length === 0){ resetZoom(); return; }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const e of state.entities){
+    const w = 280, h = 220; // estimación bbox por entidad
+    minX = Math.min(minX, e.x); minY = Math.min(minY, e.y);
+    maxX = Math.max(maxX, e.x + w); maxY = Math.max(maxY, e.y + h);
+  }
+  const r = $("#canvas-wrap").getBoundingClientRect();
+  const pad = 40;
+  const zx = (r.width  - pad * 2) / (maxX - minX);
+  const zy = (r.height - pad * 2) / (maxY - minY);
+  canvasZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.min(zx, zy)));
+  canvasPanX = pad - minX * canvasZoom;
+  canvasPanY = pad - minY * canvasZoom;
+  applyCanvasTransform();
+}
+
+// Wheel: zoom solo con Ctrl (sin Ctrl = scroll natural ignorado — overflow:hidden)
+$("#canvas-wrap").addEventListener("wheel", e => {
+  if (!e.ctrlKey && !e.metaKey){
+    // pan vertical/horizontal con shift+wheel
+    e.preventDefault();
+    if (e.shiftKey){ canvasPanX -= e.deltaY; }
+    else           { canvasPanY -= e.deltaY; canvasPanX -= e.deltaX; }
+    applyCanvasTransform();
+    return;
+  }
+  e.preventDefault();
+  const r = $("#canvas-wrap").getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  setZoom(canvasZoom * factor, mx, my);
+}, { passive:false });
+
+// Middle-click drag = pan (Alt+left-click = pan también, para trackpads)
+let panning = null;
+$("#canvas-wrap").addEventListener("mousedown", e => {
+  if (e.button === 1 || (e.button === 0 && e.altKey)){
+    e.preventDefault();
+    panning = { sx: e.clientX, sy: e.clientY, startPanX: canvasPanX, startPanY: canvasPanY };
+    $("#canvas-wrap").classList.add("panning");
+  }
+});
+document.addEventListener("mousemove", e => {
+  if (!panning) return;
+  canvasPanX = panning.startPanX + (e.clientX - panning.sx);
+  canvasPanY = panning.startPanY + (e.clientY - panning.sy);
+  applyCanvasTransform();
+});
+document.addEventListener("mouseup", () => {
+  if (panning){ panning = null; $("#canvas-wrap").classList.remove("panning"); }
+});
+
+// Toolbar
+$("#zoom-in").onclick    = () => setZoom(canvasZoom * 1.2);
+$("#zoom-out").onclick   = () => setZoom(canvasZoom / 1.2);
+$("#zoom-reset").onclick = () => resetZoom();
+$("#zoom-fit").onclick   = () => fitAll();
+
+// Atajos teclado: + / - / 0 / F (no interfiere con inputs)
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+  if (e.key === "+" || e.key === "=") { setZoom(canvasZoom * 1.2); e.preventDefault(); }
+  else if (e.key === "-" || e.key === "_") { setZoom(canvasZoom / 1.2); e.preventDefault(); }
+  else if (e.key === "0") { resetZoom(); e.preventDefault(); }
+  else if (e.key === "f" || e.key === "F") { fitAll(); e.preventDefault(); }
+});
+
+applyCanvasTransform();
 rerender();
 </script>
 </body></html>
