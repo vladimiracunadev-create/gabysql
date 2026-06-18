@@ -6,6 +6,126 @@
 
 ---
 
+## Post-v0.2.0 — 2026-06-17 → 2026-06-18 — Refresh integral de productos de gestión
+
+> 19 pushes directos a `main` sin tag de release. Eleva los dos productos
+> web (`phpgabyadmin` y `gabymodeler`) de "browse/structure/SQL básico" y
+> "ER con 14 reglas" a **cobertura funcional 1:1 con el motor VERSION 33**,
+> agrega 8 endpoints HTTP nuevos en el server con tests E2E, y unifica la
+> identidad visual con la landing.
+
+### Server HTTP — 8 endpoints nuevos del catálogo
+
+Push 7 (2026-06-17), 10 (2026-06-18), 14 (2026-06-18):
+```
+GET /views?db=<db>
+GET /policies?db=<db>[&table=<t>]
+GET /triggers?db=<db>[&table=<t>]
+GET /procedures?db=<db>
+GET /functions?db=<db>
+GET /users?db=<db>           # filtra password_hash + salt
+GET /roles?db=<db>
+GET /grants?db=<db>[&grantee=<g>][&object=<o>]
+```
+
+JSON shapes alineados: codes binarios (timing/event, privs bitmask)
+traducidos a keywords SQL para que el cliente no conozca shifts internos.
+`/users` *jamás* serializa material secreto.
+
+Tests E2E (Push 15): `tests/server_listing_endpoints.rs` con 10 tests,
+838 tests verdes en total (era 828).
+
+### `phpgabyadmin` v2 — refresh visual + 5 tabs nuevos
+
+Pushes 1, 5, 6, 8, 11, 17 (~1,400 LOC delta):
+
+- **Visual**: paleta GitHub-style (`#0a0e14`/`#58a6ff`), Inter + JetBrains
+  Mono, brand mark, server health pill 🟢/🔴, sidebar fija, toast
+  notifications auto-dismiss.
+- **Nuevos tabs**:
+  - **Sessions (M13)** — begin/commit/rollback cross-request HTTP.
+  - **Explain (M6)** — `EXPLAIN ANALYZE` con bias coloreado (GOOD verde /
+    MILD naranja / HIGH rojo).
+  - **Stats** — KPIs (DBs/tablas/cols/idx/FKs/CHECK/PKs) + breakdown
+    por tabla + Views colapsables + resumen Policies + dump `/metrics`.
+  - **Policies (RLS)** — formulario CREATE POLICY guiado + DROP por
+    fila en tabla con listado real.
+  - **Routines** — triggers + procedures + functions con cuerpo SQL
+    colapsable y signatures coloreadas.
+  - **Security** — users (con DROP + crear con password opcional) +
+    roles + grants con picker de privilegios checkbox + REVOKE ALL.
+- **CodeMirror 5.65.16** vía CDN sobre todos los textareas SQL:
+  syntax highlighting GitHub-style, Ctrl/Cmd+Enter ejecuta, Ctrl/Cmd+/
+  comenta. Aplica al editor SQL principal + USING + WITH CHECK del
+  formulario de policies.
+- Seguridad preservada: CSRF tokens, HMAC auth cookies, remote-allow
+  check. 5 nuevos handlers POST validan idents con regex antes de
+  componer SQL.
+
+### `gabymodeler` v3 — refresh visual + cobertura completa del motor
+
+Pushes 2, 3, 4, 9, 12, 13, 16 (~1,700 LOC delta):
+
+- **Visual**: paleta unificada con phpgabyadmin v2, brand mark `▦`,
+  badges semánticos (PK verde, FK naranja, UN azul, NN gris, CHK
+  púrpura), entity card con head arrastrable, modales con backdrop
+  blur.
+- **Tipos extendidos** (Y1-Y9): TINYINT/SMALLINT/MEDIUMINT/BIGINT
+  (firmados + UNSIGNED), DECIMAL(p,s), VARCHAR(n), CHAR(n), DOUBLE,
+  TIME, TIMESTAMP, BLOB, UUID. PK acepta cualquier entero o UUID
+  (antes forzaba INT). FK auto-coerciona al tipo de PK target.
+- **CHECK constraint** inline por columna con flag CHK + expresión
+  editable via prompt.
+- **Composite constraints + indexes**: PRIMARY KEY (a,b), UNIQUE (a,b)
+  table-level, CREATE INDEX multi-columna. Modal único con picker
+  de columnas mostrando orden visible (#1, #2, …).
+- **Views**: state.views[] con modal nombre + cuerpo SELECT.
+- **RLS Policies**: state.policies[] con USING + WITH CHECK, validación
+  de warn cuando CHECK se declara en SELECT (ignorado por el motor).
+- **Triggers / Procedures / Functions**: modal único reutilizable con
+  kind selector. Params multi-línea, returns dropdown, body textarea
+  con label dinámico. SQL emit ordenado (fn → proc → trg).
+- **Users / Roles / Grants**: modal único reutilizable. Password
+  warning visible (queda en el .sql emitido). Privilege picker con
+  chips multi-select. Validación cross-tipo (grant grantee debe ser
+  user o role declarado).
+- **Canvas zoom + pan + minimap**:
+  - Ctrl/Cmd + Wheel = zoom-to-cursor (rango 25%-250%, exponencial).
+  - Middle-click drag / Alt+Left = pan.
+  - Shift+Wheel = pan horizontal, Wheel sin Ctrl = pan vertical.
+  - Toolbar bottom-right: +/−/⌂ reset/⛶ fit-all.
+  - Atajos teclado: `+`/`-`/`0`/`F` (ignorados si foco en input).
+  - **Minimap** 220x150px bottom-left con click-drag navegación y
+    viewport indicator verde (var(--success)) traslúcido. Colapsable.
+  - Drag de entidades respeta zoom (delta dividido por canvasZoom).
+- **Status bar**: 13 contadores en vivo (tablas / cols / idx / FKs /
+  composite / views / policies / triggers / procedures / functions /
+  users / roles / grants).
+- **Check Model** extendido: validaciones nuevas para todas las
+  categorías de objetos (uniqueness cross-namespace, columnas
+  composite existen, NEW/OLD acordes al evento del trigger, etc.).
+- **SAMPLE** actualizado: 3 entidades (users/orders/order_lines) con
+  composite PK, composite UNIQUE, composite INDEX, CHECK, FK con
+  ON DELETE CASCADE.
+
+### Docs
+
+Push 18: `docs/STATUS.md` actualiza tests count (828 → 838), enumera
+los 8 endpoints nuevos del server, reescribe filas phpgabyadmin y
+gabymodeler con el catálogo completo de tabs/features. `README.md`
+sección "Runtime y acceso" reescrita. `web/modeler/README.md` cambios
+v3 vs v2 expandido para listar todos los pushes 2-16.
+
+### Métricas
+
+- 19 commits a `main` sin breaking changes.
+- ~3,600 LOC delta (modeler) + ~1,400 LOC (admin) + ~400 LOC (server +
+  tests).
+- 10 nuevos tests E2E HTTP en `tests/server_listing_endpoints.rs`.
+- CI verde en Ubuntu / macOS / Windows + Docker + bench job.
+
+---
+
 ## v0.2.0 — 2026-06-17 — Release tag
 
 > Primer release tageado desde v0.1.0 (2026-05-25, hace 23 días, 136
