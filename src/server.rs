@@ -1,7 +1,8 @@
 use crate::catalog::{
-    Catalog, DefaultLiteral, FunctionMeta, PolicyMeta, ProcedureMeta, TableMeta, TriggerMeta,
-    ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT,
-    POLICY_ACTION_UPDATE,
+    Catalog, DefaultLiteral, FunctionMeta, GrantMeta, PolicyMeta, ProcedureMeta, RoleMeta,
+    TableMeta, TriggerMeta, UserMeta, ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE,
+    POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE, PRIV_DELETE, PRIV_INSERT,
+    PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::sql::{decimal_to_string, decode_row, parse, Engine, ResultSet, Statement, Value};
@@ -381,6 +382,9 @@ fn handle_request(
         ("GET", "/triggers") => triggers(request, config),
         ("GET", "/procedures") => procedures(request, config),
         ("GET", "/functions") => functions(request, config),
+        ("GET", "/users") => users(request, config),
+        ("GET", "/roles") => roles(request, config),
+        ("GET", "/grants") => grants(request, config),
         ("GET", "/schema") => schema(request, config),
         ("GET", "/rows") => rows(request, config),
         ("POST", "/exec") => exec_sql(request, config, write_lock, sessions),
@@ -588,6 +592,76 @@ fn functions(request: Request, config: &ServerConfig) -> DbResult<Response> {
     Ok(Response::json(
         200,
         format!("{{\"ok\":true,\"functions\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /users?db=<db>` — lista usuarios (sin exponer password_hash).
+/// El campo `scheme` se mapea a un nombre legible.
+fn users(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let users = catalog.list_users()?;
+    let items_json = users
+        .iter()
+        .map(user_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"users\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /roles?db=<db>` — lista roles.
+fn roles(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let roles = catalog.list_roles()?;
+    let items_json = roles
+        .iter()
+        .map(role_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"roles\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /grants?db=<db>[&grantee=<name>][&object=<name>]` — lista
+/// privilegios otorgados. El bitmask `privs` se traduce a un array de
+/// keywords SQL (SELECT, INSERT, ...) para que el cliente lo pinte
+/// directo. Soporta filtros por grantee y/o object.
+fn grants(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let grants = catalog.list_grants()?;
+    let grantee_filter = request
+        .query
+        .get("grantee")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let object_filter = request
+        .query
+        .get("object")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let items_json = grants
+        .iter()
+        .filter(|g| match &grantee_filter {
+            Some(f) => g.grantee.eq_ignore_ascii_case(f),
+            None => true,
+        })
+        .filter(|g| match &object_filter {
+            Some(f) => g.object.eq_ignore_ascii_case(f),
+            None => true,
+        })
+        .map(grant_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"grants\":[{}]}}", items_json),
     ))
 }
 
@@ -1226,6 +1300,68 @@ fn function_meta_json(meta: &FunctionMeta) -> String {
         params_json,
         json_string(meta.return_type.as_sql()),
         json_string(&meta.body_sql)
+    )
+}
+
+/// JSON encoding for `UserMeta`. **No** expone `password_hash` ni
+/// `salt` — son material secreto que el server NUNCA debe filtrar
+/// via API HTTP, ni siquiera al cliente de gestión. `scheme` se
+/// mapea a un nombre legible (hoy: 1 → "argon2id").
+fn user_meta_json(meta: &UserMeta) -> String {
+    let scheme_name = match meta.scheme {
+        1 => "argon2id",
+        _ => "unknown",
+    };
+    format!(
+        "{{\"name\":{},\"scheme\":{},\"iterations\":{}}}",
+        json_string(&meta.name),
+        json_string(scheme_name),
+        meta.iterations
+    )
+}
+
+/// JSON encoding for `RoleMeta`. Hoy sólo lleva nombre — los grants
+/// se exponen en `/grants` aparte.
+fn role_meta_json(meta: &RoleMeta) -> String {
+    format!("{{\"name\":{}}}", json_string(&meta.name))
+}
+
+/// JSON encoding for `GrantMeta`. Traduce el bitmask `privs` a un
+/// array de keywords SQL para que el cliente no tenga que conocer los
+/// shifts internos.
+fn grant_meta_json(meta: &GrantMeta) -> String {
+    let mut privs = Vec::new();
+    if meta.privs & PRIV_SELECT != 0 {
+        privs.push("SELECT");
+    }
+    if meta.privs & PRIV_INSERT != 0 {
+        privs.push("INSERT");
+    }
+    if meta.privs & PRIV_UPDATE != 0 {
+        privs.push("UPDATE");
+    }
+    if meta.privs & PRIV_DELETE != 0 {
+        privs.push("DELETE");
+    }
+    if meta.privs & PRIV_REFERENCES != 0 {
+        privs.push("REFERENCES");
+    }
+    if meta.privs & PRIV_TRUNCATE != 0 {
+        privs.push("TRUNCATE");
+    }
+    let privs_json = format!(
+        "[{}]",
+        privs
+            .iter()
+            .map(|p| json_string(p))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    format!(
+        "{{\"grantee\":{},\"object\":{},\"privs\":{}}}",
+        json_string(&meta.grantee),
+        json_string(&meta.object),
+        privs_json
     )
 }
 
