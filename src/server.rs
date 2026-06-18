@@ -1,4 +1,7 @@
-use crate::catalog::{Catalog, DefaultLiteral, TableMeta};
+use crate::catalog::{
+    Catalog, DefaultLiteral, PolicyMeta, TableMeta, ViewMeta, POLICY_ACTION_ALL,
+    POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
+};
 use crate::errors::{coded, codes};
 use crate::sql::{decimal_to_string, decode_row, parse, Engine, ResultSet, Statement, Value};
 use crate::storage::Pager;
@@ -372,6 +375,8 @@ fn handle_request(
         ("GET", "/dbs") => Ok(Response::json(200, dbs_json(config)?)),
         ("POST", "/dbs") => create_db(request, config, write_lock),
         ("GET", "/tables") => tables(request, config),
+        ("GET", "/views") => views(request, config),
+        ("GET", "/policies") => policies(request, config),
         ("GET", "/schema") => schema(request, config),
         ("GET", "/rows") => rows(request, config),
         ("POST", "/exec") => exec_sql(request, config, write_lock, sessions),
@@ -480,6 +485,46 @@ fn tables(request: Request, config: &ServerConfig) -> DbResult<Response> {
     Ok(Response::json(
         200,
         format!("{{\"ok\":true,\"tables\":[{}]}}", tables_json),
+    ))
+}
+
+/// `GET /views?db=<db>` — devuelve todas las vistas declaradas en el
+/// catálogo del DB (CREATE VIEW). Sin paginación: el catálogo es chico
+/// y el cliente puede filtrar localmente. Soporta `?table=<t>` como
+/// filtro futuro pero hoy no afecta — las vistas son globales del DB.
+fn views(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let views = catalog.list_views()?;
+    let views_json = views
+        .iter()
+        .map(view_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"views\":[{}]}}", views_json),
+    ))
+}
+
+/// `GET /policies?db=<db>[&table=<t>]` — devuelve policies RLS del DB,
+/// opcionalmente filtradas por tabla. Espeja la API interna
+/// `Catalog::list_policies` / `list_policies_for_table`.
+fn policies(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let policies = match request.query.get("table") {
+        Some(table) if !table.trim().is_empty() => catalog.list_policies_for_table(table)?,
+        _ => catalog.list_policies()?,
+    };
+    let policies_json = policies
+        .iter()
+        .map(policy_meta_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"policies\":[{}]}}", policies_json),
     ))
 }
 
@@ -988,6 +1033,64 @@ fn table_meta_json(meta: &TableMeta) -> String {
         meta.root_page,
         columns,
         indexes
+    )
+}
+
+/// JSON encoding for `ViewMeta`. Espeja los campos públicos del struct;
+/// los aliases son `null` cuando la vista no los declaró (el SELECT
+/// subyacente provee los nombres).
+fn view_meta_json(meta: &ViewMeta) -> String {
+    let aliases_json = match &meta.column_aliases {
+        Some(aliases) => format!(
+            "[{}]",
+            aliases
+                .iter()
+                .map(|a| json_string(a))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"name\":{},\"source\":{},\"columnAliases\":{}}}",
+        json_string(&meta.name),
+        json_string(&meta.source),
+        aliases_json
+    )
+}
+
+/// JSON encoding for `PolicyMeta`. La acción interna es un u8; el
+/// cliente espera strings (SELECT/INSERT/UPDATE/DELETE/ALL) para
+/// poder mostrarlas tal cual aparecen en el SQL original.
+fn policy_meta_json(meta: &PolicyMeta) -> String {
+    let action_str = match meta.action {
+        POLICY_ACTION_SELECT => "SELECT",
+        POLICY_ACTION_INSERT => "INSERT",
+        POLICY_ACTION_UPDATE => "UPDATE",
+        POLICY_ACTION_DELETE => "DELETE",
+        POLICY_ACTION_ALL => "ALL",
+        _ => "UNKNOWN",
+    };
+    let roles_json = format!(
+        "[{}]",
+        meta.roles
+            .iter()
+            .map(|r| json_string(r))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let check_field = match &meta.with_check_sql {
+        Some(c) => format!(",\"withCheck\":{}", json_string(c)),
+        None => ",\"withCheck\":null".to_string(),
+    };
+    format!(
+        "{{\"name\":{},\"table\":{},\"action\":{},\"roles\":{},\"using\":{}{}}}",
+        json_string(&meta.name),
+        json_string(&meta.table),
+        json_string(action_str),
+        roles_json,
+        json_string(&meta.using_sql),
+        check_field
     )
 }
 
