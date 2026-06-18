@@ -334,6 +334,7 @@
   <button id="btn-new-view">+ View</button>
   <button id="btn-new-policy">+ Policy</button>
   <button id="btn-new-routine">+ Routine</button>
+  <button id="btn-new-security">+ Security</button>
   <button id="btn-import">Importar</button>
   <button id="btn-export">Ver SQL</button>
   <button id="btn-load-sample">Ejemplo</button>
@@ -527,6 +528,59 @@
   </div>
 </div>
 
+<!-- modal: security (user / role / grant) -->
+<div class="modal-bg" id="modal-security">
+  <div class="modal" style="width:min(640px,92vw)">
+    <div class="modal-head">
+      <h2 id="sec-title">Nuevo objeto de seguridad</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-security">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <label>Tipo</label>
+      <select id="sec-kind">
+        <option value="user">USER</option>
+        <option value="role">ROLE</option>
+        <option value="grant">GRANT</option>
+      </select>
+
+      <label id="sec-name-label">Nombre</label>
+      <input id="sec-name" type="text" placeholder="ej: alice / auditor" />
+
+      <!-- USER -->
+      <div id="sec-user-row">
+        <label>Password (opcional; queda en el SQL emitido — usá con prudencia)</label>
+        <input id="sec-password" type="text" placeholder="hunter2" />
+        <p class="muted" style="font-size:11px;margin-top:4px">
+          El motor hashea con Argon2id al ejecutar. Si no querés que el
+          password aparezca en el .sql, dejá vacío y agregalo manualmente
+          al deploy.
+        </p>
+      </div>
+
+      <!-- GRANT -->
+      <div id="sec-grant-row" style="display:none">
+        <label>Privilegios</label>
+        <div id="sec-privs" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:5px"></div>
+        <label>Sobre el objeto (tabla)</label>
+        <select id="sec-object"></select>
+        <label>Otorgar a (usuario o rol)</label>
+        <input id="sec-grantee" type="text" placeholder="ej: alice" />
+        <p class="muted" style="font-size:11px;margin-top:4px">
+          Emite <code>GRANT &lt;privs&gt; ON &lt;tabla&gt; TO &lt;grantee&gt;;</code>.
+          REVOKE no se modela como objeto — para revocar, eliminá el grant correspondiente.
+        </p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="danger" id="btn-sec-delete" style="display:none">Eliminar</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-security">cancelar</button>
+      <button id="btn-sec-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
 <!-- modal: routine (trigger / procedure / function) -->
 <div class="modal-bg" id="modal-routine">
   <div class="modal" style="width:min(760px,94vw)">
@@ -704,7 +758,10 @@
        policies:   [{ id, name, table, action, role, using, check }],
        triggers:   [{ id, name, table, timing, event, body }],
        procedures: [{ id, name, params:[{name,type}], body }],
-       functions:  [{ id, name, params:[{name,type}], returnType, body }]
+       functions:  [{ id, name, params:[{name,type}], returnType, body }],
+       users:      [{ id, name, password }],
+       roles:      [{ id, name }],
+       grants:     [{ id, grantee, object, privs:[...] }]
      }
 
    Match con motor gabysql VERSION 33:
@@ -800,12 +857,15 @@ const SAMPLE = {
   ]
 };
 
-let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[], triggers:[], procedures:[], functions:[] };
+let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[], triggers:[], procedures:[], functions:[], users:[], roles:[], grants:[] };
 if (!Array.isArray(state.views))      state.views      = [];
 if (!Array.isArray(state.policies))   state.policies   = [];
 if (!Array.isArray(state.triggers))   state.triggers   = [];
 if (!Array.isArray(state.procedures)) state.procedures = [];
 if (!Array.isArray(state.functions))  state.functions  = [];
+if (!Array.isArray(state.users))      state.users      = [];
+if (!Array.isArray(state.roles))      state.roles      = [];
+if (!Array.isArray(state.grants))     state.grants     = [];
 let selectedColumnId = null;
 let selectedEntityId = null;
 let activeFkColumn = null;     // { entityId, columnId } during FK modal
@@ -1046,6 +1106,54 @@ function renderBrowser(){
     ));
   }
   dbBlock.append(fnBlock);
+
+  // Users
+  const usrBlock = el("details");
+  usrBlock.append(el("summary", {}, "Users (" + state.users.length + ")"));
+  if (state.users.length === 0){
+    usrBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin usuarios)"));
+  }
+  for (const u of state.users){
+    usrBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openSecurityModal("user", u.id); }
+    },
+      (u.name || "(sin nombre)"),
+      el("span", { class:"muted", style:"margin-left:auto;font-size:10px" }, u.password ? "🔑 pwd" : "(sin pwd)")
+    ));
+  }
+  dbBlock.append(usrBlock);
+
+  // Roles
+  const rolBlock = el("details");
+  rolBlock.append(el("summary", {}, "Roles (" + state.roles.length + ")"));
+  if (state.roles.length === 0){
+    rolBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin roles)"));
+  }
+  for (const r of state.roles){
+    rolBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openSecurityModal("role", r.id); }
+    }, r.name || "(sin nombre)"));
+  }
+  dbBlock.append(rolBlock);
+
+  // Grants
+  const grnBlock = el("details");
+  grnBlock.append(el("summary", {}, "Grants (" + state.grants.length + ")"));
+  if (state.grants.length === 0){
+    grnBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin grants)"));
+  }
+  for (const g of state.grants){
+    grnBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openSecurityModal("grant", g.id); }
+    },
+      (g.grantee || "?") + " · " + (g.privs || []).join(", "),
+      el("span", { class:"muted", style:"margin-left:auto;font-size:10px" }, "→ " + (g.object || "?"))
+    ));
+  }
+  dbBlock.append(grnBlock);
 
   // Policies
   const polBlock = el("details");
@@ -1457,6 +1565,34 @@ function checkModel(){
     if (!r.returnType)                  findings.push(["error", `fn:${r.name}`, "RETURNS requerido", null, null]);
   }
 
+  // Security: users + roles + grants
+  const secNames = new Set();
+  for (const u of (state.users || [])){
+    if (!u.name)                        findings.push(["error", `user:${u.name||"(sin nombre)"}`, "username requerido", null, null]);
+    else if (!isValidIdent(u.name))     findings.push(["error", `user:${u.name}`, "username inválido/reservado", null, null]);
+    else if (secNames.has(u.name.toLowerCase()))
+                                        findings.push(["error", `user:${u.name}`, "colisiona con otro user/role", null, null]);
+    else if (u.password && u.password.length < 4)
+                                        findings.push(["warn",  `user:${u.name}`, "password muy corto (<4 chars)", null, null]);
+    secNames.add((u.name || "").toLowerCase());
+  }
+  for (const r of (state.roles || [])){
+    if (!r.name)                        findings.push(["error", `role:${r.name||"(sin nombre)"}`, "nombre requerido", null, null]);
+    else if (!isValidIdent(r.name))     findings.push(["error", `role:${r.name}`, "nombre inválido/reservado", null, null]);
+    else if (secNames.has(r.name.toLowerCase()))
+                                        findings.push(["error", `role:${r.name}`, "colisiona con otro user/role", null, null]);
+    secNames.add((r.name || "").toLowerCase());
+  }
+  for (const g of (state.grants || [])){
+    if (!g.object)                      findings.push(["error", `grant`, "objeto requerido", null, null]);
+    else if (!tableLower.has(g.object.toLowerCase()))
+                                        findings.push(["error", `grant`, `tabla '${g.object}' no existe`, null, null]);
+    if (!g.grantee)                     findings.push(["error", `grant`, "grantee requerido", null, null]);
+    else if (!secNames.has(g.grantee.toLowerCase()))
+                                        findings.push(["warn",  `grant`, `grantee '${g.grantee}' no está declarado como user/role`, null, null]);
+    if (!(g.privs || []).length)        findings.push(["error", `grant`, "al menos 1 privilegio requerido", null, null]);
+  }
+
   return findings;
 }
 
@@ -1579,6 +1715,23 @@ function generateSQL(){
       if (p.using) s += ` USING (${p.using})`;
       if (p.check) s += ` WITH CHECK (${p.check})`;
       lines.push(s + ";");
+    }
+    lines.push(``);
+  }
+  if ((state.users || []).length || (state.roles || []).length || (state.grants || []).length){
+    lines.push(`-- Security: USERS / ROLES / GRANTS`);
+    for (const u of (state.users || [])){
+      if (!u.name) continue;
+      if (u.password) lines.push(`CREATE USER ${u.name} WITH PASSWORD '${String(u.password).replace(/'/g, "''")}';`);
+      else            lines.push(`CREATE USER ${u.name};`);
+    }
+    for (const r of (state.roles || [])){
+      if (!r.name) continue;
+      lines.push(`CREATE ROLE ${r.name};`);
+    }
+    for (const g of (state.grants || [])){
+      if (!g.grantee || !g.object || !(g.privs || []).length) continue;
+      lines.push(`GRANT ${g.privs.join(", ")} ON ${g.object} TO ${g.grantee};`);
     }
     lines.push(``);
   }
@@ -1726,6 +1879,129 @@ $("#btn-new-policy").onclick = () => {
   openPolicyModal(null);
 };
 $("#btn-new-routine").onclick = () => openRoutineModal("trigger", null);
+$("#btn-new-security").onclick = () => openSecurityModal("user", null);
+
+/* ---------- security (users + roles + grants) ---------- */
+const PRIVS = ["SELECT","INSERT","UPDATE","DELETE","REFERENCES","TRUNCATE"];
+let activeSecurity = null; // { kind, id }
+
+function openSecurityModal(kind, id){
+  activeSecurity = { kind, id };
+  $("#sec-kind").value = kind;
+  applySecurityKindUi(kind);
+
+  let item = null;
+  if (id){
+    const arr = kind === "user" ? state.users
+              : kind === "role" ? state.roles
+              : state.grants;
+    item = arr.find(x => x.id === id);
+  }
+
+  $("#sec-title").textContent = item
+    ? `Editar ${kind.toUpperCase()}`
+    : `Nuevo ${kind.toUpperCase()}`;
+  $("#btn-sec-delete").style.display = item ? "" : "none";
+
+  if (kind === "user"){
+    $("#sec-name").value     = item ? (item.name || "") : "";
+    $("#sec-password").value = item ? (item.password || "") : "";
+  } else if (kind === "role"){
+    $("#sec-name").value = item ? (item.name || "") : "";
+  } else {
+    // grant: name field se reusa como grantee? mejor: ocultar name y poner sólo grantee adentro.
+    $("#sec-grantee").value = item ? (item.grantee || "") : "";
+    // populate object dropdown
+    const objSel = $("#sec-object");
+    objSel.innerHTML = "";
+    for (const e of state.entities){
+      objSel.append(el("option", { value:e.name }, e.name));
+    }
+    $("#sec-object").value = item ? (item.object || "") : ((state.entities[0] && state.entities[0].name) || "");
+    // privs chips
+    renderPrivsPicker(item ? (item.privs || []) : []);
+  }
+}
+
+function applySecurityKindUi(kind){
+  $("#sec-user-row").style.display    = kind === "user"  ? "block" : "none";
+  $("#sec-grant-row").style.display   = kind === "grant" ? "block" : "none";
+  // Para grant escondemos el name field — el "nombre" sale del par grantee+object
+  $("#sec-name-label").style.display = kind === "grant" ? "none" : "";
+  $("#sec-name").style.display       = kind === "grant" ? "none" : "";
+  $("#sec-name-label").textContent   = kind === "user" ? "Username" : "Nombre del rol";
+}
+$("#sec-kind").onchange = e => { applySecurityKindUi(e.target.value); if (e.target.value === "grant") renderPrivsPicker([]); };
+
+function renderPrivsPicker(selected){
+  const box = $("#sec-privs");
+  box.innerHTML = "";
+  for (const p of PRIVS){
+    const on = selected.includes(p);
+    const chip = el("div", {
+      style: `
+        padding:5px 10px;border-radius:5px;cursor:pointer;user-select:none;
+        font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;
+        border:1px solid ${on?"var(--accent)":"var(--border-strong)"};
+        background:${on?"rgba(88,166,255,.15)":"var(--bg-2)"};
+        color:${on?"var(--accent)":"var(--text-muted)"};
+      `,
+      onclick: () => {
+        const idx = selected.indexOf(p);
+        if (idx >= 0) selected.splice(idx, 1);
+        else          selected.push(p);
+        renderPrivsPicker(selected);
+      }
+    }, p);
+    box.append(chip);
+  }
+  // stash current selection on the box so save reads it
+  box.dataset.selected = JSON.stringify(selected);
+}
+
+$("#btn-sec-save").onclick = () => {
+  if (!activeSecurity) return;
+  const kind = $("#sec-kind").value;
+
+  if (kind === "user"){
+    const name     = sanitizeIdent($("#sec-name").value.trim());
+    const password = $("#sec-password").value;
+    if (!name){ toast("Username requerido."); return; }
+    if (activeSecurity.id){
+      Object.assign(state.users.find(x => x.id === activeSecurity.id), { name, password });
+    } else {
+      state.users.push({ id: id_(), name, password });
+    }
+  } else if (kind === "role"){
+    const name = sanitizeIdent($("#sec-name").value.trim());
+    if (!name){ toast("Nombre del rol requerido."); return; }
+    if (activeSecurity.id){
+      Object.assign(state.roles.find(x => x.id === activeSecurity.id), { name });
+    } else {
+      state.roles.push({ id: id_(), name });
+    }
+  } else {
+    const object  = $("#sec-object").value;
+    const grantee = sanitizeIdent($("#sec-grantee").value.trim());
+    const privs   = JSON.parse($("#sec-privs").dataset.selected || "[]");
+    if (!object)       { toast("Objeto requerido."); return; }
+    if (!grantee)      { toast("Grantee requerido."); return; }
+    if (privs.length===0){ toast("Elegí al menos 1 privilegio."); return; }
+    if (activeSecurity.id){
+      Object.assign(state.grants.find(x => x.id === activeSecurity.id), { object, grantee, privs });
+    } else {
+      state.grants.push({ id: id_(), object, grantee, privs });
+    }
+  }
+  save(); rerender(); closeModals();
+};
+$("#btn-sec-delete").onclick = () => {
+  if (!activeSecurity || !activeSecurity.id) return;
+  if      (activeSecurity.kind === "user") state.users  = state.users.filter(x => x.id !== activeSecurity.id);
+  else if (activeSecurity.kind === "role") state.roles  = state.roles.filter(x => x.id !== activeSecurity.id);
+  else                                      state.grants = state.grants.filter(x => x.id !== activeSecurity.id);
+  save(); rerender(); closeModals();
+};
 
 /* ---------- routines (triggers + procedures + functions) ---------- */
 let activeRoutine = null; // { kind, id }
@@ -2152,7 +2428,7 @@ $("#btn-do-import").onclick = doImport;
 $("#btn-load-sample").onclick = () => { state = JSON.parse(JSON.stringify(SAMPLE)); save(); rerender(); };
 $("#btn-clear").onclick = () => {
   if (!confirm("¿Borrar el modelo y limpiar localStorage?")) return;
-  state = { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[], triggers:[], procedures:[], functions:[] };
+  state = { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[], triggers:[], procedures:[], functions:[], users:[], roles:[], grants:[] };
   localStorage.removeItem(STORAGE_KEY);
   rerender();
 };
@@ -2193,8 +2469,11 @@ function rerender(){
   const trg = (state.triggers   || []).length;
   const prc = (state.procedures || []).length;
   const fns = (state.functions  || []).length;
+  const usr = (state.users      || []).length;
+  const rls = (state.roles      || []).length;
+  const grn = (state.grants     || []).length;
   $("#status-counts").textContent =
-    `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite · ${vws} views · ${pol} policies · ${trg} trg · ${prc} prc · ${fns} fn`;
+    `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite · ${vws} views · ${pol} policies · ${trg} trg · ${prc} prc · ${fns} fn · ${usr} usr · ${rls} rol · ${grn} grants`;
 
   const errs = findings.filter(f => f[0] === "error").length;
   const warns = findings.filter(f => f[0] === "warn").length;
