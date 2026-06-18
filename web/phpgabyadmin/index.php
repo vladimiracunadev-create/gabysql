@@ -454,6 +454,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_policy'])) {
     toast('error', 'Nombre inválido.');
   }
 }
+
+// Security handlers (Push 17)
+function _exec_or_toast(string $server, string $db, string $apiToken, string $sql, string $okMsg): void {
+  [$j, $e] = http_post_json($server . '/exec', ['db' => $db, 'sql' => $sql], $apiToken);
+  if (!$e && !($j['ok'] ?? false)) $e = $j['error'] ?? 'Error';
+  if ($e) toast('error', $e); else toast('success', $okMsg);
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_user'])) {
+  require_csrf_token();
+  $u_name = trim((string)($_POST['u_name'] ?? ''));
+  $u_pwd  = (string)($_POST['u_pwd'] ?? '');
+  if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $u_name)) { toast('error', 'Username inválido.'); }
+  else {
+    $escPwd = str_replace("'", "''", $u_pwd);
+    $sql = $u_pwd !== '' ? "CREATE USER {$u_name} WITH PASSWORD '{$escPwd}';" : "CREATE USER {$u_name};";
+    _exec_or_toast($server, $db, $apiToken, $sql, 'User creado: ' . $u_name);
+  }
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_user'])) {
+  require_csrf_token();
+  $du = trim((string)($_POST['du_name'] ?? ''));
+  if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $du)) {
+    _exec_or_toast($server, $db, $apiToken, "DROP USER {$du};", 'User eliminado: ' . $du);
+  } else toast('error', 'Username inválido.');
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_role'])) {
+  require_csrf_token();
+  $r_name = trim((string)($_POST['r_name'] ?? ''));
+  if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $r_name)) toast('error', 'Nombre inválido.');
+  else _exec_or_toast($server, $db, $apiToken, "CREATE ROLE {$r_name};", 'Role creado: ' . $r_name);
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_role'])) {
+  require_csrf_token();
+  $dr = trim((string)($_POST['dr_name'] ?? ''));
+  if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $dr)) {
+    _exec_or_toast($server, $db, $apiToken, "DROP ROLE {$dr};", 'Role eliminado: ' . $dr);
+  } else toast('error', 'Nombre inválido.');
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['grant_priv'])) {
+  require_csrf_token();
+  $g_grantee = trim((string)($_POST['g_grantee'] ?? ''));
+  $g_object  = trim((string)($_POST['g_object'] ?? ''));
+  $g_privs   = (array)($_POST['g_privs'] ?? []);
+  $validPrivs = ['SELECT','INSERT','UPDATE','DELETE','REFERENCES','TRUNCATE'];
+  $g_privs = array_values(array_intersect($g_privs, $validPrivs));
+  if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $g_grantee)) toast('error', 'Grantee inválido.');
+  elseif (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $g_object)) toast('error', 'Objeto inválido.');
+  elseif (empty($g_privs)) toast('error', 'Elegí al menos 1 privilegio.');
+  else _exec_or_toast($server, $db, $apiToken, "GRANT " . implode(', ', $g_privs) . " ON {$g_object} TO {$g_grantee};", 'GRANT aplicado');
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['revoke_priv'])) {
+  require_csrf_token();
+  $r_grantee = trim((string)($_POST['r_grantee'] ?? ''));
+  $r_object  = trim((string)($_POST['r_object'] ?? ''));
+  if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $r_grantee)) toast('error', 'Grantee inválido.');
+  elseif (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $r_object)) toast('error', 'Objeto inválido.');
+  else _exec_or_toast($server, $db, $apiToken, "REVOKE ALL ON {$r_object} FROM {$r_grantee};", 'REVOKE aplicado');
+}
 ?><!doctype html>
 <html lang="es">
 <head>
@@ -807,6 +865,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_policy'])) {
             'stats'     => ['Stats', '📊', true],
             'policies'  => ['Policies (RLS)', '🔒', true],
             'routines'  => ['Routines', '⚙', true],
+            'security'  => ['Security', '👥', true],
           ];
           foreach ($tabLinks as $k => $info):
             [$label, $icon, $enabled] = $info;
@@ -1403,6 +1462,157 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
               </table>
             </div>
           <?php endif; ?>
+        </div>
+
+      <?php elseif ($tab === 'security'): ?>
+        <?php
+          [$usrResp, $usrErr] = http_get_json($server . '/users?db=' . urlencode($db), $apiToken);
+          [$rolResp, $rolErr] = http_get_json($server . '/roles?db=' . urlencode($db), $apiToken);
+          [$grnResp, $grnErr] = http_get_json($server . '/grants?db=' . urlencode($db), $apiToken);
+          $usersList  = (!$usrErr && ($usrResp['ok'] ?? false)) ? ($usrResp['users']  ?? []) : [];
+          $rolesList  = (!$rolErr && ($rolResp['ok'] ?? false)) ? ($rolResp['roles']  ?? []) : [];
+          $grantsList = (!$grnErr && ($grnResp['ok'] ?? false)) ? ($grnResp['grants'] ?? []) : [];
+        ?>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">👤 Users</h2>
+            <span class="muted"><?= count($usersList) ?> declarados</span>
+          </div>
+          <?php if (empty($usersList)): ?>
+            <div class="muted" style="font-size:13px">No hay users en este DB.</div>
+          <?php else: ?>
+            <div class="table-wrapper">
+              <table class="data">
+                <thead><tr><th>Username</th><th>Scheme</th><th>Iteraciones</th><th></th></tr></thead>
+                <tbody>
+                  <?php foreach ($usersList as $u): ?>
+                    <tr>
+                      <td class="col-mono"><?= htmlspecialchars($u['name'] ?? '') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars($u['scheme'] ?? '') ?></td>
+                      <td class="col-mono"><?= (int)($u['iterations'] ?? 0) ?></td>
+                      <td>
+                        <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar user <?= htmlspecialchars($u['name']) ?>?')">
+                          <?= csrf_field() ?>
+                          <input type="hidden" name="du_name" value="<?= htmlspecialchars($u['name'] ?? '') ?>" />
+                          <button class="btn btn-ghost btn-sm" name="drop_user" type="submit">🗑</button>
+                        </form>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+          <form method="post" class="row" style="gap:10px;flex-wrap:wrap;margin-top:14px">
+            <?= csrf_field() ?>
+            <input class="input" type="text" name="u_name" placeholder="username" required style="flex:1;min-width:160px" />
+            <input class="input" type="text" name="u_pwd" placeholder="password (opcional)" style="flex:1;min-width:200px" autocomplete="off" />
+            <button class="btn btn-primary" name="create_user" type="submit">＋ Crear user</button>
+          </form>
+          <p class="muted" style="font-size:11.5px;margin-top:6px">
+            El password viaja en plano hasta el server, que lo hashea con Argon2id antes de persistirlo.
+            En producción usá HTTPS y considerá emitir <code>CREATE USER name;</code> sin password aquí, y setearlo via shell.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">👥 Roles</h2>
+            <span class="muted"><?= count($rolesList) ?> declarados</span>
+          </div>
+          <?php if (empty($rolesList)): ?>
+            <div class="muted" style="font-size:13px">No hay roles en este DB.</div>
+          <?php else: ?>
+            <div class="table-wrapper">
+              <table class="data">
+                <thead><tr><th>Nombre</th><th></th></tr></thead>
+                <tbody>
+                  <?php foreach ($rolesList as $r): ?>
+                    <tr>
+                      <td class="col-mono"><?= htmlspecialchars($r['name'] ?? '') ?></td>
+                      <td>
+                        <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar role <?= htmlspecialchars($r['name']) ?>?')">
+                          <?= csrf_field() ?>
+                          <input type="hidden" name="dr_name" value="<?= htmlspecialchars($r['name'] ?? '') ?>" />
+                          <button class="btn btn-ghost btn-sm" name="drop_role" type="submit">🗑</button>
+                        </form>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+          <form method="post" class="row" style="gap:10px;flex-wrap:wrap;margin-top:14px">
+            <?= csrf_field() ?>
+            <input class="input" type="text" name="r_name" placeholder="nombre del rol" required style="flex:1;min-width:240px" />
+            <button class="btn btn-primary" name="create_role" type="submit">＋ Crear role</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">🔐 Grants</h2>
+            <span class="muted"><?= count($grantsList) ?> activos</span>
+          </div>
+          <?php if (empty($grantsList)): ?>
+            <div class="muted" style="font-size:13px">No hay grants en este DB.</div>
+          <?php else: ?>
+            <div class="table-wrapper">
+              <table class="data">
+                <thead><tr><th>Grantee</th><th>Objeto</th><th>Privilegios</th><th></th></tr></thead>
+                <tbody>
+                  <?php foreach ($grantsList as $g): ?>
+                    <tr>
+                      <td class="col-mono"><?= htmlspecialchars($g['grantee'] ?? '') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars($g['object'] ?? '') ?></td>
+                      <td class="col-mono"><?= htmlspecialchars(implode(', ', (array)($g['privs'] ?? []))) ?></td>
+                      <td>
+                        <form method="post" style="margin:0" onsubmit="return confirm('¿REVOKE ALL en <?= htmlspecialchars($g['object']) ?> a <?= htmlspecialchars($g['grantee']) ?>?')">
+                          <?= csrf_field() ?>
+                          <input type="hidden" name="r_grantee" value="<?= htmlspecialchars($g['grantee'] ?? '') ?>" />
+                          <input type="hidden" name="r_object"  value="<?= htmlspecialchars($g['object'] ?? '') ?>" />
+                          <button class="btn btn-ghost btn-sm" name="revoke_priv" type="submit">🗑</button>
+                        </form>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+          <form method="post" style="margin-top:14px" class="stack-sm">
+            <?= csrf_field() ?>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+              <div>
+                <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Grantee</label>
+                <input class="input" type="text" name="g_grantee" required placeholder="user o role" />
+              </div>
+              <div>
+                <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Objeto (tabla)</label>
+                <select class="input" name="g_object" required>
+                  <?php foreach ($tables as $tInfo): ?>
+                    <option value="<?= htmlspecialchars($tInfo['name']) ?>"><?= htmlspecialchars($tInfo['name']) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Privilegios</label>
+              <div style="display:flex;flex-wrap:wrap;gap:14px;margin-top:6px">
+                <?php foreach (['SELECT','INSERT','UPDATE','DELETE','REFERENCES','TRUNCATE'] as $priv): ?>
+                  <label class="row muted" style="cursor:pointer;font-size:12.5px;font-family:'JetBrains Mono',monospace">
+                    <input type="checkbox" name="g_privs[]" value="<?= $priv ?>" style="width:auto;margin:0 5px 0 0" /> <?= $priv ?>
+                  </label>
+                <?php endforeach; ?>
+              </div>
+            </div>
+            <div class="row">
+              <button class="btn btn-primary" name="grant_priv" type="submit">＋ GRANT</button>
+              <span class="muted" style="font-size:12px">Emite <code>GRANT &lt;privs&gt; ON &lt;tabla&gt; TO &lt;grantee&gt;;</code></span>
+            </div>
+          </form>
         </div>
 
       <?php elseif ($tab === 'routines'): ?>
