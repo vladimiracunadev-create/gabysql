@@ -301,6 +301,75 @@ fn grants_endpoint_lists_privileges_as_keyword_array() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn stats_endpoint_returns_row_count_after_analyze() -> Result<(), Box<dyn Error>> {
+    let db = temp_db("stats");
+    setup_sql(
+        &db,
+        &[
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+            "INSERT INTO t (id, v) VALUES (1, 10)",
+            "INSERT INTO t (id, v) VALUES (2, 20)",
+            "INSERT INTO t (id, v) VALUES (3, 30)",
+            "ANALYZE TABLE t",
+        ],
+    )?;
+    let addr = spawn_server(db);
+    let (status, body) = http_get(&addr, "/stats")?;
+    assert_eq!(status, 200, "body: {}", body);
+    assert!(body.contains("\"name\":\"t\""), "body: {}", body);
+    assert!(body.contains("\"rowCount\":3"), "body: {}", body);
+    assert!(body.contains("\"columnCount\":"), "body: {}", body);
+    // Default compact — no debería incluir el array `columns`.
+    assert!(
+        !body.contains("\"columns\":["),
+        "default shape no debería ser full: {}",
+        body
+    );
+    Ok(())
+}
+
+#[test]
+fn stats_endpoint_full_includes_per_column_stats() -> Result<(), Box<dyn Error>> {
+    let db = temp_db("stats_full");
+    setup_sql(
+        &db,
+        &[
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+            "INSERT INTO t (id, v) VALUES (1, 10)",
+            "ANALYZE TABLE t",
+        ],
+    )?;
+    let addr = spawn_server(db);
+    let (status, body) = http_get(&addr, "/stats?full=1")?;
+    assert_eq!(status, 200, "body: {}", body);
+    assert!(body.contains("\"columns\":["), "body: {}", body);
+    assert!(body.contains("\"ndv\":"), "body: {}", body);
+    Ok(())
+}
+
+#[test]
+fn objects_endpoint_summarizes_catalog() -> Result<(), Box<dyn Error>> {
+    let db = temp_db("objects");
+    setup_sql(
+        &db,
+        &[
+            "CREATE TABLE a (id INT PRIMARY KEY)",
+            "CREATE TABLE b (id INT PRIMARY KEY)",
+            "CREATE VIEW v AS SELECT id FROM a",
+            "CREATE ROLE r",
+        ],
+    )?;
+    let addr = spawn_server(db);
+    let (status, body) = http_get(&addr, "/objects")?;
+    assert_eq!(status, 200, "body: {}", body);
+    assert!(body.contains("\"tables\":2"), "body: {}", body);
+    assert!(body.contains("\"views\":1"), "body: {}", body);
+    assert!(body.contains("\"roles\":1"), "body: {}", body);
+    assert!(body.contains("\"total\":"), "body: {}", body);
+    Ok(())
+}
+
+#[test]
 fn grants_endpoint_filters_by_grantee() -> Result<(), Box<dyn Error>> {
     let db = temp_db("grants_filter");
     setup_sql(

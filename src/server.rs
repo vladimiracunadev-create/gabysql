@@ -1,8 +1,8 @@
 use crate::catalog::{
-    Catalog, DefaultLiteral, FunctionMeta, GrantMeta, PolicyMeta, ProcedureMeta, RoleMeta,
-    TableMeta, TriggerMeta, UserMeta, ViewMeta, POLICY_ACTION_ALL, POLICY_ACTION_DELETE,
-    POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE, PRIV_DELETE, PRIV_INSERT,
-    PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
+    Catalog, CatalogObject, DefaultLiteral, FunctionMeta, GrantMeta, PolicyMeta, ProcedureMeta,
+    RoleMeta, StatsMeta, TableMeta, TriggerMeta, UserMeta, ViewMeta, POLICY_ACTION_ALL,
+    POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
+    PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::errors::{coded, codes};
 use crate::sql::{decimal_to_string, decode_row, parse, Engine, ResultSet, Statement, Value};
@@ -385,6 +385,8 @@ fn handle_request(
         ("GET", "/users") => users(request, config),
         ("GET", "/roles") => roles(request, config),
         ("GET", "/grants") => grants(request, config),
+        ("GET", "/stats") => stats(request, config),
+        ("GET", "/objects") => objects(request, config),
         ("GET", "/schema") => schema(request, config),
         ("GET", "/rows") => rows(request, config),
         ("POST", "/exec") => exec_sql(request, config, write_lock, sessions),
@@ -662,6 +664,85 @@ fn grants(request: Request, config: &ServerConfig) -> DbResult<Response> {
     Ok(Response::json(
         200,
         format!("{{\"ok\":true,\"grants\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /stats?db=<db>[&table=<t>]` — devuelve los registros de
+/// estadísticas persistidos por `ANALYZE TABLE` (bloque P3/P4).
+/// Acepta filtro `?table=<t>` para una sola tabla.
+///
+/// Por defecto el shape JSON es **compacto** — incluye sólo
+/// `name`, `rowCount`, `analyzedAt` y `columnCount`. Las column
+/// stats completas (MCV + histograma) se incluyen sólo si pasás
+/// `?full=1`, porque pueden ser grandes y la mayoría de los usos
+/// (tab Stats de admin) sólo necesita los counts.
+fn stats(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let stats_list = catalog.list_table_stats()?;
+    let filter = request
+        .query
+        .get("table")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let full = request.query.get("full").map(|v| v == "1").unwrap_or(false);
+    let items_json = stats_list
+        .iter()
+        .filter(|s| match &filter {
+            Some(f) => s.name.eq_ignore_ascii_case(f),
+            None => true,
+        })
+        .map(|s| stats_meta_json(s, full))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::json(
+        200,
+        format!("{{\"ok\":true,\"stats\":[{}]}}", items_json),
+    ))
+}
+
+/// `GET /objects?db=<db>` — devuelve un resumen del catálogo
+/// completo agrupado por tipo. Útil para dashboards y para detectar
+/// drift entre la API individual y `list_objects()` global.
+///
+/// Shape:
+///   { "ok": true, "counts": { "tables": N, "views": M, ... },
+///     "total": T }
+fn objects(request: Request, config: &ServerConfig) -> DbResult<Response> {
+    let (mut pager, _) = open_pager_from_request(config, request.query.get("db"))?;
+    let mut catalog = Catalog::open(&mut pager);
+    let objects = catalog.list_objects()?;
+    let mut tables = 0u64;
+    let mut views = 0u64;
+    let mut triggers = 0u64;
+    let mut procedures = 0u64;
+    let mut functions = 0u64;
+    let mut users = 0u64;
+    let mut roles = 0u64;
+    let mut grants = 0u64;
+    let mut policies = 0u64;
+    let mut table_stats = 0u64;
+    for o in &objects {
+        match o {
+            CatalogObject::Table(_) => tables += 1,
+            CatalogObject::View(_) => views += 1,
+            CatalogObject::Trigger(_) => triggers += 1,
+            CatalogObject::Procedure(_) => procedures += 1,
+            CatalogObject::Function(_) => functions += 1,
+            CatalogObject::User(_) => users += 1,
+            CatalogObject::Role(_) => roles += 1,
+            CatalogObject::Grant(_) => grants += 1,
+            CatalogObject::Policy(_) => policies += 1,
+            CatalogObject::TableStats(_) => table_stats += 1,
+        }
+    }
+    let total = objects.len();
+    Ok(Response::json(
+        200,
+        format!(
+            "{{\"ok\":true,\"counts\":{{\"tables\":{},\"views\":{},\"triggers\":{},\"procedures\":{},\"functions\":{},\"users\":{},\"roles\":{},\"grants\":{},\"policies\":{},\"tableStats\":{}}},\"total\":{}}}",
+            tables, views, triggers, procedures, functions, users, roles, grants, policies, table_stats, total
+        ),
     ))
 }
 
@@ -1300,6 +1381,41 @@ fn function_meta_json(meta: &FunctionMeta) -> String {
         params_json,
         json_string(meta.return_type.as_sql()),
         json_string(&meta.body_sql)
+    )
+}
+
+/// JSON encoding for `StatsMeta`. Default = compacto. Si `full`,
+/// agrega array `columns` con per-column NDV + null_count (MCV y
+/// histogramas se omiten siempre — son grandes y nadie en la UI los
+/// pinta directamente; quien los necesite puede llamar la API
+/// interna).
+fn stats_meta_json(meta: &StatsMeta, full: bool) -> String {
+    let column_count = meta.columns.len();
+    let columns_field = if full {
+        let cols_json = meta
+            .columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "{{\"name\":{},\"nullCount\":{},\"ndv\":{}}}",
+                    json_string(&c.name),
+                    c.null_count,
+                    c.ndv
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(",\"columns\":[{}]", cols_json)
+    } else {
+        String::new()
+    };
+    format!(
+        "{{\"name\":{},\"rowCount\":{},\"analyzedAt\":{},\"columnCount\":{}{}}}",
+        json_string(&meta.name),
+        meta.row_count,
+        meta.analyzed_at_nanos,
+        column_count,
+        columns_field
     )
 }
 
