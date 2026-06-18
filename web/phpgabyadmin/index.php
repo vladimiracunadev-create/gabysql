@@ -412,6 +412,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['run_sql'])) {
   [$execJson, $execErr] = http_post_json($server . '/exec', ['db' => $db, 'sql' => (string)$sql], $apiToken, $sessionToUse);
   if (!$execErr && !($execJson['ok'] ?? false)) $execErr = $execJson['error'] ?? 'Error';
 }
+
+// POST: create RLS policy (Push 5)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_policy'])) {
+  require_csrf_token();
+  $p_name   = trim((string)($_POST['p_name']   ?? ''));
+  $p_table  = trim((string)($_POST['p_table']  ?? ''));
+  $p_action = trim((string)($_POST['p_action'] ?? 'SELECT'));
+  $p_role   = trim((string)($_POST['p_role']   ?? ''));
+  $p_using  = trim((string)($_POST['p_using']  ?? ''));
+  $p_check  = trim((string)($_POST['p_check']  ?? ''));
+  $polErr = '';
+  if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $p_name))  $polErr = 'Nombre inválido.';
+  elseif (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $p_table)) $polErr = 'Tabla inválida.';
+  elseif (!in_array($p_action, ['SELECT','INSERT','UPDATE','DELETE','ALL'], true)) $polErr = 'Acción inválida.';
+  elseif ($p_using === '' && $p_check === '') $polErr = 'USING o WITH CHECK requerido.';
+  elseif ($p_role !== '' && !preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $p_role)) $polErr = 'Rol inválido.';
+  if ($polErr === '') {
+    $sqlGen = "CREATE POLICY {$p_name} ON {$p_table} FOR {$p_action}";
+    if ($p_role !== '') $sqlGen .= " TO {$p_role}";
+    if ($p_using !== '') $sqlGen .= " USING ({$p_using})";
+    if ($p_check !== '') $sqlGen .= " WITH CHECK ({$p_check})";
+    $sqlGen .= ";";
+    [$polExecJson, $polExecErr] = http_post_json($server . '/exec', ['db' => $db, 'sql' => $sqlGen], $apiToken);
+    if (!$polExecErr && !($polExecJson['ok'] ?? false)) $polExecErr = $polExecJson['error'] ?? 'Error';
+    if ($polExecErr) toast('error', $polExecErr);
+    else toast('success', 'Policy creada: ' . $p_name);
+  } else {
+    toast('error', $polErr);
+  }
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_policy'])) {
+  require_csrf_token();
+  $dp_name = trim((string)($_POST['dp_name'] ?? ''));
+  if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $dp_name)) {
+    [$dpJson, $dpErr] = http_post_json($server . '/exec', ['db' => $db, 'sql' => "DROP POLICY {$dp_name};"], $apiToken);
+    if (!$dpErr && !($dpJson['ok'] ?? false)) $dpErr = $dpJson['error'] ?? 'Error';
+    if ($dpErr) toast('error', $dpErr);
+    else toast('success', 'Policy eliminada: ' . $dp_name);
+  } else {
+    toast('error', 'Nombre inválido.');
+  }
+}
 ?><!doctype html>
 <html lang="es">
 <head>
@@ -719,6 +761,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['run_sql'])) {
             'sql'       => ['SQL editor', '➤', true],
             'sessions'  => ['Sessions (M13)', '↻', true],
             'explain'   => ['Explain (M6)', '⊕', true],
+            'stats'     => ['Stats', '📊', true],
+            'policies'  => ['Policies (RLS)', '🔒', true],
           ];
           foreach ($tabLinks as $k => $info):
             [$label, $icon, $enabled] = $info;
@@ -999,7 +1043,7 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
           <?php endif; ?>
         </div>
 
-      <?php else: /* SQL tab */ ?>
+      <?php elseif ($tab === 'sql'): ?>
         <div class="card">
           <div class="card-header">
             <h2 class="card-title">SQL editor</h2>
@@ -1074,6 +1118,165 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
             </details>
           <?php endif; ?>
         </div>
+
+      <?php elseif ($tab === 'stats'): ?>
+        <?php
+          // Counts derivados de $tables (ya cargado del sidebar via /tables).
+          $statTotalTables  = count($tables);
+          $statTotalCols    = 0;
+          $statTotalIdx     = 0;
+          $statTotalFks     = 0;
+          $statTotalChecks  = 0;
+          $statTotalPK      = 0;
+          $perTable = [];
+          foreach ($tables as $tInfo) {
+            $tn   = $tInfo['name'] ?? '(?)';
+            $cols = $tInfo['columns'] ?? [];
+            $idxs = $tInfo['indexes'] ?? [];
+            $nCol = count($cols);
+            $nIdx = count($idxs);
+            $nFk  = 0; $nChk = 0; $nPk = 0;
+            foreach ($cols as $c) {
+              if (!empty($c['references'])) $nFk++;
+              if (!empty($c['check']))      $nChk++;
+              if (!empty($c['pk']))         $nPk++;
+            }
+            $statTotalCols   += $nCol;
+            $statTotalIdx    += $nIdx;
+            $statTotalFks    += $nFk;
+            $statTotalChecks += $nChk;
+            $statTotalPK     += $nPk;
+            $perTable[] = compact('tn','nCol','nIdx','nFk','nChk','nPk');
+          }
+          $totalDbs = is_array($dbsResp['databases'] ?? null) ? count($dbsResp['databases']) : 0;
+        ?>
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">📊 Estadísticas · <code><?= htmlspecialchars($db) ?></code></h2>
+            <span class="muted">Derivado de <code>/tables</code> y <code>/dbs</code></span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-top:6px">
+            <?php
+              $kpis = [
+                ['DBs (server)',  $totalDbs,        'var(--accent)'],
+                ['Tablas',        $statTotalTables, 'var(--accent)'],
+                ['Columnas',      $statTotalCols,   'var(--text)'],
+                ['Índices',       $statTotalIdx,    'var(--accent)'],
+                ['FKs',           $statTotalFks,    'var(--warning)'],
+                ['CHECK',         $statTotalChecks, 'var(--success)'],
+                ['PKs',           $statTotalPK,     'var(--success)'],
+              ];
+              foreach ($kpis as [$lbl, $val, $color]):
+            ?>
+              <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:14px">
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);font-weight:600"><?= htmlspecialchars($lbl) ?></div>
+                <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:600;color:<?= $color ?>;margin-top:4px"><?= (int)$val ?></div>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        </div>
+
+        <?php if (!empty($perTable)): ?>
+          <div class="card">
+            <div class="card-header"><h2 class="card-title">Breakdown por tabla</h2></div>
+            <div class="table-wrapper">
+              <table class="data">
+                <thead><tr>
+                  <th>Tabla</th><th>Cols</th><th>PK</th><th>Índices</th><th>FKs</th><th>CHECKs</th>
+                </tr></thead>
+                <tbody>
+                  <?php foreach ($perTable as $r): ?>
+                    <tr>
+                      <td class="col-mono"><?= htmlspecialchars($r['tn']) ?></td>
+                      <td class="col-mono"><?= (int)$r['nCol'] ?></td>
+                      <td class="col-mono"><?= (int)$r['nPk'] ?></td>
+                      <td class="col-mono"><?= (int)$r['nIdx'] ?></td>
+                      <td class="col-mono"><?= (int)$r['nFk'] ?></td>
+                      <td class="col-mono"><?= (int)$r['nChk'] ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <?php [$metricsResp, $metricsErr] = http_get_json($server . '/metrics', $apiToken); ?>
+        <?php if (!$metricsErr && is_array($metricsResp)): ?>
+          <div class="card">
+            <div class="card-header"><h2 class="card-title">Server metrics · <code>/metrics</code></h2></div>
+            <pre class="code" style="max-height:320px;overflow:auto"><?= htmlspecialchars(json_encode($metricsResp, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) ?></pre>
+          </div>
+        <?php endif; ?>
+
+      <?php elseif ($tab === 'policies'): ?>
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">🔒 RLS Policies · <code><?= htmlspecialchars($db) ?></code></h2>
+            <span class="muted">CREATE POLICY · DROP POLICY</span>
+          </div>
+          <p class="muted" style="font-size:13px;margin-bottom:14px">
+            Las policies de Row-Level Security restringen qué filas ve cada rol.
+            <code>USING</code> aplica al SELECT/UPDATE/DELETE; <code>WITH CHECK</code> aplica a INSERT/UPDATE.
+          </p>
+          <form method="post" class="stack-sm">
+            <?= csrf_field() ?>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+              <div>
+                <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Nombre</label>
+                <input class="input" type="text" name="p_name" placeholder="p_orders_self" required />
+              </div>
+              <div>
+                <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Tabla</label>
+                <select class="input" name="p_table" required>
+                  <?php foreach ($tables as $tInfo): ?>
+                    <option value="<?= htmlspecialchars($tInfo['name']) ?>"><?= htmlspecialchars($tInfo['name']) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div>
+                <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Acción</label>
+                <select class="input" name="p_action">
+                  <option value="SELECT">SELECT</option>
+                  <option value="INSERT">INSERT</option>
+                  <option value="UPDATE">UPDATE</option>
+                  <option value="DELETE">DELETE</option>
+                  <option value="ALL">ALL</option>
+                </select>
+              </div>
+              <div>
+                <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">Rol (opcional)</label>
+                <input class="input" type="text" name="p_role" placeholder="bob" />
+              </div>
+            </div>
+            <div>
+              <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">USING (read-side; SELECT/UPDATE/DELETE)</label>
+              <textarea class="input" name="p_using" rows="2" placeholder="user_id = current_user_id()"></textarea>
+            </div>
+            <div>
+              <label class="muted" style="font-size:11px;text-transform:uppercase;font-weight:600">WITH CHECK (write-side; INSERT/UPDATE)</label>
+              <textarea class="input" name="p_check" rows="2" placeholder="amount <= 100000.00"></textarea>
+            </div>
+            <div class="row">
+              <button class="btn btn-primary" name="create_policy" type="submit">＋ Crear policy</button>
+              <span class="muted" style="font-size:12px">Emite <code>CREATE POLICY name ON table FOR action [TO role] [USING (...)] [WITH CHECK (...)];</code></span>
+            </div>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h2 class="card-title">Eliminar policy</h2></div>
+          <form method="post" class="row" style="gap:10px;flex-wrap:wrap">
+            <?= csrf_field() ?>
+            <input class="input" type="text" name="dp_name" placeholder="nombre exacto de la policy" required style="flex:1;min-width:240px" />
+            <button class="btn btn-danger" name="drop_policy" type="submit">🗑 DROP POLICY</button>
+          </form>
+          <p class="muted" style="font-size:12px;margin-top:10px">
+            El listado completo de policies (GET /policies) se agrega cuando el server
+            exponga el endpoint. Hoy podés crear, eliminar y consultarlas vía SQL.
+          </p>
+        </div>
+
       <?php endif; ?>
 
     <?php endif; ?>
