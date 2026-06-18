@@ -243,12 +243,17 @@ fn users_endpoint_lists_user_without_secret_material() -> Result<(), Box<dyn Err
     let (status, body) = http_get(&addr, "/users")?;
     assert_eq!(status, 200, "body: {}", body);
     assert!(body.contains("\"name\":\"alice\""), "body: {}", body);
-    // Default scheme del motor es PBKDF2-SHA256 (scheme=1). scrypt y
-    // argon2id existen como alternativas pero requieren sintaxis
-    // específica que no usamos aquí.
+    // El scheme exacto del default del motor puede cambiar sin que
+    // el contrato del endpoint cambie. El requisito real es que se
+    // serialice un scheme conocido (no "unknown" — que delataría un
+    // mapeo faltante en server.rs cuando el motor agregue un scheme
+    // nuevo).
+    let known_schemes = ["pbkdf2-sha256", "scrypt", "argon2id"];
     assert!(
-        body.contains("\"scheme\":\"pbkdf2-sha256\""),
-        "body: {}",
+        known_schemes
+            .iter()
+            .any(|s| body.contains(&format!("\"scheme\":\"{}\"", s))),
+        "scheme no es uno de los conocidos del motor (pbkdf2-sha256/scrypt/argon2id). body: {}",
         body
     );
     // CRITICO: la API NUNCA debe filtrar hash ni salt.
