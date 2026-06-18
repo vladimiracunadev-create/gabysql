@@ -634,7 +634,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_policy'])) {
              padding:14px;overflow:auto;font-size:12px;line-height:1.5}
     .pager{display:flex;justify-content:space-between;align-items:center;margin-top:14px;
            padding:10px 0;font-size:13px;color:var(--text-muted)}
+    /* ---------- CodeMirror overrides (alineado con paleta GitHub) ---------- */
+    .CodeMirror{
+      background:var(--bg) !important;
+      color:var(--text) !important;
+      font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace !important;
+      font-size:13px !important;
+      line-height:1.55 !important;
+      border:1px solid var(--border-strong) !important;
+      border-radius:6px !important;
+      height:auto !important;
+      min-height:180px;
+      padding:4px 0;
+    }
+    .CodeMirror.CodeMirror-focused{
+      border-color:var(--accent) !important;
+      box-shadow:0 0 0 3px rgba(88,166,255,.18) !important;
+    }
+    .CodeMirror-gutters{
+      background:var(--surface) !important;
+      border-right:1px solid var(--border) !important;
+    }
+    .CodeMirror-linenumber{color:var(--text-muted) !important}
+    .CodeMirror-cursor{border-left-color:var(--accent) !important}
+    .CodeMirror-selected{background:rgba(88,166,255,.22) !important}
+    .CodeMirror-line .cm-keyword   {color:#ff7b72; font-weight:600}
+    .CodeMirror-line .cm-string    {color:#a5d6ff}
+    .CodeMirror-line .cm-number    {color:#79c0ff}
+    .CodeMirror-line .cm-operator  {color:#ff7b72}
+    .CodeMirror-line .cm-variable  {color:#e6edf3}
+    .CodeMirror-line .cm-variable-2{color:#7ee787}
+    .CodeMirror-line .cm-atom      {color:#d2a8ff}
+    .CodeMirror-line .cm-comment   {color:#7d8590; font-style:italic}
+    .CodeMirror-line .cm-builtin   {color:#79c0ff}
+    .CodeMirror-line .cm-def       {color:#7ee787}
+    .CodeMirror-line .cm-bracket   {color:#e6edf3}
+    .CodeMirror-line .cm-punctuation{color:#e6edf3}
+    .CodeMirror-matchingbracket{
+      background:rgba(126,231,135,.22) !important;
+      color:inherit !important;
+      border-bottom:1px solid var(--success);
+    }
   </style>
+  <!-- CodeMirror (Push 6) — SQL syntax highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 </head>
 <body>
 
@@ -1308,6 +1351,49 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
     }, 5000);
   </script>
 <?php endif; ?>
+
+<!-- CodeMirror runtime (Push 6) — solo se monta si hay un textarea SQL en la página -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/comment/comment.min.js"></script>
+<script>
+  (function(){
+    if (typeof CodeMirror === 'undefined') return;
+    // SQL editor del tab `sql`
+    var sqlTa = document.querySelector('textarea[name="sql"]');
+    if (sqlTa) {
+      var sqlCm = CodeMirror.fromTextArea(sqlTa, {
+        mode: 'text/x-sql',
+        lineNumbers: true,
+        indentUnit: 2,
+        smartIndent: true,
+        matchBrackets: true,
+        autoCloseBrackets: true,
+        viewportMargin: Infinity,
+        extraKeys: {
+          'Ctrl-Enter': function(cm){ cm.save(); cm.getTextArea().form.submit(); },
+          'Cmd-Enter':  function(cm){ cm.save(); cm.getTextArea().form.submit(); },
+          'Ctrl-/':     'toggleComment',
+          'Cmd-/':      'toggleComment'
+        }
+      });
+      sqlTa.form.addEventListener('submit', function(){ sqlCm.save(); });
+    }
+    // Textareas RLS policy (USING / WITH CHECK)
+    document.querySelectorAll('textarea[name="p_using"], textarea[name="p_check"]').forEach(function(ta){
+      CodeMirror.fromTextArea(ta, {
+        mode: 'text/x-sql',
+        lineNumbers: false,
+        indentUnit: 2,
+        matchBrackets: true,
+        autoCloseBrackets: true,
+        viewportMargin: Infinity
+      });
+    });
+  })();
+</script>
 
 </body>
 </html>
