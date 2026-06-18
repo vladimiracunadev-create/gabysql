@@ -161,6 +161,30 @@
     display:inline-flex;align-items:center;padding:0 8px;font-size:11px;
     font-family:'JetBrains Mono',monospace;color:var(--text-muted);min-width:48px;justify-content:center;
   }
+  .bulk-bar{
+    position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:9;
+    display:flex;align-items:center;gap:4px;
+    background:var(--bg-2);border:1px solid var(--border-strong);
+    border-radius:8px;padding:5px 8px;box-shadow:var(--shadow-lg);
+    font-family:'Inter',sans-serif;
+  }
+  .bulk-bar .bulk-count{
+    font-size:12px;color:var(--accent);font-weight:600;padding:0 6px;
+    font-family:'JetBrains Mono',monospace;
+  }
+  .bulk-bar .bulk-sep{
+    display:inline-block;width:1px;height:20px;background:var(--border);margin:0 4px;
+  }
+  .bulk-bar .bulk-btn{
+    width:30px;height:28px;padding:0;font-size:14px;font-weight:600;
+    background:transparent;border:1px solid transparent;color:var(--text);
+  }
+  .bulk-bar .bulk-btn:hover{background:var(--bg-3);border-color:var(--border-strong)}
+  .bulk-bar .bulk-btn.danger{color:var(--danger)}
+  .bulk-bar .bulk-btn.danger:hover{background:rgba(255,123,114,.12);border-color:var(--danger)}
+  #lasso-svg .lasso-rect{
+    fill:rgba(88,166,255,.10);stroke:var(--accent);stroke-width:1;stroke-dasharray:4 3;
+  }
   #minimap{
     position:absolute;bottom:14px;left:14px;z-index:8;
     width:220px;height:150px;
@@ -398,6 +422,24 @@
     <div id="canvas-content">
       <svg class="relations" id="rel-svg"></svg>
     </div>
+    <div class="bulk-bar" id="bulk-bar" style="display:none">
+      <span class="bulk-count" id="bulk-count">0 seleccionadas</span>
+      <span class="bulk-sep"></span>
+      <button class="bulk-btn" data-bulk="left"   title="Alinear izquierda">⫷</button>
+      <button class="bulk-btn" data-bulk="hcenter" title="Alinear horizontal (mismo Y)">═</button>
+      <button class="bulk-btn" data-bulk="right"  title="Alinear derecha">⫸</button>
+      <span class="bulk-sep"></span>
+      <button class="bulk-btn" data-bulk="top"     title="Alinear arriba">⫶</button>
+      <button class="bulk-btn" data-bulk="vcenter" title="Alinear vertical (mismo X)">∥</button>
+      <button class="bulk-btn" data-bulk="bottom"  title="Alinear abajo">⩊</button>
+      <span class="bulk-sep"></span>
+      <button class="bulk-btn" data-bulk="distH" title="Distribuir horizontal">↔</button>
+      <button class="bulk-btn" data-bulk="distV" title="Distribuir vertical">↕</button>
+      <span class="bulk-sep"></span>
+      <button class="bulk-btn" id="bulk-duplicate" title="Duplicar (Ctrl+D)">⎘</button>
+      <button class="bulk-btn danger" id="bulk-delete" title="Eliminar (Del)">🗑</button>
+    </div>
+    <svg id="lasso-svg" style="position:absolute;inset:0;pointer-events:none;z-index:7"></svg>
     <div id="minimap">
       <span class="mm-toggle" id="mm-toggle">▭ map</span>
       <div class="mm-content" id="mm-content"></div>
@@ -902,7 +944,16 @@ if (!Array.isArray(state.users))      state.users      = [];
 if (!Array.isArray(state.roles))      state.roles      = [];
 if (!Array.isArray(state.grants))     state.grants     = [];
 let selectedColumnId = null;
-let selectedEntityId = null;
+let selectedEntityIds = new Set();   // Push 28: multi-selección
+// Compat shim: el resto del código aún lee/escribe selectedEntityId.
+// El getter devuelve el "último" (cualquier id del Set); el setter
+// reemplaza el Set por ese único id. Así pude introducir multi sin
+// reescribir todos los callsites en un solo commit.
+Object.defineProperty(window, "selectedEntityId", {
+  get(){ return selectedEntityIds.size === 0 ? null : Array.from(selectedEntityIds).pop(); },
+  set(v){ selectedEntityIds = v ? new Set([v]) : new Set(); }
+});
+function isEntitySelected(id){ return selectedEntityIds.has(id); }
 let activeFkColumn = null;     // { entityId, columnId } during FK modal
 let activeTab = "check";
 let resultsCollapsed = false;
@@ -1286,7 +1337,7 @@ function renderCanvas(){
 
 function renderEntity(ent){
   const card = el("div", {
-    class: "entity" + (selectedEntityId === ent.id ? " selected" : ""),
+    class: "entity" + (isEntitySelected(ent.id) ? " selected" : ""),
     "data-id": ent.id,
     style: `left:${ent.x}px;top:${ent.y}px`,
     onclick: e => { if (e.target === card || e.target.classList.contains("entity-body")) selectEntity(ent.id); }
@@ -1301,31 +1352,46 @@ function renderEntity(ent){
       onclick: () => {
         if (!confirm(`¿Eliminar la entidad '${ent.name}'?`)) return;
         state.entities = state.entities.filter(x => x.id !== ent.id);
-        if (selectedEntityId === ent.id) selectedEntityId = null;
+        selectedEntityIds.delete(ent.id);
         save(); rerender();
       }
     }, "✕")
   );
 
-  // drag entity (compensa por zoom: el delta en clientX/Y es screen-px,
-  // pero ent.x/y son lógicos — dividimos por canvasZoom para mantener
-  // el cursor pegado a la entidad bajo cualquier nivel de zoom).
+  // drag entity (compensa por zoom). Si la entity dragged está en
+  // selección múltiple, arrastra todo el grupo en paralelo
+  // capturando snapshot inicial de cada x/y.
   let dragging = null;
   head.addEventListener("mousedown", e => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
-    if (e.button !== 0) return; // dejar middle/right para pan / context
-    selectEntity(ent.id);
-    dragging = { startCx: e.clientX, startCy: e.clientY, startEx: ent.x, startEy: ent.y };
+    if (e.button !== 0) return;
+    // Selección con Shift+click = toggle del set sin iniciar drag.
+    if (e.shiftKey){
+      selectEntity(ent.id, { toggle: true });
+      e.preventDefault();
+      return;
+    }
+    // Click normal: si la entity está en selección múltiple, mantenerla;
+    // sino reemplazar selección por solo esta.
+    if (!isEntitySelected(ent.id)) selectEntity(ent.id);
+    // Snapshot del set actual para drag colectivo
+    const group = state.entities.filter(e2 => selectedEntityIds.has(e2.id))
+      .map(e2 => ({ id: e2.id, startEx: e2.x, startEy: e2.y }));
+    dragging = { startCx: e.clientX, startCy: e.clientY, group };
     e.preventDefault();
   });
   document.addEventListener("mousemove", e => {
     if (!dragging) return;
     const dx = (e.clientX - dragging.startCx) / canvasZoom;
     const dy = (e.clientY - dragging.startCy) / canvasZoom;
-    ent.x = Math.max(0, dragging.startEx + dx);
-    ent.y = Math.max(0, dragging.startEy + dy);
-    card.style.left = ent.x + "px";
-    card.style.top  = ent.y + "px";
+    for (const g of dragging.group){
+      const e2 = state.entities.find(x => x.id === g.id);
+      if (!e2) continue;
+      e2.x = Math.max(0, g.startEx + dx);
+      e2.y = Math.max(0, g.startEy + dy);
+      const node = document.querySelector(`.entity[data-id="${g.id}"]`);
+      if (node){ node.style.left = e2.x + "px"; node.style.top = e2.y + "px"; }
+    }
     renderRelations();
   });
   document.addEventListener("mouseup", () => { if (dragging){ dragging = null; save(); } });
@@ -1465,18 +1531,101 @@ function entityCenter(ent){
   return { x: ent.x + node.offsetWidth/2, y: ent.y + node.offsetHeight/2 };
 }
 
-/* ---------- selection ---------- */
-function selectEntity(id){
-  selectedEntityId = id;
+/* ---------- selection (Push 28: multi) ---------- */
+function selectEntity(id, opts){
+  const additive = opts && opts.additive;
+  const toggle   = opts && opts.toggle;
+  if (toggle){
+    if (selectedEntityIds.has(id)) selectedEntityIds.delete(id);
+    else                            selectedEntityIds.add(id);
+  } else if (additive){
+    selectedEntityIds.add(id);
+  } else {
+    selectedEntityIds = new Set([id]);
+  }
   selectedColumnId = null;
   rerender();
-  const node = document.querySelector(`.entity[data-id="${id}"]`);
-  if (node) node.scrollIntoView({behavior:"smooth", block:"center", inline:"center"});
+  if (!additive && !toggle){
+    const node = document.querySelector(`.entity[data-id="${id}"]`);
+    if (node) node.scrollIntoView({behavior:"smooth", block:"center", inline:"center"});
+  }
 }
 function selectColumn(entId, colId){
-  selectedEntityId = entId;
+  selectedEntityIds = new Set([entId]);
   selectedColumnId = colId;
   rerender();
+}
+function clearSelection(){
+  selectedEntityIds.clear();
+  selectedColumnId = null;
+  rerender();
+}
+function selectAllEntities(){
+  selectedEntityIds = new Set(state.entities.map(e => e.id));
+  rerender();
+}
+function deleteSelectedEntities(){
+  if (selectedEntityIds.size === 0){ toast("Nada seleccionado"); return; }
+  const sel = state.entities.filter(e => selectedEntityIds.has(e.id));
+  const msg = sel.length === 1
+    ? `¿Eliminar la entidad '${sel[0].name}'?`
+    : `¿Eliminar ${sel.length} entidades?`;
+  if (!confirm(msg)) return;
+  state.entities = state.entities.filter(e => !selectedEntityIds.has(e.id));
+  selectedEntityIds.clear();
+  save(); rerender();
+}
+function duplicateSelectedEntities(){
+  if (selectedEntityIds.size === 0){ toast("Nada seleccionado"); return; }
+  const newIds = new Set();
+  const sources = state.entities.filter(e => selectedEntityIds.has(e.id));
+  const taken = new Set(state.entities.map(e => e.name.toLowerCase()));
+  for (const src of sources){
+    const clone = JSON.parse(JSON.stringify(src));
+    clone.id = id_();
+    let n = 1, candidate;
+    do { candidate = `${src.name}_copy${n > 1 ? n : ""}`; n++; }
+    while (taken.has(candidate.toLowerCase()));
+    clone.name = candidate;
+    taken.add(candidate.toLowerCase());
+    clone.x = (src.x || 0) + 40;
+    clone.y = (src.y || 0) + 40;
+    if (Array.isArray(clone.columns))     clone.columns.forEach(c => c.id = id_());
+    if (Array.isArray(clone.constraints)) clone.constraints.forEach(c => c.id = id_());
+    if (Array.isArray(clone.indexes))     clone.indexes.forEach(c => c.id = id_());
+    state.entities.push(clone);
+    newIds.add(clone.id);
+  }
+  selectedEntityIds = newIds;
+  save(); rerender();
+  toast(`Duplicadas ${sources.length} entidades`);
+}
+function alignSelected(mode){
+  if (selectedEntityIds.size < 2){ toast("Elegí 2+ entidades"); return; }
+  const sel = state.entities.filter(e => selectedEntityIds.has(e.id));
+  const xs = sel.map(e => e.x);
+  const ys = sel.map(e => e.y);
+  const ENT_H_EST = 220;
+  if      (mode === "left")   { const m = Math.min(...xs); sel.forEach(e => e.x = m); }
+  else if (mode === "right")  { const m = Math.max(...xs); sel.forEach(e => e.x = m); }
+  else if (mode === "top")    { const m = Math.min(...ys); sel.forEach(e => e.y = m); }
+  else if (mode === "bottom") { const m = Math.max(...ys); sel.forEach(e => e.y = m); }
+  else if (mode === "hcenter"){ const avg = ys.reduce((a,b)=>a+b,0)/ys.length; sel.forEach(e => e.y = Math.round(avg)); }
+  else if (mode === "vcenter"){ const avg = xs.reduce((a,b)=>a+b,0)/xs.length; sel.forEach(e => e.x = Math.round(avg)); }
+  else if (mode === "distH" && sel.length >= 3){
+    const sorted = sel.slice().sort((a,b) => a.x - b.x);
+    const first = sorted[0].x, last = sorted[sorted.length-1].x;
+    const step = (last - first) / (sorted.length - 1);
+    sorted.forEach((e, i) => e.x = Math.round(first + step * i));
+  }
+  else if (mode === "distV" && sel.length >= 3){
+    const sorted = sel.slice().sort((a,b) => a.y - b.y);
+    const first = sorted[0].y, last = sorted[sorted.length-1].y;
+    const step = (last - first) / (sorted.length - 1);
+    sorted.forEach((e, i) => e.y = Math.round(first + step * i));
+  }
+  save(); rerender();
+  toast("Alineadas: " + mode);
 }
 
 /* ---------- Check Model ---------- */
@@ -2783,6 +2932,15 @@ document.addEventListener("keydown", e => {
   if (mod && e.shiftKey && (e.key === "s" || e.key === "S")){ saveToFile(); e.preventDefault(); return; }
   if (mod && (e.key === "s" || e.key === "S")){ save(); toast("Guardado en navegador"); e.preventDefault(); return; }
   if (mod && (e.key === "o" || e.key === "O")){ $("#file-input").click(); e.preventDefault(); return; }
+  if (mod && (e.key === "a" || e.key === "A")){ selectAllEntities(); e.preventDefault(); return; }
+  if (mod && (e.key === "d" || e.key === "D")){ duplicateSelectedEntities(); e.preventDefault(); return; }
+  if (e.key === "Escape"){ clearSelection(); return; }
+  if ((e.key === "Delete" || e.key === "Backspace") && selectedEntityIds.size > 0
+      && e.target.tagName !== "INPUT" && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "SELECT"){
+    deleteSelectedEntities();
+    e.preventDefault();
+    return;
+  }
 
   // Atajos de canvas: ignorados con foco en form fields.
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
@@ -2990,6 +3148,110 @@ $("#file-input").onchange = e => {
 pushHistory();
 updateUndoRedoUi();
 
+/* ---------- bulk toolbar (Push 28) ---------- */
+$$(".bulk-btn[data-bulk]").forEach(b => {
+  b.onclick = () => alignSelected(b.dataset.bulk);
+});
+$("#bulk-duplicate").onclick = duplicateSelectedEntities;
+$("#bulk-delete").onclick    = deleteSelectedEntities;
+
+function updateBulkBar(){
+  const bar = $("#bulk-bar");
+  if (!bar) return;
+  if (selectedEntityIds.size >= 2){
+    bar.style.display = "flex";
+    $("#bulk-count").textContent = selectedEntityIds.size + " seleccionadas";
+  } else {
+    bar.style.display = "none";
+  }
+}
+
+/* ---------- lasso (selección por rectángulo) ----------
+   mousedown sobre #canvas-wrap (no sobre #canvas-content niño →
+   sobre el wrap mismo en zona vacía), drag → SVG rect crece →
+   mouseup → entities cuyo bbox intersecta entran al set.
+   Si Shift está presionado, se ADD al set actual; sin Shift,
+   reemplaza la selección. */
+let lasso = null;
+$("#canvas-wrap").addEventListener("mousedown", e => {
+  if (e.button !== 0) return;
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  // Sólo iniciar lasso si el target es el wrap o el canvas-content
+  // (no sobre entities ni minimap ni toolbar).
+  const t = e.target;
+  if (t.closest(".entity") || t.closest("#minimap") || t.closest(".canvas-zoom-toolbar") || t.closest(".bulk-bar")) return;
+  // Click en zona vacía sin shift = clear selection
+  if (!e.shiftKey) clearSelection();
+  const r = $("#canvas-wrap").getBoundingClientRect();
+  lasso = {
+    sx: e.clientX - r.left, sy: e.clientY - r.top,
+    ex: e.clientX - r.left, ey: e.clientY - r.top,
+    additive: e.shiftKey,
+    snapshot: new Set(selectedEntityIds)
+  };
+  drawLasso();
+  e.preventDefault();
+});
+document.addEventListener("mousemove", e => {
+  if (!lasso) return;
+  const r = $("#canvas-wrap").getBoundingClientRect();
+  lasso.ex = e.clientX - r.left;
+  lasso.ey = e.clientY - r.top;
+  drawLasso();
+  applyLassoSelection();
+});
+document.addEventListener("mouseup", () => {
+  if (!lasso) return;
+  lasso = null;
+  $("#lasso-svg").innerHTML = "";
+  updateBulkBar();
+});
+function drawLasso(){
+  if (!lasso) return;
+  const svg = $("#lasso-svg");
+  const x = Math.min(lasso.sx, lasso.ex);
+  const y = Math.min(lasso.sy, lasso.ey);
+  const w = Math.abs(lasso.ex - lasso.sx);
+  const h = Math.abs(lasso.ey - lasso.sy);
+  svg.innerHTML = `<rect class="lasso-rect" x="${x}" y="${y}" width="${w}" height="${h}" rx="3"/>`;
+}
+function applyLassoSelection(){
+  if (!lasso) return;
+  // Mapear coords screen del lasso a coords lógicas del canvas.
+  // El canvas-content tiene translate(panX,panY) scale(zoom).
+  const wr = $("#canvas-wrap").getBoundingClientRect();
+  const sx = Math.min(lasso.sx, lasso.ex);
+  const sy = Math.min(lasso.sy, lasso.ey);
+  const ex = Math.max(lasso.sx, lasso.ex);
+  const ey = Math.max(lasso.sy, lasso.ey);
+  const lx1 = (sx - canvasPanX) / canvasZoom;
+  const ly1 = (sy - canvasPanY) / canvasZoom;
+  const lx2 = (ex - canvasPanX) / canvasZoom;
+  const ly2 = (ey - canvasPanY) / canvasZoom;
+  const W_EST = 280, H_EST = 220;
+  const hit = new Set();
+  for (const e of state.entities){
+    if (e.x + W_EST < lx1 || e.x > lx2) continue;
+    if (e.y + H_EST < ly1 || e.y > ly2) continue;
+    hit.add(e.id);
+  }
+  if (lasso.additive){
+    selectedEntityIds = new Set([...lasso.snapshot, ...hit]);
+  } else {
+    selectedEntityIds = hit;
+  }
+  // Sólo refrescamos visualmente la clase .selected sin rerender full.
+  $$(".entity").forEach(n => {
+    n.classList.toggle("selected", selectedEntityIds.has(n.dataset.id));
+  });
+  updateBulkBar();
+}
+
+// Hook: cada rerender debe actualizar la bulk bar.
+const _origRerender = rerender;
+rerender = function(){ _origRerender.apply(this, arguments); updateBulkBar(); };
+updateBulkBar();
+
 /* ---------- minimap ---------- */
 const ENT_W = 280, ENT_H = 220; // estimación bbox por entidad
 const MM_PAD = 8;
@@ -3028,7 +3290,7 @@ function renderMinimap(){
   content.innerHTML = "";
   for (const ent of state.entities){
     const node = el("div", {
-      class: "mm-entity" + (selectedEntityId === ent.id ? " sel" : ""),
+      class: "mm-entity" + (isEntitySelected(ent.id) ? " sel" : ""),
       style: `
         left:${MM_PAD + (ent.x - m.bbox.minX) * m.s}px;
         top:${MM_PAD + (ent.y - m.bbox.minY) * m.s}px;
