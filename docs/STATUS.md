@@ -10,7 +10,7 @@
 
 [![Versión](https://img.shields.io/badge/versi%C3%B3n-0.1.x--MVP-7c5cff)](../CHANGELOG.md)
 [![Formato en disco](https://img.shields.io/badge/on--disk%20VERSION-33-2d7a66)](TECHNICAL_SPECS.md)
-[![Tests integraci%C3%B3n](https://img.shields.io/badge/tests-828%2F828-brightgreen)](../tests/integration_test.rs)
+[![Tests integraci%C3%B3n](https://img.shields.io/badge/tests-841%2F841-brightgreen)](../tests/integration_test.rs)
 [![Fuzz parser](https://img.shields.io/badge/fuzz%20parser-503.8M%20iters%20%2F%201h%20%2F%200%20panics-blue)](fuzz/FUZZ-RUN-2026-06-15.md)
 [![Camino comercial](https://img.shields.io/badge/path-A%20%E2%80%94%20embebido%20nicho-informational)](COMMERCIAL_ROADMAP.md)
 
