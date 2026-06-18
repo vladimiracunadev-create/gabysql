@@ -1,0 +1,115 @@
+name: Desktop Release (gabymodeler .msi)
+
+# Trigger:
+#   - Tag con prefijo `desktop-v*` (ej. desktop-v0.1.0) → release con assets.
+#   - Manual desde GitHub UI (workflow_dispatch) → build de prueba.
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build .msi + .nsis (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/gabymodeler/src-tauri/target
+          key: ${{ runner.os }}-tauri-${{ hashFiles('**/Cargo.lock', 'desktop/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-tauri-
+
+      - name: Install tauri-cli 1.6
+        run: cargo install tauri-cli --version "^1.6" --locked
+
+      - name: Build gabysql-server (release)
+        # Este es el binario que se empaqueta como sidecar del modeler
+        # — lo que permite que la app funcione offline con su propio
+        # gabysql-server local.
+        run: cargo build --release --bin gabysql-server
+
+      - name: Stage sidecar binary
+        # Tauri 1.6 espera el sidecar con sufijo de target triple
+        # (gabysql-server-x86_64-pc-windows-msvc.exe).
+        shell: bash
+        run: |
+          mkdir -p desktop/gabymodeler/src-tauri/binaries
+          cp target/release/gabysql-server.exe \
+             desktop/gabymodeler/src-tauri/binaries/gabysql-server-x86_64-pc-windows-msvc.exe
+          ls -la desktop/gabymodeler/src-tauri/binaries/
+
+      - name: Verify icons exist
+        shell: bash
+        run: |
+          ls -la desktop/gabymodeler/src-tauri/icons/
+          test -f desktop/gabymodeler/src-tauri/icons/icon.ico || (echo "icon.ico missing"; exit 1)
+
+      - name: Build Tauri bundle (msi + nsis)
+        working-directory: desktop/gabymodeler/src-tauri
+        run: cargo tauri build --bundles msi nsis --verbose
+
+      - name: List bundle output
+        shell: bash
+        run: |
+          echo "MSI:"
+          find desktop/gabymodeler/src-tauri/target/release/bundle/msi -name '*.msi' || true
+          echo "NSIS:"
+          find desktop/gabymodeler/src-tauri/target/release/bundle/nsis -name '*.exe' || true
+
+      - name: Upload artifacts (run summary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gabymodeler-windows-installer
+          path: |
+            desktop/gabymodeler/src-tauri/target/release/bundle/msi/*.msi
+            desktop/gabymodeler/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## gabymodeler — Desktop release ${{ github.ref_name }}
+
+            Modelador ER profesional para `gabysql`, empaquetado como
+            app de escritorio Windows.
+
+            **Incluido en el instalador:**
+            - `gabymodeler.exe` — la app (frontend + bridge Tauri).
+            - `gabysql-server.exe` — el motor gabysql arranca como
+              sidecar local en `127.0.0.1:18080` cuando abrís la app.
+              Tu workspace de DBs vive en `%APPDATA%/dev.gabysql.gabymodeler/databases/`.
+            - Asociación de archivos `.gby`: doble-click abre la app.
+
+            **Verificación:**
+            - El `.msi` y `.exe` (NSIS) NO están firmados (sin EV cert).
+              Windows SmartScreen va a pedir confirmación la primera vez.
+              "Más información" → "Ejecutar de todos modos".
+            - Hash SHA256 de cada asset en el log del job de CI.
+
+            Build: ${{ github.sha }}
+          files: |
+            desktop/gabymodeler/src-tauri/target/release/bundle/msi/*.msi
+            desktop/gabymodeler/src-tauri/target/release/bundle/nsis/*.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

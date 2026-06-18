@@ -3339,6 +3339,13 @@ updateUndoRedoUi();
    existe (modo web puro), todo este bloque es no-op. */
 if (typeof window !== "undefined" && window.__TAURI__){
   const t = window.__TAURI__;
+  // Desktop app: pre-poblar el URL del server con el sidecar local.
+  if (t.invoke){
+    t.invoke("server_addr").then(addr => {
+      const inp = $("#imp-url");
+      if (inp && !inp.value.trim()) inp.value = addr;
+    }).catch(()=>{});
+  }
   const router = id => {
     switch (id){
       case "file:open":    $("#file-input").click(); break;
