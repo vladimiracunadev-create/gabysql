@@ -161,6 +161,47 @@
     display:inline-flex;align-items:center;padding:0 8px;font-size:11px;
     font-family:'JetBrains Mono',monospace;color:var(--text-muted);min-width:48px;justify-content:center;
   }
+  /* search palette (Ctrl+F) */
+  .search-bg{
+    position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;
+    align-items:flex-start;justify-content:center;z-index:60;
+    padding-top:12vh;backdrop-filter:blur(3px);
+  }
+  .search-bg.show{display:flex}
+  .search-palette{
+    width:min(640px,92vw);background:var(--bg-2);border:1px solid var(--border-strong);
+    border-radius:10px;box-shadow:var(--shadow-lg);overflow:hidden;
+  }
+  .search-input-row{
+    display:flex;align-items:center;gap:10px;padding:14px 16px;
+    border-bottom:1px solid var(--border);
+  }
+  .search-input-row input{
+    flex:1;background:transparent;border:0;font-size:15px;color:var(--text);outline:none;
+    font-family:'Inter',sans-serif;
+  }
+  .search-input-row span:first-child{font-size:16px}
+  .search-results{max-height:50vh;overflow-y:auto}
+  .search-results .res{
+    display:flex;align-items:center;gap:10px;padding:9px 16px;cursor:pointer;
+    border-left:2px solid transparent;
+  }
+  .search-results .res:hover, .search-results .res.active{
+    background:var(--bg-3);border-left-color:var(--accent);
+  }
+  .search-results .res .icon{font-size:14px;width:18px;text-align:center}
+  .search-results .res .name{
+    font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--text);
+  }
+  .search-results .res .kind{
+    font-size:10.5px;color:var(--text-muted);text-transform:uppercase;
+    letter-spacing:.4px;font-weight:600;margin-left:auto;
+  }
+  .search-results .res .ctx{color:var(--text-muted);margin-left:6px;font-size:11px}
+  .search-help{
+    display:flex;gap:14px;padding:8px 16px;border-top:1px solid var(--border);
+    font-size:11px;color:var(--text-muted);
+  }
   #canvas-wrap.fk-dragging{cursor:crosshair}
   #canvas-wrap.fk-dragging .colflag.pk.on{
     outline:2px solid var(--success);outline-offset:2px;
@@ -392,6 +433,8 @@
   <span class="spacer"></span>
   <button id="btn-undo" title="Deshacer (Ctrl+Z)" disabled>↶</button>
   <button id="btn-redo" title="Rehacer (Ctrl+Y / Ctrl+Shift+Z)" disabled>↷</button>
+  <button id="btn-search" title="Buscar (Ctrl+F)">🔍</button>
+  <button id="btn-autolayout" title="Auto-layout (force-directed)">⚛</button>
   <div class="dd">
     <button id="btn-file" title="Archivo">📁 Archivo ▾</button>
     <div class="dd-menu" id="file-menu">
@@ -753,6 +796,23 @@
       <span class="spacer" style="flex:1"></span>
       <button class="ghost" data-close="modal-routine">cancelar</button>
       <button id="btn-routine-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- search palette (Ctrl+F) -->
+<div class="search-bg" id="search-bg">
+  <div class="search-palette">
+    <div class="search-input-row">
+      <span>🔍</span>
+      <input id="search-input" type="text" placeholder="Buscar tablas, columnas, views, policies, routines, users, roles..." autocomplete="off" />
+      <span class="kbd">Esc</span>
+    </div>
+    <div class="search-results" id="search-results"></div>
+    <div class="search-help">
+      <span><span class="kbd">↑↓</span> navegar</span>
+      <span><span class="kbd">↵</span> ir</span>
+      <span><span class="kbd">Esc</span> cerrar</span>
     </div>
   </div>
 </div>
@@ -3005,6 +3065,7 @@ document.addEventListener("keydown", e => {
   if (mod && (e.key === "o" || e.key === "O")){ $("#file-input").click(); e.preventDefault(); return; }
   if (mod && (e.key === "a" || e.key === "A")){ selectAllEntities(); e.preventDefault(); return; }
   if (mod && (e.key === "d" || e.key === "D")){ duplicateSelectedEntities(); e.preventDefault(); return; }
+  if (mod && (e.key === "f" || e.key === "F")){ openSearch(); e.preventDefault(); return; }
   if (e.key === "Escape"){ clearSelection(); return; }
   if ((e.key === "Delete" || e.key === "Backspace") && selectedEntityIds.size > 0
       && e.target.tagName !== "INPUT" && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "SELECT"){
@@ -3220,6 +3281,187 @@ pushHistory();
 updateUndoRedoUi();
 
 /* ---------- bulk toolbar (Push 28) ---------- */
+/* ---------- search palette (Push 30) ---------- */
+let searchResults = [];
+let searchIdx = 0;
+
+function openSearch(){
+  $("#search-bg").classList.add("show");
+  $("#search-input").value = "";
+  searchResults = [];
+  searchIdx = 0;
+  renderSearchResults();
+  setTimeout(() => $("#search-input").focus(), 50);
+}
+function closeSearch(){ $("#search-bg").classList.remove("show"); }
+
+function buildSearchIndex(){
+  const out = [];
+  for (const e of state.entities){
+    out.push({ kind: "table", icon: "▦", name: e.name, ctx: e.columns.length + " cols",
+               action: () => focusEntity(e.id) });
+    for (const c of e.columns){
+      out.push({ kind: "column", icon: c.pk?"🔑":(c.fk?"🔗":"·"),
+                 name: c.name, ctx: e.name + " : " + c.type,
+                 action: () => { focusEntity(e.id); selectColumn(e.id, c.id); } });
+    }
+  }
+  for (const v of (state.views || []))
+    out.push({ kind: "view", icon:"👁", name: v.name, ctx:"", action: () => openViewModal(v.id) });
+  for (const p of (state.policies || []))
+    out.push({ kind: "policy", icon:"🔒", name: p.name, ctx: p.action + " ON " + p.table,
+               action: () => openPolicyModal(p.id) });
+  for (const t of (state.triggers || []))
+    out.push({ kind: "trigger", icon:"⚡", name: t.name, ctx: t.timing + " " + t.event + " ON " + t.table,
+               action: () => openRoutineModal("trigger", t.id) });
+  for (const pr of (state.procedures || []))
+    out.push({ kind: "procedure", icon:"🔁", name: pr.name, ctx: (pr.params || []).length + " params",
+               action: () => openRoutineModal("procedure", pr.id) });
+  for (const f of (state.functions || []))
+    out.push({ kind: "function", icon:"ƒ", name: f.name, ctx: "→ " + (f.returnType || "INT"),
+               action: () => openRoutineModal("function", f.id) });
+  for (const u of (state.users || []))
+    out.push({ kind: "user", icon:"👤", name: u.name, ctx:"", action: () => openSecurityModal("user", u.id) });
+  for (const r of (state.roles || []))
+    out.push({ kind: "role", icon:"👥", name: r.name, ctx:"", action: () => openSecurityModal("role", r.id) });
+  return out;
+}
+
+function renderSearchResults(){
+  const q = ($("#search-input").value || "").trim().toLowerCase();
+  const idx = buildSearchIndex();
+  searchResults = q
+    ? idx.filter(x => x.name && x.name.toLowerCase().includes(q)).slice(0, 40)
+    : idx.slice(0, 40);
+  searchIdx = Math.min(searchIdx, Math.max(0, searchResults.length - 1));
+  const box = $("#search-results");
+  box.innerHTML = "";
+  if (searchResults.length === 0){
+    box.append(el("div", { class:"res muted", style:"justify-content:center;color:var(--text-muted);cursor:default" },
+      q ? `Sin resultados para "${q}"` : "Empezá a tipear para buscar"));
+    return;
+  }
+  searchResults.forEach((r, i) => {
+    box.append(el("div", {
+      class: "res" + (i === searchIdx ? " active" : ""),
+      onclick: () => { closeSearch(); r.action(); }
+    },
+      el("span", { class:"icon" }, r.icon),
+      el("span", { class:"name" }, r.name),
+      r.ctx ? el("span", { class:"ctx" }, "· " + r.ctx) : null,
+      el("span", { class:"kind" }, r.kind)
+    ));
+  });
+}
+
+function focusEntity(id){
+  const e = state.entities.find(x => x.id === id);
+  if (!e) return;
+  selectedEntityIds = new Set([id]);
+  // Centrar viewport en la entity manteniendo el zoom actual.
+  const wr = $("#canvas-wrap").getBoundingClientRect();
+  const cx = e.x + 140, cy = e.y + 110;   // estimación centro entity
+  canvasPanX = (wr.width  / 2) - cx * canvasZoom;
+  canvasPanY = (wr.height / 2) - cy * canvasZoom;
+  applyCanvasTransform();
+  rerender();
+}
+
+$("#btn-search").onclick = openSearch;
+$("#search-input").addEventListener("input", () => renderSearchResults());
+$("#search-input").addEventListener("keydown", e => {
+  if (e.key === "Escape"){ closeSearch(); e.preventDefault(); return; }
+  if (e.key === "ArrowDown"){ searchIdx = Math.min(searchResults.length - 1, searchIdx + 1); renderSearchResults(); e.preventDefault(); return; }
+  if (e.key === "ArrowUp"){   searchIdx = Math.max(0, searchIdx - 1); renderSearchResults(); e.preventDefault(); return; }
+  if (e.key === "Enter" && searchResults[searchIdx]){
+    const r = searchResults[searchIdx];
+    closeSearch();
+    r.action();
+    e.preventDefault();
+  }
+});
+$("#search-bg").addEventListener("click", e => { if (e.target === $("#search-bg")) closeSearch(); });
+
+/* ---------- auto-layout (Fruchterman-Reingold compacto) ---------- */
+function autoLayout(){
+  if (state.entities.length === 0){ toast("Sin tablas para acomodar"); return; }
+  const N = state.entities.length;
+  const W_EST = 280, H_EST = 220;
+  // Área proporcional al número de entities — más tablas, más espacio.
+  const area = Math.max(N, 6) * 90000;   // 300x300 promedio por entity
+  const k = Math.sqrt(area / N);         // distancia ideal entre nodos
+  // Inicializar coords si están todas iguales o muy juntas
+  const sumX = state.entities.reduce((s,e) => s + e.x, 0);
+  const sumY = state.entities.reduce((s,e) => s + e.y, 0);
+  if (Math.abs(sumX) < 1 || Math.abs(sumY) < 1 || state.entities.every(e => Math.abs(e.x - sumX/N) < 10 && Math.abs(e.y - sumY/N) < 10)){
+    state.entities.forEach((e, i) => {
+      const ang = (i / N) * Math.PI * 2;
+      const r = k * 1.5;
+      e.x = 500 + Math.cos(ang) * r;
+      e.y = 400 + Math.sin(ang) * r;
+    });
+  }
+  // Edges: FK entity → entity destino
+  const edges = [];
+  for (const e of state.entities){
+    for (const c of (e.columns || [])){
+      if (c.fk){
+        const tgt = state.entities.find(t => t.name.toLowerCase() === c.fk.table.toLowerCase());
+        if (tgt && tgt.id !== e.id) edges.push([e, tgt]);
+      }
+    }
+  }
+  // Iteraciones de Fruchterman-Reingold
+  const ITERS = 80;
+  let temperature = k * 2;
+  for (let it = 0; it < ITERS; it++){
+    const disp = new Map();
+    state.entities.forEach(e => disp.set(e.id, { dx: 0, dy: 0 }));
+    // Repulsión n^2 (cap para que N=30 sea OK ~900 ops/it ≈ 72k total → ~30 ms)
+    for (let i = 0; i < N; i++){
+      for (let j = i + 1; j < N; j++){
+        const a = state.entities[i], b = state.entities[j];
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const dist = Math.max(Math.sqrt(dx*dx + dy*dy), 1);
+        const force = (k * k) / dist;
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        disp.get(a.id).dx += fx; disp.get(a.id).dy += fy;
+        disp.get(b.id).dx -= fx; disp.get(b.id).dy -= fy;
+      }
+    }
+    // Atracción por edges
+    for (const [a, b] of edges){
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const dist = Math.max(Math.sqrt(dx*dx + dy*dy), 1);
+      const force = (dist * dist) / k;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      disp.get(a.id).dx -= fx; disp.get(a.id).dy -= fy;
+      disp.get(b.id).dx += fx; disp.get(b.id).dy += fy;
+    }
+    // Aplicar con cooling
+    for (const e of state.entities){
+      const d = disp.get(e.id);
+      const dlen = Math.max(Math.sqrt(d.dx*d.dx + d.dy*d.dy), 1);
+      e.x += (d.dx / dlen) * Math.min(dlen, temperature);
+      e.y += (d.dy / dlen) * Math.min(dlen, temperature);
+      e.x = Math.max(40, e.x);
+      e.y = Math.max(40, e.y);
+    }
+    temperature *= 0.95;
+  }
+  // Normalizar a esquina (0,0) + padding
+  let minX = Infinity, minY = Infinity;
+  for (const e of state.entities){ minX = Math.min(minX, e.x); minY = Math.min(minY, e.y); }
+  for (const e of state.entities){ e.x = Math.round(e.x - minX + 60); e.y = Math.round(e.y - minY + 60); }
+  save(); rerender();
+  fitAll();
+  toast(`Auto-layout aplicado (${N} tablas, ${edges.length} FKs)`);
+}
+
+$("#btn-autolayout").onclick = autoLayout;
+
 /* ---------- drag-to-create FK (Push 29) ---------- */
 document.addEventListener("mousemove", e => {
   if (!fkDragState) return;
