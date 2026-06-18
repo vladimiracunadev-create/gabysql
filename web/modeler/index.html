@@ -302,6 +302,7 @@
   <button id="btn-new-entity" class="primary">+ Entidad</button>
   <button id="btn-new-view">+ View</button>
   <button id="btn-new-policy">+ Policy</button>
+  <button id="btn-new-routine">+ Routine</button>
   <button id="btn-import">Importar</button>
   <button id="btn-export">Ver SQL</button>
   <button id="btn-load-sample">Ejemplo</button>
@@ -490,6 +491,91 @@
   </div>
 </div>
 
+<!-- modal: routine (trigger / procedure / function) -->
+<div class="modal-bg" id="modal-routine">
+  <div class="modal" style="width:min(760px,94vw)">
+    <div class="modal-head">
+      <h2 id="routine-title">Nueva routine</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-routine">cerrar</button>
+    </div>
+    <div class="modal-body">
+      <label>Tipo</label>
+      <select id="routine-kind">
+        <option value="trigger">TRIGGER</option>
+        <option value="procedure">PROCEDURE</option>
+        <option value="function">FUNCTION</option>
+      </select>
+
+      <label>Nombre</label>
+      <input id="routine-name" type="text" placeholder="ej: trg_audit / bump_counter / double_balance" />
+
+      <!-- Trigger-only -->
+      <div id="routine-trg-fields">
+        <label>Tabla</label>
+        <select id="routine-table"></select>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <label>Timing</label>
+            <select id="routine-timing">
+              <option value="BEFORE">BEFORE</option>
+              <option value="AFTER">AFTER</option>
+            </select>
+          </div>
+          <div>
+            <label>Event</label>
+            <select id="routine-event">
+              <option value="INSERT">INSERT</option>
+              <option value="UPDATE">UPDATE</option>
+              <option value="DELETE">DELETE</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Procedure + Function -->
+      <div id="routine-params-row" style="display:none">
+        <label>Parámetros — uno por línea, formato <code>nombre TIPO</code> (ej: <code>n INT</code>)</label>
+        <textarea id="routine-params" rows="3" style="
+          width:100%;margin-top:5px;background:var(--bg-1);color:var(--text);
+          border:1px solid var(--border-strong);border-radius:5px;padding:8px;
+          font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;
+        " placeholder="n INT&#10;label TEXT"></textarea>
+      </div>
+
+      <!-- Function-only -->
+      <div id="routine-return-row" style="display:none">
+        <label>Returns</label>
+        <select id="routine-return">
+          <option value="INT">INT</option>
+          <option value="BIGINT">BIGINT</option>
+          <option value="FLOAT">FLOAT</option>
+          <option value="DECIMAL">DECIMAL</option>
+          <option value="TEXT">TEXT</option>
+          <option value="BOOL">BOOL</option>
+          <option value="DATETIME">DATETIME</option>
+          <option value="JSON">JSON</option>
+          <option value="UUID">UUID</option>
+        </select>
+      </div>
+
+      <label id="routine-body-label">Cuerpo</label>
+      <textarea id="routine-body" rows="8" style="
+        width:100%;margin-top:5px;background:var(--bg-1);color:var(--text);
+        border:1px solid var(--border-strong);border-radius:5px;padding:10px;
+        font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px;line-height:1.5;
+      "></textarea>
+      <p class="muted" id="routine-help" style="font-size:11px;margin-top:8px"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="danger" id="btn-routine-delete" style="display:none">Eliminar</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" data-close="modal-routine">cancelar</button>
+      <button id="btn-routine-save" class="primary">Guardar</button>
+    </div>
+  </div>
+</div>
+
 <!-- modal: composite constraint / index -->
 <div class="modal-bg" id="modal-composite">
   <div class="modal">
@@ -578,8 +664,11 @@
          constraints: [{ id, kind:'pk'|'unique', name?, columns:[colName] }],
          indexes:     [{ id, name?, unique, columns:[colName] }]
        }],
-       views:    [{ id, name, body }],
-       policies: [{ id, name, table, action, role, using, check }]
+       views:      [{ id, name, body }],
+       policies:   [{ id, name, table, action, role, using, check }],
+       triggers:   [{ id, name, table, timing, event, body }],
+       procedures: [{ id, name, params:[{name,type}], body }],
+       functions:  [{ id, name, params:[{name,type}], returnType, body }]
      }
 
    Match con motor gabysql VERSION 33:
@@ -675,9 +764,12 @@ const SAMPLE = {
   ]
 };
 
-let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[] };
-if (!Array.isArray(state.views))    state.views    = [];
-if (!Array.isArray(state.policies)) state.policies = [];
+let state = loadState() || { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[], triggers:[], procedures:[], functions:[] };
+if (!Array.isArray(state.views))      state.views      = [];
+if (!Array.isArray(state.policies))   state.policies   = [];
+if (!Array.isArray(state.triggers))   state.triggers   = [];
+if (!Array.isArray(state.procedures)) state.procedures = [];
+if (!Array.isArray(state.functions))  state.functions  = [];
 let selectedColumnId = null;
 let selectedEntityId = null;
 let activeFkColumn = null;     // { entityId, columnId } during FK modal
@@ -867,6 +959,57 @@ function renderBrowser(){
     }, v.name || "(sin nombre)"));
   }
   dbBlock.append(viewsBlock);
+
+  // Triggers
+  const trgBlock = el("details");
+  trgBlock.append(el("summary", {}, "Triggers (" + state.triggers.length + ")"));
+  if (state.triggers.length === 0){
+    trgBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin triggers)"));
+  }
+  for (const t of state.triggers){
+    trgBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openRoutineModal("trigger", t.id); }
+    },
+      (t.name || "(sin nombre)"),
+      el("span", { class:"chkbadge" }, (t.timing || "BEFORE") + " " + (t.event || "INSERT")),
+      el("span", { class:"muted", style:"margin-left:auto;font-size:10px" }, "→ " + (t.table || "?"))
+    ));
+  }
+  dbBlock.append(trgBlock);
+
+  // Procedures
+  const prcBlock = el("details");
+  prcBlock.append(el("summary", {}, "Procedures (" + state.procedures.length + ")"));
+  if (state.procedures.length === 0){
+    prcBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin procedures)"));
+  }
+  for (const p of state.procedures){
+    prcBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openRoutineModal("procedure", p.id); }
+    },
+      (p.name || "(sin nombre)") + "(" + (p.params || []).length + ")"
+    ));
+  }
+  dbBlock.append(prcBlock);
+
+  // Functions
+  const fnBlock = el("details");
+  fnBlock.append(el("summary", {}, "Functions (" + state.functions.length + ")"));
+  if (state.functions.length === 0){
+    fnBlock.append(el("div", { class:"leaf muted", style:"font-size:11px" }, "(sin functions)"));
+  }
+  for (const f of state.functions){
+    fnBlock.append(el("div", {
+      class:"leaf",
+      onclick: e => { e.stopPropagation(); openRoutineModal("function", f.id); }
+    },
+      (f.name || "(sin nombre)") + "(" + (f.params || []).length + ")",
+      el("span", { class:"muted", style:"margin-left:auto;font-size:10px" }, "→ " + (f.returnType || "INT"))
+    ));
+  }
+  dbBlock.append(fnBlock);
 
   // Policies
   const polBlock = el("details");
@@ -1241,6 +1384,43 @@ function checkModel(){
     if (!v.body)                        findings.push(["error", `view:${v.name}`, "cuerpo SELECT vacío", null, null]);
   }
 
+  // Validar triggers
+  const trgNames = new Set();
+  for (const t of (state.triggers || [])){
+    if (!t.name)                        findings.push(["error", `trigger:${t.name||"(sin nombre)"}`, "nombre requerido", null, null]);
+    else if (!isValidIdent(t.name))     findings.push(["error", `trigger:${t.name}`, "nombre inválido/reservado", null, null]);
+    else if (trgNames.has(t.name.toLowerCase()))
+                                        findings.push(["error", `trigger:${t.name}`, "nombre de trigger duplicado", null, null]);
+    trgNames.add((t.name || "").toLowerCase());
+    if (!t.table)                       findings.push(["error", `trigger:${t.name}`, "tabla requerida", null, null]);
+    else if (!tableLower.has(t.table.toLowerCase()))
+                                        findings.push(["error", `trigger:${t.name}`, `tabla '${t.table}' no existe`, null, null]);
+    if (!t.body)                        findings.push(["error", `trigger:${t.name}`, "cuerpo vacío", null, null]);
+    if (t.event === "INSERT" && /\bOLD\./i.test(t.body || ""))
+                                        findings.push(["warn",  `trigger:${t.name}`, "INSERT triggers no exponen OLD.*", null, null]);
+    if (t.event === "DELETE" && /\bNEW\./i.test(t.body || ""))
+                                        findings.push(["warn",  `trigger:${t.name}`, "DELETE triggers no exponen NEW.*", null, null]);
+  }
+  // Procedures + Functions: name/body validations
+  const routineNames = new Set();
+  for (const r of (state.procedures || [])){
+    if (!r.name)                        findings.push(["error", `proc:${r.name||"(sin nombre)"}`, "nombre requerido", null, null]);
+    else if (!isValidIdent(r.name))     findings.push(["error", `proc:${r.name}`, "nombre inválido/reservado", null, null]);
+    else if (routineNames.has(r.name.toLowerCase()))
+                                        findings.push(["error", `proc:${r.name}`, "colisiona con otra routine", null, null]);
+    routineNames.add((r.name || "").toLowerCase());
+    if (!r.body)                        findings.push(["error", `proc:${r.name}`, "cuerpo vacío", null, null]);
+  }
+  for (const r of (state.functions || [])){
+    if (!r.name)                        findings.push(["error", `fn:${r.name||"(sin nombre)"}`, "nombre requerido", null, null]);
+    else if (!isValidIdent(r.name))     findings.push(["error", `fn:${r.name}`, "nombre inválido/reservado", null, null]);
+    else if (routineNames.has(r.name.toLowerCase()))
+                                        findings.push(["error", `fn:${r.name}`, "colisiona con otra routine", null, null]);
+    routineNames.add((r.name || "").toLowerCase());
+    if (!r.body)                        findings.push(["error", `fn:${r.name}`, "cuerpo vacío", null, null]);
+    if (!r.returnType)                  findings.push(["error", `fn:${r.name}`, "RETURNS requerido", null, null]);
+  }
+
   return findings;
 }
 
@@ -1366,6 +1546,30 @@ function generateSQL(){
     }
     lines.push(``);
   }
+  if ((state.functions || []).length){
+    lines.push(`-- Functions`);
+    for (const f of state.functions){
+      if (!f.name || !f.body) continue;
+      lines.push(`CREATE FUNCTION ${f.name}(${formatParamsSql(f.params)}) RETURNS ${f.returnType || "INT"} AS ${f.body.trim().replace(/;\s*$/, "")};`);
+    }
+    lines.push(``);
+  }
+  if ((state.procedures || []).length){
+    lines.push(`-- Procedures`);
+    for (const p of state.procedures){
+      if (!p.name || !p.body) continue;
+      lines.push(`CREATE PROCEDURE ${p.name}(${formatParamsSql(p.params)}) AS ${p.body.trim().replace(/;\s*$/, "")};`);
+    }
+    lines.push(``);
+  }
+  if ((state.triggers || []).length){
+    lines.push(`-- Triggers`);
+    for (const t of state.triggers){
+      if (!t.name || !t.table || !t.body) continue;
+      lines.push(`CREATE TRIGGER ${t.name} ${t.timing || "BEFORE"} ${t.event || "INSERT"} ON ${t.table} FOR EACH ROW ${t.body.trim().replace(/;\s*$/, "")};`);
+    }
+    lines.push(``);
+  }
   return lines.join("\n");
 }
 
@@ -1484,6 +1688,130 @@ $("#btn-new-view").onclick   = () => openViewModal(null);
 $("#btn-new-policy").onclick = () => {
   if (state.entities.length === 0){ toast("Creá al menos una tabla primero."); return; }
   openPolicyModal(null);
+};
+$("#btn-new-routine").onclick = () => openRoutineModal("trigger", null);
+
+/* ---------- routines (triggers + procedures + functions) ---------- */
+let activeRoutine = null; // { kind, id }
+
+function parseParamsText(text){
+  const out = [];
+  for (const raw of String(text || "").split(/\r?\n/)){
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/^(\w+)\s+(.+)$/);
+    if (m) out.push({ name: m[1], type: m[2].trim() });
+  }
+  return out;
+}
+function paramsToText(params){
+  return (params || []).map(p => `${p.name} ${p.type}`).join("\n");
+}
+function formatParamsSql(params){
+  return (params || []).map(p => `${p.name} ${p.type}`).join(", ");
+}
+
+function openRoutineModal(kind, id){
+  activeRoutine = { kind, id };
+  $("#routine-kind").value = kind;
+  applyRoutineKindUi(kind);
+
+  let item = null;
+  if (id){
+    const arr = kind === "trigger" ? state.triggers
+              : kind === "procedure" ? state.procedures
+              : state.functions;
+    item = arr.find(x => x.id === id);
+  }
+
+  $("#routine-title").textContent = item
+    ? `Editar ${kind}`
+    : `Nuevo ${kind}`;
+
+  $("#routine-name").value = item ? (item.name || "") : "";
+  $("#routine-body").value = item ? (item.body || "") : "";
+
+  if (kind === "trigger"){
+    const tableSel = $("#routine-table");
+    tableSel.innerHTML = "";
+    for (const e of state.entities){
+      tableSel.append(el("option", { value:e.name }, e.name));
+    }
+    $("#routine-table").value  = item ? (item.table || "")  : ((state.entities[0] && state.entities[0].name) || "");
+    $("#routine-timing").value = item ? (item.timing || "BEFORE") : "BEFORE";
+    $("#routine-event").value  = item ? (item.event  || "INSERT") : "INSERT";
+  } else if (kind === "procedure"){
+    $("#routine-params").value = item ? paramsToText(item.params) : "";
+  } else if (kind === "function"){
+    $("#routine-params").value = item ? paramsToText(item.params) : "";
+    $("#routine-return").value = item ? (item.returnType || "INT") : "INT";
+  }
+
+  $("#btn-routine-delete").style.display = item ? "" : "none";
+  $("#modal-routine").classList.add("show");
+}
+
+function applyRoutineKindUi(kind){
+  $("#routine-trg-fields").style.display    = kind === "trigger"   ? "block" : "none";
+  $("#routine-params-row").style.display    = kind !== "trigger"   ? "block" : "none";
+  $("#routine-return-row").style.display    = kind === "function"  ? "block" : "none";
+  $("#routine-body-label").textContent      = kind === "function"
+    ? "Cuerpo (expresión)"
+    : kind === "procedure"
+    ? "Cuerpo (BEGIN ... END o un statement)"
+    : "Cuerpo (un statement DML; corre por cada fila)";
+  $("#routine-help").innerHTML =
+      kind === "trigger"   ? "Emite <code>CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table FOR EACH ROW &lt;body&gt;;</code>. Dentro del body se usan <code>NEW</code>/<code>OLD</code> según el evento."
+    : kind === "procedure" ? "Emite <code>CREATE PROCEDURE name(params) AS &lt;body&gt;;</code>. El body puede ser un bloque <code>BEGIN ... END</code> o un statement único."
+    :                        "Emite <code>CREATE FUNCTION name(params) RETURNS &lt;tipo&gt; AS &lt;expr&gt;;</code>. El body es una expresión escalar que devuelve el tipo declarado.";
+}
+$("#routine-kind").onchange = e => applyRoutineKindUi(e.target.value);
+
+$("#btn-routine-save").onclick = () => {
+  if (!activeRoutine) return;
+  const kind = $("#routine-kind").value;
+  const name = sanitizeIdent($("#routine-name").value.trim());
+  const body = $("#routine-body").value.trim();
+  if (!name){ toast("Nombre requerido."); return; }
+  if (!body){ toast("Cuerpo requerido."); return; }
+
+  if (kind === "trigger"){
+    const data = {
+      name, body,
+      table:  $("#routine-table").value,
+      timing: $("#routine-timing").value,
+      event:  $("#routine-event").value
+    };
+    if (!data.table){ toast("Tabla requerida."); return; }
+    if (activeRoutine.id){
+      Object.assign(state.triggers.find(x => x.id === activeRoutine.id), data);
+    } else {
+      state.triggers.push({ id: id_(), ...data });
+    }
+  } else if (kind === "procedure"){
+    const params = parseParamsText($("#routine-params").value);
+    if (activeRoutine.id){
+      Object.assign(state.procedures.find(x => x.id === activeRoutine.id), { name, body, params });
+    } else {
+      state.procedures.push({ id: id_(), name, body, params });
+    }
+  } else {
+    const params     = parseParamsText($("#routine-params").value);
+    const returnType = $("#routine-return").value;
+    if (activeRoutine.id){
+      Object.assign(state.functions.find(x => x.id === activeRoutine.id), { name, body, params, returnType });
+    } else {
+      state.functions.push({ id: id_(), name, body, params, returnType });
+    }
+  }
+  save(); rerender(); closeModals();
+};
+$("#btn-routine-delete").onclick = () => {
+  if (!activeRoutine || !activeRoutine.id) return;
+  if (activeRoutine.kind === "trigger")        state.triggers   = state.triggers.filter(x => x.id !== activeRoutine.id);
+  else if (activeRoutine.kind === "procedure") state.procedures = state.procedures.filter(x => x.id !== activeRoutine.id);
+  else                                          state.functions  = state.functions.filter(x => x.id !== activeRoutine.id);
+  save(); rerender(); closeModals();
 };
 
 /* ---------- composite constraints + indexes ---------- */
@@ -1788,7 +2116,7 @@ $("#btn-do-import").onclick = doImport;
 $("#btn-load-sample").onclick = () => { state = JSON.parse(JSON.stringify(SAMPLE)); save(); rerender(); };
 $("#btn-clear").onclick = () => {
   if (!confirm("¿Borrar el modelo y limpiar localStorage?")) return;
-  state = { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[] };
+  state = { dbName:"modeler_demo", ifNotExists:true, entities:[], views:[], policies:[], triggers:[], procedures:[], functions:[] };
   localStorage.removeItem(STORAGE_KEY);
   rerender();
 };
@@ -1824,9 +2152,13 @@ function rerender(){
   const idxs = state.entities.reduce((s,e) => s + e.columns.filter(c => c.unique && !c.pk).length + e.indexes.length, 0);
   const fks  = state.entities.reduce((s,e) => s + e.columns.filter(c => !!c.fk).length, 0);
   const cks  = state.entities.reduce((s,e) => s + e.constraints.length, 0);
-  const vws = (state.views    || []).length;
-  const pol = (state.policies || []).length;
-  $("#status-counts").textContent = `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite · ${vws} views · ${pol} policies`;
+  const vws = (state.views      || []).length;
+  const pol = (state.policies   || []).length;
+  const trg = (state.triggers   || []).length;
+  const prc = (state.procedures || []).length;
+  const fns = (state.functions  || []).length;
+  $("#status-counts").textContent =
+    `${state.entities.length} tablas · ${cols} cols · ${idxs} idx · ${fks} FKs · ${cks} composite · ${vws} views · ${pol} policies · ${trg} trg · ${prc} prc · ${fns} fn`;
 
   const errs = findings.filter(f => f[0] === "error").length;
   const warns = findings.filter(f => f[0] === "warn").length;
