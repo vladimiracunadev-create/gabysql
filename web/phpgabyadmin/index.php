@@ -1252,6 +1252,23 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
             $perTable[] = compact('tn','nCol','nIdx','nFk','nChk','nPk');
           }
           $totalDbs = is_array($dbsResp['databases'] ?? null) ? count($dbsResp['databases']) : 0;
+
+          // Push 25: stats reales + objects unificado (degradan si endpoint no existe).
+          [$statsResp, $statsErr] = http_get_json($server . '/stats?db=' . urlencode($db), $apiToken);
+          $statsList = (!$statsErr && ($statsResp['ok'] ?? false)) ? ($statsResp['stats'] ?? []) : [];
+          $statsByTable = [];
+          foreach ($statsList as $s) { $statsByTable[strtolower($s['name'] ?? '')] = $s; }
+          // Inyectar rowCount real en el breakdown.
+          foreach ($perTable as &$row) {
+            $key = strtolower($row['tn']);
+            $row['rowCount']  = isset($statsByTable[$key]) ? (int)$statsByTable[$key]['rowCount'] : null;
+            $row['analyzedAt'] = $statsByTable[$key]['analyzedAt'] ?? null;
+          }
+          unset($row);
+
+          [$objResp, $objErr] = http_get_json($server . '/objects?db=' . urlencode($db), $apiToken);
+          $objCounts = (!$objErr && ($objResp['ok'] ?? false)) ? ($objResp['counts'] ?? []) : [];
+          $objTotal  = (!$objErr && ($objResp['ok'] ?? false)) ? ($objResp['total']  ?? 0) : 0;
         ?>
         <div class="card">
           <div class="card-header">
@@ -1279,23 +1296,79 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
           </div>
         </div>
 
+        <?php if (!empty($objCounts)): ?>
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Catálogo unificado · <code>/objects</code></h2>
+              <span class="muted"><?= (int)$objTotal ?> objetos en total</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">
+              <?php
+                $objKpis = [
+                  'tables'     => ['Tables',     'var(--accent)'],
+                  'views'      => ['Views',      'var(--success)'],
+                  'triggers'   => ['Triggers',   'var(--warning)'],
+                  'procedures' => ['Procedures', 'var(--text)'],
+                  'functions'  => ['Functions',  'var(--text)'],
+                  'users'      => ['Users',      'var(--accent)'],
+                  'roles'      => ['Roles',      'var(--accent)'],
+                  'grants'     => ['Grants',     'var(--success)'],
+                  'policies'   => ['Policies',   'var(--warning)'],
+                  'tableStats' => ['Stats',      'var(--text-muted)'],
+                ];
+                foreach ($objKpis as $k => [$lbl, $color]):
+                  $val = (int)($objCounts[$k] ?? 0);
+              ?>
+                <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:10px">
+                  <div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);font-weight:600"><?= htmlspecialchars($lbl) ?></div>
+                  <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600;color:<?= $color ?>;margin-top:2px"><?= $val ?></div>
+                </div>
+              <?php endforeach; ?>
+            </div>
+          </div>
+        <?php endif; ?>
+
         <?php if (!empty($perTable)): ?>
           <div class="card">
-            <div class="card-header"><h2 class="card-title">Breakdown por tabla</h2></div>
+            <div class="card-header">
+              <h2 class="card-title">Breakdown por tabla</h2>
+              <?php if (!empty($statsList)): ?>
+                <span class="muted"><?= count($statsList) ?> con ANALYZE · <code>/stats</code></span>
+              <?php else: ?>
+                <span class="muted">Corré <code>ANALYZE TABLE &lt;t&gt;</code> para ver row counts reales</span>
+              <?php endif; ?>
+            </div>
             <div class="table-wrapper">
               <table class="data">
                 <thead><tr>
-                  <th>Tabla</th><th>Cols</th><th>PK</th><th>Índices</th><th>FKs</th><th>CHECKs</th>
+                  <th>Tabla</th>
+                  <th>Rows</th>
+                  <th>Cols</th><th>PK</th><th>Índices</th><th>FKs</th><th>CHECKs</th>
+                  <th>Analyzed</th>
                 </tr></thead>
                 <tbody>
                   <?php foreach ($perTable as $r): ?>
                     <tr>
                       <td class="col-mono"><?= htmlspecialchars($r['tn']) ?></td>
+                      <td class="col-mono">
+                        <?php if ($r['rowCount'] !== null): ?>
+                          <strong style="color:var(--success)"><?= number_format($r['rowCount']) ?></strong>
+                        <?php else: ?>
+                          <span class="muted">—</span>
+                        <?php endif; ?>
+                      </td>
                       <td class="col-mono"><?= (int)$r['nCol'] ?></td>
                       <td class="col-mono"><?= (int)$r['nPk'] ?></td>
                       <td class="col-mono"><?= (int)$r['nIdx'] ?></td>
                       <td class="col-mono"><?= (int)$r['nFk'] ?></td>
                       <td class="col-mono"><?= (int)$r['nChk'] ?></td>
+                      <td class="col-mono muted" style="font-size:11px">
+                        <?php if ($r['analyzedAt']): ?>
+                          <?= htmlspecialchars(date('Y-m-d H:i', (int)($r['analyzedAt'] / 1_000_000_000))) ?>
+                        <?php else: ?>
+                          —
+                        <?php endif; ?>
+                      </td>
                     </tr>
                   <?php endforeach; ?>
                 </tbody>
