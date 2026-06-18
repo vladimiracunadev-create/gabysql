@@ -54,7 +54,7 @@
         "timestampUrl": "",
         "webviewInstallMode": { "type": "embedBootstrapper" },
         "wix": {
-          "language": ["en-US", "es-AR"],
+          "language": ["en-US", "es-ES"],
           "license": "../../../LICENSE"
         },
         "nsis": {
