@@ -139,6 +139,37 @@
     display:inline-flex;align-items:center;padding:0 8px;font-size:11px;
     font-family:'JetBrains Mono',monospace;color:var(--text-muted);min-width:48px;justify-content:center;
   }
+  #minimap{
+    position:absolute;bottom:14px;left:14px;z-index:8;
+    width:220px;height:150px;
+    background:rgba(10,14,20,.85);
+    border:1px solid var(--border-strong);border-radius:8px;
+    overflow:hidden;cursor:crosshair;
+    backdrop-filter:blur(4px);
+    box-shadow:var(--shadow);
+  }
+  #minimap .mm-content{position:absolute;inset:0}
+  #minimap .mm-entity{
+    position:absolute;background:rgba(88,166,255,.55);
+    border:1px solid var(--accent);border-radius:2px;
+    pointer-events:none;
+  }
+  #minimap .mm-entity.sel{background:var(--accent);border-color:#fff}
+  #minimap .mm-viewport{
+    position:absolute;border:1.5px solid var(--success);
+    background:rgba(126,231,135,.10);
+    pointer-events:none;border-radius:2px;
+  }
+  #minimap .mm-toggle{
+    position:absolute;top:4px;right:6px;
+    color:var(--text-muted);font-size:11px;
+    cursor:pointer;user-select:none;
+    background:rgba(0,0,0,.4);padding:1px 6px;border-radius:3px;
+    pointer-events:auto;
+  }
+  #minimap .mm-toggle:hover{color:var(--text)}
+  #minimap.collapsed{height:22px}
+  #minimap.collapsed .mm-content,#minimap.collapsed .mm-viewport{display:none}
 
   section.results{
     grid-area:results;background:var(--bg-2);border-top:1px solid var(--border);
@@ -330,6 +361,11 @@
   <div id="canvas-wrap">
     <div id="canvas-content">
       <svg class="relations" id="rel-svg"></svg>
+    </div>
+    <div id="minimap">
+      <span class="mm-toggle" id="mm-toggle">▭ map</span>
+      <div class="mm-content" id="mm-content"></div>
+      <div class="mm-viewport" id="mm-viewport"></div>
     </div>
     <div class="canvas-zoom-toolbar">
       <button id="zoom-out"  title="Zoom out (Ctrl + Wheel)">−</button>
@@ -2177,6 +2213,7 @@ function applyCanvasTransform(){
   c.style.transform = `translate(${canvasPanX}px, ${canvasPanY}px) scale(${canvasZoom})`;
   const lbl = $("#zoom-label");
   if (lbl) lbl.textContent = Math.round(canvasZoom * 100) + "%";
+  if (typeof renderMinimapViewport === "function") renderMinimapViewport();
 }
 function setZoom(newZoom, anchorX, anchorY){
   newZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, newZoom));
@@ -2262,7 +2299,121 @@ document.addEventListener("keydown", e => {
   else if (e.key === "f" || e.key === "F") { fitAll(); e.preventDefault(); }
 });
 
+/* ---------- minimap ---------- */
+const ENT_W = 280, ENT_H = 220; // estimación bbox por entidad
+const MM_PAD = 8;
+
+function computeModelBbox(){
+  if (state.entities.length === 0) return { minX:0, minY:0, maxX:1000, maxY:700 };
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const e of state.entities){
+    minX = Math.min(minX, e.x); minY = Math.min(minY, e.y);
+    maxX = Math.max(maxX, e.x + ENT_W); maxY = Math.max(maxY, e.y + ENT_H);
+  }
+  // Asegurar área mínima para que la escala no estalle
+  if (maxX - minX < 800) maxX = minX + 800;
+  if (maxY - minY < 600) maxY = minY + 600;
+  return { minX, minY, maxX, maxY };
+}
+
+function minimapScale(){
+  const mm = $("#minimap");
+  if (!mm) return null;
+  const mmW = mm.clientWidth  - MM_PAD * 2;
+  const mmH = mm.clientHeight - MM_PAD * 2;
+  if (mmW <= 0 || mmH <= 0) return null;
+  const bbox = computeModelBbox();
+  const sx = mmW / (bbox.maxX - bbox.minX);
+  const sy = mmH / (bbox.maxY - bbox.minY);
+  const s = Math.min(sx, sy);
+  return { s, bbox, mmW, mmH };
+}
+
+function renderMinimap(){
+  const content = $("#mm-content");
+  if (!content) return;
+  const m = minimapScale();
+  if (!m) return;
+  content.innerHTML = "";
+  for (const ent of state.entities){
+    const node = el("div", {
+      class: "mm-entity" + (selectedEntityId === ent.id ? " sel" : ""),
+      style: `
+        left:${MM_PAD + (ent.x - m.bbox.minX) * m.s}px;
+        top:${MM_PAD + (ent.y - m.bbox.minY) * m.s}px;
+        width:${Math.max(2, ENT_W * m.s)}px;
+        height:${Math.max(2, ENT_H * m.s)}px;
+      `
+    });
+    content.append(node);
+  }
+  renderMinimapViewport();
+}
+
+function renderMinimapViewport(){
+  const vp = $("#mm-viewport");
+  const m = minimapScale();
+  if (!vp || !m) return;
+  const wrap = $("#canvas-wrap");
+  const r = wrap.getBoundingClientRect();
+  // Viewport en coords lógicas: ((0,0) en screen) ↦ ((-panX, -panY)/zoom)
+  const lx = -canvasPanX / canvasZoom;
+  const ly = -canvasPanY / canvasZoom;
+  const lw = r.width  / canvasZoom;
+  const lh = r.height / canvasZoom;
+  vp.style.left   = (MM_PAD + (lx - m.bbox.minX) * m.s) + "px";
+  vp.style.top    = (MM_PAD + (ly - m.bbox.minY) * m.s) + "px";
+  vp.style.width  = (lw * m.s) + "px";
+  vp.style.height = (lh * m.s) + "px";
+}
+
+function panToMinimapPoint(clientX, clientY){
+  const mm = $("#minimap");
+  const r = mm.getBoundingClientRect();
+  const mmX = clientX - r.left - MM_PAD;
+  const mmY = clientY - r.top  - MM_PAD;
+  const m = minimapScale();
+  if (!m) return;
+  // Coord lógica clickeada
+  const lx = m.bbox.minX + mmX / m.s;
+  const ly = m.bbox.minY + mmY / m.s;
+  const wrap = $("#canvas-wrap");
+  const wr = wrap.getBoundingClientRect();
+  // Centrar viewport en el punto lógico
+  canvasPanX = (wr.width  / 2) - lx * canvasZoom;
+  canvasPanY = (wr.height / 2) - ly * canvasZoom;
+  applyCanvasTransform();
+}
+
+let mmDragging = false;
+$("#minimap").addEventListener("mousedown", e => {
+  if (e.target.id === "mm-toggle") return;
+  e.preventDefault();
+  mmDragging = true;
+  panToMinimapPoint(e.clientX, e.clientY);
+});
+document.addEventListener("mousemove", e => {
+  if (!mmDragging) return;
+  panToMinimapPoint(e.clientX, e.clientY);
+});
+document.addEventListener("mouseup", () => { mmDragging = false; });
+
+$("#mm-toggle").onclick = e => {
+  e.stopPropagation();
+  $("#minimap").classList.toggle("collapsed");
+};
+
+// Re-render minimap cuando state cambia (rerender se ejecuta al final
+// de cada save+rerender, pero las entities movidas vía drag llaman a
+// renderRelations sin pasar por rerender). Hookeamos un MutationObserver
+// liviano sobre #canvas-content para refrescar el minimap cuando se
+// agreguen/quiten entidades.
+const _mmObserver = new MutationObserver(() => renderMinimap());
+_mmObserver.observe($("#canvas-content"), { childList:true });
+
 applyCanvasTransform();
 rerender();
+renderMinimap();
+window.addEventListener("resize", renderMinimap);
 </script>
 </body></html>
