@@ -89,6 +89,28 @@
   header h1{margin:0;font-size:15px;letter-spacing:-.2px}
   header .spacer{flex:1}
 
+  /* dropdown menus en topbar */
+  .dd{position:relative;display:inline-block}
+  .dd-menu{
+    display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:9;
+    min-width:280px;background:var(--bg-2);border:1px solid var(--border-strong);
+    border-radius:8px;padding:5px;box-shadow:var(--shadow-lg);
+  }
+  .dd.open .dd-menu{display:flex;flex-direction:column;gap:1px}
+  .dd-item{
+    display:flex;align-items:center;gap:8px;padding:8px 12px;
+    background:transparent;border:1px solid transparent;border-radius:5px;
+    color:var(--text);font-size:13px;font-weight:400;text-align:left;cursor:pointer;
+    white-space:nowrap;
+  }
+  .dd-item:hover{background:var(--bg-3);border-color:var(--border)}
+  .dd-item code{font-size:11.5px;color:var(--accent)}
+  .dd-item .kbd{
+    margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10.5px;
+    color:var(--text-muted);padding:1px 6px;border:1px solid var(--border);border-radius:3px;
+  }
+  .dd-sep{border:0;border-top:1px solid var(--border);margin:4px 0}
+
   /* ---------- main 3-pane layout ---------- */
   main{
     position:fixed;inset:52px 0 30px 0;
@@ -332,6 +354,17 @@
   <span class="spacer"></span>
   <button id="btn-undo" title="Deshacer (Ctrl+Z)" disabled>↶</button>
   <button id="btn-redo" title="Rehacer (Ctrl+Y / Ctrl+Shift+Z)" disabled>↷</button>
+  <div class="dd">
+    <button id="btn-file" title="Archivo">📁 Archivo ▾</button>
+    <div class="dd-menu" id="file-menu">
+      <button class="dd-item" id="mn-save-file">💾 Guardar como <code>.gby</code>… <span class="kbd">Ctrl+Shift+S</span></button>
+      <button class="dd-item" id="mn-open-file">📂 Abrir <code>.gby</code>…           <span class="kbd">Ctrl+O</span></button>
+      <hr class="dd-sep" />
+      <button class="dd-item" id="mn-export-svg">🖼 Exportar diagrama <code>.svg</code></button>
+      <button class="dd-item" id="mn-export-png">🖼 Exportar diagrama <code>.png</code></button>
+    </div>
+  </div>
+  <input id="file-input" type="file" accept=".gby,.json,application/json" style="display:none" />
   <button id="btn-new-entity" class="primary">+ Entidad</button>
   <button id="btn-new-view">+ View</button>
   <button id="btn-new-policy">+ Policy</button>
@@ -2747,7 +2780,9 @@ document.addEventListener("keydown", e => {
   const mod = e.ctrlKey || e.metaKey;
   if (mod && !e.shiftKey && (e.key === "z" || e.key === "Z")){ undo(); e.preventDefault(); return; }
   if (mod && ((e.key === "y" || e.key === "Y") || (e.shiftKey && (e.key === "z" || e.key === "Z")))){ redo(); e.preventDefault(); return; }
-  if (mod && (e.key === "s" || e.key === "S")){ save(); toast("Guardado"); e.preventDefault(); return; }
+  if (mod && e.shiftKey && (e.key === "s" || e.key === "S")){ saveToFile(); e.preventDefault(); return; }
+  if (mod && (e.key === "s" || e.key === "S")){ save(); toast("Guardado en navegador"); e.preventDefault(); return; }
+  if (mod && (e.key === "o" || e.key === "O")){ $("#file-input").click(); e.preventDefault(); return; }
 
   // Atajos de canvas: ignorados con foco en form fields.
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
@@ -2759,6 +2794,196 @@ document.addEventListener("keydown", e => {
 
 $("#btn-undo").onclick = undo;
 $("#btn-redo").onclick = redo;
+
+/* ---------- File menu (Save/Load .gby + Export SVG/PNG) ---------- */
+const FILE_FORMAT_VERSION = 1;
+
+function sanitizeFilename(s){
+  return (s || "model").replace(/[^A-Za-z0-9_\-]/g, "_");
+}
+function downloadBlob(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href:url, download:filename });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function saveToFile(){
+  const payload = {
+    format: "gabymodeler",
+    version: FILE_FORMAT_VERSION,
+    savedAt: new Date().toISOString(),
+    state: state
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:"application/json" });
+  downloadBlob(blob, sanitizeFilename(state.dbName) + ".gby");
+  toast("Guardado: " + sanitizeFilename(state.dbName) + ".gby");
+}
+
+function loadFromFile(file){
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try {
+      const text = String(ev.target.result || "");
+      const parsed = JSON.parse(text);
+      // Aceptamos tanto el formato wrapper `{format, version, state}` como
+      // un state crudo de un export viejo o de copy-paste del localStorage.
+      const newState = parsed && parsed.format === "gabymodeler" && parsed.state
+        ? parsed.state
+        : (parsed && parsed.entities ? parsed : null);
+      if (!newState){ toast("Archivo inválido (sin 'state' ni 'entities')."); return; }
+      if (!Array.isArray(newState.entities)){ toast("Archivo inválido (entities no es array)."); return; }
+      // Confirmar si hay trabajo no guardado
+      if (state.entities.length > 0){
+        if (!confirm(`Esto reemplaza el modelo actual (${state.entities.length} tablas). ¿Continuar?`)) return;
+      }
+      state = newState;
+      // ensure colecciones top-level
+      ["views","policies","triggers","procedures","functions","users","roles","grants"].forEach(k => {
+        if (!Array.isArray(state[k])) state[k] = [];
+      });
+      save(); rerender();
+      toast("Modelo cargado: " + (state.dbName || "(sin nombre)"));
+    } catch (err){
+      toast("Error al parsear: " + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+/* ---------- Export SVG ----------
+   Renderiza el modelo entero como SVG standalone — entities como
+   bloques con título + columnas, FKs como líneas rectas entre
+   bordes. Fonts embebidos como style tag (Inter no se incluye —
+   el viewer del SO usa fallback sans-serif si no está instalado).
+   El SVG resultante es navegable + editable en Figma/Illustrator. */
+function buildSvgFromState(){
+  const ENT_W = 280, COL_H = 22, HEAD_H = 36, PAD_BBOX = 40;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const e of state.entities){
+    const h = HEAD_H + (e.columns.length * COL_H) + 6;
+    minX = Math.min(minX, e.x); minY = Math.min(minY, e.y);
+    maxX = Math.max(maxX, e.x + ENT_W); maxY = Math.max(maxY, e.y + h);
+  }
+  if (!isFinite(minX)){ minX = 0; minY = 0; maxX = 800; maxY = 600; }
+  const W = (maxX - minX) + PAD_BBOX * 2;
+  const H = (maxY - minY) + PAD_BBOX * 2;
+  const offX = PAD_BBOX - minX, offY = PAD_BBOX - minY;
+
+  const entityCenters = new Map();
+  const parts = [];
+
+  parts.push(`<rect width="${W}" height="${H}" fill="#0d1117"/>`);
+  // background dots grid
+  const gridStep = 24;
+  parts.push(`<defs><pattern id="dots" x="0" y="0" width="${gridStep}" height="${gridStep}" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#7d859022"/></pattern></defs>`);
+  parts.push(`<rect width="${W}" height="${H}" fill="url(#dots)"/>`);
+
+  for (const ent of state.entities){
+    const x = ent.x + offX, y = ent.y + offY;
+    const h = HEAD_H + (ent.columns.length * COL_H) + 6;
+    entityCenters.set(ent.name, { x: x + ENT_W / 2, y: y + h / 2, w: ENT_W, h });
+
+    // card
+    parts.push(`<g>`);
+    parts.push(`<rect x="${x}" y="${y}" width="${ENT_W}" height="${h}" rx="8" fill="#11161d" stroke="#30363d"/>`);
+    // header
+    parts.push(`<rect x="${x}" y="${y}" width="${ENT_W}" height="${HEAD_H}" rx="8" fill="#161b22" stroke="#30363d"/>`);
+    parts.push(`<rect x="${x}" y="${y + 8}" width="${ENT_W}" height="${HEAD_H - 8}" fill="#161b22"/>`);
+    parts.push(`<text x="${x + 12}" y="${y + 23}" fill="#e6edf3" font-size="13" font-weight="600" font-family="Inter,sans-serif">${escapeXml(ent.name)}</text>`);
+    // columns
+    ent.columns.forEach((c, i) => {
+      const cy = y + HEAD_H + (i * COL_H);
+      const flags = [];
+      if (c.pk) flags.push({ t:"PK", fill:"#7ee787" });
+      if (c.fk) flags.push({ t:"FK", fill:"#f0883e" });
+      if (c.unique && !c.pk) flags.push({ t:"UN", fill:"#79c0ff" });
+      if (c.notNull && !c.pk) flags.push({ t:"NN", fill:"#7d8590" });
+      parts.push(`<text x="${x + 12}" y="${cy + 14}" fill="#e6edf3" font-size="11.5" font-family="JetBrains Mono,monospace">${escapeXml(c.name)}</text>`);
+      parts.push(`<text x="${x + 12 + 100}" y="${cy + 14}" fill="#7d8590" font-size="11" font-family="JetBrains Mono,monospace">${escapeXml(c.type)}</text>`);
+      flags.forEach((f, fi) => {
+        const fx = x + ENT_W - 14 - (flags.length - 1 - fi) * 22;
+        parts.push(`<rect x="${fx - 11}" y="${cy + 3}" width="22" height="14" rx="2" fill="${f.fill}"/>`);
+        parts.push(`<text x="${fx}" y="${cy + 13}" fill="#0a0e14" font-size="9" font-weight="700" text-anchor="middle" font-family="Inter,sans-serif">${f.t}</text>`);
+      });
+    });
+    parts.push(`</g>`);
+  }
+
+  // FK lines (straight, between entity centers — buen suficiente para export)
+  for (const ent of state.entities){
+    for (const c of ent.columns){
+      if (!c.fk) continue;
+      const from = entityCenters.get(ent.name);
+      const to   = entityCenters.get(c.fk.table);
+      if (!from || !to) continue;
+      parts.push(`<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" stroke="#f0883e" stroke-width="1.5" stroke-dasharray="${c.fk.onDelete === "CASCADE" ? "0" : "4 3"}" opacity="0.7"/>`);
+    }
+  }
+
+  // Footer con título del DB
+  parts.push(`<text x="${PAD_BBOX}" y="${H - 14}" fill="#7d8590" font-size="11" font-family="Inter,sans-serif">gabymodeler · ${escapeXml(state.dbName || "(sin nombre)")} · ${state.entities.length} tablas</text>`);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+${parts.join("\n")}
+</svg>`;
+}
+
+function escapeXml(s){
+  return String(s).replace(/[<>&'"]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;","'":"&apos;","\"":"&quot;"}[ch]));
+}
+
+function exportSvg(){
+  if (state.entities.length === 0){ toast("Sin tablas para exportar."); return; }
+  const svg = buildSvgFromState();
+  const blob = new Blob([svg], { type:"image/svg+xml" });
+  downloadBlob(blob, sanitizeFilename(state.dbName) + ".svg");
+  toast("Exportado SVG");
+}
+
+function exportPng(){
+  if (state.entities.length === 0){ toast("Sin tablas para exportar."); return; }
+  const svg = buildSvgFromState();
+  const svgBlob = new Blob([svg], { type:"image/svg+xml;charset=utf-8" });
+  const url = URL.createObjectURL(svgBlob);
+  const img = new Image();
+  img.onload = () => {
+    // viewBox W/H ya están en el svg root
+    const w = img.naturalWidth  || img.width;
+    const h = img.naturalHeight || img.height;
+    const cv = document.createElement("canvas");
+    // 2x para nitidez
+    const scale = 2;
+    cv.width = w * scale; cv.height = h * scale;
+    const ctx = cv.getContext("2d");
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0);
+    cv.toBlob(blob => {
+      URL.revokeObjectURL(url);
+      if (!blob){ toast("Error rasterizando PNG."); return; }
+      downloadBlob(blob, sanitizeFilename(state.dbName) + ".png");
+      toast("Exportado PNG (2x)");
+    }, "image/png");
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); toast("Error cargando SVG para rasterizar."); };
+  img.src = url;
+}
+
+/* dropdown toggle */
+const fileDd = $("#btn-file").parentElement;
+$("#btn-file").onclick = e => { e.stopPropagation(); fileDd.classList.toggle("open"); };
+document.addEventListener("click", () => fileDd.classList.remove("open"));
+
+$("#mn-save-file").onclick   = () => { fileDd.classList.remove("open"); saveToFile(); };
+$("#mn-open-file").onclick   = () => { fileDd.classList.remove("open"); $("#file-input").click(); };
+$("#mn-export-svg").onclick  = () => { fileDd.classList.remove("open"); exportSvg(); };
+$("#mn-export-png").onclick  = () => { fileDd.classList.remove("open"); exportPng(); };
+$("#file-input").onchange = e => {
+  const f = e.target.files && e.target.files[0];
+  if (f) loadFromFile(f);
+  e.target.value = "";   // permitir re-cargar el mismo archivo
+};
 
 // Boot: snapshot inicial para que el primer cambio sea undo-able
 // hacia el estado de arranque (load del localStorage o SAMPLE).
