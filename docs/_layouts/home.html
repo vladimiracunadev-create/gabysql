@@ -36,7 +36,7 @@
     <div class="container hero-grid">
       <div class="hero-copy">
         <div class="eyebrow">
-          <span class="dot"></span> v0.1.0 · Fases 1+2+3 cerradas · post-P5 hardening + cross-request tx + ANSI alignment + 3 redes property-based · 2026-06-15
+          <span class="dot"></span> v0.2.0 motor · desktop-v0.1.0 modeler · 841 tests verdes · 2026-06-18
         </div>
         <h1>Una base de datos relacional<br><span class="grad">en un solo archivo</span>.</h1>
         <p class="lede">
@@ -119,8 +119,8 @@
 
   <section class="band">
     <div class="container band-grid">
-      <div class="stat"><span class="num">828</span><span class="lbl">tests verdes (integration + 3 redes property-based)</span></div>
-      <div class="stat"><span class="num">90</span><span class="lbl">ADRs documentando decisiones de diseño</span></div>
+      <div class="stat"><span class="num">841</span><span class="lbl">tests verdes (integration + 3 redes property-based + 13 E2E HTTP)</span></div>
+      <div class="stat"><span class="num">93</span><span class="lbl">ADRs documentando decisiones de diseño</span></div>
       <div class="stat"><span class="num">503.8 M</span><span class="lbl">queries random de fuzz limpio en parser</span></div>
       <div class="stat"><span class="num">3</span><span class="lbl">OS soportados (Win/Linux/macOS)</span></div>
     </div>
@@ -181,7 +181,7 @@
 
   <section class="modos">
     <div class="container">
-      <h2 class="section-h">Cuatro modos de uso, un solo motor</h2>
+      <h2 class="section-h">Cinco modos de uso, un solo motor</h2>
       <div class="modos-table">
         <div class="mode">
           <div class="mode-name">📟 CLI</div>
@@ -190,7 +190,7 @@
         </div>
         <div class="mode">
           <div class="mode-name">🌐 HTTP server</div>
-          <div class="mode-when">App que conecta por red, multi-cliente.</div>
+          <div class="mode-when">App que conecta por red, multi-cliente. 19 endpoints (Tx M13 + catalog listing).</div>
           <div class="mode-cmd"><code>gabysql-server -db mi.db -addr :8080</code></div>
         </div>
         <div class="mode">
@@ -200,9 +200,64 @@
         </div>
         <div class="mode">
           <div class="mode-name">🐳 Docker</div>
-          <div class="mode-when">Demo rápida con UI web (phpgabyadmin).</div>
+          <div class="mode-when">Demo rápida con UI web (phpgabyadmin + gabymodeler).</div>
           <div class="mode-cmd"><code>docker compose up -d</code></div>
         </div>
+        <div class="mode">
+          <div class="mode-name">🖥 Desktop app</div>
+          <div class="mode-when"><strong>nuevo</strong> — modelador ER con instalador Windows + server local sidecar.</div>
+          <div class="mode-cmd"><code>gabymodeler.msi · doble-click un .gby</code></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="features" style="border-top:1px solid var(--border)">
+    <div class="container">
+      <h2 class="section-h">🖥 gabymodeler Desktop — el modelador ER profesional</h2>
+      <p class="section-sub">
+        Empaquetado con Tauri 1.6 + WebView2 + <code>gabysql-server</code> como sidecar local.
+        Bundle 10-15 MB. Cero setup: sin Docker, sin PHP, sin Python externo.
+        Doble-click un archivo <code>.gby</code> y la app abre el modelo.
+      </p>
+      <div class="features-grid">
+        <article class="feat">
+          <h3>Modelado ER completo</h3>
+          <p>Entidades + FK Bezier · tipos extendidos (DECIMAL/BLOB/UUID/VARCHAR/INT widths/UNSIGNED) · CHECK inline · composite PK/UNIQUE/INDEX · Views · RLS Policies (USING+CHECK) · Triggers · Procedures · Functions · Users · Roles · Grants. <strong>1:1 con motor VERSION 33</strong>.</p>
+        </article>
+        <article class="feat">
+          <h3>Canvas profesional</h3>
+          <p>Zoom-to-cursor (<code>Ctrl+Wheel</code>) · pan middle-click/Alt · fit-all · <strong>minimap navegable</strong> · multi-selección con lasso · drag-to-create FK (arrastrá del flag FK al PK target) · atajos <code>+/-/0/F</code>.</p>
+        </article>
+        <article class="feat">
+          <h3>Undo/Redo + atajos universales</h3>
+          <p>History stack 50 entries. <code>Ctrl+Z</code>, <code>Ctrl+Y</code>, <code>Ctrl+A</code> (select all), <code>Ctrl+D</code> (duplicate), <code>Delete</code>, <code>Ctrl+F</code> (búsqueda global tipo VSCode command palette).</p>
+        </article>
+        <article class="feat">
+          <h3>Save/Load .gby + Export</h3>
+          <p>Formato wrapper <code>{format, version, state}</code> persistente. <strong>Export SVG</strong> standalone (editable en Figma) + <strong>Export PNG</strong> 2x para retina. Asociación <code>.gby</code> registrada por el instalador.</p>
+        </article>
+        <article class="feat">
+          <h3>Migrations diff → ALTER</h3>
+          <p>Comparás el modelo actual contra un snapshot anterior (.gby o pegado) y obtenés los <code>CREATE</code>/<code>ALTER</code>/<code>DROP</code> exactos para llegar de uno al otro. Granular por column/check/view/policy/grant/routine.</p>
+        </article>
+        <article class="feat">
+          <h3>Auto-layout + Reverse engineering</h3>
+          <p>Algoritmo Fruchterman-Reingold acomoda N tablas con sus FK automáticamente. Reverse engineering: apuntás a un <code>gabysql-server</code> y trae <strong>todo</strong> el catálogo (tablas + views + policies + triggers + procs + funcs + users + roles + grants).</p>
+        </article>
+      </div>
+
+      <div class="install-block" style="margin-top:36px">
+        <div class="install-tabs">
+          <span class="install-tab active">Windows · .msi</span>
+          <span class="install-tab muted">macOS / Linux · próximo</span>
+        </div>
+        <p class="install-hint">
+          <a href="https://github.com/vladimiracunadev-create/gabysql/releases/tag/desktop-v0.1.0" style="color:var(--accent);text-decoration:none">
+            ⬇ Descargar gabymodeler 0.1.0 para Windows
+          </a>
+          · sin admin · sin signing aún (SmartScreen pide confirmación 1 vez) · workspace en <code>%APPDATA%</code>.
+        </p>
       </div>
     </div>
   </section>
