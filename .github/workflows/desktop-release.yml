@@ -9,6 +9,9 @@ on:
       - 'desktop-v*'
   workflow_dispatch:
 
+permissions:
+  contents: write   # necesario para softprops/action-gh-release@v2
+
 jobs:
   build-windows:
     name: Build .msi + .nsis (Windows)
