@@ -201,8 +201,8 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 ### Runtime y acceso
 - CLI `gabysql`
 - API `gabysql-server`
-- Admin web `phpgabyadmin` (browse / structure / SQL)
-- **Modelador web `gabymodeler` v2** (ER → SQL DDL, layout PowerDesigner-style, Check Model con 14 reglas, reverse engineering vía `/tables`) — ver [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) (con screenshots) y [web/modeler/README.md](web/modeler/README.md)
+- **Admin web `phpgabyadmin` v2** (paleta GitHub-style, Inter+JetBrains Mono): Browse · Structure · SQL editor con CodeMirror · Sessions (M13 cross-request tx) · Explain (M6 bias coloreado) · Stats · Policies (RLS) · Routines (triggers/procs/funcs) · Security (users/roles/grants). CSRF + HMAC auth cookies.
+- **Modelador web `gabymodeler` v3** (ER → SQL DDL): entidades + FK + tipos Y1-Y9 + CHECK + composite PK/UNIQUE/INDEX + Views + RLS Policies + Triggers + Procedures + Functions + Users + Roles + Grants. Canvas con zoom-to-cursor, pan, fit-all y minimap navegable. Check Model exhaustivo + reverse engineering vía `/tables`. Ver [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) y [web/modeler/README.md](web/modeler/README.md).
 - Docker y `docker compose`
 
 ---
@@ -261,8 +261,8 @@ php -S localhost:8000 -t web
 | [QUICKSTART.md](QUICKSTART.md) | arranque en 3 pasos |
 | [INSTALL.md](INSTALL.md) | instalación y build por sistema operativo |
 | [USER_MANUAL.md](USER_MANUAL.md) | uso diario del producto (CLI + server + admin web) |
-| [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) | manual de usuario del modelador ER `gabymodeler v2` (con screenshots) |
-| [web/modeler/README.md](web/modeler/README.md) | overview técnico de `gabymodeler v2` |
+| [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) | manual de usuario del modelador ER `gabymodeler v3` (con screenshots) |
+| [web/modeler/README.md](web/modeler/README.md) | overview técnico de `gabymodeler v3` |
 | [RUNBOOK.md](RUNBOOK.md) | operación, backup y recovery |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | resolución de fallos frecuentes |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | matriz de compatibilidad (OS, toolchain, Docker, formato) |

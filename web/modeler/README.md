@@ -4,13 +4,20 @@
 > Single-page HTML+CSS+JS vanilla, sin frameworks, sin servidor obligatorio.
 > Persistencia local en `localStorage`. Espejo del motor `gabysql VERSION 33`.
 
-**Cambios v3 vs v2** (2026-06-17):
-- 🎨 Refresh visual completo: paleta GitHub-style (#0a0e14/#58a6ff), tipografía **Inter** + **JetBrains Mono**, alineado con phpgabyadmin v2 y la landing.
-- 📦 Tipos extendidos (Y1-Y9): `TINYINT/SMALLINT/MEDIUMINT/BIGINT` (firmados y `UNSIGNED`), `DECIMAL(p,s)`, `VARCHAR(n)`, `CHAR(n)`, `DOUBLE`, `TIME`, `TIMESTAMP`, `BLOB`, `UUID`.
-- 🔑 PK ahora puede ser cualquier entero o `UUID` (antes forzaba `INT`).
-- 🔗 FK auto-coerciona al tipo de la PK target (antes forzaba `INT`).
-- ✅ Flag **CHK**: CHECK constraint inline por columna (expresión editable vía prompt).
-- 🌱 SAMPLE actualizado con `BIGINT` PK, `VARCHAR(255)`, `DECIMAL(10,2)`, `TINYINT UNSIGNED` con CHECK.
+**Cambios v3 vs v2** (sesión 2026-06-17 → 2026-06-18, pushes 2-16):
+- 🎨 **Refresh visual** completo: paleta GitHub-style (#0a0e14/#58a6ff), Inter + JetBrains Mono, alineado con phpgabyadmin v2 y la landing.
+- 📦 **Tipos extendidos** (Y1-Y9): `TINYINT/SMALLINT/MEDIUMINT/BIGINT` firmados y `UNSIGNED`, `DECIMAL(p,s)`, `VARCHAR(n)`, `CHAR(n)`, `DOUBLE`, `TIME`, `TIMESTAMP`, `BLOB`, `UUID`.
+- 🔑 **PK** puede ser cualquier entero o `UUID` (antes forzaba `INT`).
+- 🔗 **FK** auto-coerciona al tipo de la PK target.
+- ✅ **CHK** flag: CHECK constraint inline por columna.
+- 🔧 **Composite constraints**: PRIMARY KEY (a, b) y UNIQUE (a, b) table-level + CREATE INDEX multi-columna con picker de orden.
+- 👁️ **Views**: CREATE VIEW name AS SELECT ... con validación nombre + colisión con tablas.
+- 🔒 **RLS Policies**: CREATE POLICY ... FOR action [TO role] [USING] [WITH CHECK].
+- ⚡ **Triggers**: BEFORE/AFTER × INSERT/UPDATE/DELETE con validación de NEW/OLD por evento.
+- 🔁 **Procedures + Functions**: params multi-línea, returns dropdown para functions.
+- 👥 **Security**: Users (con password opcional warning), Roles, Grants con picker de privilegios (SELECT/INSERT/UPDATE/DELETE/REFERENCES/TRUNCATE) chip multi-select.
+- 🔍 **Canvas**: zoom-to-cursor (Ctrl+Wheel), pan middle-click/Alt, fit-all, atajos teclado +/−/0/F.
+- 🗺️ **Minimap** navegable click-drag con viewport indicator.
 
 ---
 
