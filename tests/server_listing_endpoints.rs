@@ -243,7 +243,14 @@ fn users_endpoint_lists_user_without_secret_material() -> Result<(), Box<dyn Err
     let (status, body) = http_get(&addr, "/users")?;
     assert_eq!(status, 200, "body: {}", body);
     assert!(body.contains("\"name\":\"alice\""), "body: {}", body);
-    assert!(body.contains("\"scheme\":\"argon2id\""), "body: {}", body);
+    // Default scheme del motor es PBKDF2-SHA256 (scheme=1). scrypt y
+    // argon2id existen como alternativas pero requieren sintaxis
+    // específica que no usamos aquí.
+    assert!(
+        body.contains("\"scheme\":\"pbkdf2-sha256\""),
+        "body: {}",
+        body
+    );
     // CRITICO: la API NUNCA debe filtrar hash ni salt.
     assert!(
         !body.contains("password_hash"),

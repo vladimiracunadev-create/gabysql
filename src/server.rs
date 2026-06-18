@@ -1305,11 +1305,15 @@ fn function_meta_json(meta: &FunctionMeta) -> String {
 
 /// JSON encoding for `UserMeta`. **No** expone `password_hash` ni
 /// `salt` — son material secreto que el server NUNCA debe filtrar
-/// via API HTTP, ni siquiera al cliente de gestión. `scheme` se
-/// mapea a un nombre legible (hoy: 1 → "argon2id").
+/// via API HTTP, ni siquiera al cliente de gestión. Schemes:
+/// 1 = PBKDF2-SHA256 (default), 2 = scrypt (RFC 7914),
+/// 3 = Argon2id estructural. Otros valores → "unknown" (no fail —
+/// migración futura podría agregar uno y queremos forward-compat).
 fn user_meta_json(meta: &UserMeta) -> String {
     let scheme_name = match meta.scheme {
-        1 => "argon2id",
+        1 => "pbkdf2-sha256",
+        2 => "scrypt",
+        3 => "argon2id",
         _ => "unknown",
     };
     format!(
