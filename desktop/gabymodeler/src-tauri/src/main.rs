@@ -193,8 +193,16 @@ fn main() {
     // Run con handler de exit que kill al server child antes de cerrar.
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { .. } | RunEvent::Exit = event {
-            let state = app_handle.state::<ServerHandle>();
-            if let Some(child) = state.0.lock().unwrap().take() {
+            // Scopear el MutexGuard al bloque interior — sin esto
+            // el guard del `state.0.lock()` vive hasta el final del
+            // `if let Some(child)` y rustc rechaza (E0597) porque el
+            // `state` local se dropea antes que el guard temporal.
+            let child = {
+                let state = app_handle.state::<ServerHandle>();
+                let mut slot = state.0.lock().unwrap();
+                slot.take()
+            };
+            if let Some(child) = child {
                 let _ = child.kill();
                 eprintln!("gabysql-server detenido");
             }
