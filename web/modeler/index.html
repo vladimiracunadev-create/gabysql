@@ -2333,17 +2333,122 @@ async function doImport(){
   const db  = $("#imp-db").value.trim();
   if (!url || !db){ toast("Falta URL o DB."); return; }
   const headers = tok ? { "Authorization": "Bearer " + tok } : {};
+  const qs = `?db=${encodeURIComponent(db)}`;
+
+  /* Helper: fetch JSON con tolerancia — si el endpoint no existe o
+     el campo viene vacío, devolvemos []. El server de gabysql ≥ Push
+     14 expone los 8 endpoints, pero el importer debe degradar limpio
+     si lo conectás a un build viejo. */
+  const fetchList = async (path, field) => {
+    try {
+      const r = await fetch(`${url}${path}${qs}`, { headers });
+      if (!r.ok) return [];
+      const j = await r.json();
+      return (j && j.ok && Array.isArray(j[field])) ? j[field] : [];
+    } catch { return []; }
+  };
+
   try {
-    const r = await fetch(`${url}/tables?db=${encodeURIComponent(db)}`, { headers });
+    // /tables sigue siendo el único endpoint crítico — si falla, abortamos.
+    const r = await fetch(`${url}/tables${qs}`, { headers });
     if (!r.ok){ toast(`Server respondió ${r.status}`); return; }
     const data = await r.json();
     if (!data.ok || !Array.isArray(data.tables)){ toast("Respuesta inesperada del server."); return; }
-    importTablesFromJson(data.tables, db);
+
+    // El resto degrada silenciosamente.
+    const [views, policies, triggers, procedures, functions, users, roles, grants] = await Promise.all([
+      fetchList("/views",      "views"),
+      fetchList("/policies",   "policies"),
+      fetchList("/triggers",   "triggers"),
+      fetchList("/procedures", "procedures"),
+      fetchList("/functions",  "functions"),
+      fetchList("/users",      "users"),
+      fetchList("/roles",      "roles"),
+      fetchList("/grants",     "grants"),
+    ]);
+
+    importCatalogFromJson({
+      tables: data.tables,
+      views, policies, triggers, procedures, functions, users, roles, grants,
+    }, db);
+
     closeModals();
-    toast(`Importadas ${data.tables.length} tablas de ${db}.`);
+    const counts = [
+      `${data.tables.length} tablas`,
+      views.length      && `${views.length} views`,
+      policies.length   && `${policies.length} policies`,
+      triggers.length   && `${triggers.length} triggers`,
+      procedures.length && `${procedures.length} procs`,
+      functions.length  && `${functions.length} funcs`,
+      users.length      && `${users.length} users`,
+      roles.length      && `${roles.length} roles`,
+      grants.length     && `${grants.length} grants`,
+    ].filter(Boolean).join(" · ");
+    toast(`Importado de ${db}: ${counts}`);
   } catch (err){
     toast("Error de red: " + err.message);
   }
+}
+
+function importCatalogFromJson(payload, dbName){
+  importTablesFromJson(payload.tables, dbName);
+
+  state.views = (payload.views || []).map(v => ({
+    id: id_(), name: v.name || "", body: v.source || ""
+  }));
+
+  state.policies = (payload.policies || []).map(p => ({
+    id: id_(),
+    name:   p.name   || "",
+    table:  p.table  || "",
+    action: p.action || "SELECT",
+    role:   (Array.isArray(p.roles) && p.roles.length) ? p.roles[0] : "",
+    using:  p.using     || "",
+    check:  p.withCheck || ""
+  }));
+
+  state.triggers = (payload.triggers || []).map(t => ({
+    id: id_(),
+    name:   t.name   || "",
+    table:  t.table  || "",
+    timing: t.timing || "BEFORE",
+    event:  t.event  || "INSERT",
+    body:   t.body   || ""
+  }));
+
+  state.procedures = (payload.procedures || []).map(p => ({
+    id: id_(),
+    name:   p.name || "",
+    params: (p.params || []).map(par => ({ name: par.name || "", type: par.type || "INT" })),
+    body:   p.body || ""
+  }));
+
+  state.functions = (payload.functions || []).map(f => ({
+    id: id_(),
+    name:       f.name       || "",
+    params:     (f.params || []).map(par => ({ name: par.name || "", type: par.type || "INT" })),
+    returnType: f.returnType || "INT",
+    body:       f.body       || ""
+  }));
+
+  state.users = (payload.users || []).map(u => ({
+    id: id_(),
+    name: u.name || "",
+    password: ""   // el server NUNCA devuelve el hash — el modeler no tiene cómo recuperarlo
+  }));
+
+  state.roles = (payload.roles || []).map(r => ({
+    id: id_(), name: r.name || ""
+  }));
+
+  state.grants = (payload.grants || []).map(g => ({
+    id: id_(),
+    grantee: g.grantee || "",
+    object:  g.object  || "",
+    privs:   (g.privs || []).slice()
+  }));
+
+  save(); rerender();
 }
 function importTablesFromJson(tables, dbName){
   state.entities = [];
