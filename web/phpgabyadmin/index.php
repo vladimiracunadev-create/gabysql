@@ -806,6 +806,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['drop_policy'])) {
             'explain'   => ['Explain (M6)', '⊕', true],
             'stats'     => ['Stats', '📊', true],
             'policies'  => ['Policies (RLS)', '🔒', true],
+            'routines'  => ['Routines', '⚙', true],
           ];
           foreach ($tabLinks as $k => $info):
             [$label, $icon, $enabled] = $info;
@@ -1402,6 +1403,95 @@ COMMIT  <span style="color:var(--text-muted)">-- cierra la sesión</span></pre>
               </table>
             </div>
           <?php endif; ?>
+        </div>
+
+      <?php elseif ($tab === 'routines'): ?>
+        <?php
+          [$trgResp, $trgErr] = http_get_json($server . '/triggers?db=' . urlencode($db), $apiToken);
+          [$prcResp, $prcErr] = http_get_json($server . '/procedures?db=' . urlencode($db), $apiToken);
+          [$fnResp,  $fnErr]  = http_get_json($server . '/functions?db=' . urlencode($db), $apiToken);
+          $triggers    = (!$trgErr && ($trgResp['ok'] ?? false)) ? ($trgResp['triggers']  ?? []) : [];
+          $procedures  = (!$prcErr && ($prcResp['ok'] ?? false)) ? ($prcResp['procedures']?? []) : [];
+          $functions   = (!$fnErr  && ($fnResp['ok']  ?? false)) ? ($fnResp['functions']  ?? []) : [];
+          $fmtParams = function(array $params) {
+            return implode(', ', array_map(fn($p) =>
+              ($p['name'] ?? '?') . ' ' . ($p['type'] ?? '?'), $params));
+          };
+        ?>
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">⚡ Triggers</h2>
+            <span class="muted"><?= count($triggers) ?> declarados</span>
+          </div>
+          <?php if ($trgErr): ?>
+            <div class="alert alert-error"><?= htmlspecialchars($trgErr) ?></div>
+          <?php elseif (empty($triggers)): ?>
+            <div class="muted" style="font-size:13px">No hay triggers en este DB.</div>
+          <?php else: ?>
+            <?php foreach ($triggers as $t): ?>
+              <details style="margin-bottom:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
+                <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px">
+                  <span style="color:var(--success);font-weight:600"><?= htmlspecialchars($t['name'] ?? '') ?></span>
+                  <span class="muted"> · <?= htmlspecialchars($t['timing'] ?? '') ?> <?= htmlspecialchars($t['event'] ?? '') ?> ON </span>
+                  <code><?= htmlspecialchars($t['table'] ?? '') ?></code>
+                </summary>
+                <pre class="code" style="margin-top:8px"><?= htmlspecialchars($t['body'] ?? '') ?></pre>
+              </details>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">🔁 Procedures</h2>
+            <span class="muted"><?= count($procedures) ?> declarados</span>
+          </div>
+          <?php if ($prcErr): ?>
+            <div class="alert alert-error"><?= htmlspecialchars($prcErr) ?></div>
+          <?php elseif (empty($procedures)): ?>
+            <div class="muted" style="font-size:13px">No hay procedures en este DB.</div>
+          <?php else: ?>
+            <?php foreach ($procedures as $p): ?>
+              <details style="margin-bottom:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
+                <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px">
+                  <span style="color:var(--accent);font-weight:600"><?= htmlspecialchars($p['name'] ?? '') ?></span><span class="muted">(<?= htmlspecialchars($fmtParams($p['params'] ?? [])) ?>)</span>
+                </summary>
+                <pre class="code" style="margin-top:8px"><?= htmlspecialchars($p['body'] ?? '') ?></pre>
+              </details>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">ƒ Functions</h2>
+            <span class="muted"><?= count($functions) ?> declaradas</span>
+          </div>
+          <?php if ($fnErr): ?>
+            <div class="alert alert-error"><?= htmlspecialchars($fnErr) ?></div>
+          <?php elseif (empty($functions)): ?>
+            <div class="muted" style="font-size:13px">No hay functions en este DB.</div>
+          <?php else: ?>
+            <?php foreach ($functions as $f): ?>
+              <details style="margin-bottom:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
+                <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px">
+                  <span style="color:var(--warning);font-weight:600"><?= htmlspecialchars($f['name'] ?? '') ?></span><span class="muted">(<?= htmlspecialchars($fmtParams($f['params'] ?? [])) ?>)</span>
+                  <span class="muted"> → <?= htmlspecialchars($f['returnType'] ?? '?') ?></span>
+                </summary>
+                <pre class="code" style="margin-top:8px"><?= htmlspecialchars($f['body'] ?? '') ?></pre>
+              </details>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h2 class="card-title">Crear / modificar routine</h2></div>
+          <p class="muted" style="font-size:13px;margin:0">
+            Para crear, redefinir o eliminar routines usá el tab <a href="?server=<?= urlencode($server) ?>&token=<?= urlencode($apiToken) ?>&db=<?= urlencode($db) ?>&tab=sql"><b>SQL editor</b></a>.
+            Sintaxis: <code>CREATE TRIGGER &lt;name&gt; {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON &lt;tabla&gt; FOR EACH ROW &lt;stmt&gt;;</code>
+            · <code>CREATE PROCEDURE &lt;name&gt;(&lt;params&gt;) AS BEGIN ... END;</code>
+            · <code>CREATE FUNCTION &lt;name&gt;(&lt;params&gt;) RETURNS &lt;tipo&gt; AS &lt;expr&gt;;</code>
+          </p>
         </div>
 
       <?php endif; ?>
