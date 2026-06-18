@@ -17,13 +17,15 @@ M3/M4/M6/M12/M13). 838 tests verdes en CI Ubuntu/macOS/Windows +
 Docker + bench job. Ver [docs/STATUS.md](docs/STATUS.md) para el
 detalle.
 
-Trinity de productos:
+Stack de productos:
 1. **`gabysql` CLI** — REPL + scripts.
-2. **`gabysql-server` HTTP/JSON** — 17 endpoints incluyendo M13
-   cross-request tx y listado completo del catálogo.
+2. **`gabysql-server` HTTP/JSON** — 19 endpoints (core + Tx M13 + catalog listing).
 3. **`web/phpgabyadmin/`** (PHP single-file) + **`web/modeler/`** (HTML
    single-file) — productos de gestión visual. Ambos vanilla, sin
    build system, deploy-zero.
+4. **`desktop/gabymodeler/`** — el modelador empaquetado con Tauri 1.6
+   como `.msi` Windows. Incluye `gabysql-server` como sidecar local.
+   Build CI con `git tag desktop-v*`.
 
 ## Reglas duras
 
@@ -123,6 +125,9 @@ docs/
 | Nuevo error code | `src/errors.rs` (constante en el rango del bloque correspondiente) |
 | Tab nuevo en phpgabyadmin | `web/phpgabyadmin/index.php` ($tabLinks array + elseif tab block) |
 | Feature nueva en modeler | `web/modeler/index.html` (state schema + modal + browser tree + generateSQL + checkModel + status counts) |
+| Release desktop .msi | `git tag desktop-v0.1.X && git push --tags` → workflow `desktop-release.yml` |
+| Config sidecar / menú nativo | `desktop/gabymodeler/src-tauri/{tauri.conf.json, src/main.rs}` |
+| Regenerar iconos | `cd desktop/gabymodeler && python generate_icons.py` |
 | ADR nuevo | `docs/adr/NNNN-titulo-corto.md` (formato: fecha, estado, bloque, refina, contexto, decisión, alternativas, consecuencias, referencias) |
 
 ## Comandos comunes

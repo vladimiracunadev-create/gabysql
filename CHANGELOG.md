@@ -6,6 +6,44 @@
 
 ---
 
+## desktop-v0.1.0 — 2026-06-18 — gabymodeler como app Windows
+
+> Primer release del modelador como `.msi` con instalador.
+> Tag dispara CI workflow `desktop-release.yml` que produce `.msi` +
+> `.exe` (NSIS) con sidecar `gabysql-server` empaquetado.
+
+### Highlights
+
+**Bundle 10-15 MB** que incluye:
+- `gabymodeler.exe` — frontend Tauri 1.6 + WebView2 nativo.
+- `gabysql-server.exe` — motor `gabysql VERSION 33` arrancado como
+  sidecar local en `127.0.0.1:18080` al abrir la app.
+- Asociación `.gby`: doble-click un modelo abre la app.
+- Workspace de DBs en `%APPDATA%/dev.gabysql.gabymodeler/databases/`.
+
+**Setup**: cero — sin Docker, sin PHP, sin Python externos. WebView2
+runtime de Windows 11 ya viene; en Windows 10 el bootstrapper lo
+instala (+120 KB).
+
+**Menús nativos** (Archivo / Edición / Vista / Herramientas / Ayuda)
+con todos los atajos del modeler v3 (Ctrl+Z, Ctrl+F, Ctrl+D, F, etc.).
+
+**Build pipeline**: `git tag desktop-v0.1.0 && git push --tags` →
+GitHub Actions Windows runner → `.msi` + `.exe` como release assets
+en ~20 min. Sin servidor de build propio.
+
+**Limitaciones honestas v0.1.0**:
+- Sin code signing → SmartScreen pide confirmación 1 vez por
+  máquina. Decisión comercial (cert EV ~$200/año).
+- Sin auto-update → cada release el usuario descarga manualmente.
+- Sólo Windows builds en CI. macOS .dmg y Linux .deb/.AppImage
+  pendientes (matrices CI extra cuando haya demanda).
+
+Ver [ADR-0093](docs/adr/0093-desktop-app-tauri.md) para detalle de
+decisiones.
+
+---
+
 ## Post-v0.2.0 — 2026-06-17 → 2026-06-18 — Refresh integral de productos de gestión
 
 > 19 pushes directos a `main` sin tag de release. Eleva los dos productos

@@ -202,7 +202,8 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 - CLI `gabysql`
 - API `gabysql-server`
 - **Admin web `phpgabyadmin` v2** (paleta GitHub-style, Inter+JetBrains Mono): Browse · Structure · SQL editor con CodeMirror · Sessions (M13 cross-request tx) · Explain (M6 bias coloreado) · Stats · Policies (RLS) · Routines (triggers/procs/funcs) · Security (users/roles/grants). CSRF + HMAC auth cookies.
-- **Modelador web `gabymodeler` v3** (ER → SQL DDL): entidades + FK + tipos Y1-Y9 + CHECK + composite PK/UNIQUE/INDEX + Views + RLS Policies + Triggers + Procedures + Functions + Users + Roles + Grants. Canvas con zoom-to-cursor, pan, fit-all y minimap navegable. Check Model exhaustivo + reverse engineering vía `/tables`. Ver [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) y [web/modeler/README.md](web/modeler/README.md).
+- **Modelador web `gabymodeler` v3** (ER → SQL DDL): entidades + FK + tipos Y1-Y9 + CHECK + composite PK/UNIQUE/INDEX + Views + RLS Policies + Triggers + Procedures + Functions + Users + Roles + Grants. Canvas con zoom-to-cursor, pan, fit-all y minimap navegable. **Undo/Redo, Save/Load `.gby`, Export SVG/PNG, multi-selección + lasso, drag-to-create FK, búsqueda global Ctrl+F, auto-layout, migrations diff → ALTER**. Check Model exhaustivo + reverse engineering vía endpoints HTTP. Ver [web/modeler/USER_MANUAL.md](web/modeler/USER_MANUAL.md) y [web/modeler/README.md](web/modeler/README.md).
+- **`gabymodeler` Desktop edition** (`.msi` Windows): el modelador empaquetado con Tauri 1.6 + WebView2 + `gabysql-server` como sidecar local. Doble-click un `.gby` abre la app. Bundle 10-15 MB, cero setup. Ver [desktop/gabymodeler/README.md](desktop/gabymodeler/README.md).
 - Docker y `docker compose`
 
 ---
