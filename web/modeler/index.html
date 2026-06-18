@@ -161,6 +161,20 @@
     display:inline-flex;align-items:center;padding:0 8px;font-size:11px;
     font-family:'JetBrains Mono',monospace;color:var(--text-muted);min-width:48px;justify-content:center;
   }
+  #canvas-wrap.fk-dragging{cursor:crosshair}
+  #canvas-wrap.fk-dragging .colflag.pk.on{
+    outline:2px solid var(--success);outline-offset:2px;
+    animation:pulse-pk 0.8s ease-in-out infinite;
+  }
+  @keyframes pulse-pk{50%{outline-color:#fff}}
+  #fk-drag-line{
+    position:absolute;inset:0;pointer-events:none;z-index:8;
+    width:100%;height:100%;
+  }
+  #fk-drag-line line{
+    stroke:var(--accent);stroke-width:2;stroke-dasharray:6 4;
+    marker-end:url(#fk-drag-arrow);
+  }
   .bulk-bar{
     position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:9;
     display:flex;align-items:center;gap:4px;
@@ -945,6 +959,7 @@ if (!Array.isArray(state.roles))      state.roles      = [];
 if (!Array.isArray(state.grants))     state.grants     = [];
 let selectedColumnId = null;
 let selectedEntityIds = new Set();   // Push 28: multi-selección
+let fkDragState = null;              // Push 29: drag-to-create FK
 // Compat shim: el resto del código aún lee/escribe selectedEntityId.
 // El getter devuelve el "último" (cualquier id del Set); el setter
 // reemplaza el Set por ese único id. Así pude introducir multi sin
@@ -1462,11 +1477,67 @@ function renderColumnRow(ent, c){
     }
   }, "CHK");
 
-  return el("tr", { onclick: () => selectColumn(ent.id, c.id) },
-    el("td", {}, el("input", {
-      type:"text", value: c.name,
-      onchange: e => { c.name = sanitizeIdent(e.target.value); save(); rerender(); }
-    })),
+  // Push 29: drag-to-create FK — mousedown sobre flagFK + drag a otra
+  // PK crea la FK directa; click sin drag mantiene el modal viejo.
+  flagFK.addEventListener("mousedown", e => {
+    e.stopPropagation();
+    const r = $("#canvas-wrap").getBoundingClientRect();
+    fkDragState = {
+      sourceEntId: ent.id,
+      sourceColId: c.id,
+      sx: e.clientX - r.left,
+      sy: e.clientY - r.top,
+      didMove: false
+    };
+  });
+
+  // Push 29: edición inline mejorada — Tab y Enter en el input del
+  // nombre navegan/expanden sin tocar el mouse.
+  const colNameInput = el("input", {
+    type:"text", value: c.name, "data-col-name-input":"1",
+    onchange: e => { c.name = sanitizeIdent(e.target.value); save(); rerender(); }
+  });
+  colNameInput.addEventListener("keydown", ev => {
+    if (ev.key === "Enter" && !ev.shiftKey){
+      ev.preventDefault();
+      ev.target.blur();   // dispara onchange para grabar el nombre
+      const idx = ent.columns.findIndex(x => x.id === c.id);
+      ent.columns.splice(idx + 1, 0, col("col" + (ent.columns.length + 1), "TEXT"));
+      save(); rerender();
+      // Focus el input del nombre de la nueva columna
+      setTimeout(() => {
+        const tbody = document.querySelector(`.entity[data-id="${ent.id}"] tbody`);
+        const trs = tbody ? tbody.querySelectorAll("tr") : [];
+        const newTr = trs[idx + 1];
+        const inp = newTr ? newTr.querySelector("input[data-col-name-input]") : null;
+        if (inp){ inp.focus(); inp.select(); }
+      }, 0);
+    } else if (ev.key === "Enter" && ev.shiftKey){
+      ev.preventDefault();
+      ev.target.blur();
+      const idx = ent.columns.findIndex(x => x.id === c.id);
+      ent.columns.splice(idx, 0, col("col" + (ent.columns.length + 1), "TEXT"));
+      save(); rerender();
+      setTimeout(() => {
+        const tbody = document.querySelector(`.entity[data-id="${ent.id}"] tbody`);
+        const trs = tbody ? tbody.querySelectorAll("tr") : [];
+        const newTr = trs[idx];
+        const inp = newTr ? newTr.querySelector("input[data-col-name-input]") : null;
+        if (inp){ inp.focus(); inp.select(); }
+      }, 0);
+    } else if (ev.key === "Tab"){
+      ev.preventDefault();
+      ev.target.blur();
+      const sel = ev.target.closest("tr").querySelector("select");
+      if (sel) sel.focus();
+    }
+  });
+
+  return el("tr", {
+    "data-col-id": c.id, "data-ent-id": ent.id,
+    onclick: () => selectColumn(ent.id, c.id)
+  },
+    el("td", {}, colNameInput),
     el("td", {}, (() => {
       const sel = el("select", { onchange: e => {
         c.type = e.target.value;
@@ -3149,6 +3220,68 @@ pushHistory();
 updateUndoRedoUi();
 
 /* ---------- bulk toolbar (Push 28) ---------- */
+/* ---------- drag-to-create FK (Push 29) ---------- */
+document.addEventListener("mousemove", e => {
+  if (!fkDragState) return;
+  const wrap = $("#canvas-wrap");
+  const r = wrap.getBoundingClientRect();
+  const ex = e.clientX - r.left, ey = e.clientY - r.top;
+  if (!fkDragState.didMove && (Math.abs(ex - fkDragState.sx) + Math.abs(ey - fkDragState.sy) > 5)){
+    fkDragState.didMove = true;
+    wrap.classList.add("fk-dragging");
+    // SVG overlay para la línea ghost
+    let svg = $("#fk-drag-line");
+    if (!svg){
+      svg = document.createElementNS("http://www.w3.org/2000/svg","svg");
+      svg.id = "fk-drag-line";
+      svg.innerHTML = `<defs><marker id="fk-drag-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+        markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker></defs><line/>`;
+      wrap.append(svg);
+    }
+  }
+  if (fkDragState.didMove){
+    const line = $("#fk-drag-line line");
+    if (line){
+      line.setAttribute("x1", fkDragState.sx);
+      line.setAttribute("y1", fkDragState.sy);
+      line.setAttribute("x2", ex);
+      line.setAttribute("y2", ey);
+    }
+  }
+});
+
+document.addEventListener("mouseup", e => {
+  if (!fkDragState) return;
+  const wasDrag = fkDragState.didMove;
+  const src = fkDragState;
+  fkDragState = null;
+  const svg = $("#fk-drag-line");
+  if (svg) svg.remove();
+  $("#canvas-wrap").classList.remove("fk-dragging");
+  if (!wasDrag) return;   // click puro → onclick original abre el modal
+
+  // Hit-test: ¿el cursor está sobre una <tr data-col-id> de OTRA entity con PK?
+  const targetEl = document.elementFromPoint(e.clientX, e.clientY);
+  const tr = targetEl && targetEl.closest("tr[data-col-id]");
+  if (!tr){ toast("Soltá sobre una columna PK"); return; }
+  const tEntId = tr.dataset.entId;
+  const tColId = tr.dataset.colId;
+  if (tEntId === src.sourceEntId){ toast("Self-FK no se permite por drag (usá el modal)"); return; }
+  const tEnt = state.entities.find(x => x.id === tEntId);
+  const tCol = tEnt && tEnt.columns.find(c => c.id === tColId);
+  if (!tCol){ return; }
+  if (!tCol.pk){ toast(`'${tCol.name}' no es PK — arrastrá sobre una PK`); return; }
+  const sEnt = state.entities.find(x => x.id === src.sourceEntId);
+  const sCol = sEnt && sEnt.columns.find(c => c.id === src.sourceColId);
+  if (!sCol){ return; }
+  sCol.fk = { table: tEnt.name, column: tCol.name, onDelete: "RESTRICT" };
+  // Auto-coerce tipo al de la PK target (consistente con el modal)
+  if (sCol.type !== tCol.type) sCol.type = tCol.type;
+  save(); rerender();
+  toast(`FK creada: ${sEnt.name}.${sCol.name} → ${tEnt.name}.${tCol.name}`);
+});
+
 $$(".bulk-btn[data-bulk]").forEach(b => {
   b.onclick = () => alignSelected(b.dataset.bulk);
 });
