@@ -30,9 +30,8 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo registry + target
-        # zizmor: ignore[cache-poisoning]
-        # Workflow disparado solo por tag push o workflow_dispatch — no corre en
-        # PRs, así que un contribuidor externo no puede envenenar la caché.
+        # Exención de cache-poisoning declarada en .github/zizmor.yml — el
+        # workflow no corre por PRs, no hay vector externo de envenenamiento.
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: |

@@ -1,0 +1,11 @@
+# Config de zizmor — auto-descubierta al correr `zizmor .github/workflows/`.
+# Ver https://docs.zizmor.sh/configuration/
+
+rules:
+  cache-poisoning:
+    ignore:
+      # desktop-release.yml — el workflow SOLO corre por tag push o
+      # workflow_dispatch. No hay ejecución en PRs, así que un contribuidor
+      # externo no tiene un vector para envenenar la caché de cargo/tauri.
+      # Skippear la caché en tag pushes agrega ~10 min a cada release.
+      - desktop-release.yml
