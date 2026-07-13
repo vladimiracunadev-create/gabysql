@@ -7601,13 +7601,9 @@ impl<'a> Engine<'a> {
                     if let Some(handler) = matched {
                         let mut handler_msg = format!("OK · EXCEPTION caught: {}", e);
                         for h in handler.clone() {
-                            match self.exec(h) {
-                                Ok(rs) => {
-                                    if let Some(m) = rs.message {
-                                        handler_msg = m;
-                                    }
-                                }
-                                Err(he) => return Err(he),
+                            let rs = self.exec(h)?;
+                            if let Some(m) = rs.message {
+                                handler_msg = m;
                             }
                         }
                         return Ok(ResultSet {
