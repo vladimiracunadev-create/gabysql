@@ -4,6 +4,7 @@ use crate::catalog::{
     POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
     PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
+use crate::dblog::DbLogger;
 use crate::errors::{coded, codes};
 use crate::sql::{decimal_to_string, decode_row, parse, Engine, ResultSet, Statement, Value};
 use crate::storage::Pager;
@@ -51,6 +52,11 @@ pub struct ServerConfig {
     /// Emit one JSON line per request to stdout. Opt-in so the default
     /// stdout stays clean for humans / `tail -f` runbooks.
     pub log_json: bool,
+    /// Bloque L (2026-08-13): sink del log de sentencias del motor
+    /// (ADR-0094). Ortogonal a `log_json`: aquél describe el request
+    /// HTTP, éste describe el SQL que se ejecutó y con qué código de
+    /// error falló. `None` = sin log.
+    pub logger: Option<Arc<DbLogger>>,
 }
 
 impl ServerConfig {
@@ -61,6 +67,7 @@ impl ServerConfig {
             token,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             log_json: false,
+            logger: None,
         }
     }
 }
@@ -855,6 +862,28 @@ fn rows(request: Request, config: &ServerConfig) -> DbResult<Response> {
     ))
 }
 
+/// Bloque L (2026-08-13): anota en el log del motor un SQL que ni
+/// siquiera parseó.
+///
+/// `Engine::exec` recibe `Statement` ya construidos, así que los errores
+/// del parser (`[GBY-4xxx]`) no pasan por el hook del motor. Se registran
+/// desde el frontend con `kind = "PARSE"` para que sean distinguibles de
+/// una sentencia que sí se ejecutó y falló.
+fn log_parse_error(config: &ServerConfig, sql: &str, error: &str) {
+    if let Some(logger) = config.logger.as_ref() {
+        logger.log(&crate::dblog::LogRecord {
+            kind: "PARSE",
+            mutating: false,
+            sql: Some(sql),
+            stmt_index: 0,
+            ok: false,
+            error: Some(error),
+            rows: 0,
+            duration_us: 0,
+        });
+    }
+}
+
 fn exec_sql(
     request: Request,
     config: &ServerConfig,
@@ -891,6 +920,11 @@ fn exec_sql(
     let statements = match parse(&sql) {
         Ok(v) => v,
         Err(err) => {
+            // Bloque L: el fallo de parseo nunca llega a `Engine::exec`,
+            // así que el hook del motor no lo ve. Se loguea acá o se
+            // pierde — y "el SQL que mandé no compiló" es justamente lo
+            // que un operador va a buscar en el log.
+            log_parse_error(config, &sql, &err.to_string());
             return Ok(Response::json(
                 400,
                 format!(
@@ -929,6 +963,10 @@ fn exec_sql(
         };
         let response = (|| -> DbResult<Response> {
             let mut engine = Engine::new(pager);
+            if let Some(logger) = config.logger.as_ref() {
+                engine.attach_logger(Arc::clone(logger));
+                engine.set_log_source(&sql);
+            }
             let mut results = Vec::new();
             for statement in statements {
                 results.push(engine.exec(statement)?);
@@ -974,6 +1012,10 @@ fn exec_sql(
 
     let response = (|| -> DbResult<Response> {
         let mut engine = Engine::new(&mut pager);
+        if let Some(logger) = config.logger.as_ref() {
+            engine.attach_logger(Arc::clone(logger));
+            engine.set_log_source(&sql);
+        }
         let mut results = Vec::new();
         for statement in statements {
             results.push(engine.exec(statement)?);
@@ -1580,22 +1622,11 @@ fn string_array_json(values: &[String]) -> String {
     format!("[{}]", encoded)
 }
 
+/// Bloque L (2026-08-13): la implementación canónica vive en
+/// [`crate::dblog::json_escape`] — el server delega para no mantener dos
+/// copias del mismo escape.
 fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    crate::dblog::json_escape(value)
 }
 
 fn normalize_bind_addr(addr: &str) -> String {

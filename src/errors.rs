@@ -56,6 +56,7 @@ use crate::DbError;
 /// | `3000`–`3999`  | Constraints (PK, NOT NULL, UNIQUE, FK)       |
 /// | `4000`–`4999`  | SQL surface (parser, planner, limitations)   |
 /// | `5000`–`5999`  | Server / HTTP / auth                         |
+/// | `6000`–`6999`  | Observabilidad / log de sentencias            |
 pub mod codes {
     // ---------- Storage (1000s) ----------
     /// `Pager::create` rehúsa sobrescribir una DB existente.
@@ -730,6 +731,17 @@ pub mod codes {
     /// permitido (`MAX_REQUEST_BODY_BYTES`). Defensa contra DoS por
     /// memory exhaustion (CWE-400).
     pub const REQUEST_BODY_TOO_LARGE: u32 = 5007;
+
+    // ---------- Observabilidad / log de sentencias (6000s) ----------
+    /// Bloque L (2026-08-13): `DbLogger::open` no pudo crear/abrir el
+    /// archivo de log (ruta inexistente, permisos, disco lleno). Es el
+    /// único error del subsistema de log que **aborta** el arranque —
+    /// una vez abierto, los fallos de append son best-effort a stderr
+    /// (ver ADR-0094).
+    pub const LOG_OPEN_FAILED: u32 = 6001;
+    /// Bloque L: nivel de log desconocido. Válidos: `none`, `error`,
+    /// `mod`, `all`.
+    pub const LOG_INVALID_LEVEL: u32 = 6002;
 }
 
 /// Build a `DbError` with the `[GBY-NNNN]` prefix. See module docs for

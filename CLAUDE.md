@@ -13,7 +13,8 @@ Estado: VERSION on-disk 33, fase 2 cerrada (SQL relacional completo +
 constraints + vistas + CTEs + window functions + triggers + procs +
 funcs + tipos extendidos + USERS/ROLES/GRANT/REVOKE + RLS), fase 3
 cerrada (planner cost-based P1-P5e + hardening + sesión maratón
-M3/M4/M6/M12/M13). 838 tests verdes en CI Ubuntu/macOS/Windows +
+M3/M4/M6/M12/M13) + bloque L (log de sentencias del motor, ADR-0094).
+850 tests en `tests/` verdes en CI Ubuntu/macOS/Windows +
 Docker + bench job. Ver [docs/STATUS.md](docs/STATUS.md) para el
 detalle.
 
@@ -88,6 +89,8 @@ src/
   catalog.rs      Catálogo persistido — tablas, índices, views,
                   policies, triggers, procs, funcs, users, roles, grants
   server.rs       HTTP server + sessions M13 + 17 endpoints
+  dblog.rs        Log de sentencias/errores del motor — JSONL append-only
+                  con rotación por tamaño. Enganchado en Engine::exec
   errors.rs       ~210 mensajes en español [GBY-NNNN]
   bin/
     gabybench.rs       Bench de carga
@@ -98,6 +101,7 @@ tests/
   integration_test.rs              818 tests integración
   m13_server.rs                    4 E2E tx cross-request
   server_listing_endpoints.rs      10 E2E catalog endpoints (Push 15)
+  dblog_engine.rs                  9 E2E del log del motor (bloque L)
   proptest_planner.rs              3 property tests (M3)
   proptest_pager.rs                3 property tests
   fuzz_parser.rs                   M4, 503.8M iters/h limpia
@@ -122,7 +126,9 @@ docs/
 | Cambiar shape de página | `src/storage.rs` + bumpear VERSION en magic header |
 | Nuevo endpoint HTTP | `src/server.rs` (match en handle_request + handler fn + JSON serializer) |
 | Nuevo tipo de objeto persistible | `src/catalog.rs` (struct + serialize/deserialize + put_X/get_X/list_X) |
-| Nuevo error code | `src/errors.rs` (constante en el rango del bloque correspondiente) |
+| Nuevo error code | `src/errors.rs` (constante en el rango del bloque correspondiente) + fila en `docs/ERROR_CODES.md` |
+| Nuevo campo en el log de sentencias | `src/dblog.rs` (`LogRecord` + `render_entry`) — bumpear `LOG_SCHEMA_VERSION` si cambia el shape |
+| Clasificar un `Statement` nuevo para el log | `src/sql.rs` (`statement_kind` — el `match` es exhaustivo, el compilador te avisa) |
 | Tab nuevo en phpgabyadmin | `web/phpgabyadmin/index.php` ($tabLinks array + elseif tab block) |
 | Feature nueva en modeler | `web/modeler/index.html` (state schema + modal + browser tree + generateSQL + checkModel + status counts) |
 | Release desktop .msi | `git tag desktop-v0.1.X && git push --tags` → workflow `desktop-release.yml` |

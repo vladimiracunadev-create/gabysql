@@ -7,6 +7,7 @@ use crate::catalog::{
     POLICY_ACTION_DELETE, POLICY_ACTION_INSERT, POLICY_ACTION_SELECT, POLICY_ACTION_UPDATE,
     PRIV_ALL, PRIV_DELETE, PRIV_INSERT, PRIV_REFERENCES, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
+use crate::dblog::{DbLogger, LogRecord};
 use crate::errors::{coded, codes};
 use crate::index::{
     bucket_insert, bucket_lookup, bucket_remove, bucket_unique_conflict, decode_bucket,
@@ -17,6 +18,8 @@ use crate::index::{
 use crate::storage::Pager;
 use crate::{DbError, DbResult};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -2227,6 +2230,105 @@ pub struct ResultSet {
     pub message: Option<String>,
 }
 
+/// Bloque L (2026-08-13): forma de la sentencia para el log del motor —
+/// `(etiqueta, cambia_estado)`.
+///
+/// `cambia_estado` decide el corte del nivel `mod` y abarca tres cosas,
+/// no sólo la escritura de datos:
+///
+/// 1. **Estado durable**: DDL, DML, `ANALYZE` (persiste stats desde P3b).
+/// 2. **Estado transaccional**: `BEGIN`/`COMMIT`/`ROLLBACK`/savepoints.
+///    Sin ellos el log no permite reconstruir *qué quedó aplicado*, que
+///    es justamente lo que se le pide a un log de auditoría. PostgreSQL
+///    los excluye de `log_statement=mod`; acá se incluyen a propósito.
+/// 3. **Contexto de seguridad**: `SET SESSION AUTHORIZATION` no toca un
+///    byte del disco pero cambia bajo qué identidad se evalúan los
+///    privilegios de todo lo que sigue.
+///
+/// Las sentencias de control de flujo (`CALL`, `BEGIN…END`, `IF`,
+/// loops, `CASE`) se marcan como cambio de estado de forma
+/// **conservadora**: su body puede contener DML y desde afuera no se
+/// sabe. Un falso positivo cuesta una línea de log de más; un falso
+/// negativo pierde una escritura del log de auditoría.
+fn statement_kind(statement: &Statement) -> (&'static str, bool) {
+    match statement {
+        Statement::CreateTable(_) => ("CREATE TABLE", true),
+        Statement::DropTable(_) => ("DROP TABLE", true),
+        Statement::AlterTableAddColumn(_) => ("ALTER TABLE ADD COLUMN", true),
+        Statement::AlterTableAddCheck(_) => ("ALTER TABLE ADD CHECK", true),
+        Statement::AlterTableDropConstraint(_) => ("ALTER TABLE DROP CONSTRAINT", true),
+        Statement::AlterTableDropColumn(_) => ("ALTER TABLE DROP COLUMN", true),
+        Statement::AlterTableRenameColumn(_) => ("ALTER TABLE RENAME COLUMN", true),
+        Statement::RenameTable(_) => ("ALTER TABLE RENAME", true),
+        Statement::CreateTableAs(_) => ("CREATE TABLE AS", true),
+        Statement::CreateView(_) => ("CREATE VIEW", true),
+        Statement::DropView(_) => ("DROP VIEW", true),
+        Statement::CreateTrigger(_) => ("CREATE TRIGGER", true),
+        Statement::DropTrigger(_) => ("DROP TRIGGER", true),
+        Statement::CreateProcedure(_) => ("CREATE PROCEDURE", true),
+        Statement::DropProcedure(_) => ("DROP PROCEDURE", true),
+        Statement::CreateFunction(_) => ("CREATE FUNCTION", true),
+        Statement::DropFunction(_) => ("DROP FUNCTION", true),
+        Statement::CreateIndex(_) => ("CREATE INDEX", true),
+        Statement::DropIndex(_) => ("DROP INDEX", true),
+        Statement::CreateDatabase(_) => ("CREATE DATABASE", true),
+        Statement::DropDatabase(_) => ("DROP DATABASE", true),
+        Statement::Insert(_) => ("INSERT", true),
+        Statement::Replace(_) => ("REPLACE", true),
+        Statement::Update(_) => ("UPDATE", true),
+        Statement::Delete(_) => ("DELETE", true),
+        Statement::Truncate(_) => ("TRUNCATE", true),
+        // Persiste un record TableStats en el catálogo (P3b).
+        Statement::AnalyzeTable { .. } => ("ANALYZE", true),
+        // Seguridad: cambia el catálogo de identidades y privilegios.
+        Statement::CreateUser(_) => ("CREATE USER", true),
+        Statement::DropUser(_) => ("DROP USER", true),
+        Statement::AlterUserPassword(_) => ("ALTER USER PASSWORD", true),
+        Statement::CreateRole(_) => ("CREATE ROLE", true),
+        Statement::DropRole(_) => ("DROP ROLE", true),
+        Statement::Grant(_) => ("GRANT", true),
+        Statement::Revoke(_) => ("REVOKE", true),
+        Statement::CreatePolicy(_) => ("CREATE POLICY", true),
+        Statement::DropPolicy(_) => ("DROP POLICY", true),
+        Statement::SetSessionAuth(_) => ("SET SESSION AUTHORIZATION", true),
+        // Control transaccional.
+        Statement::Begin => ("BEGIN", true),
+        Statement::Commit => ("COMMIT", true),
+        Statement::Rollback => ("ROLLBACK", true),
+        Statement::Savepoint(_) => ("SAVEPOINT", true),
+        Statement::RollbackToSavepoint(_) => ("ROLLBACK TO SAVEPOINT", true),
+        Statement::ReleaseSavepoint(_) => ("RELEASE SAVEPOINT", true),
+        // Control de flujo: conservador, el body puede escribir.
+        Statement::Call(_) => ("CALL", true),
+        Statement::Block(_) => ("BLOCK", true),
+        Statement::If(_) => ("IF", true),
+        Statement::While(_) => ("WHILE", true),
+        Statement::Loop(_) => ("LOOP", true),
+        Statement::For(_) => ("FOR", true),
+        Statement::ForSelect(_) => ("FOR SELECT", true),
+        Statement::Case(_) => ("CASE", true),
+        // `EXPLAIN ANALYZE` **ejecuta** el statement interno, así que
+        // hereda su condición; el `EXPLAIN` pelado sólo planifica.
+        Statement::Explain { analyze, inner } => {
+            if *analyze {
+                ("EXPLAIN ANALYZE", statement_kind(inner).1)
+            } else {
+                ("EXPLAIN", false)
+            }
+        }
+        // Sólo leen, o tocan variables de sesión sin efecto durable.
+        Statement::Select(_) => ("SELECT", false),
+        Statement::SelectRecursive(_) => ("SELECT RECURSIVE", false),
+        Statement::ShowDatabases => ("SHOW DATABASES", false),
+        Statement::IntegrityCheck => ("INTEGRITY CHECK", false),
+        Statement::Declare(_) => ("DECLARE", false),
+        Statement::Set(_) => ("SET", false),
+        Statement::Exit(_) => ("EXIT", false),
+        Statement::Return(_) => ("RETURN", false),
+        Statement::Raise(_) => ("RAISE", false),
+    }
+}
+
 pub struct Engine<'a> {
     pager: &'a mut Pager,
     /// Stack de outer-rows activas para resolver `EqColumnRef` dentro de
@@ -2281,6 +2383,24 @@ pub struct Engine<'a> {
     /// la DB `Engine::open` hidrata este HashMap desde el catálogo. DROP
     /// TABLE limpia tanto este HashMap como el record persistido.
     table_stats: HashMap<String, TableStats>,
+    /// Bloque L (2026-08-13): sink del log de sentencias/errores del
+    /// motor. `None` = sin log (default; overhead cero, ni un syscall).
+    /// Se adjunta con [`Engine::attach_logger`]. Ver ADR-0094.
+    logger: Option<Arc<DbLogger>>,
+    /// Bloque L: profundidad de anidamiento de `exec`. `Engine::exec` se
+    /// llama recursivamente a sí mismo desde bodies de trigger,
+    /// procedure, function, loops y handlers de excepción. Sólo se
+    /// loguea el nivel 0 — de lo contrario un `CALL` con un loop de
+    /// 1000 iteraciones escribiría 1000 líneas por una sentencia del
+    /// usuario.
+    exec_depth: usize,
+    /// Bloque L: texto SQL del batch en curso, seteado por el caller con
+    /// [`Engine::set_log_source`]. `Engine::exec` recibe un `Statement`
+    /// ya parseado, así que el texto original sólo puede venir de arriba.
+    log_source: Option<String>,
+    /// Bloque L: índice de la sentencia dentro del batch de
+    /// `log_source`. Se resetea en cada `set_log_source`.
+    log_stmt_index: usize,
 }
 
 /// Bloque P3 (2026-05-29): stats básicas por tabla, cacheadas en memoria.
@@ -3172,10 +3292,81 @@ impl<'a> Engine<'a> {
             pending_return_value: None,
             current_user: None,
             table_stats,
+            logger: None,
+            exec_depth: 0,
+            log_source: None,
+            log_stmt_index: 0,
         }
     }
 
+    /// Bloque L (2026-08-13): adjunta el sink del log de sentencias.
+    /// Sin esto el motor no escribe nada — el default es silencioso.
+    pub fn attach_logger(&mut self, logger: Arc<DbLogger>) {
+        self.logger = Some(logger);
+    }
+
+    /// Bloque L: declara el texto SQL del batch que se va a ejecutar y
+    /// resetea el contador de sentencias.
+    ///
+    /// `parse()` puede devolver varios `Statement` para un solo texto, y
+    /// para cuando llegan a `exec` ya perdieron su origen textual. El
+    /// caller que tiene el texto (CLI, server, gateway) lo declara acá y
+    /// cada entrada del log queda con el batch completo más su
+    /// `stmt_index` dentro de él.
+    pub fn set_log_source(&mut self, sql: &str) {
+        if self.logger.is_some() {
+            self.log_source = Some(sql.to_string());
+            self.log_stmt_index = 0;
+        }
+    }
+
+    /// Ejecuta una sentencia.
+    ///
+    /// Bloque L: éste es el único punto por el que pasa toda acción
+    /// sobre la base, venga del CLI, del server HTTP, del gateway MCP o
+    /// de un embebido — por eso el log se engancha acá y no en cada
+    /// frontend. Las llamadas anidadas (bodies de trigger/procedure/
+    /// loop) delegan directo en el dispatch sin loguear.
     pub fn exec(&mut self, statement: Statement) -> DbResult<ResultSet> {
+        // Camino sin log y camino anidado: dispatch pelado. La rama
+        // barata es la default, así que un motor sin logger no paga ni
+        // el `Instant::now()`.
+        if self.logger.is_none() || self.exec_depth > 0 {
+            self.exec_depth += 1;
+            let result = self.exec_dispatch(statement);
+            self.exec_depth -= 1;
+            return result;
+        }
+
+        let (kind, mutating) = statement_kind(&statement);
+        let started = Instant::now();
+        self.exec_depth += 1;
+        let result = self.exec_dispatch(statement);
+        self.exec_depth -= 1;
+
+        let ok = result.is_ok();
+        // `admits` primero: evita construir el record para lo que el
+        // nivel va a descartar igual.
+        if let Some(logger) = self.logger.as_ref() {
+            if logger.admits(mutating, ok) {
+                let error_msg = result.as_ref().err().map(|e| e.to_string());
+                logger.log(&LogRecord {
+                    kind,
+                    mutating,
+                    sql: self.log_source.as_deref(),
+                    stmt_index: self.log_stmt_index,
+                    ok,
+                    error: error_msg.as_deref(),
+                    rows: result.as_ref().map(|rs| rs.rows.len()).unwrap_or(0),
+                    duration_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                });
+            }
+        }
+        self.log_stmt_index += 1;
+        result
+    }
+
+    fn exec_dispatch(&mut self, statement: Statement) -> DbResult<ResultSet> {
         match statement {
             Statement::CreateTable(stmt) => self.exec_create(stmt),
             Statement::DropTable(stmt) => self.exec_drop_table(stmt),

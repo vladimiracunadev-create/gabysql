@@ -36,6 +36,7 @@ Todo mensaje de gabysql con código tiene esta forma:
 | **3000–3999** | Constraints (PK, NOT NULL, UNIQUE, FK) |
 | **4000–4999** | Superficie SQL (parser, planner, limitaciones) |
 | **5000–5999** | Server / HTTP / auth |
+| **6000–6999** | Observabilidad / log de sentencias |
 
 Los rangos están reservados (no se asignan códigos cross-range) para que un código sea suficiente para inferir el subsistema sin abrir docs.
 
@@ -233,6 +234,21 @@ Los rangos están reservados (no se asignan códigos cross-range) para que un c�
 | `5004` | `UNAUTHORIZED` | Falta header `Authorization: Bearer <token>` o el token es incorrecto. | Pasar el token con el que arrancó el server. |
 | `5005` | `SERVER_BUSY` | El cap de conexiones simultáneas está al máximo (default 64). | Esperar y reintentar, o subir `-max-connections N`. |
 | `5006` | `SERVER_NOT_MULTI_DB` | Endpoint multi-DB (`?db=...`) sobre un server arrancado con `-db` (modo single-DB). | Arrancar el server con `-dir <carpeta>` para habilitar multi-DB. |
+| `5007` | `REQUEST_BODY_TOO_LARGE` | `Content-Length` del request supera `MAX_REQUEST_BODY_BYTES` (100 MiB). Defensa contra DoS por memory exhaustion (CWE-400, bloque Sec1). | Partir el script SQL o el payload en requests más chicos. |
+
+---
+
+## 6000–6999 · Observabilidad / log de sentencias
+
+Códigos del log de sentencias del motor ([ADR-0094](adr/0094-engine-statement-log.md)).
+Sólo se emiten al **configurar** el log; una vez abierto, los fallos de escritura
+son best-effort y van a `stderr` sin código (por diseño: un disco lleno no debe
+tumbar escrituras que el motor ya aplicó).
+
+| Código | Símbolo | Causa | Remedio |
+| :---: | :--- | :--- | :--- |
+| `6001` | `LOG_OPEN_FAILED` | No se pudo crear/abrir el archivo indicado en `-log-file` / `GABYSQL_LOG_FILE` (ruta inválida, permisos, disco lleno). | Verificar que el directorio exista y sea escribible por el usuario del proceso. El motor crea directorios padre faltantes, pero no puede sortear permisos. |
+| `6002` | `LOG_INVALID_LEVEL` | Valor desconocido en `-log-level` / `GABYSQL_LOG_LEVEL`. | Valores válidos: `none`, `error` (default), `mod`, `all`. |
 
 ---
 

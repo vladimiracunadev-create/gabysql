@@ -195,7 +195,34 @@ Hoy el server:
 - expone `/health` como endpoint de salud
 - expone `GET /metrics` (JSON) con `requests_total`, `requests_by_status`, `errors_total`, `latency_ms` (p50/p95/samples/count) y `uptime_s`. Ideal para scraping periódico o dashboard mínimo. Ver [ADR-0014](docs/adr/0014-logs-json-metrics.md) y [docs/API.md §GET /metrics](docs/API.md#get-metrics).
 - soporta `-log-json`: con el flag, cada request termina emitiendo una línea JSON a stdout: `{ts_unix, method, path, status, latency_ms}`. Sin el flag, no hay log por request — solo el banner de arranque a stderr.
+- soporta `-log-file <ruta>` + `-log-level <none|error|mod|all>`: log de sentencias del **motor** en JSONL, con el SQL completo y el código `[GBY-NNNN]`. Ver abajo.
 - no tiene todavía métricas Prometheus textfile, tracing distribuido ni dashboard integrado
+
+### Log de sentencias del motor
+
+`-log-json` responde *"qué requests entraron"*; el log del motor responde *"qué SQL se ejecutó y qué falló"*. Son ortogonales y conviene tener los dos activos en producción.
+
+```bash
+gabysql-server -db demo.db -log-file /var/log/gabysql/statements.log -log-level mod
+```
+
+Equivalentes por entorno (útiles para el CLI y para el sidecar del `.msi`, que no aceptan flags): `GABYSQL_LOG_FILE`, `GABYSQL_LOG_LEVEL`, `GABYSQL_LOG_MAX_BYTES` (default 8 MiB), `GABYSQL_LOG_MAX_FILES` (default 3).
+
+Triage típico — los errores de las últimas líneas, agrupados por código:
+
+```bash
+tail -n 1000 /var/log/gabysql/statements.log | jq -r 'select(.ok == false) | "\(.code // "sin-código")\t\(.kind)"' | sort | uniq -c | sort -rn
+```
+
+Puntos operativos:
+
+- **Rotación incorporada.** No hace falta `logrotate`: rota sola a `max_bytes` y conserva `max_files` archivos. Si ya tenés `logrotate` apuntado ahí, desactivá una de las dos (`GABYSQL_LOG_MAX_BYTES=0` apaga la interna) — las dos rotando el mismo archivo compiten.
+- **Un archivo por proceso.** El append de una línea es atómico, pero dos servers rotando el mismo archivo pisan la rotación del otro. Instancias concurrentes → rutas distintas.
+- **Fallos de escritura no tumban la base.** Si el disco se llena, el error va a stderr y la sentencia sigue su curso. Se pierden líneas de log, no escrituras. Alertá sobre `gabysql: append al log ... falló` en stderr.
+- **Sólo `-log-file` inválido aborta el arranque** (`[GBY-6001]`): ruta no escribible o permisos. Es config rota y conviene enterarse al arrancar, no seis horas después.
+- **Contiene datos.** El SQL se registra completo, con los valores de cada `INSERT`/`UPDATE`. El archivo hereda la sensibilidad de la base — mismos permisos, misma política de retención.
+
+Ver [ADR-0094](docs/adr/0094-engine-statement-log.md).
 
 ### Smoke check de métricas
 ```powershell

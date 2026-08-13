@@ -1,3 +1,4 @@
+use gabysql::dblog::{self, DbLogger, LogRecord};
 use gabysql::sql::{decimal_to_string, parse, Engine, ResultSet, Statement, Value};
 use gabysql::storage::Pager;
 use gabysql::{DbError, DbResult};
@@ -5,6 +6,29 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+/// Bloque L (2026-08-13): log de sentencias del motor, resuelto una sola
+/// vez por proceso desde `GABYSQL_LOG_FILE` / `GABYSQL_LOG_LEVEL`.
+///
+/// El CLI usa argumentos posicionales (`gabysql exec <db> <sql...>`), así
+/// que meter flags acá obligaría a distinguirlas del SQL. Por env queda
+/// limpio y además es la vía natural para el `.msi` de escritorio y para
+/// los wrappers que lanzan el binario. Ver ADR-0094.
+fn logger() -> Option<&'static Arc<DbLogger>> {
+    static LOGGER: OnceLock<Option<Arc<DbLogger>>> = OnceLock::new();
+    LOGGER
+        .get_or_init(|| match dblog::from_env_or_flags(None, None) {
+            Ok(l) => l.map(Arc::new),
+            // Config de log rota no debe impedir usar la base: se avisa
+            // y se sigue sin log.
+            Err(e) => {
+                eprintln!("gabysql: log deshabilitado: {e}");
+                None
+            }
+        })
+        .as_ref()
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -127,7 +151,26 @@ fn run_backup_cmd(rest: &[String], is_restore: bool) -> DbResult<()> {
 }
 
 fn run_exec(db_path: PathBuf, query: &str) -> DbResult<()> {
-    let statements = parse(query)?;
+    let statements = match parse(query) {
+        Ok(v) => v,
+        Err(err) => {
+            // Bloque L: los errores del parser no pasan por
+            // `Engine::exec`; se registran acá o se pierden.
+            if let Some(l) = logger() {
+                l.log(&LogRecord {
+                    kind: "PARSE",
+                    mutating: false,
+                    sql: Some(query),
+                    stmt_index: 0,
+                    ok: false,
+                    error: Some(&err.to_string()),
+                    rows: 0,
+                    duration_us: 0,
+                });
+            }
+            return Err(err);
+        }
+    };
 
     // CLI mode treats the directory containing db_path as the "multi-DB
     // directory" so CREATE/DROP/SHOW DATABASE work the same way they do
@@ -146,6 +189,10 @@ fn run_exec(db_path: PathBuf, query: &str) -> DbResult<()> {
     pager.begin()?;
     let response = (|| -> DbResult<Vec<ResultSet>> {
         let mut engine = Engine::new(&mut pager);
+        if let Some(l) = logger() {
+            engine.attach_logger(Arc::clone(l));
+            engine.set_log_source(query);
+        }
         let mut results = Vec::new();
         for statement in statements {
             results.push(engine.exec(statement)?);

@@ -240,6 +240,51 @@ cargo run --release --bin gabysql-server -- -db demo.db -log-json
 ```
 Con `-log-json`, cada request finalizado emite una sola línea JSON a stdout: `{ts_unix, method, path, status, latency_ms}`. Pensado para ingestión por Loki, Vector, journald, etc. Sin el flag, el binario solo escribe el banner de arranque a stderr (default silencioso por request). Ver [ADR-0014](docs/adr/0014-logs-json-metrics.md).
 
+Ojo con el alcance: `-log-json` describe el **transporte HTTP**. Un `POST /exec` que falla aparece como `{"status":400}`, sin decir qué SQL se mandó ni qué código de error dio. Para eso está el log de sentencias del motor, abajo.
+
+### Log de sentencias del motor (`-log-file`)
+
+El equivalente a `log_statement` / `log_min_error_statement` de PostgreSQL: registra **qué SQL se ejecutó y qué falló**, no el request que lo transportó. Vive en el motor, así que captura lo mismo venga del server HTTP, del CLI, del REPL, del gateway MCP o de un uso embebido.
+
+```powershell
+cargo run --release --bin gabysql-server -- -db demo.db -log-file gabysql.log -log-level mod
+```
+
+En el CLI se configura por variables de entorno (los argumentos son posicionales):
+
+```powershell
+$env:GABYSQL_LOG_FILE = "gabysql.log"
+$env:GABYSQL_LOG_LEVEL = "mod"
+gabysql exec demo.db "INSERT INTO users (id,name) VALUES (1,'Ana');"
+```
+
+**Niveles** (`-log-level` / `GABYSQL_LOG_LEVEL`):
+
+| Nivel | Qué registra |
+| :--- | :--- |
+| `none` | nada |
+| `error` (**default**) | sólo sentencias que fallaron |
+| `mod` | errores + todo lo que cambia estado: DDL, DML, `ANALYZE`, `BEGIN`/`COMMIT`/`ROLLBACK`, GRANT/REVOKE, `SET SESSION AUTHORIZATION` |
+| `all` | todo, incluidos los `SELECT` |
+
+Cada línea es un JSON independiente (formato JSONL):
+
+```json
+{"v":1,"ts_unix":1786655967,"kind":"INSERT","mutating":true,"stmt_index":0,"ok":false,"rows":0,"duration_us":136,"sql":"INSERT INTO users (id,name) VALUES (1,'Duplicada');","code":3001,"error":"[GBY-3001] PRIMARY KEY duplicada: la clave 1 ya existe en la tabla"}
+```
+
+Filtrable directo con `jq` — todos los fallos de constraint de PK:
+
+```bash
+jq 'select(.code == 3001)' gabysql.log
+```
+
+**Rotación**: por defecto rota a los 8 MiB y conserva 3 archivos (`gabysql.log.1`, `.2`, `.3`), o sea ~32 MiB de techo. Ajustable con `GABYSQL_LOG_MAX_BYTES` y `GABYSQL_LOG_MAX_FILES`; `GABYSQL_LOG_MAX_BYTES=0` desactiva la rotación.
+
+> ⚠️ **El SQL se registra completo, valores incluidos.** Los datos de un `INSERT`/`UPDATE` quedan en texto plano en el archivo. Tratalo con los mismos permisos que la base: hereda su sensibilidad.
+
+Ver [ADR-0094](docs/adr/0094-engine-statement-log.md).
+
 ### Endpoint `/metrics`
 ```powershell
 Invoke-WebRequest -UseBasicParsing http://localhost:8080/metrics

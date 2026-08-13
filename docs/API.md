@@ -102,7 +102,8 @@ Ejemplo de respuesta:
 Notas:
 - `errors_total` cuenta status `>= 500` (errores del server, no del cliente).
 - `latency_ms.samples` es el tamaño del ring buffer en memoria (cap fijo `LATENCY_SAMPLE_RING = 1024`); `count` es el total observado desde el arranque. `p50`/`p95` se calculan sobre el sample.
-- Si el server arranca con `-log-json`, cada request termina emitiendo una línea JSON a stdout (`{ts_unix, method, path, status, latency_ms}`).
+- Si el server arranca con `-log-json`, cada request termina emitiendo una línea JSON a stdout (`{ts_unix, method, path, status, latency_ms}`). Eso describe el **transporte**: un `/exec` fallido sale como `{"status":400}`, sin el SQL ni el código de error.
+- Para el SQL y sus errores está el log de sentencias del motor: `-log-file <ruta>` + `-log-level <none|error|mod|all>`, JSONL con rotación. Incluye el `code` numérico de `[GBY-NNNN]`, útil para alertar por clase de error sin parsear texto. Ver [ADR-0094](adr/0094-engine-statement-log.md) y [ERROR_CODES.md](ERROR_CODES.md).
 - No requiere autenticación distinta a la del server (si arrancaste con `-token`, el header se exige también acá).
 
 ---

@@ -59,6 +59,7 @@ fn spawn_server(db_path: PathBuf) -> String {
                 token: None,
                 max_connections: 16,
                 log_json: false,
+                logger: None,
             },
         );
     });

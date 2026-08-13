@@ -6,6 +6,64 @@
 
 ---
 
+## 2026-08-13 — Bloque L: log de sentencias y errores del motor
+
+> Zero-bump (no toca el formato on-disk). Ver [ADR-0094](docs/adr/0094-engine-statement-log.md).
+
+### Contexto
+
+Faltaba lo que cualquier motor persiste: **qué se ejecutó y qué falló**.
+`DbError` se propagaba hasta el frontend y moría ahí — el CLI lo imprimía,
+el server lo serializaba a un `400`, y nadie lo escribía a ningún lado. Las
+dos capas que había (audit log del gateway MCP, ADR-0012; logs JSON del
+server, ADR-0014) cubrían el tráfico MCP y el transporte HTTP
+respectivamente, pero ninguna registraba el SQL con su código de error.
+
+### Agregado
+
+- **`src/dblog.rs`** — sink JSONL append-only con rotación por tamaño
+  (default 8 MiB × 3 archivos ≈ 32 MiB de techo). Cero deps.
+- **Enganche en `Engine::exec`** — un solo punto cubre CLI, REPL, server
+  HTTP, gateway MCP y uso embebido. Guard de anidamiento: un `CALL` con un
+  loop de 1000 iteraciones escribe **una** línea, no 1000.
+- **Niveles** estilo PostgreSQL: `none` / `error` (default) / `mod` / `all`.
+- **Flags** `-log-file` y `-log-level` en `gabysql-server`; env
+  `GABYSQL_LOG_FILE`, `GABYSQL_LOG_LEVEL`, `GABYSQL_LOG_MAX_BYTES`,
+  `GABYSQL_LOG_MAX_FILES` en ambos binarios.
+- **Códigos nuevos**: rango `6000–6999` (observabilidad). `GBY-6001`
+  `LOG_OPEN_FAILED`, `GBY-6002` `LOG_INVALID_LEVEL`.
+- **21 tests nuevos**: 12 unit en `src/dblog.rs` + 9 E2E en
+  `tests/dblog_engine.rs`. Total en `tests/`: 841 → **850**.
+
+Cada entrada trae `kind`, `sql` completo, `ok`, `code` extraído del prefijo
+`[GBY-NNNN]`, `rows`, `duration_us` y `v` de schema (versionado desde el
+día uno, cerrando la deuda que ADR-0012 dejó anotada).
+
+### Cambios internos
+
+- `server.rs` deja de mantener su propia copia de `json_string`: delega en
+  `dblog::json_escape`.
+- `ServerConfig` gana el campo `logger: Option<Arc<DbLogger>>`. **Breaking
+  para quien construya `ServerConfig` literal** (usar `ServerConfig::new`
+  o agregar `logger: None`).
+
+### A tener en cuenta
+
+- **El SQL se registra completo, con valores.** El archivo hereda la
+  sensibilidad de la base. Documentado en RUNBOOK y USER_MANUAL.
+- Los errores del **parser** no pasan por `Engine::exec` (fallan antes de
+  que exista un `Statement`); se registran desde el frontend con
+  `kind: "PARSE"`.
+
+### Corregido de paso
+
+- `GBY-5007` (`REQUEST_BODY_TOO_LARGE`) existía en `errors.rs` desde el
+  bloque Sec1 pero nunca se había agregado a la tabla de
+  [ERROR_CODES.md](docs/ERROR_CODES.md).
+- Conteo de tests desactualizado en README (828) y CLAUDE.md (838).
+
+---
+
 ## desktop-v0.1.0 — 2026-06-18 — gabymodeler como app Windows
 
 > Primer release del modelador como `.msi` con instalador.
