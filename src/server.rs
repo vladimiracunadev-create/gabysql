@@ -1,3 +1,10 @@
+//! Minimal HTTP/JSON adapter around the embedded SQL engine.
+//!
+//! The server supports single- and multi-database modes, optional token
+//! authentication, bounded request/concurrency handling, metrics and
+//! cross-request transaction sessions. It deliberately does not terminate TLS;
+//! deployments outside a trusted local network need an external reverse proxy.
+
 use crate::catalog::{
     Catalog, CatalogObject, DefaultLiteral, FunctionMeta, GrantMeta, PolicyMeta, ProcedureMeta,
     RoleMeta, StatsMeta, TableMeta, TriggerMeta, UserMeta, ViewMeta, POLICY_ACTION_ALL,

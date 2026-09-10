@@ -1,3 +1,9 @@
+//! Command-line and interactive REPL adapter for the gabysql library.
+//!
+//! Commands translate arguments or SQL text into pager/engine operations and
+//! print `ResultSet` values without adding a second storage or SQL semantics
+//! layer. Backup, restore and verify delegate to the validated library helpers.
+
 use gabysql::dblog::{self, DbLogger, LogRecord};
 use gabysql::sql::{decimal_to_string, parse, Engine, ResultSet, Statement, Value};
 use gabysql::storage::Pager;

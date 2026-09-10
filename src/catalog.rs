@@ -1,3 +1,11 @@
+//! Persistent schema catalog and metadata codecs.
+//!
+//! This module defines the durable representation of tables, columns, indexes,
+//! constraints, routines, identities, policies and planner statistics. Numeric
+//! object discriminants and field encodings are an on-disk compatibility
+//! boundary; validation helpers protect names and schema invariants before the
+//! engine writes them.
+
 use crate::bptree::{init_leaf_page, LeafCursor, Tree};
 use crate::errors::{coded, codes};
 use crate::storage::Pager;

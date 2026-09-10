@@ -68,6 +68,19 @@ El motor actual prioriza estabilidad, durabilidad y claridad arquitectónica com
 
 ## 📚 Documentos clave del producto
 
+### Documentación integral del sistema
+
+La documentación transversal para incorporación, auditoría y comprensión del repositorio se encuentra en:
+
+- [Índice general](docs/system-documentation/README.md)
+- [Descripción general](docs/system-documentation/01-system-overview.md)
+- [Arquitectura](docs/system-documentation/03-architecture.md)
+- [Referencia técnica](docs/system-documentation/05-technical-reference.md)
+- [Persistencia y modelo de datos](docs/system-documentation/07-database.md)
+- [Resumen ejecutivo](docs/system-documentation/17-executive-summary.md)
+- [Guía para nuevos desarrolladores](docs/system-documentation/18-new-developer-guide.md)
+- [Documentos PDF](docs/system-documentation/pdf/)
+
 > **Atajos a los 7 documentos estratégicos.** El resto del repo está enlazado más abajo en *Mapa documental*.
 
 | 📄 | Documento | Para qué sirve |

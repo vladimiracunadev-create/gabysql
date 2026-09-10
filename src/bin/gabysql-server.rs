@@ -1,3 +1,8 @@
+//! Process entry point and flag parser for the gabysql HTTP server.
+//!
+//! Network behavior lives in `gabysql::server`; this binary validates operating
+//! mode, address, authentication, connection limits and logging configuration.
+
 use gabysql::dblog;
 use gabysql::server::{run, ServerConfig, DEFAULT_MAX_CONNECTIONS};
 use gabysql::DbResult;

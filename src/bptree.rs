@@ -1,3 +1,9 @@
+//! Persistent B+Tree used by table rows, catalog objects and secondary indexes.
+//!
+//! Nodes occupy pager pages. Internal separators route lookups while linked
+//! leaves support lazy full/range scans. Encoding and split rules are part of
+//! the on-disk contract, so changes here require storage compatibility review.
+
 use crate::storage::{Pager, PAGE_CHECKSUM_BYTES};
 use crate::{DbError, DbResult};
 

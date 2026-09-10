@@ -1,3 +1,11 @@
+//! SQL abstract syntax tree, parser, expression evaluator and execution engine.
+//!
+//! [`parse`] converts SQL text into [`Statement`] values. [`Engine`] resolves
+//! those statements against the catalog and coordinates constraints, indexes,
+//! authorization, row-level security, transactions and persistence through the
+//! pager. Because this is the semantic hub, changes should be covered by focused
+//! parser/engine tests and reflected in the SQL reference.
+
 use crate::bptree::{init_leaf_page, KeyValue, Tree};
 use crate::catalog::{
     validate_create_table, validate_identifier, Catalog, CatalogObject, CheckConstraint, Column,

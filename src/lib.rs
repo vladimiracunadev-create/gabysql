@@ -1,3 +1,10 @@
+//! Public library surface for the gabysql embedded database engine.
+//!
+//! The crate is layered from [`storage`] and [`bptree`] through [`catalog`],
+//! [`index`] and [`sql`], with optional adapters in [`server`], [`backup`] and
+//! [`dblog`]. Callers share the small [`DbError`]/[`DbResult`] contract; stable
+//! user-facing error identifiers are defined in [`errors`].
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
